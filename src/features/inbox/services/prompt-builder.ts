@@ -49,6 +49,17 @@ const WHATSAPP_FORMAT_NOTE =
   'Escribes para WhatsApp. Usa *negrita* (un solo asterisco), _cursiva_ y listas con "- ". ' +
   "NO uses Markdown: nada de **, ##, encabezados, ni tablas.";
 
+// Voice notes are auto-transcribed and images auto-described before they reach
+// the agent, so the text it reads already contains their content. Without this
+// the model falls back to the generic "no puedo escuchar audios" chatbot
+// disclaimer when a customer's (transcribed) message asks about voice/audio.
+const MEDIA_CAPABILITY_NOTE =
+  "## Notas de voz e imágenes\n" +
+  "Las notas de voz del cliente se transcriben automáticamente a texto y las " +
+  "imágenes se describen automáticamente: lo que lees ya incluye su contenido. " +
+  "Respóndelo con normalidad. NUNCA digas que no puedes escuchar audios/notas " +
+  "de voz ni ver imágenes — sí puedes, ya te llegan convertidos a texto.";
+
 export function substituteVars(text: string, vars?: SystemPromptVars): string {
   if (!vars) return text;
   return text
@@ -100,6 +111,7 @@ export function buildSystemPrompt(parts: BuildSystemPromptParts): string {
     styleBlock,
     base,
     WHATSAPP_FORMAT_NOTE,
+    MEDIA_CAPABILITY_NOTE,
     guardrailsBlock,
   ]
     .filter(Boolean)
