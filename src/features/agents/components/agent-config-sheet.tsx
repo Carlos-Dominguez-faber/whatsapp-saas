@@ -16,6 +16,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
+import { Textarea } from "@/components/ui/textarea";
 import { AvatarGalleryPicker } from "./avatar-gallery-picker";
 import { ModelPicker } from "./model-picker";
 import { AgentAvatar } from "./agent-avatar";
@@ -53,6 +54,11 @@ export function AgentConfigSheet({
   const [avatarKey, setAvatarKey] = useState(agent.avatarKey);
   const [model, setModel] = useState<string | null>(agent.model);
   const [autoTag, setAutoTag] = useState(Boolean(agent.config.autoTag));
+  const [tagTaxonomy, setTagTaxonomy] = useState(
+    Array.isArray(agent.config.tagTaxonomy)
+      ? agent.config.tagTaxonomy.join(", ")
+      : "",
+  );
   const [summarize, setSummarize] = useState(Boolean(agent.config.summarize));
   const [responseStyle, setResponseStyle] = useState<ResponseStyle>(
     agent.config.responseStyle ?? "balanced",
@@ -69,6 +75,14 @@ export function AgentConfigSheet({
       return;
     }
     setSaving(true);
+    const taxonomyList = Array.from(
+      new Set(
+        tagTaxonomy
+          .split(",")
+          .map((t) => t.toLowerCase().trim())
+          .filter(Boolean),
+      ),
+    );
     try {
       const res = await fetch(`/api/workspace/${workspaceId}/agents`, {
         method: "PATCH",
@@ -84,6 +98,8 @@ export function AgentConfigSheet({
             summarize,
             responseStyle,
             sleepOnManualMessage: sleepOnManual,
+            // undefined is dropped by JSON.stringify → clears the key.
+            tagTaxonomy: taxonomyList.length > 0 ? taxonomyList : undefined,
           },
         }),
       });
@@ -169,6 +185,26 @@ export function AgentConfigSheet({
                   aria-label="Auto-etiquetado"
                 />
               </div>
+              {autoTag && (
+                <div className="space-y-1.5">
+                  <Label htmlFor="tag-taxonomy" className="text-xs">
+                    Temas permitidos (separados por coma)
+                  </Label>
+                  <Textarea
+                    id="tag-taxonomy"
+                    value={tagTaxonomy}
+                    onChange={(e) => setTagTaxonomy(e.target.value)}
+                    placeholder="Ej: chasis, motor, cerámico, precio, horario"
+                    rows={3}
+                    className="text-xs"
+                  />
+                  <p className="text-[10px] text-muted-foreground">
+                    La IA etiqueta solo con estos temas; lo que no encaje llega
+                    como &quot;nuevo:&quot; para detectar gaps. Vacío = etiquetas
+                    libres.
+                  </p>
+                </div>
+              )}
               <div className="flex items-center justify-between gap-3">
                 <div>
                   <p className="text-sm font-medium text-foreground">
