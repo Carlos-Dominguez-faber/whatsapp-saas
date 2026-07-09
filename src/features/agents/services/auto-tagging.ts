@@ -15,6 +15,16 @@ function svc() {
   );
 }
 
+/** Normalized controlled vocabulary from config, or null → free-form tags. */
+function parseTaxonomy(raw: unknown): string[] | null {
+  if (!Array.isArray(raw)) return null;
+  const items = raw
+    .filter((t): t is string => typeof t === "string")
+    .map((t) => t.toLowerCase().trim())
+    .filter(Boolean);
+  return items.length > 0 ? Array.from(new Set(items)) : null;
+}
+
 function safeParseJson(text: string): Record<string, unknown> | null {
   try {
     const cleaned = text
@@ -57,10 +67,16 @@ export async function maybeAutoProcess(opts: {
       .map((m) => `${m.direction === "in" ? "Cliente" : "Agente"}: ${m.body}`)
       .join("\n");
 
+    const taxonomy = config.autoTag ? parseTaxonomy(config.tagTaxonomy) : null;
+
     const fields: string[] = [];
     if (config.autoTag)
       fields.push(
-        '- "tags": array de 1 a 3 etiquetas cortas en minúsculas (ej: ["interesado","precio"]).',
+        taxonomy
+          ? `- "tags": array de 1 a 3 etiquetas elegidas SOLO de esta lista: ${taxonomy.join(
+              ", ",
+            )}. Si el cliente preguntó por un tema importante que NO está en la lista, agrega ADEMÁS una etiqueta con el prefijo "nuevo:" (ej: "nuevo:encerado"). No inventes etiquetas fuera de la lista sin ese prefijo.`
+          : '- "tags": array de 1 a 3 etiquetas cortas en minúsculas (ej: ["interesado","precio"]).',
       );
     if (config.summarize)
       fields.push('- "summary": resumen de la conversación en una sola frase.');
@@ -81,11 +97,20 @@ export async function maybeAutoProcess(opts: {
     if (!parsed) return;
 
     if (config.autoTag && Array.isArray(parsed.tags)) {
-      const newTags = parsed.tags
+      const cleaned = parsed.tags
         .filter((t): t is string => typeof t === "string")
         .map((t) => t.toLowerCase().trim())
-        .filter(Boolean)
-        .slice(0, 3);
+        .filter(Boolean);
+      // With a controlled vocabulary, drop hallucinated tags: keep only
+      // list members (max 3) plus at most one "nuevo:" gap candidate.
+      const newTags = taxonomy
+        ? [
+            ...cleaned.filter((t) => taxonomy.includes(t)).slice(0, 3),
+            ...cleaned
+              .filter((t) => t.startsWith("nuevo:") && t.length > "nuevo:".length)
+              .slice(0, 1),
+          ]
+        : cleaned.slice(0, 3);
       if (newTags.length > 0) {
         const { data: contact } = await db
           .from("contacts")

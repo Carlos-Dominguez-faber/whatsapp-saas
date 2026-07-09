@@ -12,6 +12,12 @@ export interface AgentConfig {
   /** Opt-in v1.5 features. */
   autoTag?: boolean;
   summarize?: boolean;
+  /**
+   * Controlled tag vocabulary for autoTag. When set, the tagger picks tags
+   * only from this list; unknown-but-important topics come back prefixed
+   * "nuevo:" so gaps stay visible. Unset → free-form tags (legacy behavior).
+   */
+  tagTaxonomy?: string[];
   /** Verbosity of replies; "balanced" when unset. */
   responseStyle?: ResponseStyle;
   /** Pause the AI when a human sends a manual message (default true). */
