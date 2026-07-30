@@ -5,6 +5,7 @@ import { Space_Grotesk } from "next/font/google";
 import { ThemeProvider } from "@/components/theme-provider";
 import { Toaster } from "@/components/ui/sonner";
 import { Agentation } from "agentation";
+import { brandStyleOverride } from "@/lib/branding";
 import "./globals.css";
 
 const spaceGrotesk = Space_Grotesk({
@@ -23,8 +24,16 @@ export default function RootLayout({
 }: {
   children: React.ReactNode;
 }) {
+  const brand = brandStyleOverride();
+
   return (
     <html lang="es" suppressHydrationWarning>
+      {brand && (
+        <head>
+          {/* Inline so the brand tint lands on first paint, before hydration. */}
+          <style dangerouslySetInnerHTML={{ __html: brand }} />
+        </head>
+      )}
       <body
         className={`${GeistSans.variable} ${GeistMono.variable} ${spaceGrotesk.variable} font-body antialiased`}
       >
