@@ -67,36 +67,20 @@ export async function decide(opts: {
 
   // 3. Detect handoff trigger in message text
   if (detectsHandoffTrigger(mergedText)) {
-    // Validate the transition is legal before applying
+    // This used to UPDATE the row inline, which meant the most common handoff
+    // path — the contact asking for a human — skipped applyTransition() and
+    // therefore every side effect hanging off it. Route it through the same
+    // function as the other two paths.
     if (canTransition(currentState, "handoff_pending")) {
-      const { error: updateError } = await supabase
-        .from("conversations")
-        .update({
-          state: "handoff_pending",
-          ai_enabled: false,
-          updated_at: new Date().toISOString(),
-        })
-        .eq("id", conversationId);
-
-      if (updateError) {
+      try {
+        await applyTransition(conversationId, "handoff_pending", {
+          trigger: "keyword",
+        });
+      } catch (err) {
         console.error(
           "[decision-engine] failed to transition to handoff_pending:",
-          updateError,
+          err,
         );
-      } else {
-        // Log the state change to events
-        await supabase.from("events").insert({
-          type: "state_change",
-          level: "info",
-          workspace_id: workspaceId,
-          conversation_id: conversationId,
-          payload: {
-            from: currentState,
-            to: "handoff_pending",
-            trigger: "keyword",
-            actor: "system",
-          },
-        });
       }
     }
 
@@ -121,16 +105,28 @@ export async function decide(opts: {
   return { decision: "respond", reason: "normal", availableTools };
 }
 
+export interface TransitionOptions {
+  /** Set when a human drove the transition — becomes assigned_to + event actor. */
+  userId?: string;
+  /** What caused it: keyword | agent | manual. Recorded in the event payload. */
+  trigger?: string;
+}
+
 /**
  * Applies a validated state transition to a conversation.
  * Logs the transition to the events table.
  * If transitioning to human_active and userId is provided, sets assigned_to.
+ *
+ * This is the single choke point for state changes: every side effect of
+ * entering a state hangs off here, so all callers must go through it rather
+ * than UPDATE `conversations` directly.
  */
 export async function applyTransition(
   conversationId: string,
   to: ConversationState,
-  userId?: string,
+  opts: TransitionOptions = {},
 ): Promise<void> {
+  const { userId, trigger } = opts;
   const supabase = svc();
 
   // 1. Load current state
@@ -186,6 +182,19 @@ export async function applyTransition(
       from: currentState,
       to,
       actor: userId ?? "system",
+      ...(trigger ? { trigger } : {}),
     },
   });
+
+  // 5. Side effects of the new state. Deliberately last and deliberately
+  //    non-throwing: the transition above is already committed and must stand
+  //    even if notifying anyone fails.
+  if (to === "handoff_pending") {
+    const { notifyHandoffPending } = await import("./handoff-notifier");
+    await notifyHandoffPending({
+      workspaceId: conv.workspace_id as string,
+      conversationId,
+      trigger: trigger ?? (userId ? "manual" : "agent"),
+    });
+  }
 }

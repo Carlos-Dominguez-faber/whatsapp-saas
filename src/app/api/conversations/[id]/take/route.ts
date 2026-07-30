@@ -44,7 +44,7 @@ export async function POST(
 
   try {
     // 3. Transition to human_active, assign to current user
-    await applyTransition(conversationId, "human_active", user.id);
+    await applyTransition(conversationId, "human_active", { userId: user.id });
 
     return NextResponse.json({ ok: true, state: "human_active" });
   } catch (err) {
