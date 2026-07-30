@@ -728,7 +728,9 @@ async function executeSetterPostAction(p: PostActionParams): Promise<void> {
       case "handoff": {
         // handoff_pending sets ai_enabled=false; only valid from ai_active.
         try {
-          await applyTransition(p.conversationId, "handoff_pending");
+          await applyTransition(p.conversationId, "handoff_pending", {
+            trigger: "agent",
+          });
         } catch (e) {
           console.warn(
             "[setter] handoff skipped:",

@@ -41,7 +41,10 @@ export async function POST(
     // 'cancel'  → ai_active (from handoff_pending)
     const to = action === "request" ? "handoff_pending" : "ai_active";
 
-    await applyTransition(conversationId, to, user.id);
+    await applyTransition(conversationId, to, {
+      userId: user.id,
+      trigger: "manual",
+    });
 
     // 4. Return updated state
     return NextResponse.json({ ok: true, state: to });

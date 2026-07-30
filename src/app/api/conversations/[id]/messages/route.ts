@@ -65,7 +65,9 @@ export async function POST(
       const activeAgent = await getActiveAgent(conv.workspace_id);
       const sleepOnManual = activeAgent?.config.sleepOnManualMessage !== false;
       if (sleepOnManual) {
-        await applyTransition(conversationId, "human_active", user.id);
+        await applyTransition(conversationId, "human_active", {
+          userId: user.id,
+        });
       }
     } catch (e) {
       // Non-fatal: the message was already sent. Most likely the conversation

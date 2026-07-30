@@ -13,6 +13,9 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Separator } from "@/components/ui/separator";
+import { Switch } from "@/components/ui/switch";
+import { Textarea } from "@/components/ui/textarea";
+import { DEFAULT_HANDOFF_ACK } from "@/features/inbox/types/handoff";
 import { ModelPicker } from "@/features/agents/components/model-picker";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -124,6 +127,14 @@ function YCloudSection({
   const [messagesInMemory, setMessagesInMemory] = useState<number>(
     (initial?.config?.message_history_window as number | undefined) ?? 10,
   );
+  // Handoff acknowledgement: defaults to on, so a workspace that never opens
+  // this screen still replies to the contact instead of going silent.
+  const [handoffAckEnabled, setHandoffAckEnabled] = useState<boolean>(
+    (initial?.config?.handoff_ack_enabled as boolean | undefined) !== false,
+  );
+  const [handoffAckMessage, setHandoffAckMessage] = useState<string>(
+    (initial?.config?.handoff_ack_message as string | undefined) ?? "",
+  );
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
   const [copied, setCopied] = useState(false);
@@ -186,6 +197,8 @@ function YCloudSection({
             phone_number: phone,
             buffer_silence_seconds: bufferSeconds,
             message_history_window: messagesInMemory,
+            handoff_ack_enabled: handoffAckEnabled,
+            handoff_ack_message: handoffAckMessage.trim(),
           },
         }),
       });
@@ -314,6 +327,34 @@ function YCloudSection({
           <p className="text-xs text-muted-foreground">
             Cuántos mensajes recientes recuerda la IA al responder (entre 5 y
             50). Por defecto 10.
+          </p>
+        </div>
+
+        <div className="space-y-2 border-t border-border/60 pt-4">
+          <div className="flex items-center justify-between gap-4">
+            <Label htmlFor="ycloud-handoff-ack">
+              Avisar al contacto cuando pasa a un humano
+            </Label>
+            <Switch
+              id="ycloud-handoff-ack"
+              checked={handoffAckEnabled}
+              onCheckedChange={setHandoffAckEnabled}
+            />
+          </div>
+          <Textarea
+            id="ycloud-handoff-ack-message"
+            rows={2}
+            maxLength={500}
+            disabled={!handoffAckEnabled}
+            placeholder={DEFAULT_HANDOFF_ACK}
+            value={handoffAckMessage}
+            onChange={(e) => setHandoffAckMessage(e.target.value)}
+            aria-label="Mensaje de aviso al contacto"
+          />
+          <p className="text-xs text-muted-foreground">
+            Se envía en cuanto la conversación queda en espera de un asesor, para
+            que el contacto no se quede sin respuesta. Si lo dejas vacío se usa:
+            “{DEFAULT_HANDOFF_ACK}”
           </p>
         </div>
 
