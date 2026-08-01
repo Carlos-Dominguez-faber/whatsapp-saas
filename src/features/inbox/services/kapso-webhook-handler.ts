@@ -127,13 +127,36 @@ function asString(value: unknown): string | null {
 }
 
 /**
+ * Resolves the event name for a webhook request.
+ *
+ * Kapso sends it in the `X-Webhook-Event` HEADER — an unbuffered request body
+ * carries no top-level `type` at all (only `message.type`, which is "text" /
+ * "image" / …). The body-level `type` exists solely on the batch envelope, so
+ * it is used only as a fallback.
+ */
+export function resolveEventName(
+  header: string | null,
+  body: unknown,
+): string | null {
+  if (header && header.trim()) return header.trim();
+  const event = asRecord(body);
+  return asString(event?.type);
+}
+
+/**
  * Parses and normalises a raw Kapso webhook body.
  * Returns null if the event is not an inbound message or is malformed.
+ *
+ * `eventName` comes from resolveEventName() — never from body.type, which real
+ * payloads do not have.
  *
  * Kapso docs warn explicitly: "Do not assume phone_number, from, to, or wa_id
  * are always present" — so every field below is read defensively.
  */
-export function parseInbound(body: unknown): NormalizedInbound | null {
+export function parseInbound(
+  body: unknown,
+  eventName: string | null,
+): NormalizedInbound | null {
   try {
     const event = asRecord(body);
     if (!event) return null;
@@ -148,7 +171,7 @@ export function parseInbound(body: unknown): NormalizedInbound | null {
       return null;
     }
 
-    if (event.type !== "whatsapp.message.received") return null;
+    if (eventName !== "whatsapp.message.received") return null;
 
     const message = asRecord(event.message);
     if (!message) return null;
@@ -264,11 +287,14 @@ export interface OutboundEcho {
  * Returns null for our own sends (origin 'cloud_api') and for history backfills
  * ('history_sync'), which are not live human activity.
  */
-export function parseOutboundEcho(body: unknown): OutboundEcho | null {
+export function parseOutboundEcho(
+  body: unknown,
+  eventName: string | null,
+): OutboundEcho | null {
   try {
     const event = asRecord(body);
     if (!event) return null;
-    if (event.type !== "whatsapp.message.sent") return null;
+    if (eventName !== "whatsapp.message.sent") return null;
 
     const message = asRecord(event.message);
     if (!message) return null;
@@ -330,15 +356,16 @@ export interface ParsedStatus {
  * single `whatsapp.message.updated` into one event per status.
  * Returns null when the event is not a status update or carries no wamid.
  */
-export function parseStatusUpdate(body: unknown): ParsedStatus | null {
+export function parseStatusUpdate(
+  body: unknown,
+  eventName: string | null,
+): ParsedStatus | null {
   try {
     const event = asRecord(body);
     if (!event) return null;
+    if (!eventName) return null;
 
-    const type = asString(event.type);
-    if (!type) return null;
-
-    const status = STATUS_EVENTS[type];
+    const status = STATUS_EVENTS[eventName];
     if (!status) return null;
 
     const message = asRecord(event.message);
@@ -352,8 +379,6 @@ export function parseStatusUpdate(body: unknown): ParsedStatus | null {
 }
 
 /** True when the event is one of Kapso's outbound status events. */
-export function isStatusEvent(body: unknown): boolean {
-  const event = asRecord(body);
-  const type = asString(event?.type);
-  return type !== null && type in STATUS_EVENTS;
+export function isStatusEvent(eventName: string | null): boolean {
+  return eventName !== null && eventName in STATUS_EVENTS;
 }

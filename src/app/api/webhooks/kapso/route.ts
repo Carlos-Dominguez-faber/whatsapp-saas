@@ -6,6 +6,7 @@ import {
   parseStatusUpdate,
   parseOutboundEcho,
   isStatusEvent,
+  resolveEventName,
 } from "@/features/inbox/services/kapso-webhook-handler";
 import {
   processInbound,
@@ -98,9 +99,17 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
       return NextResponse.json({ error: "Invalid JSON" }, { status: 400 });
     }
 
+    // The event name lives in the X-Webhook-Event HEADER. An unbuffered Kapso
+    // body has no top-level `type` — only message.type ("text"/"image"/…) — so
+    // classifying off the body silently drops every real event.
+    const eventName = resolveEventName(
+      request.headers.get("X-Webhook-Event"),
+      body,
+    );
+
     // WH-02: classify the event. Signature verification MUST happen before we
     // act on EITHER a status update or an inbound message.
-    const isStatusUpdate = isStatusEvent(body);
+    const isStatusUpdate = isStatusEvent(eventName);
 
     // Kapso identifies the receiving business number by its Meta phone_number_id
     // (there is no `to` field). This is the fallback when ?wsid is absent.
@@ -182,7 +191,7 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
     // not a status update — it's a human answering from the WhatsApp Business
     // App on their phone. Record it and hand the conversation to them, before
     // the status branch swallows it as an unknown wamid.
-    const echo = parseOutboundEcho(body);
+    const echo = parseOutboundEcho(body, eventName);
     if (echo) {
       const result = await processOutboundEcho(ws.workspace_id, echo);
       return NextResponse.json({
@@ -195,14 +204,14 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
 
     // WH-02: monotonic status updates — only reached after signature verification.
     if (isStatusUpdate) {
-      const statusData = parseStatusUpdate(body);
+      const statusData = parseStatusUpdate(body, eventName);
       if (statusData) {
         await handleStatusUpdate(supabase, statusData.wamid, statusData.status);
       }
       return NextResponse.json({ received: true });
     }
 
-    const normalized = parseInbound(body);
+    const normalized = parseInbound(body, eventName);
     if (!normalized) {
       return NextResponse.json({ received: true });
     }
