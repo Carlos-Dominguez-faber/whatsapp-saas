@@ -40,7 +40,7 @@ async function resolveMember(
 const NAME_REGEX = /^[a-z0-9_]+$/;
 
 // Shared rich fields (header text-only, footer, buttons). Stored as a local
-// draft; only built into YCloud `components` at submit time.
+// draft; only built into Kapso `components` at submit time.
 const RICH_FIELDS = {
   header_type: z.enum(["none", "text"]).default("none"),
   header_text: z.string().max(60).default(""),

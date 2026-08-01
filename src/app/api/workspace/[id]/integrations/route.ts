@@ -8,7 +8,7 @@ import {
 } from "@/lib/auth/workspace-access";
 
 const IntegrationSchema = z.object({
-  provider: z.enum(["ycloud", "openrouter", "highlevel"]),
+  provider: z.enum(["kapso", "openrouter", "highlevel"]),
   enabled: z.boolean().optional(),
   credentials: z.record(z.string(), z.string()).optional(),
   config: z.record(z.string(), z.unknown()).optional(),

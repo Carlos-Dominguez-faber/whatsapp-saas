@@ -11,9 +11,11 @@ export const OnboardingSchema = z.object({
   businessName: z.string().min(1, "El nombre del negocio es requerido"),
   industry: z.string().optional(),
   description: z.string().optional(),
-  ycloudApiKey: z.string().optional(),
-  ycloudPhone: z.string().optional(),
-  ycloudSigningSecret: z.string().optional(),
+  kapsoApiKey: z.string().optional(),
+  kapsoPhone: z.string().optional(),
+  kapsoPhoneNumberId: z.string().optional(),
+  kapsoWabaId: z.string().optional(),
+  kapsoSigningSecret: z.string().optional(),
 });
 
 export type OnboardingInput = z.infer<typeof OnboardingSchema>;
@@ -229,20 +231,25 @@ export async function completeOnboarding(
     });
   }
 
-  // 9. Save YCloud integration (if credentials provided)
-  if (data.ycloudApiKey) {
+  // 9. Save Kapso integration (if credentials provided)
+  if (data.kapsoApiKey) {
     const { error: intError } = await serviceClient
       .from("integrations")
       .insert({
         workspace_id: workspaceId,
-        provider: "ycloud",
+        provider: "kapso",
         enabled: true,
         credentials: {
-          ycloud_api_key: data.ycloudApiKey,
-          webhook_signing_secret: data.ycloudSigningSecret ?? "",
+          kapso_api_key: data.kapsoApiKey,
+          webhook_signing_secret: data.kapsoSigningSecret ?? "",
         },
         config: {
-          phone_number: data.ycloudPhone ?? "",
+          phone_number: data.kapsoPhone ?? "",
+          // Meta's IDs — phone_number_id is required to send at all, waba_id to
+          // manage templates. Neither is discoverable from the API without the
+          // other, so both come from the Kapso dashboard.
+          phone_number_id: data.kapsoPhoneNumberId ?? "",
+          waba_id: data.kapsoWabaId ?? "",
         },
         oauth_tokens: {},
       });

@@ -9,7 +9,7 @@ const connectSrc = [
   "'self'",
   "*.supabase.co",
   "wss://*.supabase.co",
-  "api.ycloud.com",
+  "api.kapso.ai",
   "openrouter.ai",
   "services.leadconnectorhq.com",
   ...(isDev ? ["ws://localhost:*", "http://localhost:*"] : []),

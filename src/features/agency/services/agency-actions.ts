@@ -272,7 +272,7 @@ export async function createWorkspaceForClient(
       "NEXT_PUBLIC_APP_URL no está configurada — no se puede generar el webhook URL del workspace.",
     );
   }
-  const webhookUrl = `${baseUrl}/api/webhooks/ycloud?wsid=${workspaceId}`;
+  const webhookUrl = `${baseUrl}/api/webhooks/kapso?wsid=${workspaceId}`;
 
   return { workspaceId, webhookUrl, clientCredentials };
 }
@@ -338,11 +338,11 @@ export async function getAllWorkspacesWithStats(): Promise<GetWorkspacesResult> 
     .select("workspace_id")
     .in("workspace_id", ids);
 
-  // YCloud integrations
+  // Kapso integrations
   const { data: integrations } = await service
     .from("integrations")
     .select("workspace_id, enabled")
-    .eq("provider", "ycloud")
+    .eq("provider", "kapso")
     .in("workspace_id", ids);
 
   // Build lookup maps
@@ -358,10 +358,10 @@ export async function getAllWorkspacesWithStats(): Promise<GetWorkspacesResult> 
     convMap.set(id, (convMap.get(id) ?? 0) + 1);
   }
 
-  const ycloudMap = new Map<string, boolean>();
+  const kapsoMap = new Map<string, boolean>();
   for (const i of integrations ?? []) {
     const row = i as { workspace_id: string; enabled: boolean };
-    ycloudMap.set(row.workspace_id, row.enabled);
+    kapsoMap.set(row.workspace_id, row.enabled);
   }
 
   const result: WorkspaceWithStats[] = (
@@ -378,7 +378,7 @@ export async function getAllWorkspacesWithStats(): Promise<GetWorkspacesResult> 
     created_at: w.created_at,
     member_count: memberMap.get(w.id) ?? 0,
     conversation_count: convMap.get(w.id) ?? 0,
-    ycloud_connected: ycloudMap.get(w.id) ?? false,
+    kapso_connected: kapsoMap.get(w.id) ?? false,
   }));
 
   return { workspaces: result };

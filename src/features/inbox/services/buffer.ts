@@ -243,7 +243,7 @@ async function consolidateBatch(
 //   5. checkRateLimits
 //   6. generateReply with consolidated text
 //   7. recordLlmUsage
-//   8. sendText via ycloud-client (or insert dev_mode outbound)
+//   8. sendText via kapso-client (or insert dev_mode outbound)
 //   9. Mark batch 'processed', persist merged_text
 //  10. On error: increment retry counter; if > MAX_BATCH_RETRIES → cancel_batch()
 // ──────────────────────────────────────────────────────────────────────────────
@@ -307,17 +307,17 @@ export async function processNextBatch(): Promise<ProcessBatchResult> {
     };
 
     // ── 6b. Resolve conversational memory window (WS2: configurable) ─────────
-    // The YCloud integration config carries message_history_window; clamp to
+    // The Kapso integration config carries message_history_window; clamp to
     // [5, 50] and default to 10 when unset or non-numeric.
-    const { data: ycloudCfg } = await supabase
+    const { data: kapsoCfg } = await supabase
       .from("integrations")
       .select("config")
       .eq("workspace_id", batch.workspace_id)
-      .eq("provider", "ycloud")
+      .eq("provider", "kapso")
       .eq("enabled", true)
       .maybeSingle();
     const rawWindow = Number(
-      (ycloudCfg?.config as { message_history_window?: number } | null)
+      (kapsoCfg?.config as { message_history_window?: number } | null)
         ?.message_history_window,
     );
     const historyWindow = Number.isFinite(rawWindow)
@@ -427,17 +427,17 @@ export async function processNextBatch(): Promise<ProcessBatchResult> {
       completionTokens: reply.outputTokens,
     });
 
-    // ── 9. Load YCloud integration credentials ──────────────────────────────
+    // ── 9. Load Kapso integration credentials ──────────────────────────────
     const { data: integration, error: intError } = await supabase
       .from("integrations")
       .select("credentials, config")
       .eq("workspace_id", batch.workspace_id)
-      .eq("provider", "ycloud")
+      .eq("provider", "kapso")
       .eq("enabled", true)
       .single();
 
     if (intError || !integration) {
-      throw new Error(`YCloud integration not found: ${intError?.message}`);
+      throw new Error(`Kapso integration not found: ${intError?.message}`);
     }
 
     // ── 10a. Dispatch via single exit point (SEC-04) ────────────────────────

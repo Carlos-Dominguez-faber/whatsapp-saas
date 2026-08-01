@@ -33,7 +33,7 @@ export default async function AgencyWorkspacesPage() {
     (sum, w) => sum + w.conversation_count,
     0,
   );
-  const connectedCount = workspaces.filter((w) => w.ycloud_connected).length;
+  const connectedCount = workspaces.filter((w) => w.kapso_connected).length;
 
   const kpis = [
     {
@@ -52,7 +52,7 @@ export default async function AgencyWorkspacesPage() {
       icon: MessageCircle,
     },
     {
-      label: "YCloud conectado",
+      label: "Kapso conectado",
       value: connectedCount,
       icon: Wifi,
     },

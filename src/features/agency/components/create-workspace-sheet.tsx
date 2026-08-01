@@ -183,7 +183,7 @@ export function CreateWorkspaceSheet({ open, onClose, onCreated }: Props) {
               </p>
               <p className="text-xs text-muted-foreground">
                 Comparte esta URL de webhook con tu cliente para conectar
-                YCloud:
+                Kapso:
               </p>
               <div className="flex items-center gap-2 mt-1">
                 <code className="flex-1 rounded bg-muted px-2 py-1.5 font-mono text-xs text-foreground break-all">

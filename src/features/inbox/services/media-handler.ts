@@ -7,7 +7,7 @@ function svc() {
   );
 }
 
-const ALLOWED_YCLOUD_HOST = "api.ycloud.com";
+const ALLOWED_KAPSO_HOST = "api.kapso.ai";
 const BUCKET = "whatsapp-media";
 
 /** MIME type → file extension map */
@@ -42,7 +42,7 @@ function extensionFor(mime: string): string {
 export interface MediaMeta {
   storage_path: string;
   mime_type: string;
-  ycloud_media_id?: string;
+  kapso_media_id?: string;
   /** Caption from image / video payloads */
   caption?: string;
   /** Original filename from document payloads */
@@ -55,10 +55,12 @@ export interface MediaMeta {
 }
 
 export interface DownloadAndStoreOptions {
-  /** YCloud direct download URL (must be on api.ycloud.com — SEC-08) */
+  /**
+   * Kapso media download URL (must be on api.kapso.ai — SEC-08). The signed
+   * token is embedded in the URL and EXPIRES, so pass it straight from the
+   * webhook payload — never a value read back out of storage.
+   */
   link: string;
-  /** YCloud workspace API key — sent as X-API-Key header */
-  apiKey: string;
   /** Forge workspace ID used as first path segment in storage */
   workspaceId: string;
   /** Conversation ID used as second path segment in storage */
@@ -69,51 +71,51 @@ export interface DownloadAndStoreOptions {
   filename?: string;
   /** Caption text for images / videos */
   caption?: string;
-  /** YCloud media ID from the payload */
-  ycloudMediaId?: string;
+  /** Meta media ID from the payload */
+  kapsoMediaId?: string;
 }
 
 /**
- * SEC-08: Validates that the URL host is exactly api.ycloud.com.
+ * SEC-08: Validates that the URL host is exactly api.kapso.ai.
  * Returns false on any parse error.
  */
-export function validateYCloudUrl(url: string): boolean {
+export function validateKapsoUrl(url: string): boolean {
   try {
-    return new URL(url).hostname === ALLOWED_YCLOUD_HOST;
+    return new URL(url).hostname === ALLOWED_KAPSO_HOST;
   } catch {
     return false;
   }
 }
 
 /**
- * Downloads a media file from YCloud and stores it in the whatsapp-media
+ * Downloads a media file from Kapso and stores it in the whatsapp-media
  * Supabase Storage bucket.
  *
  * Storage path: {workspaceId}/{conversationId}/{timestamp}-{filename}.{ext}
  *
  * Returns null when:
  * - The URL fails SEC-08 host validation
- * - The YCloud download request fails (non-2xx)
+ * - The Kapso download request fails (non-2xx)
  * - The Supabase upload fails
  */
 export async function downloadAndStoreMedia(
   opts: DownloadAndStoreOptions,
 ): Promise<MediaMeta | null> {
-  // SEC-08: block requests to non-YCloud hosts
-  if (!validateYCloudUrl(opts.link)) {
+  // SEC-08: block requests to non-Kapso hosts
+  if (!validateKapsoUrl(opts.link)) {
     console.error(
-      "[media-handler] SEC-08 violation — URL host is not api.ycloud.com:",
+      "[media-handler] SEC-08 violation — URL host is not api.kapso.ai:",
       opts.link,
     );
     return null;
   }
 
-  // Download from YCloud
+  // Download from Kapso. NO X-API-Key here: the download URL is pre-signed and
+  // carries its own token — and it expires, so a 401/403 usually means the URL
+  // sat around too long rather than that the credentials are wrong.
   let response: Response;
   try {
-    response = await fetch(opts.link, {
-      headers: { "X-API-Key": opts.apiKey },
-    });
+    response = await fetch(opts.link);
   } catch (err) {
     console.error("[media-handler] fetch failed:", err);
     return null;
@@ -121,7 +123,7 @@ export async function downloadAndStoreMedia(
 
   if (!response.ok) {
     console.error(
-      `[media-handler] YCloud download returned ${response.status} for ${opts.link}`,
+      `[media-handler] Kapso download returned ${response.status} for ${opts.link}`,
     );
     return null;
   }
@@ -163,7 +165,7 @@ export async function downloadAndStoreMedia(
     size_bytes: buffer.byteLength,
   };
 
-  if (opts.ycloudMediaId) meta.ycloud_media_id = opts.ycloudMediaId;
+  if (opts.kapsoMediaId) meta.kapso_media_id = opts.kapsoMediaId;
   if (opts.caption) meta.caption = opts.caption;
   if (opts.filename) meta.filename = opts.filename;
 

@@ -30,9 +30,11 @@ interface WizardState {
   businessName: string;
   industry: string;
   description: string;
-  ycloudApiKey: string;
-  ycloudPhone: string;
-  ycloudSigningSecret: string;
+  kapsoApiKey: string;
+  kapsoPhone: string;
+  kapsoPhoneNumberId: string;
+  kapsoWabaId: string;
+  kapsoSigningSecret: string;
 }
 
 // ─── Use case cards data ──────────────────────────────────────────────────────
@@ -220,7 +222,7 @@ function Step2({
   );
 }
 
-// ─── Step 3 — YCloud connection ───────────────────────────────────────────────
+// ─── Step 3 — Kapso connection ───────────────────────────────────────────────
 
 function Step3({
   state,
@@ -248,7 +250,7 @@ function Step3({
     <div className="space-y-6">
       <div>
         <h1 className="font-display text-2xl font-semibold text-foreground">
-          Conectar YCloud
+          Conectar Kapso
         </h1>
         <p className="mt-1 text-sm text-muted-foreground">
           Opcional. Podrás configurar esto más tarde desde Configuración →
@@ -258,36 +260,62 @@ function Step3({
 
       <div className="space-y-4">
         <div className="space-y-2">
-          <Label htmlFor="ycloud-key">API Key YCloud</Label>
+          <Label htmlFor="kapso-key">API Key Kapso</Label>
           <Input
-            id="ycloud-key"
+            id="kapso-key"
             type="password"
-            placeholder="yk_..."
-            value={state.ycloudApiKey}
-            onChange={(e) => onChange({ ycloudApiKey: e.target.value })}
+            placeholder="kapso_..."
+            value={state.kapsoApiKey}
+            onChange={(e) => onChange({ kapsoApiKey: e.target.value })}
             autoComplete="off"
           />
         </div>
 
         <div className="space-y-2">
-          <Label htmlFor="ycloud-phone">Número de WhatsApp (E.164)</Label>
+          <Label htmlFor="kapso-phone">Número de WhatsApp (E.164)</Label>
           <Input
-            id="ycloud-phone"
+            id="kapso-phone"
             type="tel"
             placeholder="+521234567890"
-            value={state.ycloudPhone}
-            onChange={(e) => onChange({ ycloudPhone: e.target.value })}
+            value={state.kapsoPhone}
+            onChange={(e) => onChange({ kapsoPhone: e.target.value })}
           />
         </div>
 
         <div className="space-y-2">
-          <Label htmlFor="ycloud-secret">Webhook Signing Secret</Label>
+          <Label htmlFor="kapso-phone-number-id">Phone Number ID (Meta)</Label>
           <Input
-            id="ycloud-secret"
+            id="kapso-phone-number-id"
+            inputMode="numeric"
+            placeholder="123456789012345"
+            value={state.kapsoPhoneNumberId}
+            onChange={(e) => onChange({ kapsoPhoneNumberId: e.target.value })}
+          />
+          <p className="text-xs text-muted-foreground">
+            Se llena solo al pulsar «Probar conexión». Es el ID numérico de Meta,
+            no el número de teléfono.
+          </p>
+        </div>
+
+        <div className="space-y-2">
+          <Label htmlFor="kapso-waba-id">WABA ID</Label>
+          <Input
+            id="kapso-waba-id"
+            inputMode="numeric"
+            placeholder="123456789012345"
+            value={state.kapsoWabaId}
+            onChange={(e) => onChange({ kapsoWabaId: e.target.value })}
+          />
+        </div>
+
+        <div className="space-y-2">
+          <Label htmlFor="kapso-secret">Webhook Signing Secret</Label>
+          <Input
+            id="kapso-secret"
             type="password"
             placeholder="whsec_..."
-            value={state.ycloudSigningSecret}
-            onChange={(e) => onChange({ ycloudSigningSecret: e.target.value })}
+            value={state.kapsoSigningSecret}
+            onChange={(e) => onChange({ kapsoSigningSecret: e.target.value })}
             autoComplete="off"
           />
         </div>
@@ -321,7 +349,7 @@ function Step3({
           </p>
         </div>
 
-        {state.ycloudApiKey && (
+        {state.kapsoApiKey && (
           <Button
             type="button"
             variant="outline"
@@ -372,12 +400,12 @@ function Step4({
         {state.industry && <Row label="Industria" value={state.industry} />}
         <Row label="Tipo de agente" value={useCaseLabel} />
         <Row label="Prompt inicial" value="Generado automáticamente" />
-        {state.ycloudApiKey && (
-          <Row label="YCloud" value="Credenciales guardadas" />
+        {state.kapsoApiKey && (
+          <Row label="Kapso" value="Credenciales guardadas" />
         )}
         <Row
           label="Webhook URL"
-          value={`/api/webhooks/ycloud?wsid=${workspaceId}`}
+          value={`/api/webhooks/kapso?wsid=${workspaceId}`}
           mono
         />
       </div>
@@ -433,9 +461,11 @@ export function OnboardingWizard() {
     businessName: "",
     industry: "",
     description: "",
-    ycloudApiKey: "",
-    ycloudPhone: "",
-    ycloudSigningSecret: "",
+    kapsoApiKey: "",
+    kapsoPhone: "",
+    kapsoPhoneNumberId: "",
+    kapsoWabaId: "",
+    kapsoSigningSecret: "",
   });
 
   function patch(update: Partial<WizardState>) {
@@ -469,9 +499,11 @@ export function OnboardingWizard() {
         businessName: state.businessName.trim(),
         industry: state.industry.trim() || undefined,
         description: state.description.trim() || undefined,
-        ycloudApiKey: state.ycloudApiKey.trim() || undefined,
-        ycloudPhone: state.ycloudPhone.trim() || undefined,
-        ycloudSigningSecret: state.ycloudSigningSecret.trim() || undefined,
+        kapsoApiKey: state.kapsoApiKey.trim() || undefined,
+        kapsoPhone: state.kapsoPhone.trim() || undefined,
+        kapsoPhoneNumberId: state.kapsoPhoneNumberId.trim() || undefined,
+        kapsoWabaId: state.kapsoWabaId.trim() || undefined,
+        kapsoSigningSecret: state.kapsoSigningSecret.trim() || undefined,
       };
 
       const result = await completeOnboarding(input);
@@ -491,34 +523,48 @@ export function OnboardingWizard() {
     }
   }
 
-  async function handleTestYCloud() {
-    if (!state.ycloudApiKey) return;
+  async function handleTestKapso() {
+    if (!state.kapsoApiKey) return;
     setIsTesting(true);
     try {
       // Proxy through the server so the API key isn't exposed to the browser
       // and the request isn't CORS-blocked.
-      const res = await fetch("/api/integrations/ycloud/test", {
+      const res = await fetch("/api/integrations/kapso/test", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ apiKey: state.ycloudApiKey }),
+        body: JSON.stringify({ apiKey: state.kapsoApiKey }),
       });
       const json = (await res.json()) as {
         ok?: boolean;
-        balance?: { balance?: number; currency?: string };
+        phoneNumbers?: Array<{
+          phone_number_id?: string;
+          waba_id?: string;
+          display_phone_number?: string | null;
+        }>;
         error?: string;
       };
       if (json.ok) {
-        const balance =
-          typeof json.balance?.balance === "number"
-            ? json.balance.balance
-            : "?";
-        const currency = json.balance?.currency ?? "";
-        toast.success(`YCloud conectado — Saldo: ${balance} ${currency}`);
+        // Kapso has no balance endpoint — success means the project's numbers
+        // came back. Fill both IDs from the first (production) one so they are
+        // never copied by hand: a mistyped phone_number_id breaks every send.
+        const first = json.phoneNumbers?.[0];
+        if (first?.phone_number_id) {
+          patch({
+            kapsoPhoneNumberId: first.phone_number_id,
+            ...(first.waba_id ? { kapsoWabaId: first.waba_id } : {}),
+          });
+        }
+        const extra = (json.phoneNumbers?.length ?? 0) - 1;
+        toast.success(
+          `Kapso conectado${
+            first?.display_phone_number ? ` — ${first.display_phone_number}` : ""
+          }${extra > 0 ? ` (+${extra} número${extra > 1 ? "s" : ""} más)` : ""}`,
+        );
       } else {
         toast.error(json.error ?? "API Key inválida o sin acceso");
       }
     } catch {
-      toast.error("No se pudo conectar con YCloud");
+      toast.error("No se pudo conectar con Kapso");
     } finally {
       setIsTesting(false);
     }
@@ -543,7 +589,7 @@ export function OnboardingWizard() {
           state={state}
           onChange={patch}
           isTesting={isTesting}
-          onTest={handleTestYCloud}
+          onTest={handleTestKapso}
         />
       )}
       {step === 3 && completedWorkspaceId && (

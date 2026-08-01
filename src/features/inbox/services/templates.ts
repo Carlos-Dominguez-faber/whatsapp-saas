@@ -1,9 +1,9 @@
 /**
- * templates.ts — Template management: list, sync from YCloud, helpers.
+ * templates.ts — Template management: list, sync from Kapso, helpers.
  */
 
 import { createClient as createSbClient } from "@supabase/supabase-js";
-import { fetchYCloudTemplates } from "./ycloud-client";
+import { fetchKapsoTemplates } from "./kapso-client";
 
 function svc() {
   return createSbClient(
@@ -40,28 +40,28 @@ export interface TemplateRow {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// YCloud API shape (raw response)
+// Kapso API shape (Meta Graph raw response)
 // ──────────────────────────────────────────────────────────────────────────────
 
-interface YCloudTemplateComponent {
+interface KapsoTemplateComponent {
   type: string;
   text?: string;
   parameters?: unknown[];
   [key: string]: unknown;
 }
 
-interface YCloudTemplate {
+interface KapsoTemplate {
   id?: string;
   name?: string;
   language?: string;
   category?: string;
   status?: string;
-  components?: YCloudTemplateComponent[];
+  components?: KapsoTemplateComponent[];
   [key: string]: unknown;
 }
 
-// Maps YCloud status strings to our enum
-const YCLOUD_STATUS_MAP: Record<string, TemplateRow["status"]> = {
+// Maps Meta status strings to our enum
+const KAPSO_STATUS_MAP: Record<string, TemplateRow["status"]> = {
   APPROVED: "approved",
   PENDING: "submitted",
   PENDING_DELETION: "submitted",
@@ -70,12 +70,12 @@ const YCLOUD_STATUS_MAP: Record<string, TemplateRow["status"]> = {
   DISABLED: "paused",
 };
 
-function mapYCloudStatus(raw: string): TemplateRow["status"] {
-  return YCLOUD_STATUS_MAP[raw.toUpperCase()] ?? "submitted";
+function mapKapsoStatus(raw: string): TemplateRow["status"] {
+  return KAPSO_STATUS_MAP[raw.toUpperCase()] ?? "submitted";
 }
 
-// Extracts the body text from YCloud components array
-function extractBodyText(components: YCloudTemplateComponent[]): string {
+// Extracts the body text from the Meta components array
+function extractBodyText(components: KapsoTemplateComponent[]): string {
   const bodyComp = components.find((c) => c.type?.toUpperCase() === "BODY");
   return typeof bodyComp?.text === "string" ? bodyComp.text : "";
 }
@@ -110,38 +110,49 @@ export async function listTemplates(
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// syncTemplatesFromYCloud
+// syncTemplatesFromKapso
 // ──────────────────────────────────────────────────────────────────────────────
 
-export async function syncTemplatesFromYCloud(
+export async function syncTemplatesFromKapso(
   workspaceId: string,
 ): Promise<{ synced: number; errors: number }> {
   const supabase = svc();
 
-  // 1. Load YCloud integration credentials
+  // 1. Load Kapso integration credentials
   const { data: integration, error: intError } = await supabase
     .from("integrations")
-    .select("credentials")
+    .select("credentials, config")
     .eq("workspace_id", workspaceId)
-    .eq("provider", "ycloud")
+    .eq("provider", "kapso")
     .eq("enabled", true)
     .single();
 
   if (intError || !integration) {
     throw new Error(
-      `[templates] YCloud integration not found: ${intError?.message}`,
+      `[templates] Kapso integration not found: ${intError?.message}`,
     );
   }
 
   const credentials = integration.credentials as Record<string, unknown>;
-  const apiKey = (credentials.ycloud_api_key as string | undefined) ?? "";
+  const config = (integration.config ?? {}) as Record<string, unknown>;
+  const apiKey = (credentials.kapso_api_key as string | undefined) ?? "";
+  // Kapso's template endpoints are Meta's, so they are scoped to a WABA id.
+  // It is configured per workspace — there is no way to discover it from the
+  // API without already having it.
+  const wabaId = (config.waba_id as string | undefined) ?? "";
 
   if (!apiKey || apiKey === "placeholder") {
     return { synced: 0, errors: 0 };
   }
 
-  // 2. Fetch templates from YCloud
-  const records = await fetchYCloudTemplates(apiKey);
+  if (!wabaId) {
+    throw new Error(
+      "[templates] falta waba_id en la configuración de Kapso del workspace",
+    );
+  }
+
+  // 2. Fetch templates from Kapso
+  const records = await fetchKapsoTemplates(apiKey, wabaId);
 
   let synced = 0;
   let errors = 0;
@@ -149,11 +160,11 @@ export async function syncTemplatesFromYCloud(
   // 3. Upsert each template
   for (const raw of records) {
     try {
-      const t = raw as YCloudTemplate;
+      const t = raw as KapsoTemplate;
       const name = typeof t.name === "string" ? t.name : "";
       const language = typeof t.language === "string" ? t.language : "es";
       const category = typeof t.category === "string" ? t.category : "UTILITY";
-      const status = mapYCloudStatus(
+      const status = mapKapsoStatus(
         typeof t.status === "string" ? t.status : "PENDING",
       );
       const components = Array.isArray(t.components) ? t.components : [];

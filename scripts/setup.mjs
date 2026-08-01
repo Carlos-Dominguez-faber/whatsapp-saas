@@ -44,7 +44,7 @@ const PASTED = [
   "OPENROUTER_API_KEY",
   "OPENROUTER_DEFAULT_MODEL",
 ];
-// NOTE: YCloud is NOT an env var — each workspace's API key + webhook signing
+// NOTE: Kapso is NOT an env var — each workspace's API key + webhook signing
 // secret live in the app (Settings → Integraciones), encrypted per-tenant.
 
 // ── tiny ui helpers ─────────────────────────────────────────────────────────

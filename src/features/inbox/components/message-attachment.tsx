@@ -192,7 +192,7 @@ export function MessageAttachment({ media, type }: MessageAttachmentProps) {
     };
   }, [parsed.storage_path]);
 
-  // Media not yet downloaded from YCloud (storage_path missing)
+  // Media not yet downloaded from Kapso (storage_path missing)
   if (!parsed.storage_path) {
     return (
       <div className="flex items-center gap-2 rounded-lg bg-muted/50 px-3 py-2 max-w-[280px]">

@@ -6,8 +6,8 @@
  */
 
 import { createClient as createSbClient } from "@supabase/supabase-js";
-import { sendText, sendTemplate } from "./ycloud-client";
-import type { TemplateParams } from "./ycloud-client";
+import { sendText, sendTemplate } from "./kapso-client";
+import type { TemplateParams } from "./kapso-client";
 import { formatWhatsAppMarkdown } from "./text-formatter";
 
 function svc() {
@@ -68,25 +68,27 @@ interface ConversationWindowRow {
 async function loadIntegration(
   workspaceId: string,
   supabase: ReturnType<typeof svc>,
-): Promise<{ apiKey: string; fromPhone: string }> {
+): Promise<{ apiKey: string; phoneNumberId: string }> {
   const { data, error } = await supabase
     .from("integrations")
     .select("credentials, config")
     .eq("workspace_id", workspaceId)
-    .eq("provider", "ycloud")
+    .eq("provider", "kapso")
     .eq("enabled", true)
     .single();
 
   if (error || !data) {
     throw new Error(
-      `[dispatch] YCloud integration not found: ${error?.message}`,
+      `[dispatch] Kapso integration not found: ${error?.message}`,
     );
   }
 
   const row = data as IntegrationRow;
   return {
-    apiKey: (row.credentials.ycloud_api_key as string | undefined) ?? "",
-    fromPhone: (row.config.phone_number as string | undefined) ?? "",
+    apiKey: (row.credentials.kapso_api_key as string | undefined) ?? "",
+    // Kapso identifies the sender by Meta's phone_number_id in the request PATH,
+    // not by the E.164 number. config.phone_number is kept for the UI/CRM only.
+    phoneNumberId: (row.config.phone_number_id as string | undefined) ?? "",
   };
 }
 
@@ -137,7 +139,7 @@ export async function dispatchText(
   } = params;
 
   // Normalise Markdown → WhatsApp formatting (e.g. **bold** → *bold*) once, so
-  // both the YCloud send and the persisted message match what the user receives.
+  // both the Kapso send and the persisted message match what the user receives.
   const body = formatWhatsAppMarkdown(rawBody);
 
   const supabase = svc();
@@ -182,31 +184,29 @@ export async function dispatchText(
     return { ok: false, error: "WINDOW_EXPIRED" };
   }
 
-  // 3. Load YCloud credentials
-  const { apiKey, fromPhone } = await loadIntegration(workspaceId, supabase);
+  // 3. Load Kapso credentials
+  const { apiKey, phoneNumberId } = await loadIntegration(workspaceId, supabase);
 
-  // 4. Send via YCloud (skip if placeholder / dev mode)
-  // YCloud returns its own `id` synchronously and assigns the WhatsApp `wamid`
-  // asynchronously (delivered via a status webhook). A 2xx response means the
-  // message was accepted for delivery, even when `wamid` is still empty.
+  // 4. Send via Kapso (skip if placeholder / dev mode)
+  // Kapso returns the WhatsApp `wamid` synchronously as messages[0].id and no
+  // status of its own. A 2xx means the message was accepted for delivery; the
+  // delivered/read webhooks advance the status from there.
   let wamid: string | undefined;
-  let ycloudId: string | undefined;
   const realSend = Boolean(apiKey && apiKey !== "placeholder");
 
   if (realSend) {
     try {
       const sent = await sendText({
         apiKey,
-        from: fromPhone,
+        phoneNumberId,
         to: toPhone,
         body,
       });
       wamid = sent.wamid || undefined;
-      ycloudId = sent.id || undefined;
     } catch (sendErr) {
       const errMsg =
         sendErr instanceof Error ? sendErr.message : String(sendErr);
-      console.error("[dispatch] YCloud sendText error:", errMsg);
+      console.error("[dispatch] Kapso sendText error:", errMsg);
 
       // Persist failed message for audit
       await supabase.from("messages").insert({
@@ -234,12 +234,11 @@ export async function dispatchText(
     type: "text",
     body,
     wamid: wamid ?? null,
-    // A real YCloud send is 'sent'; only a placeholder key stays a dev no-op.
+    // A real Kapso send is 'sent'; only a placeholder key stays a dev no-op.
     status: realSend ? "sent" : "queued",
     sender_user_id: senderUserId ?? null,
     meta: {
       dev_mode: realSend ? undefined : true,
-      ycloud_id: ycloudId,
       override_admin: overrideAdmin || undefined,
     },
   });
@@ -301,17 +300,17 @@ export async function dispatchTemplate(
     }
   }
 
-  // 2. Load YCloud credentials
-  const { apiKey, fromPhone } = await loadIntegration(workspaceId, supabase);
+  // 2. Load Kapso credentials
+  const { apiKey, phoneNumberId } = await loadIntegration(workspaceId, supabase);
 
-  // 3. Send template via YCloud
+  // 3. Send template via Kapso
   let wamid: string | undefined;
 
   if (apiKey && apiKey !== "placeholder") {
     try {
       const sent = await sendTemplate({
         apiKey,
-        from: fromPhone,
+        phoneNumberId,
         to: toPhone,
         templateName,
         language: templateLanguage,
@@ -321,7 +320,7 @@ export async function dispatchTemplate(
     } catch (sendErr) {
       const errMsg =
         sendErr instanceof Error ? sendErr.message : String(sendErr);
-      console.error("[dispatch] YCloud sendTemplate error:", errMsg);
+      console.error("[dispatch] Kapso sendTemplate error:", errMsg);
 
       await supabase.from("messages").insert({
         workspace_id: workspaceId,

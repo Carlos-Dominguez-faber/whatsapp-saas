@@ -38,7 +38,7 @@ export interface HandoffAckConfig {
 }
 
 /**
- * Reads the per-workspace acknowledgement settings from the YCloud integration
+ * Reads the per-workspace acknowledgement settings from the Kapso integration
  * config — the same jsonb bag that already carries message_history_window.
  * Defaults to enabled so a workspace that never touches the setting still gives
  * the contact a reply instead of silence.
@@ -52,7 +52,7 @@ export async function getHandoffAckConfig(
     .from("integrations")
     .select("config")
     .eq("workspace_id", workspaceId)
-    .eq("provider", "ycloud")
+    .eq("provider", "kapso")
     .maybeSingle();
 
   const config = (data?.config ?? {}) as {
@@ -175,9 +175,9 @@ export async function notifyHandoffPending(
     }
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    // A workspace with no YCloud integration yet is a normal state during
+    // A workspace with no Kapso integration yet is a normal state during
     // onboarding, not an incident worth an error-level event.
-    const notConnected = message.includes("YCloud integration not found");
+    const notConnected = message.includes("Kapso integration not found");
     await logEvent(
       workspaceId,
       conversationId,

@@ -1,4 +1,4 @@
-// Internal notes — stored as messages but never dispatched to YCloud.
+// Internal notes — stored as messages but never dispatched to Kapso.
 
 import { NextRequest, NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
@@ -46,7 +46,7 @@ export async function POST(
     return NextResponse.json({ error: "Not found" }, { status: 404 });
   }
 
-  // 4. Insert internal note as a system message — NOT dispatched to YCloud
+  // 4. Insert internal note as a system message — NOT dispatched to Kapso
   const { error: insertError } = await supabase.from("messages").insert({
     workspace_id: conv.workspace_id,
     conversation_id: conversationId,

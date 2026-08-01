@@ -141,7 +141,7 @@ function EmptyState({
         <p className="mt-1 text-xs text-muted-foreground">
           {filtered
             ? "Prueba con otro filtro."
-            : "Crea una nueva, usa la biblioteca o sincroniza desde YCloud."}
+            : "Crea una nueva, usa la biblioteca o sincroniza desde Kapso."}
         </p>
       </div>
       {!filtered && (
@@ -435,7 +435,7 @@ export function TemplatesTab({ workspaceId, initialTemplates }: Props) {
     }
   }
 
-  // ── Submit to YCloud ──────────────────────────────────────────────────────
+  // ── Submit to Kapso ──────────────────────────────────────────────────────
   async function handleSubmitTemplate(t: TemplateRow) {
     setSubmittingId(t.id);
     try {
@@ -542,7 +542,7 @@ export function TemplatesTab({ workspaceId, initialTemplates }: Props) {
                   className={cn("mr-2 h-4 w-4", isSyncing && "animate-spin")}
                   aria-hidden="true"
                 />
-                {isSyncing ? "Sincronizando…" : "Sincronizar desde YCloud"}
+                {isSyncing ? "Sincronizando…" : "Sincronizar desde Kapso"}
               </Button>
               <Button size="sm" onClick={openNew}>
                 <Plus className="mr-2 h-4 w-4" aria-hidden="true" />

@@ -5,7 +5,7 @@ export interface WorkspaceWithStats {
   created_at: string;
   member_count: number;
   conversation_count: number;
-  ycloud_connected: boolean;
+  kapso_connected: boolean;
 }
 
 export type UseCase = "setter" | "soporte" | "agendamiento" | "general";

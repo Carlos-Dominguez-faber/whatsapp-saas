@@ -1,10 +1,16 @@
 import { type NextRequest, NextResponse, after } from "next/server";
 import { createClient as createSbClient } from "@supabase/supabase-js";
 import {
-  verifyYCloudSignature,
+  verifyKapsoSignature,
   parseInbound,
-} from "@/features/inbox/services/ycloud-webhook-handler";
-import { processInbound } from "@/features/inbox/services/normalizer";
+  parseStatusUpdate,
+  parseOutboundEcho,
+  isStatusEvent,
+} from "@/features/inbox/services/kapso-webhook-handler";
+import {
+  processInbound,
+  processOutboundEcho,
+} from "@/features/inbox/services/normalizer";
 import { checkRateLimits } from "@/features/inbox/services/cost-tracker";
 import {
   upsertBatch,
@@ -78,9 +84,11 @@ async function handleStatusUpdate(
 export async function POST(request: NextRequest): Promise<NextResponse> {
   try {
     const rawBody = await request.text();
-    const sigHeader = request.headers.get("YCloud-Signature");
+    // Kapso signs the RAW body with HMAC-SHA256 (hex), no timestamp.
+    const sigHeader = request.headers.get("X-Webhook-Signature");
 
-    // E3: per-tenant webhook routing via ?wsid query param
+    // E3: per-tenant webhook routing via ?wsid query param. With Kapso this is
+    // effectively the only route in, since the payload carries no business phone.
     const wsidParam = request.nextUrl.searchParams.get("wsid");
 
     let body: unknown;
@@ -90,27 +98,24 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
       return NextResponse.json({ error: "Invalid JSON" }, { status: 400 });
     }
 
-    // WH-02: classify the event. Status updates carry NO `to` phone — they can
-    // only be routed via the ?wsid query param. Signature verification MUST
-    // happen before we act on EITHER a status update or an inbound message.
-    const isStatusUpdate =
-      typeof body === "object" &&
-      body !== null &&
-      "type" in body &&
-      (body as { type: string }).type === "whatsapp.message.updated";
+    // WH-02: classify the event. Signature verification MUST happen before we
+    // act on EITHER a status update or an inbound message.
+    const isStatusUpdate = isStatusEvent(body);
 
-    // Extract destination phone to identify the workspace integration (inbound).
-    const toPhone =
-      typeof body === "object" &&
-      body !== null &&
-      "whatsappInboundMessage" in body
-        ? ((body as { whatsappInboundMessage?: { to?: string } })
-            .whatsappInboundMessage?.to ?? null)
+    // Kapso identifies the receiving business number by its Meta phone_number_id
+    // (there is no `to` field). This is the fallback when ?wsid is absent.
+    const phoneNumberId =
+      typeof body === "object" && body !== null && "phone_number_id" in body
+        ? ((body as { phone_number_id?: unknown }).phone_number_id ?? null)
+        : null;
+    const phoneNumberIdStr =
+      typeof phoneNumberId === "string" && phoneNumberId
+        ? phoneNumberId
         : null;
 
     // Events that carry NO actionable data AND cannot identify a workspace
-    // (no wsid, no inbound `to`, not a status update) → harmless early 200.
-    if (!isStatusUpdate && !toPhone && !wsidParam) {
+    // (no wsid, no phone_number_id, not a status update) → harmless early 200.
+    if (!isStatusUpdate && !phoneNumberIdStr && !wsidParam) {
       return NextResponse.json({ received: true });
     }
 
@@ -126,28 +131,29 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
 
     if (wsidParam) {
       // E3: direct lookup by workspace_id — faster, no phone scan needed.
-      // Status updates always take this path (they have no inbound `to`).
+      // Status updates always take this path.
       const { data } = await supabase
         .from("integrations")
         .select("workspace_id, credentials, config")
         .eq("workspace_id", wsidParam)
-        .eq("provider", "ycloud")
+        .eq("provider", "kapso")
         .eq("enabled", true)
         .single();
       ws = data ?? null;
     } else {
-      // Fallback: phone-based lookup across all enabled integrations (inbound)
+      // Fallback: match the Meta phone_number_id across enabled integrations.
       const { data: integrations } = await supabase
         .from("integrations")
         .select("workspace_id, credentials, config")
-        .eq("provider", "ycloud")
+        .eq("provider", "kapso")
         .eq("enabled", true)
         .limit(10);
 
       ws =
         (integrations ?? []).find(
           (i: IntegrationRow) =>
-            (i.config as { phone_number?: string }).phone_number === toPhone,
+            (i.config as { phone_number_id?: string }).phone_number_id ===
+            phoneNumberIdStr,
         ) ?? null;
     }
 
@@ -158,7 +164,7 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
     }
 
     const creds = ws.credentials as {
-      ycloud_api_key?: string;
+      kapso_api_key?: string;
       webhook_signing_secret?: string;
     };
 
@@ -168,16 +174,29 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
     }
 
     // CRITICAL: verify the signature BEFORE acting on ANY event (status or inbound).
-    if (!verifyYCloudSignature(rawBody, sigHeader, webhookSecret)) {
+    if (!verifyKapsoSignature(rawBody, sigHeader, webhookSecret)) {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    }
+
+    // Coexistence: a `whatsapp.message.sent` carrying origin 'business_app' is
+    // not a status update — it's a human answering from the WhatsApp Business
+    // App on their phone. Record it and hand the conversation to them, before
+    // the status branch swallows it as an unknown wamid.
+    const echo = parseOutboundEcho(body);
+    if (echo) {
+      const result = await processOutboundEcho(ws.workspace_id, echo);
+      return NextResponse.json({
+        received: true,
+        echo: true,
+        recorded: result.inserted,
+        aiDisabled: result.aiDisabled,
+      });
     }
 
     // WH-02: monotonic status updates — only reached after signature verification.
     if (isStatusUpdate) {
-      const statusData = (
-        body as { whatsappMessage?: { wamid?: string; status?: string } }
-      ).whatsappMessage;
-      if (statusData?.wamid && statusData?.status) {
+      const statusData = parseStatusUpdate(body);
+      if (statusData) {
         await handleStatusUpdate(supabase, statusData.wamid, statusData.status);
       }
       return NextResponse.json({ received: true });
@@ -188,13 +207,31 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
       return NextResponse.json({ received: true });
     }
 
+    // Defence in depth: when routed by ?wsid, make sure the event actually
+    // belongs to this workspace's number. Kapso webhooks are per-number, so a
+    // mismatch means the wsid and the Kapso webhook config drifted apart.
+    const configuredPhoneNumberId = (
+      ws.config as { phone_number_id?: string }
+    ).phone_number_id;
+    if (
+      configuredPhoneNumberId &&
+      normalized.phoneNumberId &&
+      configuredPhoneNumberId !== normalized.phoneNumberId
+    ) {
+      console.warn(
+        "[webhook] phone_number_id mismatch for workspace — check the Kapso webhook URL's ?wsid",
+      );
+      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    }
+
     const workspaceId = ws.workspace_id as string;
     const { contact, conversation, message } = await processInbound(
       workspaceId,
       normalized,
     );
 
-    // Duplicate wamid — already processed
+    // Duplicate wamid — already processed. This is also what absorbs Kapso's
+    // at-least-once delivery, since its signature carries no anti-replay window.
     if (!message) {
       return NextResponse.json({ received: true, dedup: true });
     }
@@ -210,7 +247,8 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
           try {
             const mediaMeta = await downloadAndStoreMedia({
               link: mediaLink,
-              apiKey: creds.ycloud_api_key ?? "",
+              // Kapso's media_url embeds a signed token — no API key is sent,
+              // and the URL expires, so this must run promptly.
               workspaceId,
               conversationId,
               mimeType: normalized.mediaMime ?? undefined,
@@ -219,17 +257,20 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
                 normalized.text && normalized.text !== "[Multimedia]"
                   ? normalized.text
                   : undefined,
-              ycloudMediaId: normalized.mediaId ?? undefined,
+              kapsoMediaId: normalized.mediaId ?? undefined,
             });
             if (!mediaMeta) return;
 
             // Translate voice/image to text so the agent understands them.
             if (normalized.type === "audio" || normalized.type === "voice") {
-              const transcript = await transcribeAudio({
-                storagePath: mediaMeta.storage_path,
-                mimeType: mediaMeta.mime_type,
-                workspaceId,
-              });
+              // Kapso may have transcribed it already — skip the extra call.
+              const transcript =
+                normalized.transcript ??
+                (await transcribeAudio({
+                  storagePath: mediaMeta.storage_path,
+                  mimeType: mediaMeta.mime_type,
+                  workspaceId,
+                }));
               if (transcript) mediaMeta.transcript = transcript;
             } else if (normalized.type === "image") {
               const description = await describeImage({
@@ -267,7 +308,7 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
     }
 
     // Buffer the message — AI reply is deferred to the cron job.
-    // The silence window is configurable per workspace (YCloud settings).
+    // The silence window is configurable per workspace (Kapso settings).
     const bufferSeconds = Number(
       (ws.config as { buffer_silence_seconds?: number }).buffer_silence_seconds,
     );

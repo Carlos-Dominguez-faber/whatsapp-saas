@@ -20,7 +20,7 @@ import { ModelPicker } from "@/features/agents/components/model-picker";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
-type Provider = "ycloud" | "openrouter" | "highlevel";
+type Provider = "kapso" | "openrouter" | "highlevel";
 
 type IntegrationData = {
   provider: Provider;
@@ -101,9 +101,9 @@ function Section({
   );
 }
 
-// ─── YCloud section ───────────────────────────────────────────────────────────
+// ─── Kapso section ───────────────────────────────────────────────────────────
 
-function YCloudSection({
+function KapsoSection({
   workspaceId,
   initial,
   onSaved,
@@ -113,10 +113,18 @@ function YCloudSection({
   onSaved: () => void;
 }) {
   const [apiKey, setApiKey] = useState(
-    initial?.credentials?.ycloud_api_key ?? "",
+    initial?.credentials?.kapso_api_key ?? "",
   );
   const [phone, setPhone] = useState(
     (initial?.config?.phone_number as string | undefined) ?? "",
+  );
+  // Meta's phone number ID — this is what actually sends. The E.164 number
+  // above is kept for display and the CRM only.
+  const [phoneNumberId, setPhoneNumberId] = useState(
+    (initial?.config?.phone_number_id as string | undefined) ?? "",
+  );
+  const [wabaId, setWabaId] = useState(
+    (initial?.config?.waba_id as string | undefined) ?? "",
   );
   const [secret, setSecret] = useState(
     initial?.credentials?.webhook_signing_secret ?? "",
@@ -141,8 +149,8 @@ function YCloudSection({
 
   const webhookUrl =
     typeof window !== "undefined"
-      ? `${window.location.origin}/api/webhooks/ycloud?wsid=${workspaceId}`
-      : `/api/webhooks/ycloud?wsid=${workspaceId}`;
+      ? `${window.location.origin}/api/webhooks/kapso?wsid=${workspaceId}`
+      : `/api/webhooks/kapso?wsid=${workspaceId}`;
 
   function handleCopy() {
     navigator.clipboard.writeText(webhookUrl).then(() => {
@@ -163,15 +171,32 @@ function YCloudSection({
       const json = (await res.json()) as {
         ok: boolean;
         error?: string;
-        balance?: unknown;
+        warning?: string;
+        phoneNumbers?: Array<{
+          phone_number_id?: string;
+          waba_id?: string;
+          display_phone_number?: string | null;
+        }>;
       };
       if (json.ok) {
-        const bal = json.balance as Record<string, unknown> | undefined;
-        const display = bal
-          ? ` — Saldo: ${bal.balance ?? "?"} ${bal.currency ?? ""}`
-          : "";
-        toast.success(`YCloud conectado${display}`);
+        // Kapso has no balance endpoint; the test lists the project's numbers
+        // and confirms the configured phone_number_id is one of them.
+        const first = json.phoneNumbers?.[0];
+        toast.success(
+          `Kapso conectado${
+            first?.display_phone_number ? ` — ${first.display_phone_number}` : ""
+          }`,
+        );
+        if (json.warning) toast.warning(json.warning);
       } else {
+        // A failed test still returns the project's numbers — offer to fill in
+        // the right IDs rather than making them be hunted down by hand.
+        const first = json.phoneNumbers?.[0];
+        if (first?.phone_number_id && !phoneNumberId) {
+          setPhoneNumberId(first.phone_number_id);
+          if (first.waba_id && !wabaId) setWabaId(first.waba_id);
+          toast.info("Rellené los IDs con el número del proyecto — revisa y guarda");
+        }
         toast.error(json.error ?? "Error al probar la conexión");
       }
     } catch {
@@ -188,13 +213,15 @@ function YCloudSection({
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          provider: "ycloud",
+          provider: "kapso",
           credentials: {
-            ycloud_api_key: apiKey,
+            kapso_api_key: apiKey,
             webhook_signing_secret: secret,
           },
           config: {
             phone_number: phone,
+            phone_number_id: phoneNumberId.trim(),
+            waba_id: wabaId.trim(),
             buffer_silence_seconds: bufferSeconds,
             message_history_window: messagesInMemory,
             handoff_ack_enabled: handoffAckEnabled,
@@ -204,7 +231,7 @@ function YCloudSection({
       });
       const json = (await res.json()) as { ok?: boolean; error?: string };
       if (json.ok) {
-        toast.success("Configuración de YCloud guardada");
+        toast.success("Configuración de Kapso guardada");
         onSaved();
       } else {
         toast.error(json.error ?? "Error al guardar");
@@ -218,17 +245,17 @@ function YCloudSection({
 
   return (
     <Section
-      title="YCloud (WhatsApp)"
-      description="Conecta tu número de WhatsApp Business a través de YCloud."
+      title="Kapso (WhatsApp)"
+      description="Conecta tu número de WhatsApp Business a través de Kapso."
       defaultOpen
     >
       <div className="grid gap-4">
         <div className="space-y-2">
-          <Label htmlFor="ycloud-api-key">API Key</Label>
+          <Label htmlFor="kapso-api-key">API Key</Label>
           <Input
-            id="ycloud-api-key"
+            id="kapso-api-key"
             type="password"
-            placeholder="yk_..."
+            placeholder="kapso_..."
             value={apiKey}
             onChange={(e) => setApiKey(e.target.value)}
             autoComplete="off"
@@ -236,9 +263,9 @@ function YCloudSection({
         </div>
 
         <div className="space-y-2">
-          <Label htmlFor="ycloud-phone">Número de WhatsApp (E.164)</Label>
+          <Label htmlFor="kapso-phone">Número de WhatsApp (E.164)</Label>
           <Input
-            id="ycloud-phone"
+            id="kapso-phone"
             type="tel"
             placeholder="+521234567890"
             value={phone}
@@ -247,9 +274,40 @@ function YCloudSection({
         </div>
 
         <div className="space-y-2">
-          <Label htmlFor="ycloud-secret">Webhook Signing Secret</Label>
+          <Label htmlFor="kapso-phone-number-id">Phone Number ID (Meta)</Label>
           <Input
-            id="ycloud-secret"
+            id="kapso-phone-number-id"
+            inputMode="numeric"
+            placeholder="123456789012345"
+            value={phoneNumberId}
+            onChange={(e) => setPhoneNumberId(e.target.value)}
+          />
+          <p className="text-xs text-muted-foreground">
+            El ID numérico del número en Meta, no el número en sí. Sin esto no
+            se puede enviar ningún mensaje. Lo encuentras en el dashboard de
+            Kapso.
+          </p>
+        </div>
+
+        <div className="space-y-2">
+          <Label htmlFor="kapso-waba-id">WABA ID</Label>
+          <Input
+            id="kapso-waba-id"
+            inputMode="numeric"
+            placeholder="123456789012345"
+            value={wabaId}
+            onChange={(e) => setWabaId(e.target.value)}
+          />
+          <p className="text-xs text-muted-foreground">
+            ID de la cuenta de WhatsApp Business. Necesario para las plantillas
+            y para probar la conexión.
+          </p>
+        </div>
+
+        <div className="space-y-2">
+          <Label htmlFor="kapso-secret">Webhook Signing Secret</Label>
+          <Input
+            id="kapso-secret"
             type="password"
             placeholder="whsec_..."
             value={secret}
@@ -282,16 +340,16 @@ function YCloudSection({
             </Button>
           </div>
           <p className="text-xs text-muted-foreground">
-            Pega esta URL en la configuración de webhooks de YCloud.
+            Pega esta URL en la configuración de webhooks de Kapso.
           </p>
         </div>
 
         <div className="space-y-2">
-          <Label htmlFor="ycloud-buffer">
+          <Label htmlFor="kapso-buffer">
             Tiempo de espera del buffer (segundos)
           </Label>
           <Input
-            id="ycloud-buffer"
+            id="kapso-buffer"
             type="number"
             min={3}
             max={120}
@@ -310,9 +368,9 @@ function YCloudSection({
         </div>
 
         <div className="space-y-2">
-          <Label htmlFor="ycloud-memory">Mensajes en memoria de la IA</Label>
+          <Label htmlFor="kapso-memory">Mensajes en memoria de la IA</Label>
           <Input
-            id="ycloud-memory"
+            id="kapso-memory"
             type="number"
             min={5}
             max={50}
@@ -332,17 +390,17 @@ function YCloudSection({
 
         <div className="space-y-2 border-t border-border/60 pt-4">
           <div className="flex items-center justify-between gap-4">
-            <Label htmlFor="ycloud-handoff-ack">
+            <Label htmlFor="kapso-handoff-ack">
               Avisar al contacto cuando pasa a un humano
             </Label>
             <Switch
-              id="ycloud-handoff-ack"
+              id="kapso-handoff-ack"
               checked={handoffAckEnabled}
               onCheckedChange={setHandoffAckEnabled}
             />
           </div>
           <Textarea
-            id="ycloud-handoff-ack-message"
+            id="kapso-handoff-ack-message"
             rows={2}
             maxLength={500}
             disabled={!handoffAckEnabled}
@@ -841,15 +899,15 @@ export function IntegrationsTab({ workspaceId, initialIntegrations }: Props) {
     }
   }, [workspaceId]);
 
-  const ycloud = findIntegration(integrations, "ycloud");
+  const kapso = findIntegration(integrations, "kapso");
   const openrouter = findIntegration(integrations, "openrouter");
   const highlevel = findIntegration(integrations, "highlevel");
 
   return (
     <div className="space-y-6">
-      <YCloudSection
+      <KapsoSection
         workspaceId={workspaceId}
-        initial={ycloud}
+        initial={kapso}
         onSaved={refresh}
       />
       <Separator />

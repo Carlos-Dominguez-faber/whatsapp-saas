@@ -1,20 +1,21 @@
-// Phase 4: submit a draft template to YCloud (Meta approval).
+// Phase 4: submit a draft template to Kapso (Meta approval).
 //
-// We don't store the wabaId, so we resolve it from the registered phone number
-// at submit time, build the YCloud `components` from the stored rich fields, and
-// flip the row to status='submitted' on success.
+// Kapso's template endpoints are Meta's, so they are scoped to a WABA id that
+// goes in the request path. It cannot be discovered from the phone number the
+// way YCloud allowed — the only listing endpoint already requires it — so it is
+// read from the workspace's Kapso config. We build the `components` from the
+// stored rich fields and flip the row to status='submitted' on success.
 
 import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
 import { createClient } from "@/lib/supabase/server";
 import { createClient as createSbClient } from "@supabase/supabase-js";
 import {
-  createYCloudTemplate,
-  resolveWabaId,
-  YCloudError,
-} from "@/features/inbox/services/ycloud-client";
+  createKapsoTemplate,
+  KapsoError,
+} from "@/features/inbox/services/kapso-client";
 import {
-  buildYCloudPayload,
+  buildKapsoPayload,
   createTemplateSchema,
   type CreateTemplateInput,
   type TemplateButton,
@@ -132,12 +133,12 @@ export async function POST(
     );
   }
 
-  // ── Load YCloud credentials ───────────────────────────────────────────────
+  // ── Load Kapso credentials ───────────────────────────────────────────────
   const { data: integration } = await db
     .from("integrations")
     .select("credentials, config")
     .eq("workspace_id", workspaceId)
-    .eq("provider", "ycloud")
+    .eq("provider", "kapso")
     .eq("enabled", true)
     .maybeSingle();
 
@@ -146,27 +147,29 @@ export async function POST(
     unknown
   >;
   const config = (integration?.config ?? {}) as Record<string, unknown>;
-  const apiKey = (credentials.ycloud_api_key as string | undefined) ?? "";
-  const phoneNumber = (config.phone_number as string | undefined) ?? "";
+  const apiKey = (credentials.kapso_api_key as string | undefined) ?? "";
+  const wabaId = (config.waba_id as string | undefined) ?? "";
 
   if (!apiKey || apiKey === "placeholder") {
     return NextResponse.json(
-      { error: "Configura la API key de YCloud antes de enviar plantillas" },
+      { error: "Configura la API key de Kapso antes de enviar plantillas" },
       { status: 400 },
     );
   }
-  if (!phoneNumber) {
+  if (!wabaId) {
     return NextResponse.json(
-      { error: "Falta el número de WhatsApp en la configuración de YCloud" },
+      {
+        error:
+          "Falta el WABA ID en la configuración de Kapso — sin él no se pueden crear plantillas",
+      },
       { status: 400 },
     );
   }
 
-  // ── Resolve wabaId + create on YCloud ─────────────────────────────────────
+  // ── Create on Kapso ──────────────────────────────────────────────────────
   try {
-    const wabaId = await resolveWabaId(apiKey, phoneNumber);
-    const payload = buildYCloudPayload(wabaId, valid.data);
-    const result = await createYCloudTemplate(apiKey, payload);
+    const payload = buildKapsoPayload(valid.data);
+    const result = await createKapsoTemplate(apiKey, wabaId, payload);
 
     const { data: updated, error: updateError } = await db
       .from("templates")
@@ -184,19 +187,19 @@ export async function POST(
 
     if (updateError) {
       console.error("[templates/submit] update error:", updateError);
-      // The template WAS created on YCloud; surface success but warn.
+      // The template WAS created on Kapso; surface success but warn.
       return NextResponse.json({
         data: { ...row, status: "submitted" },
-        warning: "Enviada a YCloud, pero no se pudo actualizar el estado local",
+        warning: "Enviada a Kapso, pero no se pudo actualizar el estado local",
       });
     }
 
     return NextResponse.json({ data: updated });
   } catch (err) {
-    if (err instanceof YCloudError) {
-      console.error("[templates/submit] YCloud error:", err.status, err.body);
+    if (err instanceof KapsoError) {
+      console.error("[templates/submit] Kapso error:", err.status, err.body);
       return NextResponse.json(
-        { error: `YCloud rechazó la plantilla: ${err.message}` },
+        { error: `Kapso rechazó la plantilla: ${err.message}` },
         { status: 502 },
       );
     }

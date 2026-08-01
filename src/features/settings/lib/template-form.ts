@@ -5,17 +5,17 @@
  * routes can import it. Text-header only for now (media headers are a later
  * add-on). Categories are stored lowercase (consistent with the existing
  * `templates` rows, `template_library`, and the CRUD API) and only uppercased
- * at the YCloud submission boundary via `buildYCloudPayload`.
+ * at the Kapso submission boundary via `buildKapsoPayload`.
  */
 
 import { z } from "zod";
 
-// Language is fixed to "es" for now (matches the YCloud account + the CRUD API
+// Language is fixed to "es" for now (matches the Kapso account + the CRUD API
 // literal). Kept as a constant so widening it later is a one-line change.
 export const TEMPLATE_LANGUAGE = "es" as const;
 
-// Stored lowercase. Meta/YCloud only accept the uppercase form on creation, so
-// we uppercase at the submit boundary (see buildYCloudPayload).
+// Stored lowercase. Meta/Kapso only accept the uppercase form on creation, so
+// we uppercase at the submit boundary (see buildKapsoPayload).
 export const TEMPLATE_CATEGORIES = ["utility", "marketing"] as const;
 export type TemplateCategory = (typeof TEMPLATE_CATEGORIES)[number];
 
@@ -95,28 +95,27 @@ export function sanitizeTemplateName(raw: string): string {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// YCloud payload builder (pure) — mirrors POST /v2/whatsapp/templates
+// Kapso payload builder (pure) — mirrors POST /{waba_id}/message_templates
 // ──────────────────────────────────────────────────────────────────────────────
 
-export type YCloudButton =
+export type KapsoButton =
   | { type: "QUICK_REPLY"; text: string }
   | { type: "URL"; text: string; url: string }
   | { type: "PHONE_NUMBER"; text: string; phone_number: string };
 
-export interface YCloudComponent {
+export interface KapsoComponent {
   type: "HEADER" | "BODY" | "FOOTER" | "BUTTONS";
   format?: "TEXT";
   text?: string;
   example?: { header_text?: string[]; body_text?: string[][] };
-  buttons?: YCloudButton[];
+  buttons?: KapsoButton[];
 }
 
-export interface YCloudTemplatePayload {
-  wabaId: string;
+export interface KapsoTemplatePayload {
   name: string;
   language: string;
   category: string; // UPPERCASE
-  components: YCloudComponent[];
+  components: KapsoComponent[];
 }
 
 /** Looks up the user-provided example for a {{n}}, falling back to a sample. */
@@ -125,7 +124,7 @@ function exampleForIndex(variables: TemplateVariable[], index: number): string {
   return found && found.length > 0 ? found : `Ejemplo ${index}`;
 }
 
-function toYCloudButton(btn: TemplateButton): YCloudButton {
+function toKapsoButton(btn: TemplateButton): KapsoButton {
   if (btn.type === "quick_reply") {
     return { type: "QUICK_REPLY", text: btn.text };
   }
@@ -136,19 +135,19 @@ function toYCloudButton(btn: TemplateButton): YCloudButton {
 }
 
 /**
- * Builds the YCloud `components` array from builder input. Meta requires an
+ * Builds the Kapso `components` array from builder input. Meta requires an
  * `example` for every component that contains a {{n}} variable, so we always
  * emit non-empty samples for header/body variables.
  */
-export function buildYCloudComponents(
+export function buildKapsoComponents(
   input: CreateTemplateInput,
-): YCloudComponent[] {
-  const components: YCloudComponent[] = [];
+): KapsoComponent[] {
+  const components: KapsoComponent[] = [];
 
   // HEADER (text only)
   if (input.header_type === "text" && input.header_text.trim()) {
     const headerVars = detectBodyVariables(input.header_text);
-    const header: YCloudComponent = {
+    const header: KapsoComponent = {
       type: "HEADER",
       format: "TEXT",
       text: input.header_text,
@@ -165,7 +164,7 @@ export function buildYCloudComponents(
 
   // BODY (required)
   const bodyVars = detectBodyVariables(input.body_template);
-  const body: YCloudComponent = { type: "BODY", text: input.body_template };
+  const body: KapsoComponent = { type: "BODY", text: input.body_template };
   if (bodyVars.length > 0) {
     body.example = {
       body_text: [
@@ -184,23 +183,24 @@ export function buildYCloudComponents(
   if (input.buttons.length > 0) {
     components.push({
       type: "BUTTONS",
-      buttons: input.buttons.map(toYCloudButton),
+      buttons: input.buttons.map(toKapsoButton),
     });
   }
 
   return components;
 }
 
-/** Full create payload for YCloud (category uppercased here). */
-export function buildYCloudPayload(
-  wabaId: string,
+/**
+ * Full create payload for Kapso (category uppercased here). The WABA id is NOT
+ * part of the body under Kapso — it goes in the request path.
+ */
+export function buildKapsoPayload(
   input: CreateTemplateInput,
-): YCloudTemplatePayload {
+): KapsoTemplatePayload {
   return {
-    wabaId,
     name: input.name,
     language: TEMPLATE_LANGUAGE,
     category: input.category.toUpperCase(),
-    components: buildYCloudComponents(input),
+    components: buildKapsoComponents(input),
   };
 }

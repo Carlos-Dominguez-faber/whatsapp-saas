@@ -16,7 +16,7 @@ super admin y deja el cron corriendo. Tarda ~15 minutos.
 | -------------- | ------------------------------ | -------------- |
 | **Supabase**   | Base de datos + Auth + Storage | Free sirve     |
 | **Vercel**     | Hospedaje de la app            | Hobby (gratis) |
-| **YCloud**     | Número de WhatsApp (proveedor) | Según su plan  |
+| **Kapso**     | Número de WhatsApp (proveedor) | Según su plan  |
 | **OpenRouter** | El modelo de IA (LLM)          | Pago por uso   |
 
 El agente instala lo demás (Node, los CLIs de Supabase y Vercel). Cuando termine,
@@ -85,7 +85,7 @@ npm install
 > Cuando esté listo: **Settings → API**, y copia estos 3 valores.
 
 Pídele las 3 keys de Supabase (y, si ya la tiene, la de OpenRouter) y córrelas
-inline. Esto **genera los 3 secrets** y escribe `.env.local`. (YCloud NO va aquí:
+inline. Esto **genera los 3 secrets** y escribe `.env.local`. (Kapso NO va aquí:
 se configura por workspace en la app, paso 10.)
 
 ```bash
@@ -161,12 +161,31 @@ entra con tu super admin, y en el **panel de agencia** (`/workspaces`) dale **cr
 workspace**. La app lo arma completo (prompt, agentes, business info e integración).
 Este es el flujo real que repetirás por cada cliente.
 
-**11. Conecta YCloud en ESE workspace.** Dentro del workspace, ve a
-**Settings → Integraciones**: pega la **API Key** y el **Webhook Signing Secret** de
-YCloud (cada cliente tiene los suyos), y copia el **Webhook URL** que muestra la app
-(ya trae el `wsid` correcto) → pégalo en **YCloud → Webhooks** y conecta el número.
+**11. Conecta Kapso en ESE workspace.** Dentro del workspace, ve a
+**Settings → Integraciones** y captura cuatro datos del dashboard de Kapso
+(cada cliente tiene los suyos):
 
-**12. Verificación final.** Desde un teléfono, manda un WhatsApp al número de YCloud.
+| Campo | Qué es | Para qué |
+| --- | --- | --- |
+| **API Key** | key del proyecto | todo |
+| **Phone Number ID** | ID numérico de Meta (`123456789012345`), **no** el número | enviar mensajes |
+| **WABA ID** | ID de la cuenta de WhatsApp Business | plantillas y probar conexión |
+| **Webhook Signing Secret** | lo defines tú | verificar los webhooks |
+
+El **Phone Number ID no es el número de teléfono**: si lo confundes con el E.164
+todos los envíos fallan con 400. Usa **Probar conexión** — lista los números del
+WABA y avisa si el ID configurado no pertenece a esa cuenta.
+
+Luego copia el **Webhook URL** que muestra la app (ya trae el `wsid` correcto) →
+pégalo en **Kapso → Webhooks** con el mismo signing secret y conecta el número.
+
+> ⚠️ **El buffering de webhooks de Kapso debe quedar APAGADO.** Si se activa,
+> Kapso agrupa los mensajes en un sobre `{batch:true, data:[…]}` que este webhook
+> no procesa. La app ya tiene su propio buffer (`buffer_silence_seconds`); dos
+> sobran. Si queda encendido lo verás en los logs como
+> `[kapso] webhook batching is ON`.
+
+**12. Verificación final.** Desde un teléfono, manda un WhatsApp al número de Kapso.
 En ~1 minuto (cuando dispare el cron) el agente debe responder. Si no, revisa las
 corridas del cron:
 
@@ -178,7 +197,7 @@ order by start_time desc limit 5;
 ```
 
 **13. Más clientes.** Repite los pasos 10–11 por cada cliente nuevo: un workspace +
-su propia integración de YCloud.
+su propia integración de Kapso.
 
 ---
 
@@ -193,7 +212,7 @@ su propia integración de YCloud.
 - **`vercel-env` dice "already exists":** esa var ya estaba; actualízala en el
   dashboard de Vercel → Settings → Environment Variables.
 - **El agente no responde al WhatsApp:** revisa `cron.job_run_details` (paso 11),
-  que el webhook de YCloud apunte a tu URL, y que `OPENROUTER_API_KEY` tenga saldo.
+  que el webhook de Kapso apunte a tu URL, y que `OPENROUTER_API_KEY` tenga saldo.
 
 ## Actualizar a una versión nueva
 

@@ -1,8 +1,8 @@
-// G1: Templates sync — pulls templates from YCloud and upserts into workspace.
+// G1: Templates sync — pulls templates from Kapso and upserts into workspace.
 
 import { NextRequest, NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
-import { syncTemplatesFromYCloud } from "@/features/inbox/services/templates";
+import { syncTemplatesFromKapso } from "@/features/inbox/services/templates";
 
 // ── Shared auth helper ────────────────────────────────────────────────────────
 
@@ -51,7 +51,7 @@ export async function POST(
   }
 
   try {
-    const result = await syncTemplatesFromYCloud(workspaceId);
+    const result = await syncTemplatesFromKapso(workspaceId);
     return NextResponse.json({ synced: result.synced, errors: result.errors });
   } catch (err) {
     const message = err instanceof Error ? err.message : "Error desconocido";
@@ -59,18 +59,18 @@ export async function POST(
 
     // Surface integration-not-configured as a 422 so the UI can show a
     // helpful message instead of a generic 500.
-    if (message.includes("YCloud integration not found")) {
+    if (message.includes("Kapso integration not found")) {
       return NextResponse.json(
         {
           error:
-            "Integración de YCloud no configurada. Actívala en la pestaña Integraciones.",
+            "Integración de Kapso no configurada. Actívala en la pestaña Integraciones.",
         },
         { status: 422 },
       );
     }
 
     return NextResponse.json(
-      { error: "Error al sincronizar templates desde YCloud" },
+      { error: "Error al sincronizar templates desde Kapso" },
       { status: 500 },
     );
   }
