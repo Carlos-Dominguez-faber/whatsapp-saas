@@ -19,13 +19,21 @@ export class KapsoError extends Error {
   }
 }
 
-/** Pulls a human-readable message out of a Graph-style error envelope. */
+/**
+ * Pulls a human-readable message out of an error body.
+ *
+ * Kapso is inconsistent here: its own errors come back as a bare
+ * `{"error": "Active sandbox session required to send messages"}` while the Meta
+ * mirror returns Graph's `{"error": {"message": …, "error_user_msg": …}}`. Miss
+ * the string form and the operator only ever sees "error 403".
+ */
 function extractKapsoErrorMessage(body: unknown): string | null {
   if (!body || typeof body !== "object") return null;
   const obj = body as Record<string, unknown>;
+  if (typeof obj.error === "string" && obj.error) return obj.error;
   if (typeof obj.message === "string") return obj.message;
   const error = obj.error as Record<string, unknown> | undefined;
-  if (error) {
+  if (error && typeof error === "object") {
     if (typeof error.error_user_msg === "string") return error.error_user_msg;
     if (typeof error.message === "string") return error.message;
   }
