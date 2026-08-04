@@ -48,8 +48,49 @@ Supabase/Vercel.
 | Estilos   | Tailwind CSS + shadcn/ui                     |
 | Backend   | Supabase (Auth + PostgreSQL + RLS + Storage) |
 | IA        | OpenRouter (LLM gateway)                     |
-| WhatsApp  | YCloud                                       |
+| WhatsApp  | YCloud (ver abajo)                           |
 | Hosting   | Vercel                                       |
+
+## Elegir proveedor de WhatsApp
+
+El proveedor no es intercambiable por configuración: su API define la forma de los
+envíos, el payload de los webhooks y el esquema de firma. Por eso vive en una
+rama, no en una variable de entorno.
+
+| Rama | Proveedor | Cuándo usarla |
+| --- | --- | --- |
+| `main` | **YCloud** | Por defecto |
+| `provider/kapso` | **Kapso** | **Obligatoria en Estados Unidos** — YCloud no opera ahí |
+
+```bash
+# YCloud (por defecto)
+git clone https://github.com/Carlos-Dominguez-faber/whatsapp-saas.git
+
+# Kapso
+git clone -b provider/kapso https://github.com/Carlos-Dominguez-faber/whatsapp-saas.git
+```
+
+### En qué se diferencian
+
+| | YCloud (`main`) | Kapso (`provider/kapso`) |
+| --- | --- | --- |
+| Disponible en EE.UU. | ❌ | ✅ |
+| Identidad del emisor | `phone_number` (E.164) | `phone_number_id` de Meta |
+| Firma del webhook | con timestamp, ventana anti-replay de 300 s | HMAC-SHA256 sin timestamp |
+| Nombre del evento | en el body | en el header `X-Webhook-Event` |
+| Coexistence | no soportado | soportado |
+| Prueba de conexión | `GET /balance` | listado de números del proyecto |
+
+La rama de Kapso pide **dos IDs de Meta** que YCloud no necesita —`phone_number_id`
+y `waba_id`— y ambos se autocompletan al pulsar «Probar conexión» en
+Settings → Integraciones. Trae además dos migraciones propias y soporte de
+**coexistence**: si el mismo número se usa también desde la app de WhatsApp
+Business en un celular, esas respuestas humanas se guardan y la conversación pasa
+a `human_active` para que el agente no conteste encima de la persona.
+
+> `provider/kapso` incluye todo lo de `main` más el cambio de proveedor. Las
+> mejoras que no son del proveedor (inbox, KB, agente) se llevan allá con
+> `git merge main`.
 
 ## Desarrollo local
 
