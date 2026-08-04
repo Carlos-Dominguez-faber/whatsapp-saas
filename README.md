@@ -48,8 +48,56 @@ Supabase/Vercel.
 | Estilos   | Tailwind CSS + shadcn/ui                     |
 | Backend   | Supabase (Auth + PostgreSQL + RLS + Storage) |
 | IA        | OpenRouter (LLM gateway)                     |
-| WhatsApp  | Kapso                                       |
+| WhatsApp  | Kapso (ver abajo)                            |
 | Hosting   | Vercel                                       |
+
+## Elegir proveedor de WhatsApp
+
+El proveedor no es intercambiable por configuración: su API define la forma de
+los envíos, el payload de los webhooks y el esquema de firma. Por eso vive en una
+rama, no en una variable de entorno.
+
+| Rama | Proveedor | Cuándo usarla |
+| --- | --- | --- |
+| `main` | **Kapso** | Por defecto. Único disponible en Estados Unidos |
+| `provider/ycloud` | **YCloud** | Si ya tienes cuenta y número en YCloud |
+
+```bash
+# Kapso (por defecto)
+git clone https://github.com/Carlos-Dominguez-faber/whatsapp-saas.git
+
+# YCloud
+git clone -b provider/ycloud https://github.com/Carlos-Dominguez-faber/whatsapp-saas.git
+```
+
+`provider/ycloud` es la foto exacta del producto antes de la migración
+(commit `c6f94eb`). Está **congelada**: no recibe correcciones nuevas.
+
+### En qué se diferencian
+
+| | YCloud | Kapso |
+| --- | --- | --- |
+| Disponible en EE.UU. | ❌ | ✅ |
+| Identidad del emisor | `phone_number` (E.164) | `phone_number_id` de Meta |
+| Firma del webhook | con timestamp, ventana anti-replay de 300 s | HMAC-SHA256 sin timestamp |
+| Nombre del evento | en el body | en el header `X-Webhook-Event` |
+| Coexistence | no soportado | soportado (ver abajo) |
+| Prueba de conexión | `GET /balance` | listado de números del proyecto |
+
+Kapso pide **dos IDs de Meta** que YCloud no necesitaba —`phone_number_id` y
+`waba_id`— y ambos se autocompletan al pulsar «Probar conexión» en
+Settings → Integraciones.
+
+**Coexistence:** si el mismo número se usa también desde la app de WhatsApp
+Business en un celular, Kapso reenvía esas respuestas humanas
+(`whatsapp.message.sent` con `origin: business_app`). El sistema las guarda y
+pasa la conversación a `human_active` para que el agente no conteste encima de
+la persona. La rama de YCloud no tiene nada de esto.
+
+> **Migrar de YCloud a Kapso** en una instancia existente: aplica las dos
+> migraciones de `supabase/migrations/2026073100000{0,1}_*.sql` y sigue
+> `docs/runbook-conectar-numero-kapso.md`. El valor `'ycloud'` sigue en el enum
+> `integration_provider`, así que la fila vieja no estorba.
 
 ## Desarrollo local
 
