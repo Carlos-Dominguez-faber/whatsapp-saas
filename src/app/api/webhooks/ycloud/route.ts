@@ -202,7 +202,7 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
     // Media handling (download + AI understanding) runs AFTER the response so
     // the webhook stays fast. transcript/description land in meta before the
     // batch is processed, so the agent reads voice notes/images as text.
-    const mediaLink = normalized.type !== "text" ? normalized.mediaLink : null;
+    const mediaLink = normalized.mediaLink;
     const messageId = message.id;
     const conversationId = conversation.id;
     const mediaJob = mediaLink

@@ -139,7 +139,10 @@ export async function processInbound(
         body: normalized.text,
         wamid: normalized.wamid,
         status: "delivered",
-        meta: { from_name: normalized.customerName },
+        meta: {
+          from_name: normalized.customerName,
+          raw_ycloud_type: normalized.rawType,
+        },
       },
       {
         onConflict: "workspace_id,wamid",
