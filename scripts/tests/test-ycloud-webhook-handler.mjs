@@ -83,12 +83,25 @@ assert.equal(
   "[Mensaje de WhatsApp no compatible: future_payload]",
 );
 
+// Current YCloud production shape when WhatsApp itself does not expose the
+// original content. It must remain diagnosable and must never masquerade as
+// downloadable media.
+const providerUnsupported = parseInbound(
+  inbound({ type: "unsupported", unsupported: { type: "unknown" } }),
+);
+assert.equal(providerUnsupported?.type, "text");
+assert.equal(providerUnsupported?.rawType, "unsupported");
+assert.equal(
+  providerUnsupported?.text,
+  "[Mensaje de WhatsApp no compatible: unsupported]",
+);
+
 assert.equal(parseInbound({ type: "whatsapp.message.updated" }), null);
 
 console.log(
   JSON.stringify({
     ok: true,
-    assertions: 23,
+    assertions: 26,
     covered: [
       "plain_text",
       "nested_text_fallback",
@@ -97,6 +110,7 @@ console.log(
       "interactive_reply",
       "voice_media",
       "future_type_fallback",
+      "provider_unsupported_fallback",
       "non_inbound_rejected",
     ],
   }),
