@@ -65,6 +65,10 @@ export interface NormalizedInbound {
   type: string;
   /** Sanitised raw message type, retained for diagnostics */
   rawType: string;
+  /** Sanitised provider subtype (for example unsupported.type), if present */
+  rawSubtype: string | null;
+  /** Provider error codes only; descriptions may contain user data */
+  diagnosticCodes: string[];
   /** Text content, the media caption, or "[Multimedia]" when neither exists */
   text: string | null;
   /** YCloud WhatsApp message ID */
@@ -105,6 +109,38 @@ function nonEmptyString(value: unknown): string | null {
 
 function sanitiseRawType(value: string): string {
   return value.toLowerCase().replace(/[^a-z0-9_.-]/g, "").slice(0, 40) || "unknown";
+}
+
+function sanitiseDiagnosticCode(value: unknown): string | null {
+  if (typeof value !== "string" && typeof value !== "number") return null;
+  const code = String(value).replace(/[^a-z0-9_.-]/gi, "").slice(0, 40);
+  return code || null;
+}
+
+function extractDiagnosticCodes(message: Record<string, unknown>): string[] {
+  if (!Array.isArray(message.errors)) return [];
+  return [
+    ...new Set(
+      message.errors
+        .map((error) => {
+          if (typeof error !== "object" || error === null) return null;
+          return sanitiseDiagnosticCode(
+            (error as Record<string, unknown>).code,
+          );
+        })
+        .filter((code): code is string => code !== null),
+    ),
+  ].slice(0, 8);
+}
+
+function extractSubtype(
+  message: Record<string, unknown>,
+  rawType: string,
+): string | null {
+  const value = message[rawType];
+  if (typeof value !== "object" || value === null) return null;
+  const subtype = nonEmptyString((value as Record<string, unknown>).type);
+  return subtype ? sanitiseRawType(subtype) : null;
 }
 
 function bodyLike(value: unknown): string | null {
@@ -162,10 +198,29 @@ function inferRawType(message: Record<string, unknown>): string {
   for (const type of MEDIA_TYPES) {
     if (typeof message[type] === "object" && message[type] !== null) return type;
   }
-  for (const type of ["button", "interactive", "location"] as const) {
+  for (const type of [
+    "button",
+    "interactive",
+    "location",
+    "reaction",
+    "system",
+    "order",
+    "product",
+  ] as const) {
     if (typeof message[type] === "object" && message[type] !== null) return type;
   }
+  if (Array.isArray(message.contacts)) return "contacts";
   return "unknown";
+}
+
+function countNestedItems(value: unknown): number {
+  if (Array.isArray(value)) return value.length;
+  if (typeof value !== "object" || value === null) return 0;
+  const record = value as Record<string, unknown>;
+  for (const key of ["product_items", "items", "products"]) {
+    if (Array.isArray(record[key])) return record[key].length;
+  }
+  return 0;
 }
 
 /**
@@ -214,6 +269,8 @@ export function parseInbound(body: unknown): NormalizedInbound | null {
 
     const declaredType = nonEmptyString(wimObj.type);
     const msgType = sanitiseRawType(declaredType ?? inferRawType(wimObj));
+    const rawSubtype = extractSubtype(wimObj, msgType);
+    const diagnosticCodes = extractDiagnosticCodes(wimObj);
 
     const createTime =
       typeof event.createTime === "string"
@@ -266,6 +323,35 @@ export function parseInbound(body: unknown): NormalizedInbound | null {
       if (text === null) text = "[Multimedia]";
     } else if (msgType === "location") {
       text = "[Ubicación compartida]";
+    } else if (msgType === "reaction") {
+      const reaction = wimObj.reaction;
+      const emoji =
+        typeof reaction === "object" && reaction !== null
+          ? nonEmptyString((reaction as Record<string, unknown>).emoji)
+          : null;
+      text = emoji ? `[Reacción: ${emoji.slice(0, 16)}]` : "[Reacción retirada]";
+    } else if (msgType === "contacts") {
+      const count = Array.isArray(wimObj.contacts) ? wimObj.contacts.length : 0;
+      text =
+        count > 0
+          ? `[${count} contacto(s) compartido(s)]`
+          : "[Contacto compartido]";
+    } else if (msgType === "system") {
+      text = bodyLike(wimObj.system) ?? "[Mensaje del sistema]";
+    } else if (msgType === "order") {
+      const count = countNestedItems(wimObj.order);
+      text =
+        count > 0
+          ? `[Pedido compartido: ${count} producto(s)]`
+          : "[Pedido compartido]";
+    } else if (msgType === "product") {
+      text = "[Consulta de producto]";
+    } else if (msgType === "request_welcome") {
+      text = "[Solicitud de bienvenida]";
+    } else if (msgType === "unsupported") {
+      text = rawSubtype
+        ? `[Mensaje de WhatsApp no compatible: unsupported/${rawSubtype}]`
+        : "[Mensaje de WhatsApp no compatible: unsupported]";
     } else if (conversationalText) {
       text = conversationalText;
     } else {
@@ -277,6 +363,8 @@ export function parseInbound(body: unknown): NormalizedInbound | null {
       from,
       type: toMessageType(msgType),
       rawType: msgType,
+      rawSubtype,
+      diagnosticCodes,
       text,
       wamid,
       customerName,

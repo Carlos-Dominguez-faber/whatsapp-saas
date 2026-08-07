@@ -87,21 +87,59 @@ assert.equal(
 // original content. It must remain diagnosable and must never masquerade as
 // downloadable media.
 const providerUnsupported = parseInbound(
-  inbound({ type: "unsupported", unsupported: { type: "unknown" } }),
+  inbound({
+    type: "unsupported",
+    unsupported: { type: "poll_creation" },
+    errors: [{ code: 131051, title: "not persisted" }],
+  }),
 );
 assert.equal(providerUnsupported?.type, "text");
 assert.equal(providerUnsupported?.rawType, "unsupported");
+assert.equal(providerUnsupported?.rawSubtype, "poll_creation");
+assert.deepEqual(providerUnsupported?.diagnosticCodes, ["131051"]);
 assert.equal(
   providerUnsupported?.text,
-  "[Mensaje de WhatsApp no compatible: unsupported]",
+  "[Mensaje de WhatsApp no compatible: unsupported/poll_creation]",
 );
+
+const reaction = parseInbound(
+  inbound({
+    type: "reaction",
+    reaction: { message_id: "wamid.original", emoji: "👍" },
+  }),
+);
+assert.equal(reaction?.type, "text");
+assert.equal(reaction?.rawType, "reaction");
+assert.equal(reaction?.text, "[Reacción: 👍]");
+
+const contacts = parseInbound(
+  inbound({ type: "contacts", contacts: [{}, {}] }),
+);
+assert.equal(contacts?.type, "text");
+assert.equal(contacts?.text, "[2 contacto(s) compartido(s)]");
+
+const system = parseInbound(
+  inbound({ type: "system", system: { body: "Cambio de número" } }),
+);
+assert.equal(system?.type, "system");
+assert.equal(system?.text, "Cambio de número");
+
+const order = parseInbound(
+  inbound({ type: "order", order: { product_items: [{}, {}, {}] } }),
+);
+assert.equal(order?.type, "text");
+assert.equal(order?.text, "[Pedido compartido: 3 producto(s)]");
+
+const welcome = parseInbound(inbound({ type: "request_welcome" }));
+assert.equal(welcome?.type, "text");
+assert.equal(welcome?.text, "[Solicitud de bienvenida]");
 
 assert.equal(parseInbound({ type: "whatsapp.message.updated" }), null);
 
 console.log(
   JSON.stringify({
     ok: true,
-    assertions: 26,
+    assertions: 39,
     covered: [
       "plain_text",
       "nested_text_fallback",
@@ -111,6 +149,11 @@ console.log(
       "voice_media",
       "future_type_fallback",
       "provider_unsupported_fallback",
+      "reaction",
+      "contacts",
+      "system",
+      "order",
+      "request_welcome",
       "non_inbound_rejected",
     ],
   }),
