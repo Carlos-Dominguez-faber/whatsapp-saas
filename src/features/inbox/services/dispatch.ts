@@ -9,6 +9,7 @@ import { createClient as createSbClient } from "@supabase/supabase-js";
 import { sendText, sendTemplate } from "./kapso-client";
 import type { TemplateParams } from "./kapso-client";
 import { formatWhatsAppMarkdown } from "./text-formatter";
+import { decryptCredentials } from "@/shared/lib/integration-secrets";
 
 function svc() {
   return createSbClient(
@@ -84,8 +85,9 @@ async function loadIntegration(
   }
 
   const row = data as IntegrationRow;
+  const creds = await decryptCredentials(row.credentials, workspaceId, "kapso");
   return {
-    apiKey: (row.credentials.kapso_api_key as string | undefined) ?? "",
+    apiKey: (creds.kapso_api_key as string | undefined) ?? "",
     // Kapso identifies the sender by Meta's phone_number_id in the request PATH,
     // not by the E.164 number. config.phone_number is kept for the UI/CRM only.
     phoneNumberId: (row.config.phone_number_id as string | undefined) ?? "",
@@ -185,7 +187,10 @@ export async function dispatchText(
   }
 
   // 3. Load Kapso credentials
-  const { apiKey, phoneNumberId } = await loadIntegration(workspaceId, supabase);
+  const { apiKey, phoneNumberId } = await loadIntegration(
+    workspaceId,
+    supabase,
+  );
 
   // 4. Send via Kapso (skip if placeholder / dev mode)
   // Kapso returns the WhatsApp `wamid` synchronously as messages[0].id and no
@@ -301,7 +306,10 @@ export async function dispatchTemplate(
   }
 
   // 2. Load Kapso credentials
-  const { apiKey, phoneNumberId } = await loadIntegration(workspaceId, supabase);
+  const { apiKey, phoneNumberId } = await loadIntegration(
+    workspaceId,
+    supabase,
+  );
 
   // 3. Send template via Kapso
   let wamid: string | undefined;

@@ -430,7 +430,9 @@ export async function processNextBatch(): Promise<ProcessBatchResult> {
     // ── 9. Load Kapso integration credentials ──────────────────────────────
     const { data: integration, error: intError } = await supabase
       .from("integrations")
-      .select("credentials, config")
+      // Only an existence check — dispatchText() loads and decrypts the
+      // credentials itself, so there is no reason to pull secrets here.
+      .select("workspace_id")
       .eq("workspace_id", batch.workspace_id)
       .eq("provider", "kapso")
       .eq("enabled", true)

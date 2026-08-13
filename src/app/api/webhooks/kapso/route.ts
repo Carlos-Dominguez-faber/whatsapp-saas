@@ -25,6 +25,7 @@ import {
   transcribeAudio,
   describeImage,
 } from "@/features/inbox/services/media-understanding";
+import { decryptCredentials } from "@/shared/lib/integration-secrets";
 
 // Keep the function alive long enough for the best-effort fast path below
 // (sleep through the buffer window + AI generation). The cron is the fallback.
@@ -118,9 +119,7 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
         ? ((body as { phone_number_id?: unknown }).phone_number_id ?? null)
         : null;
     const phoneNumberIdStr =
-      typeof phoneNumberId === "string" && phoneNumberId
-        ? phoneNumberId
-        : null;
+      typeof phoneNumberId === "string" && phoneNumberId ? phoneNumberId : null;
 
     // Events that carry NO actionable data AND cannot identify a workspace
     // (no wsid, no phone_number_id, not a status update) → harmless early 200.
@@ -172,7 +171,13 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
 
-    const creds = ws.credentials as {
+    // The workspace was resolved via config / wsid — both plaintext — so
+    // decryption happens only after we know which row we need.
+    const creds = (await decryptCredentials(
+      ws.credentials,
+      ws.workspace_id,
+      "kapso",
+    )) as {
       kapso_api_key?: string;
       webhook_signing_secret?: string;
     };
@@ -219,9 +224,8 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
     // Defence in depth: when routed by ?wsid, make sure the event actually
     // belongs to this workspace's number. Kapso webhooks are per-number, so a
     // mismatch means the wsid and the Kapso webhook config drifted apart.
-    const configuredPhoneNumberId = (
-      ws.config as { phone_number_id?: string }
-    ).phone_number_id;
+    const configuredPhoneNumberId = (ws.config as { phone_number_id?: string })
+      .phone_number_id;
     if (
       configuredPhoneNumberId &&
       normalized.phoneNumberId &&

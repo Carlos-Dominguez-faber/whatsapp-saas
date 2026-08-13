@@ -40,6 +40,7 @@ import type {
 } from "@/features/tools/core/tool";
 import { registry } from "@/features/tools/index";
 import { getActiveAgent } from "@/features/agents/services/active-agent";
+import { decryptCredentials } from "@/shared/lib/integration-secrets";
 
 // ──────────────────────────────────────────────────────────────────────────────
 // getWorkspaceModel
@@ -104,8 +105,12 @@ export async function getOpenRouterApiKey(
       .eq("provider", "openrouter")
       .maybeSingle();
 
-    const creds = data?.credentials as Record<string, unknown> | null;
-    const key = creds?.openrouter_api_key;
+    const creds = await decryptCredentials(
+      data?.credentials as Record<string, unknown> | null,
+      workspaceId,
+      "openrouter",
+    );
+    const key = creds.openrouter_api_key;
     if (typeof key === "string" && key.length > 0) return key;
   } catch {
     // Non-fatal — fall through to env key

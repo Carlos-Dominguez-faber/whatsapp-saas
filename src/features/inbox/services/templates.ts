@@ -4,6 +4,7 @@
 
 import { createClient as createSbClient } from "@supabase/supabase-js";
 import { fetchKapsoTemplates } from "./kapso-client";
+import { decryptCredentials } from "@/shared/lib/integration-secrets";
 
 function svc() {
   return createSbClient(
@@ -133,7 +134,11 @@ export async function syncTemplatesFromKapso(
     );
   }
 
-  const credentials = integration.credentials as Record<string, unknown>;
+  const credentials = await decryptCredentials(
+    integration.credentials as Record<string, unknown>,
+    workspaceId,
+    "kapso",
+  );
   const config = (integration.config ?? {}) as Record<string, unknown>;
   const apiKey = (credentials.kapso_api_key as string | undefined) ?? "";
   // Kapso's template endpoints are Meta's, so they are scoped to a WABA id.

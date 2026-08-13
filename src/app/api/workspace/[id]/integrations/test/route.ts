@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { createClient as svcClient } from "@supabase/supabase-js";
 import { requireWorkspaceMember } from "@/lib/auth/workspace-access";
 import { listAllPhoneNumbers } from "@/features/inbox/services/kapso-client";
+import { decryptCredentials } from "@/shared/lib/integration-secrets";
 
 // Kapso has no /balance endpoint like YCloud's, so "test connection" lists the
 // project's WhatsApp numbers. That proves the API key works AND lets us catch
@@ -33,12 +34,16 @@ export async function POST(
     .eq("provider", "kapso")
     .single();
 
-  const creds = data?.credentials as KapsoCredentials | null;
+  const creds = (await decryptCredentials(
+    data?.credentials as Record<string, unknown> | null,
+    workspaceId,
+    "kapso",
+  )) as KapsoCredentials;
   const config = (data?.config ?? {}) as {
     waba_id?: string;
     phone_number_id?: string;
   };
-  const apiKey = creds?.kapso_api_key;
+  const apiKey = creds.kapso_api_key;
 
   if (!apiKey) {
     return NextResponse.json({ ok: false, error: "No API key configured" });

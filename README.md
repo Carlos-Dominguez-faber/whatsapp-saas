@@ -57,9 +57,9 @@ Supabase/Vercel.
 configuración: su API define la forma de los envíos, el payload de los webhooks y
 el esquema de firma. Por eso vive en una rama, no en una variable de entorno.
 
-| Rama | Proveedor | Cuándo usarla |
-| --- | --- | --- |
-| `main` | **YCloud** | Por defecto |
+| Rama             | Proveedor        | Cuándo usarla                                           |
+| ---------------- | ---------------- | ------------------------------------------------------- |
+| `main`           | **YCloud**       | Por defecto                                             |
 | `provider/kapso` | **Kapso** ← esta | **Obligatoria en Estados Unidos** — YCloud no opera ahí |
 
 ```bash
@@ -68,14 +68,14 @@ git clone -b provider/kapso https://github.com/Carlos-Dominguez-faber/whatsapp-s
 
 ### Qué trae esta rama que `main` no
 
-| | YCloud (`main`) | Kapso (esta rama) |
-| --- | --- | --- |
-| Disponible en EE.UU. | ❌ | ✅ |
-| Identidad del emisor | `phone_number` (E.164) | `phone_number_id` de Meta |
-| Firma del webhook | con timestamp, ventana anti-replay de 300 s | HMAC-SHA256 sin timestamp |
-| Nombre del evento | en el body | en el header `X-Webhook-Event` |
-| Coexistence | no soportado | soportado |
-| Prueba de conexión | `GET /balance` | listado de números del proyecto |
+|                      | YCloud (`main`)                             | Kapso (esta rama)               |
+| -------------------- | ------------------------------------------- | ------------------------------- |
+| Disponible en EE.UU. | ❌                                          | ✅                              |
+| Identidad del emisor | `phone_number` (E.164)                      | `phone_number_id` de Meta       |
+| Firma del webhook    | con timestamp, ventana anti-replay de 300 s | HMAC-SHA256 sin timestamp       |
+| Nombre del evento    | en el body                                  | en el header `X-Webhook-Event`  |
+| Coexistence          | no soportado                                | soportado                       |
+| Prueba de conexión   | `GET /balance`                              | listado de números del proyecto |
 
 Kapso pide **dos IDs de Meta** que YCloud no necesita —`phone_number_id` y
 `waba_id`— y ambos se autocompletan al pulsar «Probar conexión» en
@@ -131,7 +131,25 @@ scripts/
 Ver [`.env.local.example`](.env.local.example). Las de Supabase y OpenRouter las
 pegas tú; `ENCRYPTION_KEY`, `BUFFER_PROCESS_SECRET` y `CRON_SECRET` las **genera**
 `scripts/setup.mjs`. **Kapso y HighLevel NO son env vars** — se configuran por
-workspace en Settings → Integraciones (encriptados por tenant).
+workspace en Settings → Integraciones.
+
+### Credenciales de integraciones
+
+Lo que guardas en Settings → Integraciones (API key de Kapso, signing secret,
+PIT de HighLevel) se cifra con **AES-256-GCM** antes de tocar la base. La llave
+es `ENCRYPTION_KEY` y vive solo en el entorno del servidor: quien tenga acceso
+de lectura a Postgres ve ciphertext, no las keys.
+
+Cada valor queda ligado a su `workspace_id` + proveedor, así que un blob copiado
+de un tenant a otro no descifra.
+
+> **Si instalaste antes de esta versión**, tus credenciales están en texto plano.
+> La app las sigue leyendo, pero para cifrarlas corre:
+>
+> ```bash
+> node scripts/encrypt-credentials.mjs --dry-run   # ver qué cambiaría
+> node scripts/encrypt-credentials.mjs             # aplicar
+> ```
 
 ---
 

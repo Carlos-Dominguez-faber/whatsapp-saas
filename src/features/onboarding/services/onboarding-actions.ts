@@ -3,6 +3,7 @@
 import { createClient } from "@/lib/supabase/server";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { z } from "zod";
+import { encryptCredentials } from "@/shared/lib/integration-secrets";
 
 // ─── Schema ───────────────────────────────────────────────────────────────────
 
@@ -239,10 +240,14 @@ export async function completeOnboarding(
         workspace_id: workspaceId,
         provider: "kapso",
         enabled: true,
-        credentials: {
-          kapso_api_key: data.kapsoApiKey,
-          webhook_signing_secret: data.kapsoSigningSecret ?? "",
-        },
+        credentials: await encryptCredentials(
+          {
+            kapso_api_key: data.kapsoApiKey,
+            webhook_signing_secret: data.kapsoSigningSecret ?? "",
+          },
+          workspaceId,
+          "kapso",
+        ),
         config: {
           phone_number: data.kapsoPhone ?? "",
           // Meta's IDs — phone_number_id is required to send at all, waba_id to

@@ -3,14 +3,24 @@
  * Key is loaded from ENCRYPTION_KEY env var (base64-encoded 32-byte key).
  * Key version is loaded from ENCRYPTION_KEY_VERSION (default: "v1").
  *
+ * Ciphertext format: `enc:<version>:<ivB64>:<ciphertextB64>`
+ * The `enc:` prefix makes encrypted values unambiguously distinguishable from
+ * plaintext, which is what lets readers tolerate not-yet-migrated rows.
+ *
+ * Every call takes an `aad` (additional authenticated data) string that is
+ * authenticated but not encrypted. Binding a ciphertext to its owner — e.g.
+ * "<workspaceId>:<provider>" — means a blob copied from one tenant's row into
+ * another's fails to decrypt instead of silently working.
+ *
  * Usage:
- *   const cipher = await encrypt("plaintext")
- *   const plain  = await decrypt(cipher)
+ *   const cipher = await encrypt("plaintext", `${workspaceId}:ycloud`)
+ *   const plain  = await decrypt(cipher, `${workspaceId}:ycloud`)
  */
 
 const ALG = "AES-GCM";
 const IV_BYTES = 12; // 96-bit IV recommended for GCM
 const KEY_VERSION = process.env.ENCRYPTION_KEY_VERSION ?? "v1";
+const PREFIX = "enc";
 
 /** Copy a Buffer/Uint8Array into a plain ArrayBuffer so crypto.subtle accepts it. */
 function toArrayBuffer(buf: Buffer): ArrayBuffer {
@@ -43,29 +53,46 @@ async function getCryptoKey(): Promise<CryptoKey> {
   return _cryptoKey;
 }
 
-/** Encrypts a UTF-8 string and returns a base64-encoded ciphertext (iv:ciphertext:version). */
-export async function encrypt(plaintext: string): Promise<string> {
+/** True when `value` was produced by {@link encrypt} (vs. a legacy plaintext value). */
+export function isEncrypted(value: unknown): value is string {
+  return typeof value === "string" && value.startsWith(`${PREFIX}:`);
+}
+
+/** Encrypts a UTF-8 string, binding the ciphertext to `aad`. */
+export async function encrypt(plaintext: string, aad: string): Promise<string> {
   const key = await getCryptoKey();
   const iv = crypto.getRandomValues(new Uint8Array(IV_BYTES));
-  const encoded = new TextEncoder().encode(plaintext);
   const cipherBuf = await crypto.subtle.encrypt(
-    { name: ALG, iv },
+    { name: ALG, iv, additionalData: new TextEncoder().encode(aad) },
     key,
-    encoded,
+    new TextEncoder().encode(plaintext),
   );
   const ivB64 = Buffer.from(iv).toString("base64");
   const ctB64 = Buffer.from(cipherBuf).toString("base64");
-  return `${ivB64}:${ctB64}:${KEY_VERSION}`;
+  return `${PREFIX}:${KEY_VERSION}:${ivB64}:${ctB64}`;
 }
 
-/** Decrypts a base64-encoded ciphertext produced by {@link encrypt}. */
-export async function decrypt(ciphertext: string): Promise<string> {
+/**
+ * Decrypts a ciphertext produced by {@link encrypt}. `aad` must match the value
+ * used at encryption time or GCM authentication fails and this throws.
+ */
+export async function decrypt(
+  ciphertext: string,
+  aad: string,
+): Promise<string> {
   const parts = ciphertext.split(":");
-  if (parts.length !== 3) throw new Error("Invalid ciphertext format");
-  const [ivB64, ctB64] = parts;
+  if (parts.length !== 4 || parts[0] !== PREFIX)
+    throw new Error("Invalid ciphertext format");
+  const [, , ivB64, ctB64] = parts;
   const key = await getCryptoKey();
-  const iv = toArrayBuffer(Buffer.from(ivB64, "base64"));
-  const ct = toArrayBuffer(Buffer.from(ctB64, "base64"));
-  const plainBuf = await crypto.subtle.decrypt({ name: ALG, iv }, key, ct);
+  const plainBuf = await crypto.subtle.decrypt(
+    {
+      name: ALG,
+      iv: toArrayBuffer(Buffer.from(ivB64, "base64")),
+      additionalData: new TextEncoder().encode(aad),
+    },
+    key,
+    toArrayBuffer(Buffer.from(ctB64, "base64")),
+  );
   return new TextDecoder().decode(plainBuf);
 }

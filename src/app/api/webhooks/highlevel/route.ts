@@ -11,6 +11,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { timingSafeEqual } from "node:crypto";
 import { createClient as createSbClient } from "@supabase/supabase-js";
 import { syncContactFromHL } from "@/features/inbox/services/highlevel-client";
+import { decryptCredentials } from "@/shared/lib/integration-secrets";
 
 function svc() {
   return createSbClient(
@@ -71,7 +72,8 @@ export async function POST(req: NextRequest) {
   }
 
   const { credentials } = integration as HLIntegrationRow;
-  const secret = credentials?.highlevel_webhook_secret;
+  const decrypted = await decryptCredentials(credentials, wsid, "highlevel");
+  const secret = decrypted.highlevel_webhook_secret as string | undefined;
 
   if (!secret || !safeEqual(token, secret)) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
