@@ -4,6 +4,7 @@
 
 import { createClient as createSbClient } from "@supabase/supabase-js";
 import { fetchYCloudTemplates } from "./ycloud-client";
+import { decryptCredentials } from "@/shared/lib/integration-secrets";
 
 function svc() {
   return createSbClient(
@@ -133,7 +134,11 @@ export async function syncTemplatesFromYCloud(
     );
   }
 
-  const credentials = integration.credentials as Record<string, unknown>;
+  const credentials = await decryptCredentials(
+    integration.credentials as Record<string, unknown>,
+    workspaceId,
+    "ycloud",
+  );
   const apiKey = (credentials.ycloud_api_key as string | undefined) ?? "";
 
   if (!apiKey || apiKey === "placeholder") {

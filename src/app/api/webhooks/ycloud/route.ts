@@ -18,6 +18,7 @@ import {
   transcribeAudio,
   describeImage,
 } from "@/features/inbox/services/media-understanding";
+import { decryptCredentials } from "@/shared/lib/integration-secrets";
 
 // Keep the function alive long enough for the best-effort fast path below
 // (sleep through the buffer window + AI generation). The cron is the fallback.
@@ -157,7 +158,13 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
 
-    const creds = ws.credentials as {
+    // The workspace was resolved via config.phone_number / wsid — both
+    // plaintext — so decryption happens only after we know which row we need.
+    const creds = (await decryptCredentials(
+      ws.credentials,
+      ws.workspace_id,
+      "ycloud",
+    )) as {
       ycloud_api_key?: string;
       webhook_signing_secret?: string;
     };

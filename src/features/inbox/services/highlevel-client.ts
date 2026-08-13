@@ -9,6 +9,7 @@
  */
 
 import { createClient as createSbClient } from "@supabase/supabase-js";
+import { decryptCredentials } from "@/shared/lib/integration-secrets";
 
 const HL_BASE_URL = "https://services.leadconnectorhq.com";
 const HL_API_VERSION = "2021-07-28";
@@ -99,7 +100,11 @@ export async function getHLConfig(
 
   if (error || !data) return null;
 
-  const creds = (data.credentials as Record<string, unknown> | null) ?? {};
+  const creds = await decryptCredentials(
+    data.credentials as Record<string, unknown> | null,
+    workspaceId,
+    "highlevel",
+  );
   const config = (data.config as Record<string, unknown> | null) ?? {};
 
   const token = creds.highlevel_pit;

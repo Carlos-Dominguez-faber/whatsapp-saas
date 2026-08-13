@@ -204,8 +204,10 @@ supabase db push         # aplica migraciones nuevas
 vercel --prod            # redeploy
 ```
 
-**Nunca** rotes los secrets de `.env.local` (romperías los credentials cifrados de
-los tenants). `setup.mjs env` ya los respeta.
+**Nunca** rotes `ENCRYPTION_KEY`: es la llave con la que se cifran las
+credenciales de integraciones de cada workspace, y cambiarla las vuelve
+ilegibles (habría que recapturarlas una por una en Settings → Integraciones).
+`setup.mjs env` ya respeta los secrets existentes.
 
 ## Desinstalar
 

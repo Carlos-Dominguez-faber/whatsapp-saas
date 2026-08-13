@@ -20,6 +20,7 @@ import {
   type TemplateButton,
   type TemplateVariable,
 } from "@/features/settings/lib/template-form";
+import { decryptCredentials } from "@/shared/lib/integration-secrets";
 
 function svc() {
   return createSbClient(
@@ -141,10 +142,11 @@ export async function POST(
     .eq("enabled", true)
     .maybeSingle();
 
-  const credentials = (integration?.credentials ?? {}) as Record<
-    string,
-    unknown
-  >;
+  const credentials = await decryptCredentials(
+    integration?.credentials as Record<string, unknown> | null,
+    workspaceId,
+    "ycloud",
+  );
   const config = (integration?.config ?? {}) as Record<string, unknown>;
   const apiKey = (credentials.ycloud_api_key as string | undefined) ?? "";
   const phoneNumber = (config.phone_number as string | undefined) ?? "";

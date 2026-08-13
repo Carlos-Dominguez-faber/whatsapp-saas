@@ -6,6 +6,10 @@ import {
   requireWorkspaceMember,
   readJsonBody,
 } from "@/lib/auth/workspace-access";
+import {
+  encryptCredentials,
+  decryptCredentials,
+} from "@/shared/lib/integration-secrets";
 
 const IntegrationSchema = z.object({
   provider: z.enum(["ycloud", "openrouter", "highlevel"]),
@@ -39,7 +43,13 @@ export async function GET(
 ) {
   const { id: workspaceId } = await params;
 
-  const auth = await requireWorkspaceMember(workspaceId);
+  // This route reads through the service-role client, which bypasses RLS, so it
+  // has to reproduce the table's own policy: integrations_select_admins limits
+  // SELECT to admin/manager. Without this, any member (viewer/agent included)
+  // could read the HighLevel webhook token exposed below.
+  const auth = await requireWorkspaceMember(workspaceId, {
+    minRole: "manager",
+  });
   if (!auth.ok) return auth.response;
 
   const svc = svcClient(
@@ -54,35 +64,43 @@ export async function GET(
 
   const appUrl = process.env.NEXT_PUBLIC_APP_URL ?? "";
 
-  const masked = ((data ?? []) as IntegrationRow[]).map((row) => {
-    const base = {
-      id: row.id,
-      provider: row.provider,
-      enabled: row.enabled,
-      config: row.config ?? {},
-      credentials: maskRecord(row.credentials),
-      oauth_tokens: maskRecord(row.oauth_tokens),
-    };
-
-    // The HighLevel inbound-sync webhook token is low-sensitivity (it only
-    // authorizes inbound contact-sync), so expose it unmasked plus a prebuilt
-    // URL so the settings UI can render the webhook endpoint.
-    if (row.provider === "highlevel") {
-      const secret =
-        typeof row.credentials?.highlevel_webhook_secret === "string"
-          ? row.credentials.highlevel_webhook_secret
-          : "";
-      return {
-        ...base,
-        highlevel_webhook_secret: secret,
-        highlevel_webhook_url: secret
-          ? `${appUrl}/api/webhooks/highlevel?wsid=${workspaceId}&token=${secret}`
-          : "",
+  const masked = await Promise.all(
+    ((data ?? []) as IntegrationRow[]).map(async (row) => {
+      const base = {
+        id: row.id,
+        provider: row.provider,
+        enabled: row.enabled,
+        config: row.config ?? {},
+        credentials: maskRecord(row.credentials),
+        oauth_tokens: maskRecord(row.oauth_tokens),
       };
-    }
 
-    return base;
-  });
+      // The HighLevel inbound-sync webhook token has to travel to the client:
+      // the operator copies the resulting URL into HighLevel, so there is no way
+      // to render it masked. It is scoped to inbound contact-sync only, and this
+      // route is manager+ (see the auth gate above).
+      if (row.provider === "highlevel") {
+        const creds = await decryptCredentials(
+          row.credentials,
+          workspaceId,
+          row.provider,
+        );
+        const secret =
+          typeof creds.highlevel_webhook_secret === "string"
+            ? creds.highlevel_webhook_secret
+            : "";
+        return {
+          ...base,
+          highlevel_webhook_secret: secret,
+          highlevel_webhook_url: secret
+            ? `${appUrl}/api/webhooks/highlevel?wsid=${workspaceId}&token=${secret}`
+            : "",
+        };
+      }
+
+      return base;
+    }),
+  );
 
   return NextResponse.json({ integrations: masked });
 }
@@ -143,12 +161,21 @@ export async function PUT(
     ...(parsed.data.config ?? {}),
   };
 
+  // Encrypt the whole merged set: incoming plaintext gets wrapped, values
+  // already stored encrypted are left untouched, and a legacy plaintext row is
+  // migrated in place the first time it is saved.
+  const encryptedCreds = await encryptCredentials(
+    mergedCreds,
+    workspaceId,
+    parsed.data.provider,
+  );
+
   const { error } = await svc.from("integrations").upsert(
     {
       workspace_id: workspaceId,
       provider: parsed.data.provider,
       enabled: parsed.data.enabled ?? true,
-      credentials: mergedCreds,
+      credentials: encryptedCreds,
       config: mergedConfig,
       updated_at: new Date().toISOString(),
     },

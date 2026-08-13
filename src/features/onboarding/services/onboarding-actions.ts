@@ -3,6 +3,7 @@
 import { createClient } from "@/lib/supabase/server";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { z } from "zod";
+import { encryptCredentials } from "@/shared/lib/integration-secrets";
 
 // ─── Schema ───────────────────────────────────────────────────────────────────
 
@@ -237,10 +238,14 @@ export async function completeOnboarding(
         workspace_id: workspaceId,
         provider: "ycloud",
         enabled: true,
-        credentials: {
-          ycloud_api_key: data.ycloudApiKey,
-          webhook_signing_secret: data.ycloudSigningSecret ?? "",
-        },
+        credentials: await encryptCredentials(
+          {
+            ycloud_api_key: data.ycloudApiKey,
+            webhook_signing_secret: data.ycloudSigningSecret ?? "",
+          },
+          workspaceId,
+          "ycloud",
+        ),
         config: {
           phone_number: data.ycloudPhone ?? "",
         },
