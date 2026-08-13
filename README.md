@@ -89,7 +89,25 @@ scripts/
 Ver [`.env.local.example`](.env.local.example). Las de Supabase y OpenRouter las
 pegas tú; `ENCRYPTION_KEY`, `BUFFER_PROCESS_SECRET` y `CRON_SECRET` las **genera**
 `scripts/setup.mjs`. **YCloud y HighLevel NO son env vars** — se configuran por
-workspace en Settings → Integraciones (encriptados por tenant).
+workspace en Settings → Integraciones.
+
+### Credenciales de integraciones
+
+Lo que guardas en Settings → Integraciones (API key de YCloud, signing secret,
+PIT de HighLevel) se cifra con **AES-256-GCM** antes de tocar la base. La llave
+es `ENCRYPTION_KEY` y vive solo en el entorno del servidor: quien tenga acceso
+de lectura a Postgres ve ciphertext, no las keys.
+
+Cada valor queda ligado a su `workspace_id` + proveedor, así que un blob copiado
+de un tenant a otro no descifra.
+
+> **Si instalaste antes de esta versión**, tus credenciales están en texto plano.
+> La app las sigue leyendo, pero para cifrarlas corre:
+>
+> ```bash
+> node scripts/encrypt-credentials.mjs --dry-run   # ver qué cambiaría
+> node scripts/encrypt-credentials.mjs             # aplicar
+> ```
 
 ---
 
