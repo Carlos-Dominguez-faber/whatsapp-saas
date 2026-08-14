@@ -8,6 +8,7 @@
     "start": "next start",
     "lint": "eslint src/ middleware.ts",
     "typecheck": "tsc --noEmit",
+    "test:ycloud": "node --experimental-strip-types scripts/tests/test-ycloud-webhook-handler.mjs && node --experimental-strip-types scripts/tests/test-ycloud-duplicate-repair.mjs",
     "test:e2e": "playwright test",
     "test:e2e:headed": "playwright test --headed"
   },

@@ -1,6 +1,10 @@
 import { createClient as createSbClient } from "@supabase/supabase-js";
 import type { NormalizedInbound } from "./ycloud-webhook-handler";
 import type { ContactRow, ConversationRow, MessageRow } from "../types/index";
+import {
+  buildDuplicateRepairPatch,
+  buildInboundMeta,
+} from "./ycloud-duplicate-repair";
 
 function svc() {
   return createSbClient(
@@ -35,6 +39,7 @@ export interface ProcessInboundResult {
   contact: ContactRow;
   conversation: ConversationRow;
   message: MessageRow | null;
+  duplicateRepaired: boolean;
 }
 
 /**
@@ -139,7 +144,7 @@ export async function processInbound(
         body: normalized.text,
         wamid: normalized.wamid,
         status: "delivered",
-        meta: { from_name: normalized.customerName },
+        meta: buildInboundMeta(normalized),
       },
       {
         onConflict: "workspace_id,wamid",
@@ -155,6 +160,51 @@ export async function processInbound(
   }
 
   const message = msgData ? (msgData as MessageRow) : null;
+  let duplicateRepaired = false;
+
+  if (!message) {
+    const { data: existingData, error: existingError } = await supabase
+      .from("messages")
+      .select("id, type, body, meta")
+      .eq("workspace_id", workspaceId)
+      .eq("wamid", normalized.wamid)
+      .maybeSingle();
+
+    if (existingError) {
+      throw new Error(
+        `[normalizer] duplicate lookup failed: ${existingError.message}`,
+      );
+    }
+
+    if (existingData) {
+      const repair = buildDuplicateRepairPatch(
+        {
+          type: existingData.type as string,
+          body: (existingData.body as string | null) ?? null,
+          meta:
+            typeof existingData.meta === "object" && existingData.meta !== null
+              ? (existingData.meta as Record<string, unknown>)
+              : null,
+        },
+        normalized,
+      );
+
+      if (repair) {
+        const { error: repairError } = await supabase
+          .from("messages")
+          .update(repair)
+          .eq("id", existingData.id)
+          .eq("workspace_id", workspaceId);
+
+        if (repairError) {
+          throw new Error(
+            `[normalizer] duplicate repair failed: ${repairError.message}`,
+          );
+        }
+        duplicateRepaired = true;
+      }
+    }
+  }
 
   // F8-D1: media download hooks in here when message.type !== 'text' and message is not a dedup.
   // The webhook handler extracts the media `link` from the raw YCloud payload and passes it
@@ -168,5 +218,5 @@ export async function processInbound(
   // See media-handler.ts for downloadAndStoreMedia() and patchMessageMedia().
   // NormalizedInbound extension (mediaLink field) + webhook wiring is D2 scope.
 
-  return { contact, conversation, message };
+  return { contact, conversation, message, duplicateRepaired };
 }
