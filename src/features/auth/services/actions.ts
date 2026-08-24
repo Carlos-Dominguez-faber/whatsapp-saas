@@ -50,7 +50,10 @@ export async function login(
     return { error: localizeAuthError(error.message) };
   }
 
-  redirect("/inbox");
+  // Role-aware landing: "/" sends admin/manager to the inbox and everyone
+  // else (e.g. a client-tester "viewer" account) to the isolated /probar
+  // screen — see src/app/page.tsx.
+  redirect("/");
 }
 
 export async function signup(
