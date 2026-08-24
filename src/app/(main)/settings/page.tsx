@@ -33,6 +33,12 @@ export default async function SettingsPage() {
     );
   }
 
+  // Config is staff-only. A client-tester "viewer"/"agent" account (created
+  // for the isolated /probar screen) never reaches this page, even by URL.
+  if (!["admin", "manager"].includes(membership.role as string)) {
+    redirect("/probar");
+  }
+
   const workspaceId = membership.workspace_id as string;
 
   const svc = createSbClient(
