@@ -196,7 +196,17 @@ export async function fetchYCloudTemplates(apiKey: string): Promise<unknown[]> {
   }
 
   const data = responseBody as Record<string, unknown>;
-  return Array.isArray(data.records) ? data.records : [];
+const candidates = [
+    data.records,
+    data.templates,
+    data.items,
+    data.data,
+    data.results,
+  ];
+  for (const candidate of candidates) {
+      if (Array.isArray(candidate)) return candidate;
+  }
+  return [];
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -323,10 +333,19 @@ export async function createYCloudTemplate(
     );
   }
 
-  const data = responseBody as Record<string, unknown>;
+const data = responseBody as Record<string, unknown>;
+  const nested = (data.data ?? data.template ?? {}) as Record<
+      string,
+      unknown
+  >;
+  const idCandidates = [data.id, data.templateId, nested.id, nested.templateId];
+  const statusCandidates = [data.status, nested.status];
+
   return {
-    id: typeof data.id === "string" ? data.id : "",
-    status: typeof data.status === "string" ? data.status : "PENDING",
+      id: (idCandidates.find((v) => typeof v === "string" && v) as string) ?? "",
+      status:
+            (statusCandidates.find((v) => typeof v === "string" && v) as string) ??
+            "PENDING",
   };
 }
 
