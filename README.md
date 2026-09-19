@@ -152,4 +152,12 @@ de un tenant a otro no descifra.
 
 ---
 
-_Material para miembros de Imperio Agentico._
+## Licencia
+
+[MIT](LICENSE). Puedes usar, modificar, forkear, redistribuir, vender y cobrar
+por este software, incluso con fines comerciales y sin pagar regalías. La única
+condición es conservar el aviso de copyright y el texto de la licencia en las
+copias o partes sustanciales que distribuyas. Se entrega **sin garantía**.
+
+_Nacido como material para miembros de Imperio Agentico — el código es MIT para
+cualquiera._
