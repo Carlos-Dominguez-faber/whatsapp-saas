@@ -49,6 +49,11 @@ const EVENT_TYPE_STYLES: Record<string, EventTypeStyle> = {
     variant: "default",
     className: "bg-orange-500/20 text-orange-300 border-orange-500/30",
   },
+  jev_judgment: {
+    label: "Jev",
+    variant: "default",
+    className: "bg-amber-500/20 text-amber-200 border-amber-500/30",
+  },
 };
 
 const LEVEL_INDICATOR: Record<string, string> = {

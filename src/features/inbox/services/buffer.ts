@@ -3,6 +3,7 @@ import { generateWithTools, getWorkspaceModel } from "./openrouter";
 import { recordLlmUsage } from "./cost-tracker";
 import { dispatchText, dispatchTemplate } from "./dispatch";
 import { decide, applyTransition } from "./decision-engine";
+import { applyJevToBatch } from "@/features/jev-judge/apply";
 import type { ToolContext } from "@/features/tools/core/tool";
 import { resolveSystemPrompt } from "./prompt-resolver";
 import { buildSystemPrompt } from "./prompt-builder";
@@ -299,6 +300,19 @@ export async function processNextBatch(): Promise<ProcessBatchResult> {
       return { processed: true, conversationId: batch.conversation_id };
     }
 
+    // Jev runs only after state, keyword handoff and rate limit already passed.
+    // A failure falls through to the existing reply. It never downgrades customer.
+    const jev = await applyJevToBatch(supabase, {
+      workspaceId: batch.workspace_id,
+      conversationId: batch.conversation_id,
+      contactId: conversation.contact_id as string,
+      mergedText,
+    });
+    if (jev.suppressReply) {
+      await markBatchProcessed(batch.id, mergedText, supabase);
+      return { processed: true, conversationId: batch.conversation_id };
+    }
+
     // ── 6. Build ToolContext (SEC-01: anchored server-side, never from client) ─
     const toolCtx: ToolContext = {
       workspaceId: batch.workspace_id,
@@ -476,7 +490,7 @@ export async function processNextBatch(): Promise<ProcessBatchResult> {
     // runs even if the serverless function is frozen right after the batch. It is
     // fully try/catched internally and never throws into the batch path. Dormant
     // unless an enabled setter_config exists for the workspace.
-    if (activeAgent?.type === "setter") {
+    if (!jev.ownsStage && activeAgent?.type === "setter") {
       await runSetterEvaluation({
         workspaceId: batch.workspace_id,
         conversationId: batch.conversation_id,
