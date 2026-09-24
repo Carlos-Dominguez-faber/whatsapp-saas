@@ -141,10 +141,14 @@ export async function POST(request: Request): Promise<NextResponse> {
   // ── 3b. Process next ready batch (or the one we just primed above) ────────
   const result = await processNextBatch();
 
+  if (result.error) {
+    console.error("[internal/buffer/process] processing error:", result.error);
+  }
+
   return NextResponse.json({
     ok: true,
     processed: result.processed,
     batchId: batchId ?? undefined,
-    ...(result.error ? { error: result.error } : {}),
+    ...(result.error ? { error: "No se pudo procesar el lote" } : {}),
   });
 }

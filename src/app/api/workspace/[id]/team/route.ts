@@ -140,10 +140,14 @@ export async function POST(
       password: password || undefined,
     });
   } catch (err) {
+    console.error(
+      "[POST /api/workspace/[id]/team] provision error:",
+      err instanceof Error ? err.message : String(err),
+    );
     return NextResponse.json(
       {
         error:
-          err instanceof Error ? err.message : "No se pudo crear el usuario",
+          "No se pudo crear el usuario. Revisa el correo y la contraseña e intenta de nuevo.",
       },
       { status: 400 },
     );
@@ -162,7 +166,14 @@ export async function POST(
   );
 
   if (memberError) {
-    return NextResponse.json({ error: memberError.message }, { status: 500 });
+    console.error(
+      "[POST /api/workspace/[id]/team] membership error:",
+      memberError.message,
+    );
+    return NextResponse.json(
+      { error: "No se pudo agregar al usuario al equipo. Intenta de nuevo." },
+      { status: 500 },
+    );
   }
 
   return NextResponse.json({

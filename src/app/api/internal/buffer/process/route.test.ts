@@ -14,6 +14,7 @@ const updateFilters: Array<[string, unknown]> = [];
 // Rows the re-arm UPDATE reports as affected; [] = someone else claimed it first.
 let updatedRows: unknown[] = [{ id: "batch_1" }];
 let updateError: unknown = null;
+let processResult: { processed: boolean; error?: string } = { processed: true };
 
 const fakeSvc = {
   from: () => ({
@@ -52,7 +53,7 @@ mock.module("@/features/inbox/services/buffer.ts", {
   exports: {
     processNextBatch: async () => {
       processCalls++;
-      return { processed: true };
+      return processResult;
     },
   },
 });
@@ -76,6 +77,7 @@ function reset() {
   updateFilters.length = 0;
   updatedRows = [{ id: "batch_1" }];
   updateError = null;
+  processResult = { processed: true };
 }
 
 test("a targeted batchId only revives batches still in 'buffering', never one in flight", async () => {
@@ -127,6 +129,37 @@ test("500 without processing when the re-arm UPDATE fails", async () => {
   assert.equal(res.status, 500);
   assert.ok(!JSON.stringify(await res.json()).includes("connection reset"));
   assert.equal(processCalls, 0);
+});
+
+test("a processing error is logged server-side and replaced by a generic message in the body", async () => {
+  reset();
+  const raw = "LLM returned an empty reply (toolCallsExecuted=5)";
+  processResult = { processed: false, error: raw };
+  const logs: unknown[][] = [];
+  const originalError = console.error;
+  console.error = (...args: unknown[]) => {
+    logs.push(args);
+  };
+  try {
+    const res = await POST(signed("{}"));
+    assert.equal(res.status, 200);
+    const body = (await res.json()) as { processed: boolean; error?: string };
+    assert.equal(body.processed, false);
+    assert.ok(body.error, "the caller still learns that processing failed");
+    assert.ok(!JSON.stringify(body).includes(raw), `raw error leaked: ${JSON.stringify(body)}`);
+    assert.ok(logs.some((a) => a.map(String).join(" ").includes(raw)));
+  } finally {
+    console.error = originalError;
+  }
+});
+
+test("a successful run returns processed without an error field", async () => {
+  reset();
+  const res = await POST(signed("{}"));
+  assert.equal(res.status, 200);
+  const body = (await res.json()) as Record<string, unknown>;
+  assert.equal(body.processed, true);
+  assert.equal("error" in body, false);
 });
 
 test("rejects a body signed with the wrong secret", async () => {
