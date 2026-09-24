@@ -116,7 +116,11 @@ class ToolRegistry {
     }
 
     const timeoutMs = opts?.timeoutMs ?? 10_000;
-    const retries = opts?.retries ?? 1;
+    // A "write" tool's side effect (e.g. booking/cancelling an appointment)
+    // may have already succeeded even when the HTTP call that reported it
+    // times out or throws — retrying would risk repeating the mutation.
+    // "sensitive" tools never reach this loop (see the early return above).
+    const retries = tool.sensitivity === "write" ? 0 : (opts?.retries ?? 1);
 
     const attempt = () =>
       runWithTimeout(() => tool.run(parsed.data, ctx, opts), timeoutMs);
