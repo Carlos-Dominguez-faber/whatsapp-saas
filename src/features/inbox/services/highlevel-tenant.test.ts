@@ -17,7 +17,7 @@ const tables: Record<string, Row[]> = {
       provider: "highlevel",
       enabled: true,
       credentials: { highlevel_pit: "pit-a" },
-      config: { location_id: "loc_a" },
+      config: { location_id: "loc_a", pipeline_id: "pipe_a", pipeline_stage_id: "stage_a" },
     },
   ],
 };
@@ -81,10 +81,13 @@ mock.module("@/shared/lib/integration-secrets.ts", {
 let fetches: string[] = [];
 globalThis.fetch = (async (url: string) => {
   fetches.push(String(url));
-  return new Response(JSON.stringify({ contact: { id: "hl_new" } }), { status: 200 });
+  return new Response(
+    JSON.stringify({ contact: { id: "hl_new" }, opportunity: { id: "opp_new" } }),
+    { status: 200 },
+  );
 }) as typeof fetch;
 
-const { syncContactToHL } = await import("./highlevel-client.ts");
+const { syncContactToHL, createHLOpportunity } = await import("./highlevel-client.ts");
 
 beforeEach(() => {
   fetches = [];
@@ -105,6 +108,26 @@ test("syncContactToHL pushes and links a contact of the caller's own workspace",
 
 test("syncContactToHL does not read or push a contact from another workspace", async () => {
   const result = await syncContactToHL("ws_a", "ct_b");
+
+  assert.equal(result, null);
+  assert.equal(fetches.length, 0, "the foreign contact must not reach HighLevel");
+  assert.equal(updates.length, 0, "the foreign contact must not be written");
+});
+
+test("createHLOpportunity links and opens an opportunity for a contact of the caller's own workspace", async () => {
+  const result = await createHLOpportunity("ws_a", "ct_a");
+
+  assert.deepEqual(result, { id: "opp_new" });
+  assert.equal(fetches.length, 2);
+  assert.equal(updates.length, 1);
+  assert.deepEqual(updates[0].filters, [
+    ["id", "ct_a"],
+    ["workspace_id", "ws_a"],
+  ]);
+});
+
+test("createHLOpportunity does not read or push a contact from another workspace", async () => {
+  const result = await createHLOpportunity("ws_a", "ct_b");
 
   assert.equal(result, null);
   assert.equal(fetches.length, 0, "the foreign contact must not reach HighLevel");
