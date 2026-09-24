@@ -35,6 +35,11 @@ export interface HLConfig {
   pipelineId: string | null;
   /** Stage within the pipeline for new opportunities; null when not configured. */
   pipelineStageId: string | null;
+  /**
+   * IANA timezone for availability queries when the model does not pass a
+   * valid one. Defaults to "UTC".
+   */
+  timezone: string;
 }
 
 export interface HLPipeline {
@@ -125,6 +130,7 @@ export async function getHLConfig(
     calendarId: str(calendarId),
     pipelineId: str(pipelineId),
     pipelineStageId: str(pipelineStageId),
+    timezone: str(config.timezone) ?? "UTC",
   };
 }
 
