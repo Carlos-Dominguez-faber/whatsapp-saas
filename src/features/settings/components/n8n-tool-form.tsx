@@ -55,6 +55,12 @@ interface Props {
   onSaved: () => void;
 }
 
+// Must match the CHECK in supabase/migrations/20260830000000_n8n_tools.sql and
+// the Zod schema in src/app/api/workspace/[id]/n8n-tools/**.
+const MIN_TIMEOUT_MS = 1000;
+const MAX_TIMEOUT_MS = 15000;
+const DEFAULT_TIMEOUT_MS = 8000;
+
 function emptyParam(): N8nToolParamForm {
   return { key: "", label: "", type: "string", required: true, description: "" };
 }
@@ -74,6 +80,9 @@ export function N8nToolForm({ workspaceId, tool, open, onOpenChange, onSaved }: 
   const [parameters, setParameters] = useState<N8nToolParamForm[]>(
     tool?.parameters ?? [],
   );
+  // String, not number: an empty field must stay empty while typing instead of
+  // snapping back to 0 (and canSubmit rejects anything outside the DB CHECK).
+  const [timeoutMs, setTimeoutMs] = useState(String(tool?.timeout_ms ?? DEFAULT_TIMEOUT_MS));
   const [isLoading, setIsLoading] = useState(false);
 
   useEffect(() => {
@@ -87,15 +96,23 @@ export function N8nToolForm({ workspaceId, tool, open, onOpenChange, onSaved }: 
       setAuthHeaderName(tool?.auth_header_name ?? "");
       setAuthHeaderValue("");
       setParameters(tool?.parameters ?? []);
+      setTimeoutMs(String(tool?.timeout_ms ?? DEFAULT_TIMEOUT_MS));
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, tool?.id]);
+
+  const timeoutValue = Number(timeoutMs);
+  const timeoutIsValid =
+    Number.isInteger(timeoutValue) &&
+    timeoutValue >= MIN_TIMEOUT_MS &&
+    timeoutValue <= MAX_TIMEOUT_MS;
 
   const canSubmit =
     name.trim().length > 0 &&
     /^[a-zA-Z0-9_-]+$/.test(name.trim()) &&
     description.trim().length > 0 &&
     webhookUrl.trim().length > 0 &&
+    timeoutIsValid &&
     parameters.every(
       (p) =>
         p.key.trim().length > 0 &&
@@ -128,6 +145,7 @@ export function N8nToolForm({ workspaceId, tool, open, onOpenChange, onSaved }: 
       mode,
       sensitivity,
       webhook_url: webhookUrl.trim(),
+      timeout_ms: timeoutValue,
       parameters: parameters.map((p) => ({
         key: p.key.trim(),
         label: p.label.trim(),
@@ -242,6 +260,26 @@ export function N8nToolForm({ workspaceId, tool, open, onOpenChange, onSaved }: 
               placeholder="https://tu-n8n.com/webhook/..."
               required
             />
+          </div>
+
+          <div className="space-y-1.5">
+            <Label htmlFor="n8n-timeout">Timeout (ms)</Label>
+            <Input
+              id="n8n-timeout"
+              type="number"
+              className="sm:max-w-[12rem]"
+              value={timeoutMs}
+              onChange={(e) => setTimeoutMs(e.target.value)}
+              min={MIN_TIMEOUT_MS}
+              max={MAX_TIMEOUT_MS}
+              step={500}
+              required
+            />
+            <p className="text-xs text-muted-foreground">
+              Cuánto espera el agente la respuesta del workflow, entre{" "}
+              {MIN_TIMEOUT_MS} y {MAX_TIMEOUT_MS} ms (por defecto{" "}
+              {DEFAULT_TIMEOUT_MS}).
+            </p>
           </div>
 
           <div className="grid grid-cols-2 gap-3">

@@ -40,7 +40,12 @@ const CreateSchema = z.object({
     .optional(),
   auth_header_value: z.string().max(2000).optional(),
   parameters: z.array(N8nParameterSchema).max(20).default([]),
-  timeout_ms: z.number().int().min(1000).max(15000).default(8000),
+  timeout_ms: z
+    .number()
+    .int()
+    .min(1000, "El timeout debe estar entre 1000 y 15000 ms")
+    .max(15000, "El timeout debe estar entre 1000 y 15000 ms")
+    .default(8000),
 });
 
 // ── GET /api/workspace/[id]/n8n-tools ─────────────────────────────────────────
@@ -97,7 +102,10 @@ export async function POST(
   const parsed = CreateSchema.safeParse(parsedBody.body);
   if (!parsed.success) {
     return NextResponse.json(
-      { error: parsed.error.flatten() },
+      // A string, not flatten()'s object: every consumer (the Settings form
+      // included) shows `error` verbatim, so an object degrades to a generic
+      // "algo falló" and the admin never learns which field to fix.
+      { error: parsed.error.issues[0]?.message ?? "Datos inválidos" },
       { status: 400 },
     );
   }

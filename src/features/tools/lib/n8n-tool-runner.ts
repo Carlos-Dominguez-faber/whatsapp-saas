@@ -29,6 +29,15 @@ export function buildN8nToolRun(
   row: N8nToolRow,
 ): (args: unknown, ctx: ToolContext) => Promise<ToolResult> {
   return async function run(args: unknown, ctx: ToolContext): Promise<ToolResult> {
+    // The caller (registry.runTool) races this whole function against
+    // row.timeout_ms starting NOW, so the HTTP call only gets whatever is left
+    // of that budget after DNS validation. Passing the full timeout_ms to
+    // fetchPinned would put the inner deadline strictly after the outer one,
+    // so the outer always won — and for a "read" tool that means registry
+    // retries while the first POST is still in flight, hitting the n8n
+    // workflow twice for one invocation.
+    const start = Date.now();
+
     // Defense in depth: getEnabledTools(ctx.workspaceId) already scopes rows
     // to this workspace, but this is the single point of execution, so the
     // invariant is checked here explicitly too (SEC-01 spirit).
@@ -53,12 +62,14 @@ export function buildN8nToolRun(
       args,
     });
 
+    const remainingMs = Math.max(0, row.timeout_ms - (Date.now() - start));
+
     try {
       const res = await fetchPinned(row.webhook_url, resolvedIp, {
         method: "POST",
         headers,
         body,
-        timeoutMs: row.timeout_ms,
+        timeoutMs: remainingMs,
         maxResponseBytes: row.mode === "sync" ? MAX_SYNC_RESPONSE_BYTES : 0,
       });
 
@@ -70,7 +81,19 @@ export function buildN8nToolRun(
       }
 
       if (row.mode === "async") {
-        return { ok: true, output: { status: "queued" } };
+        // There is no callback/correlation for async workflows yet, so "ok"
+        // only means "n8n accepted the job". Say so in the output the LLM
+        // reads, or it may confirm an action that can still fail inside n8n.
+        return {
+          ok: true,
+          output: {
+            status: "queued",
+            result: "unknown",
+            note:
+              "La acción quedó encolada en n8n y todavía no hay resultado. " +
+              "No le confirmes al cliente que se completó: dile que quedó registrada y que se le avisará.",
+          },
+        };
       }
 
       let output: unknown = res.bodyText;

@@ -40,7 +40,12 @@ const UpdateSchema = z.object({
     .optional(),
   auth_header_value: z.string().max(2000).nullable().optional(),
   parameters: z.array(N8nParameterSchema).max(20).optional(),
-  timeout_ms: z.number().int().min(1000).max(15000).optional(),
+  timeout_ms: z
+    .number()
+    .int()
+    .min(1000, "El timeout debe estar entre 1000 y 15000 ms")
+    .max(15000, "El timeout debe estar entre 1000 y 15000 ms")
+    .optional(),
   enabled: z.boolean().optional(),
 });
 
@@ -61,7 +66,8 @@ export async function PATCH(
   const parsed = UpdateSchema.safeParse(parsedBody.body);
   if (!parsed.success) {
     return NextResponse.json(
-      { error: parsed.error.flatten() },
+      // See the POST route: a string, so the client can show it as-is.
+      { error: parsed.error.issues[0]?.message ?? "Datos inválidos" },
       { status: 400 },
     );
   }
