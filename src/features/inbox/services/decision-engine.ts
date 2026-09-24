@@ -182,7 +182,15 @@ export async function applyTransition(
   }
 
   // 4. Log the state change to events
-  await supabase.from("events").insert({
+  //
+  // El UPDATE de arriba YA está confirmado: esto es un segundo statement y
+  // puede fallar solo. Cuando falla, la conversación queda en el estado nuevo
+  // sin evento en el historial, y "Derivadas a humano" del dashboard de
+  // análisis —que se cuenta desde estos eventos— subcuenta.
+  // NO se transaccionaliza acá: hacerlo exige mover applyTransition a una RPC,
+  // que es un cambio del corazón del inbox con su propio plan. Lo mínimo es
+  // que deje rastro.
+  const { error: eventError } = await supabase.from("events").insert({
     type: "state_change",
     level: "info",
     workspace_id: conv.workspace_id,
@@ -194,6 +202,11 @@ export async function applyTransition(
       ...(trigger ? { trigger } : {}),
     },
   });
+
+  if (eventError) {
+    // Solo el código: nunca el mensaje crudo.
+    console.error("[decision-engine] state_change insert failed", eventError.code);
+  }
 
   // 5. Side effects of the new state. Deliberately last and deliberately
   //    non-throwing: the transition above is already committed and must stand
