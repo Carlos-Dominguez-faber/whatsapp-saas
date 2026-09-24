@@ -10,6 +10,10 @@ const filterCalls: Array<[string, string, unknown]> = [];
 const updates: unknown[] = [];
 let lookupRow: Record<string, unknown> | null = null;
 let processCalls = 0;
+const updateFilters: Array<[string, unknown]> = [];
+// Rows the re-arm UPDATE reports as affected; [] = someone else claimed it first.
+let updatedRows: unknown[] = [{ id: "batch_1" }];
+let updateError: unknown = null;
 
 const fakeSvc = {
   from: () => ({
@@ -29,7 +33,14 @@ const fakeSvc = {
     },
     update: (patch: unknown) => {
       updates.push(patch);
-      const chain: any = { eq: () => chain, then: (r: any) => r({ error: null }) };
+      const chain: any = {
+        eq(col: string, val: unknown) {
+          updateFilters.push([col, val]);
+          return chain;
+        },
+        select: async () => ({ data: updatedRows, error: updateError }),
+        then: (r: any) => r({ error: updateError }),
+      };
       return chain;
     },
   }),
@@ -62,6 +73,9 @@ function reset() {
   updates.length = 0;
   lookupRow = null;
   processCalls = 0;
+  updateFilters.length = 0;
+  updatedRows = [{ id: "batch_1" }];
+  updateError = null;
 }
 
 test("a targeted batchId only revives batches still in 'buffering', never one in flight", async () => {
@@ -84,6 +98,35 @@ test("a buffering batch is re-armed and processed", async () => {
   assert.equal(res.status, 200);
   assert.equal(updates.length, 1);
   assert.equal(processCalls, 1);
+});
+
+test("the re-arm UPDATE is conditioned on status 'buffering' too", async () => {
+  reset();
+  lookupRow = { id: "batch_1", workspace_id: "ws_1", status: "buffering" };
+  await POST(signed(JSON.stringify({ batchId: "batch_1" })));
+  assert.ok(
+    updateFilters.some(([col, val]) => col === "status" && val === "buffering"),
+    `expected the UPDATE to filter status=buffering, got ${JSON.stringify(updateFilters)}`,
+  );
+});
+
+test("409 without processing when the batch was claimed between the lookup and the re-arm", async () => {
+  reset();
+  lookupRow = { id: "batch_1", workspace_id: "ws_1", status: "buffering" };
+  updatedRows = []; // the cron claimed it: the conditional UPDATE matched nothing
+  const res = await POST(signed(JSON.stringify({ batchId: "batch_1" })));
+  assert.equal(res.status, 409);
+  assert.equal(processCalls, 0);
+});
+
+test("500 without processing when the re-arm UPDATE fails", async () => {
+  reset();
+  lookupRow = { id: "batch_1", workspace_id: "ws_1", status: "buffering" };
+  updateError = { message: "connection reset" };
+  const res = await POST(signed(JSON.stringify({ batchId: "batch_1" })));
+  assert.equal(res.status, 500);
+  assert.ok(!JSON.stringify(await res.json()).includes("connection reset"));
+  assert.equal(processCalls, 0);
 });
 
 test("rejects a body signed with the wrong secret", async () => {

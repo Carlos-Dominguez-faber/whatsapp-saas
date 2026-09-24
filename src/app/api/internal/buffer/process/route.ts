@@ -107,17 +107,35 @@ export async function POST(request: Request): Promise<NextResponse> {
       );
     }
 
-    // Force the batch into 'buffering' with flush_at = now so processNextBatch
-    // can claim it immediately via the RPC
-    await supabase
+    // Set flush_at = now so processNextBatch can claim it immediately via the
+    // RPC. The UPDATE repeats the status guard: between the SELECT above and
+    // this write the cron may have claimed the batch, and re-arming it then
+    // would hand it to a second worker → double reply.
+    const { data: rearmed, error: rearmError } = await supabase
       .from("message_batches")
       .update({
-        status: "buffering",
         flush_at: new Date().toISOString(),
         updated_at: new Date().toISOString(),
       })
       .eq("id", batchId)
-      .eq("workspace_id", batch.workspace_id); // explicit workspace guard
+      .eq("workspace_id", batch.workspace_id) // explicit workspace guard
+      .eq("status", "buffering")
+      .select("id");
+
+    if (rearmError) {
+      console.error("[internal/buffer/process] batch re-arm error:", rearmError);
+      return NextResponse.json(
+        { error: "No se pudo preparar el lote" },
+        { status: 500 },
+      );
+    }
+
+    if (!rearmed || rearmed.length === 0) {
+      return NextResponse.json(
+        { error: "El lote ya está siendo procesado" },
+        { status: 409 },
+      );
+    }
   }
 
   // ── 3b. Process next ready batch (or the one we just primed above) ────────
