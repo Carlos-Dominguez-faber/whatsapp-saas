@@ -1,5 +1,6 @@
 import { z } from "zod";
 import type { Tool, ToolContext, ToolResult } from "../core/tool";
+import { resolveCalendarId } from "../lib/calendar-id";
 import {
   buildAvailabilityOutput,
   groupByDay,
@@ -77,7 +78,7 @@ async function run(args: Args, ctx: ToolContext): Promise<ToolResult> {
     };
   }
 
-  const calendarId = args.calendar_id ?? cfg.calendarId;
+  const calendarId = resolveCalendarId(cfg.calendarId, args.calendar_id);
   if (!calendarId) {
     return {
       ok: false,
