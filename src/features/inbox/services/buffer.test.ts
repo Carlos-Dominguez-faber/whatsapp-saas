@@ -791,6 +791,41 @@ test("processNextBatch treats an empty LLM reply as a batch error (retry) instea
   generateWithToolsResult = { text: "hola!", inputTokens: 100, outputTokens: 20 };
 });
 
+test("processNextBatch records the tokens of an empty LLM reply before failing the batch", async () => {
+  primeHappyPathUntilDispatch();
+  generateWithToolsResult = { text: "", inputTokens: 37, outputTokens: 5 };
+  const result = await processNextBatch();
+  // The call was made and paid for: it must count against the daily budget
+  // even though the batch fails and will be retried.
+  assert.equal(recordLlmUsageCalls.length, 1);
+  const usage = recordLlmUsageCalls[0] as { promptTokens: number; completionTokens: number; reservationId?: string };
+  assert.equal(usage.promptTokens, 37);
+  assert.equal(usage.completionTokens, 5);
+  assert.equal(usage.reservationId, "res_1");
+  assert.equal(result.processed, false);
+  assert.match(result.error ?? "", /empty reply/);
+  assert.equal(dispatchTextCalls.length, 0);
+  generateWithToolsResult = { text: "hola!", inputTokens: 100, outputTokens: 20 };
+});
+
+test("processNextBatch still fails an empty LLM reply as before when recording its usage throws", async () => {
+  primeHappyPathUntilDispatch();
+  recordLlmUsageShouldThrow = true;
+  generateWithToolsResult = { text: "", inputTokens: 37, outputTokens: 5 };
+  const originalError = console.error;
+  console.error = () => {};
+  try {
+    const result = await processNextBatch();
+    assert.equal(recordLlmUsageCalls.length, 1);
+    assert.equal(result.processed, false);
+    assert.match(result.error ?? "", /empty reply/);
+    assert.equal(dispatchTextCalls.length, 0);
+  } finally {
+    console.error = originalError;
+    generateWithToolsResult = { text: "hola!", inputTokens: 100, outputTokens: 20 };
+  }
+});
+
 test("processNextBatch skips the dispatch when a human took the thread while the LLM was generating", async () => {
   primeHappyPathUntilDispatch();
   // Replace the re-check entry primed by the helper: the thread is now human_active.

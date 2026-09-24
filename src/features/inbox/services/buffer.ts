@@ -517,17 +517,10 @@ export async function processNextBatch(): Promise<ProcessBatchResult> {
       history,
     });
 
-    // With stopWhen(stepCountIs(5)) a turn that
-    // burns every step on tool calls comes back with text "". Kapso rejects an
-    // empty body (131009) and the batch would end as processed with a failed
-    // message. Treat it as a batch error so the retry path regenerates.
-    if (!reply.text.trim()) {
-      throw new Error(
-        `LLM returned an empty reply (toolCallsExecuted=${reply.toolCallsExecuted ?? 0})`,
-      );
-    }
-
-    // ── 8. Record LLM usage — una falla aquí NO debe reencolar el batch más
+    // ── 8. Record LLM usage — va ANTES de cualquier chequeo de la respuesta:
+    // una respuesta vacía también se pagó y tiene que contar en el presupuesto
+    // diario aunque el batch falle y se reintente.
+    // Una falla aquí NO debe reencolar el batch más
     // abajo: el LLM ya se llamó y ya se pagó, así que reencolar volvería a
     // llamarlo. Se loguea
     // y se sigue — el usuario igual recibe su respuesta y el batch se marca
@@ -552,6 +545,16 @@ export async function processNextBatch(): Promise<ProcessBatchResult> {
           batchId: batch.id,
           error: usageErr instanceof Error ? usageErr.message : String(usageErr),
         },
+      );
+    }
+
+    // With stopWhen(stepCountIs(5)) a turn that
+    // burns every step on tool calls comes back with text "". Kapso rejects an
+    // empty body (131009) and the batch would end as processed with a failed
+    // message. Treat it as a batch error so the retry path regenerates.
+    if (!reply.text.trim()) {
+      throw new Error(
+        `LLM returned an empty reply (toolCallsExecuted=${reply.toolCallsExecuted ?? 0})`,
       );
     }
 
