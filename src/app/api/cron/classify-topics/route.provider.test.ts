@@ -56,7 +56,7 @@ const { GET } = await import("./route.ts");
 
 test("OpenRouter con 503 → una sola petición, cero intentos, halt y 500 ok:false", async () => {
   const res = await GET(
-    new Request("http://localhost:3010/api/cron/classify-topics", { headers: { Authorization: "Bearer s3cret" } }),
+    new Request("http://localhost:3000/api/cron/classify-topics", { headers: { Authorization: "Bearer s3cret" } }),
   );
   const body = await res.json();
   assert.equal(res.status, 500);

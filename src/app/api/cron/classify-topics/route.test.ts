@@ -21,7 +21,7 @@ mock.module("@/features/analytics/services/classify-topics.ts", {
 const { GET, RUN_BUDGET_MS, maxDuration } = await import("./route.ts");
 
 const req = (auth?: string) =>
-  new Request("http://localhost:3010/api/cron/classify-topics", {
+  new Request("http://localhost:3000/api/cron/classify-topics", {
     headers: auth ? { Authorization: auth } : {},
   });
 
