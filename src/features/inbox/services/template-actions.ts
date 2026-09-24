@@ -1,5 +1,6 @@
 "use server";
 
+import { checkWorkspaceMember } from "@/lib/auth/workspace-access";
 import { listTemplates } from "./templates";
 import { dispatchTemplate } from "./dispatch";
 // NOTE: do NOT re-export types from a "use server" file — Next/Turbopack treats
@@ -15,6 +16,11 @@ import type { TemplateRow } from "./templates";
 export async function getApprovedTemplates(
   workspaceId: string,
 ): Promise<TemplateRow[]> {
+  const access = await checkWorkspaceMember(workspaceId);
+  if (!access.ok) {
+    throw new Error("No tienes acceso a las plantillas de este espacio de trabajo");
+  }
+
   return listTemplates(workspaceId, "approved");
 }
 
@@ -29,6 +35,14 @@ export async function sendTemplateAction(
   language: string,
   variables: string[],
 ): Promise<{ ok: boolean; error?: string }> {
+  const access = await checkWorkspaceMember(workspaceId, { minRole: "agent" });
+  if (!access.ok) {
+    return {
+      ok: false,
+      error: "No tienes permiso para enviar templates en este espacio de trabajo",
+    };
+  }
+
   const components =
     variables.length > 0
       ? [
@@ -48,6 +62,7 @@ export async function sendTemplateAction(
     templateName,
     templateLanguage: language,
     components,
+    senderUserId: access.userId,
   });
 
   if (!result.ok) {
