@@ -479,17 +479,30 @@ export async function processNextBatch(): Promise<ProcessBatchResult> {
     });
 
     // ── 8. Record LLM usage ──────────────────────────────────────────────────
-    await recordLlmUsage({
-      // Fill in the slot decide() reserved instead of inserting a second row:
-      // both would count toward the contact's hourly limit.
-      reservationId: decisionResult.reservationId,
-      workspaceId: batch.workspace_id,
-      conversationId: batch.conversation_id,
-      contactId: conversation.contact_id as string,
-      model,
-      promptTokens: reply.inputTokens,
-      completionTokens: reply.outputTokens,
-    });
+    // A failure here must not re-queue the batch: the model was already paid,
+    // and the retry would call it again. recordLlmUsage retries the write
+    // itself; if it still fails, log and deliver the reply.
+    try {
+      await recordLlmUsage({
+        // Fill in the slot decide() reserved instead of inserting a second row:
+        // both would count toward the contact's hourly limit.
+        reservationId: decisionResult.reservationId,
+        workspaceId: batch.workspace_id,
+        conversationId: batch.conversation_id,
+        contactId: conversation.contact_id as string,
+        model,
+        promptTokens: reply.inputTokens,
+        completionTokens: reply.outputTokens,
+      });
+    } catch (usageErr) {
+      console.error(
+        "[buffer] recordLlmUsage failed, continuing without retrying the LLM call:",
+        {
+          batchId: batch.id,
+          error: usageErr instanceof Error ? usageErr.message : String(usageErr),
+        },
+      );
+    }
     // The slot now holds this attempt's spend. Should a later step throw, the
     // retry's model call is new spend: it reserves and records its own row
     // instead of overwriting this one.
