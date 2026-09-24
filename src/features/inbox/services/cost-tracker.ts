@@ -26,7 +26,14 @@ interface RecordLlmUsageOpts {
  * reserveLlmTurn()), updates that reservation row in place instead of
  * inserting a second row for the same turn.
  */
-export async function recordLlmUsage(opts: RecordLlmUsageOpts): Promise<void> {
+export async function recordLlmUsage(
+  opts: RecordLlmUsageOpts,
+  retryOpts: {
+    attempts?: number;
+    delayMs?: number;
+    sleep?: (ms: number) => Promise<void>;
+  } = {},
+): Promise<void> {
   const supabase = svc();
 
   const {
@@ -47,18 +54,55 @@ export async function recordLlmUsage(opts: RecordLlmUsageOpts): Promise<void> {
     contact_id: contactId,
   };
 
-  const { error } = reservationId
-    ? await supabase
+  if (reservationId) {
+    const {
+      attempts = 3,
+      delayMs = 300,
+      sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms)),
+    } = retryOpts;
+
+    let lastError: { message: string } | null = null;
+    for (let attempt = 0; attempt < attempts; attempt++) {
+      const { error } = await supabase
         .from("events")
         .update({ conversation_id: conversationId, payload })
-        .eq("id", reservationId)
-    : await supabase.from("events").insert({
-        type: "llm_usage",
-        level: "info",
-        workspace_id: workspaceId,
-        conversation_id: conversationId,
-        payload,
-      });
+        .eq("id", reservationId);
+
+      if (!error) return;
+
+      lastError = error;
+      // Espera fija, no exponencial — esto cubre un blip transitorio
+      // en la escritura de una sola fila, no un servicio degradado que
+      // necesite backoff creciente.
+      if (attempt < attempts - 1) await sleep(delayMs);
+    }
+
+    console.error(
+      "[cost-tracker] failed to update llm_usage reservation after retries:",
+      lastError,
+    );
+    // Propagate. La fila de reserva ya contó este turno contra el límite
+    // horario del contacto; darse por vencido en silencio la deja atascada
+    // en total_tokens=0 para siempre, inflando el presupuesto disponible del
+    // contacto. Reintentar primero cierra el caso realista (blip transitorio)
+    // sin volver a ejecutar la llamada al LLM ya pagada, que es lo que
+    // dispararía un throw incondicional vía el reintento de batch completo de
+    // buffer.ts (MAX_BATCH_RETRIES → decide() → reserva nueva). Si los
+    // reintentos se agotan, sigue lanzando para que ese mecanismo de
+    // dead-letter siga siendo la red de seguridad ante una falla realmente
+    // persistente.
+    throw new Error(
+      `Failed to update llm_usage reservation ${reservationId}: ${lastError?.message}`,
+    );
+  }
+
+  const { error } = await supabase.from("events").insert({
+    type: "llm_usage",
+    level: "info",
+    workspace_id: workspaceId,
+    conversation_id: conversationId,
+    payload,
+  });
 
   if (error) {
     console.error("[cost-tracker] failed to record llm_usage event:", error);
