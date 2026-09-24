@@ -8,6 +8,7 @@ import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { ConversationItem } from "./conversation-item";
 import { useRealtimeConversations } from "@/features/inbox/hooks/use-realtime-conversations";
+import { useHandoffAlerts } from "@/features/inbox/hooks/use-handoff-alerts";
 import type {
   ConversationWithContact,
   ConversationState,
@@ -38,9 +39,14 @@ export function InboxLayout({
   const [search, setSearch] = useState("");
   const [activeTab, setActiveTab] = useState<FilterTab>("all");
 
+  // Contador en el título de la pestaña + notificación nativa cuando una
+  // conversación entra a handoff_pending (ver use-handoff-alerts.ts).
+  const { permission, requestPermission, handleConversationChange } =
+    useHandoffAlerts(conversations);
+
   // Live-update the list when chats arrive/change (new conversation, new
   // message, state/handoff change) — re-runs the server component.
-  useRealtimeConversations(workspaceId);
+  useRealtimeConversations(workspaceId, handleConversationChange);
 
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
@@ -77,6 +83,16 @@ export function InboxLayout({
               {filtered.length} de {conversations.length}
             </p>
           </div>
+
+          {permission === "default" && (
+            <button
+              type="button"
+              onClick={requestPermission}
+              className="text-[11px] text-muted-foreground hover:text-foreground underline underline-offset-2"
+            >
+              Avisarme cuando alguien pida hablar con una persona
+            </button>
+          )}
 
           {/* Search input */}
           <div className="relative">
