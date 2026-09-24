@@ -247,7 +247,14 @@ export async function generateChatReply(params: {
         description: forgeTool.description,
         inputSchema: zodSchema(forgeTool.schema),
         execute: async (args: unknown): Promise<unknown> =>
-          registry.run(forgeTool.name, args, ctx),
+          registry.runTool(
+            forgeTool,
+            args,
+            ctx,
+            forgeTool.preferredTimeoutMs !== undefined
+              ? { timeoutMs: forgeTool.preferredTimeoutMs }
+              : undefined,
+          ),
       });
     }
   }
@@ -340,6 +347,9 @@ export async function generateWithTools(
   // Build AI SDK v6 ToolSet from available Forge tools.
   // Each entry uses inputSchema (zodSchema wrapper) + execute — the correct v6 shape.
   // execute returns Promise<unknown> to satisfy ToolSet's output constraint.
+  // runTool (not run by name) so dynamic n8n tools — resolved per-workspace
+  // by getEnabledTools, never registered in the shared registry Map — work
+  // the same way static tools do.
   const aiTools: ToolSet = {};
   // A start hook that fails (the caller couldn't record a write) aborts the
   // turn: the model must not carry on as if the tool had run.
@@ -355,7 +365,10 @@ export async function generateWithTools(
       description: forgeTool.description,
       inputSchema: zodSchema(forgeTool.schema),
       execute: async (args: unknown): Promise<unknown> => {
-        const run = registry.run(forgeTool.name, args, ctx, {
+        const run = registry.runTool(forgeTool, args, ctx, {
+          ...(forgeTool.preferredTimeoutMs !== undefined
+            ? { timeoutMs: forgeTool.preferredTimeoutMs }
+            : {}),
           onStart: async (start) => {
             try {
               await params.onToolStart?.(start);

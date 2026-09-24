@@ -33,14 +33,20 @@ async function runWithTimeout<T>(
 
 /**
  * SEC-01: Strip sensitive fields from args before logging.
- * Never log values whose keys hint at secrets or tokens.
+ * Never log values whose keys hint at secrets or tokens, plus any key the
+ * tool itself flagged via `sensitiveArgKeys` (n8n dynamic tools with a
+ * free-named parameter the admin marked sensitive).
  */
-function sanitizeArgs(args: unknown): unknown {
+export function sanitizeArgs(
+  args: unknown,
+  extraSensitiveKeys: string[] = [],
+): unknown {
   if (!args || typeof args !== "object" || Array.isArray(args)) return args;
   const BLOCKED_KEYS = /token|secret|key|password|auth|credential/i;
+  const extra = new Set(extraSensitiveKeys);
   const out: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(args as Record<string, unknown>)) {
-    out[k] = BLOCKED_KEYS.test(k) ? "[REDACTED]" : v;
+    out[k] = BLOCKED_KEYS.test(k) || extra.has(k) ? "[REDACTED]" : v;
   }
   return out;
 }
@@ -51,6 +57,7 @@ async function logToolCall(
   result: ToolResult,
   latencyMs: number,
   ctx: ToolContext,
+  sensitiveArgKeys: string[],
 ): Promise<void> {
   try {
     const supabase = svc();
@@ -61,7 +68,7 @@ async function logToolCall(
       conversation_id: ctx.conversationId,
       payload: {
         tool_name: name,
-        args_summary: sanitizeArgs(args),
+        args_summary: sanitizeArgs(args, sensitiveArgKeys),
         result_ok: result.ok,
         latency_ms: latencyMs,
         error: result.error ?? null,
@@ -89,6 +96,12 @@ class ToolRegistry {
     return this.tools.get(name);
   }
 
+  /**
+   * Resolves `name` against the static registry map and runs it. Dynamic
+   * (n8n) tools never go through this — they're resolved per-workspace by
+   * getEnabledTools and passed straight to runTool, so two workspaces can
+   * use the same tool `name` without colliding in this shared Map.
+   */
   async run(
     name: string,
     args: unknown,
@@ -99,7 +112,21 @@ class ToolRegistry {
     if (!tool) {
       return { ok: false, output: null, error: `Tool "${name}" not found` };
     }
+    return this.runTool(tool, args, ctx, opts);
+  }
 
+  /**
+   * Runs an already-resolved Tool object — the shared dispatch path for
+   * both static tools (via run(), above) and dynamic n8n tools (called
+   * directly from openrouter.ts with the Tool instance getEnabledTools
+   * already scoped to the right workspace).
+   */
+  async runTool(
+    tool: Tool,
+    args: unknown,
+    ctx: ToolContext,
+    opts?: ToolRunOptions,
+  ): Promise<ToolResult> {
     const parsed = tool.schema.safeParse(args);
     if (!parsed.success) {
       return { ok: false, output: null, error: parsed.error.message };
@@ -113,7 +140,14 @@ class ToolRegistry {
         requiresConfirmation: true,
         error: "Sensitive tool requires human approval before execution",
       };
-      void logToolCall(name, args, pendingResult, 0, ctx);
+      void logToolCall(
+        tool.name,
+        args,
+        pendingResult,
+        0,
+        ctx,
+        tool.sensitiveArgKeys ?? [],
+      );
       return pendingResult;
     }
 
@@ -129,7 +163,11 @@ class ToolRegistry {
 
     const callId = randomUUID();
     // Before anything runs; a throw here means the tool never does.
-    await opts?.onStart?.({ callId, name, sensitivity: tool.sensitivity });
+    await opts?.onStart?.({
+      callId,
+      name: tool.name,
+      sensitivity: tool.sensitivity,
+    });
 
     const start = Date.now();
     let result: ToolResult;
@@ -138,7 +176,7 @@ class ToolRegistry {
       if (!opts?.onExecuted) return;
       const execution: ToolExecution = {
         callId,
-        name,
+        name: tool.name,
         sensitivity: tool.sensitivity,
         ok,
       };
@@ -154,14 +192,21 @@ class ToolRegistry {
         result = await attempt();
         const latencyMs = Date.now() - start;
         // Fire-and-forget logging
-        void logToolCall(name, args, result, latencyMs, ctx);
+        void logToolCall(
+          tool.name,
+          args,
+          result,
+          latencyMs,
+          ctx,
+          tool.sensitiveArgKeys ?? [],
+        );
         await reportExecution(result.ok);
         return result;
       } catch (err) {
         lastError = err instanceof Error ? err.message : String(err);
         if (i < retries) {
           console.warn(
-            `[registry] tool "${name}" failed (attempt ${i + 1}), retrying:`,
+            `[registry] tool "${tool.name}" failed (attempt ${i + 1}), retrying:`,
             lastError,
           );
         }
@@ -173,7 +218,14 @@ class ToolRegistry {
       output: null,
       error: lastError ?? "Unknown tool error",
     };
-    void logToolCall(name, args, errorResult, Date.now() - start, ctx);
+    void logToolCall(
+      tool.name,
+      args,
+      errorResult,
+      Date.now() - start,
+      ctx,
+      tool.sensitiveArgKeys ?? [],
+    );
     // Threw or timed out: a write may have happened anyway.
     await reportExecution(null);
     return errorResult;
