@@ -1,19 +1,12 @@
 "use client";
 
 import { useState } from "react";
-import { Plus, Trash2, Save, Link as LinkIcon } from "lucide-react";
+import { Save, Link as LinkIcon } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { cn } from "@/lib/utils";
-import {
-  WEBHOOK_VARIABLES,
-  WEBHOOK_VARIABLE_CATEGORIES,
-  scheduleLinkConfigSchema,
-  webhookConfigSchema,
-  type WebhookField,
-} from "@/features/tools/lib/tool-config";
+import { scheduleLinkConfigSchema } from "@/features/tools/lib/tool-config";
 
 // ── Shared save helper ──────────────────────────────────────────────────────────
 
@@ -121,211 +114,6 @@ function ScheduleLinkForm({
   );
 }
 
-// ── custom_webhook ──────────────────────────────────────────────────────────────
-
-function WebhookForm({
-  workspaceId,
-  initialConfig,
-}: {
-  workspaceId: string;
-  initialConfig: Record<string, unknown> | null;
-}) {
-  const initialUrl = (initialConfig?.webhook_url as string) ?? "";
-  const initialFields = Array.isArray(initialConfig?.payload_fields)
-    ? (initialConfig.payload_fields as WebhookField[])
-    : [];
-
-  const [url, setUrl] = useState(initialUrl);
-  const [fields, setFields] = useState<WebhookField[]>(initialFields);
-  const [baseline, setBaseline] = useState(() =>
-    JSON.stringify({ webhook_url: initialUrl, payload_fields: initialFields }),
-  );
-  const [focusedIdx, setFocusedIdx] = useState<number | null>(null);
-  const [flashed, setFlashed] = useState<string | null>(null);
-  const [saving, setSaving] = useState(false);
-
-  const dirty =
-    JSON.stringify({ webhook_url: url, payload_fields: fields }) !== baseline;
-
-  function updateField(idx: number, patch: Partial<WebhookField>) {
-    setFields((prev) =>
-      prev.map((f, i) => (i === idx ? { ...f, ...patch } : f)),
-    );
-  }
-  function addField() {
-    setFields((prev) => [...prev, { key: "", value: "" }]);
-  }
-  function removeField(idx: number) {
-    setFields((prev) => prev.filter((_, i) => i !== idx));
-  }
-  function insertVariable(token: string) {
-    const idx = focusedIdx ?? fields.length - 1;
-    if (idx < 0) {
-      toast.message("Agrega un campo primero para insertar la variable");
-      return;
-    }
-    setFields((prev) =>
-      prev.map((f, i) =>
-        i === idx ? { ...f, value: `${f.value}{{${token}}}` } : f,
-      ),
-    );
-    // Micro-feedback: briefly flash the inserted chip.
-    setFlashed(token);
-    window.setTimeout(
-      () => setFlashed((cur) => (cur === token ? null : cur)),
-      180,
-    );
-  }
-
-  async function save() {
-    const parsed = webhookConfigSchema.safeParse({
-      webhook_url: url,
-      payload_fields: fields,
-    });
-    if (!parsed.success) {
-      toast.error("Revisa la URL (HTTPS) y que cada campo tenga nombre válido");
-      return;
-    }
-    setSaving(true);
-    try {
-      await saveToolConfig(workspaceId, "custom_webhook", parsed.data);
-      setBaseline(JSON.stringify(parsed.data));
-      toast.success("Webhook guardado");
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : "Error al guardar");
-    } finally {
-      setSaving(false);
-    }
-  }
-
-  return (
-    <div className="space-y-4">
-      {/* URL — grouped in a card with the request contract as a code block */}
-      <div className="space-y-2 rounded-lg border border-border bg-muted/20 p-3">
-        <Label htmlFor="wh-url" className="text-sm font-medium text-foreground">
-          URL del webhook
-        </Label>
-        <div className="relative">
-          <LinkIcon
-            className="pointer-events-none absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground"
-            aria-hidden="true"
-          />
-          <Input
-            id="wh-url"
-            value={url}
-            onChange={(e) => setUrl(e.target.value)}
-            placeholder="https://n8n.tu-dominio.com/webhook/abc123"
-            type="url"
-            className="pl-9"
-          />
-        </div>
-        <p className="text-xs text-muted-foreground">
-          El agente hará POST a esta URL (solo HTTPS público) con:
-        </p>
-        <pre className="overflow-x-auto rounded-md border border-border bg-background px-3 py-2 font-mono text-xs text-muted-foreground">
-          {`{ "workspace_id": "…", "payload": { … } }`}
-        </pre>
-      </div>
-
-      {/* Payload fields */}
-      <div className="space-y-2">
-        <Label className="text-sm font-medium text-foreground">
-          Payload{" "}
-          <span className="font-normal text-xs text-muted-foreground">
-            (campos con variables)
-          </span>
-        </Label>
-
-        {fields.length === 0 && (
-          <p className="text-xs text-muted-foreground">
-            Sin campos: se enviará un payload por defecto (nombre, teléfono,
-            último mensaje y nota).
-          </p>
-        )}
-
-        {fields.map((f, idx) => (
-          <div key={idx} className="flex items-center gap-2">
-            <Input
-              value={f.key}
-              onChange={(e) => updateField(idx, { key: e.target.value })}
-              placeholder="nombre_campo"
-              className="h-8 w-1/3 font-mono text-sm"
-              aria-label={`Nombre del campo ${idx + 1}`}
-            />
-            <span className="text-muted-foreground">:</span>
-            <Input
-              value={f.value}
-              onChange={(e) => updateField(idx, { value: e.target.value })}
-              onFocus={() => setFocusedIdx(idx)}
-              placeholder="Hola {{contact.name}}"
-              className="h-8 flex-1 text-sm"
-              aria-label={`Valor del campo ${idx + 1}`}
-            />
-            <button
-              type="button"
-              onClick={() => removeField(idx)}
-              className="shrink-0 rounded p-1 text-muted-foreground transition-colors hover:text-destructive"
-              aria-label={`Eliminar campo ${idx + 1}`}
-            >
-              <Trash2 className="h-3.5 w-3.5" aria-hidden="true" />
-            </button>
-          </div>
-        ))}
-
-        <Button type="button" variant="outline" size="sm" onClick={addField}>
-          <Plus className="mr-1.5 h-3.5 w-3.5" aria-hidden="true" />
-          Agregar campo
-        </Button>
-
-        {/* Variable chips — grouped by category, styled as tokens */}
-        <div className="space-y-3 rounded-lg border border-border bg-muted/20 p-3">
-          <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-            Variables — clic para insertar en el campo enfocado
-          </p>
-          {WEBHOOK_VARIABLE_CATEGORIES.map((category) => (
-            <div key={category} className="space-y-1.5">
-              <p className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground/70">
-                {category}
-              </p>
-              <div className="flex flex-wrap gap-1.5">
-                {WEBHOOK_VARIABLES.filter((v) => v.category === category).map(
-                  (v) => (
-                    <button
-                      key={v.token}
-                      type="button"
-                      onClick={() => insertVariable(v.token)}
-                      title={`${v.label} (ej. ${v.example})`}
-                      className={cn(
-                        "rounded border border-dashed border-primary/30 bg-primary/10 px-2 py-0.5 font-mono text-xs text-primary transition-all hover:border-primary hover:bg-primary/20",
-                        flashed === v.token && "scale-105 ring-2 ring-primary",
-                      )}
-                    >
-                      {`{{${v.token}}}`}
-                    </button>
-                  ),
-                )}
-              </div>
-            </div>
-          ))}
-        </div>
-      </div>
-
-      <div className="flex items-center gap-3">
-        <Button
-          size="sm"
-          onClick={save}
-          disabled={saving || !dirty}
-          aria-busy={saving}
-        >
-          <Save className="mr-1.5 h-3.5 w-3.5" aria-hidden="true" />
-          {saving ? "Guardando…" : "Guardar webhook"}
-        </Button>
-        <DirtyHint dirty={dirty} />
-      </div>
-    </div>
-  );
-}
-
 // ── Dispatcher ──────────────────────────────────────────────────────────────────
 
 export function ToolConfigPanel({
@@ -345,13 +133,8 @@ export function ToolConfigPanel({
       />
     );
   }
-  if (toolKey === "custom_webhook") {
-    return (
-      <WebhookForm workspaceId={workspaceId} initialConfig={initialConfig} />
-    );
-  }
   return null;
 }
 
 /** Tool keys that expose a config panel. */
-export const CONFIGURABLE_TOOLS = new Set(["schedule_link", "custom_webhook"]);
+export const CONFIGURABLE_TOOLS = new Set(["schedule_link"]);

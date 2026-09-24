@@ -246,7 +246,17 @@ export async function PATCH(
   }
 
   try {
-    await publishPromptVersion(parsed.data.promptId, parsed.data.versionId);
+    const published = await publishPromptVersion(
+      workspaceId,
+      parsed.data.promptId,
+      parsed.data.versionId,
+    );
+    if (!published) {
+      return NextResponse.json(
+        { error: "No se encontró el prompt o la versión indicada" },
+        { status: 404 },
+      );
+    }
     return NextResponse.json({ success: true });
   } catch (err) {
     console.error("[PATCH /api/workspace/[id]/prompts]:", err);

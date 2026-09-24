@@ -32,4 +32,10 @@ export interface Tool<TArgs = unknown> {
     ctx: ToolContext,
     opts?: ToolRunOptions,
   ): Promise<ToolResult>;
+  /** Per-tool timeout preference, read by the caller before invoking
+   *  registry.runTool (n8n dynamic tools only — see getEnabledTools). */
+  preferredTimeoutMs?: number;
+  /** Extra arg keys to redact in tool_call logs, beyond the generic
+   *  secret-name regex in registry.ts (n8n dynamic tools only). */
+  sensitiveArgKeys?: string[];
 }

@@ -162,9 +162,11 @@ export async function notifyHandoffPending(
       // WINDOW_EXPIRED and OPT_OUT are expected outcomes, not incidents: the
       // contact may have opted out, or the trigger came from an agent long
       // after the contact's last message.
-      const expected = ["WINDOW_EXPIRED", "OPT_OUT"].some((code) =>
-        (result.error ?? "").startsWith(code),
-      );
+      // Se ramifica por errorCode, no por el texto: el mensaje que ve el
+      // operador ahora va en español y puede cambiar de redacción.
+      const expected =
+        result.errorCode === "WINDOW_EXPIRED" ||
+        result.errorCode === "OPT_OUT";
       await logEvent(
         workspaceId,
         conversationId,
