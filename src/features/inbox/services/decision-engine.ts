@@ -8,7 +8,7 @@ import {
   detectsHandoffTrigger,
   type ConversationState,
 } from "./state-machine";
-import { checkRateLimits } from "./cost-tracker";
+import { reserveLlmTurn } from "./cost-tracker";
 import { getEnabledTools } from "@/features/tools/services/tool-configs";
 import type { Tool } from "@/features/tools/core/tool";
 
@@ -25,6 +25,7 @@ export interface DecisionResult {
   decision: Decision;
   reason: string;
   availableTools?: Tool[];
+  reservationId?: string;
 }
 
 /**
@@ -34,7 +35,7 @@ export interface DecisionResult {
  *   1. Load conversation state from DB
  *   2. If state !== 'ai_active' → abstain
  *   3. detectsHandoffTrigger → if true, transition to handoff_pending and log
- *   4. checkRateLimits → if exceeded, return rate_limited
+ *   4. reserveLlmTurn → if exceeded, return rate_limited
  *   5. → respond
  */
 export async function decide(opts: {
@@ -67,31 +68,30 @@ export async function decide(opts: {
 
   // 3. Detect handoff trigger in message text
   if (detectsHandoffTrigger(mergedText)) {
-    // This used to UPDATE the row inline, which meant the most common handoff
-    // path — the contact asking for a human — skipped applyTransition() and
-    // therefore every side effect hanging off it. Route it through the same
-    // function as the other two paths.
+    // Route through the single choke point for state changes so every side
+    // effect of entering handoff_pending (event log, contact notification)
+    // fires. This no longer swallows the error: if it throws, decide()
+    // propagates it instead of reporting a successful handoff that never
+    // happened. processNextBatch() (buffer.ts) already retries transient
+    // failures with backoff and dead-letters after MAX_BATCH_RETRIES — that
+    // is the correct place for this to be handled, not a second bespoke
+    // retry here.
     if (canTransition(currentState, "handoff_pending")) {
-      try {
-        await applyTransition(conversationId, "handoff_pending", {
-          trigger: "keyword",
-        });
-      } catch (err) {
-        console.error(
-          "[decision-engine] failed to transition to handoff_pending:",
-          err,
-        );
-      }
+      await applyTransition(conversationId, "handoff_pending", {
+        trigger: "keyword",
+      });
     }
 
     return { decision: "handoff", reason: "handoff_trigger" };
   }
 
-  // 4. Rate limit check
-  const { allowed, reason: rateLimitReason } = await checkRateLimits(
-    workspaceId,
-    contactId,
-  );
+  // 4. Rate limit check — atomically reserves a turn slot so two concurrent
+  // batches for the same contact can't both pass.
+  const {
+    allowed,
+    reason: rateLimitReason,
+    reservationId,
+  } = await reserveLlmTurn(workspaceId, contactId);
 
   if (!allowed) {
     return {
@@ -102,7 +102,7 @@ export async function decide(opts: {
 
   // 5. All checks passed — load enabled tools and respond
   const availableTools = await getEnabledTools(workspaceId);
-  return { decision: "respond", reason: "normal", availableTools };
+  return { decision: "respond", reason: "normal", availableTools, reservationId };
 }
 
 export interface TransitionOptions {
@@ -110,6 +110,12 @@ export interface TransitionOptions {
   userId?: string;
   /** What caused it: keyword | agent | manual. Recorded in the event payload. */
   trigger?: string;
+  /**
+   * Scope guard. When set, the conversation must belong to this workspace:
+   * lookup and update both filter by it, so a caller that already verified
+   * membership cannot be tricked into moving another tenant's conversation.
+   */
+  workspaceId?: string;
 }
 
 /**
@@ -126,15 +132,16 @@ export async function applyTransition(
   to: ConversationState,
   opts: TransitionOptions = {},
 ): Promise<void> {
-  const { userId, trigger } = opts;
+  const { userId, trigger, workspaceId } = opts;
   const supabase = svc();
 
-  // 1. Load current state
-  const { data: conv, error: convError } = await supabase
+  // 1. Load current state (scoped to the workspace when the caller gives one)
+  let lookup = supabase
     .from("conversations")
     .select("state, workspace_id")
-    .eq("id", conversationId)
-    .single();
+    .eq("id", conversationId);
+  if (workspaceId) lookup = lookup.eq("workspace_id", workspaceId);
+  const { data: conv, error: convError } = await lookup.single();
 
   if (convError || !conv) {
     throw new Error(
@@ -161,10 +168,12 @@ export async function applyTransition(
     updatePayload.assigned_to = userId;
   }
 
-  const { error: updateError } = await supabase
+  let update = supabase
     .from("conversations")
     .update(updatePayload)
     .eq("id", conversationId);
+  if (workspaceId) update = update.eq("workspace_id", workspaceId);
+  const { error: updateError } = await update;
 
   if (updateError) {
     throw new Error(
@@ -190,11 +199,18 @@ export async function applyTransition(
   //    non-throwing: the transition above is already committed and must stand
   //    even if notifying anyone fails.
   if (to === "handoff_pending") {
-    const { notifyHandoffPending } = await import("./handoff-notifier");
-    await notifyHandoffPending({
-      workspaceId: conv.workspace_id as string,
-      conversationId,
-      trigger: trigger ?? (userId ? "manual" : "agent"),
-    });
+    try {
+      const { notifyHandoffPending } = await import("./handoff-notifier");
+      await notifyHandoffPending({
+        workspaceId: conv.workspace_id as string,
+        conversationId,
+        trigger: trigger ?? (userId ? "manual" : "agent"),
+      });
+    } catch (err) {
+      console.error(
+        "[decision-engine] failed to notify handoff_pending:",
+        err instanceof Error ? err.message : err,
+      );
+    }
   }
 }

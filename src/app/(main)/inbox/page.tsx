@@ -74,6 +74,14 @@ export default async function InboxPage() {
   >();
 
   if (convIds.length > 0) {
+    // Limitación conocida: esto trae TODOS los mensajes de hasta 50
+    // conversaciones para quedarse con el último de cada una. Con poco volumen
+    // no molesta, pero PostgREST corta en su tope de filas por defecto: pasado
+    // ese tope, las conversaciones que queden afuera
+    // muestran preview vacío en la lista, sin error. No se arregla poniéndole
+    // un `.limit(N)` acá — eso deja el mismo bug en otra forma. El arreglo es
+    // un lateral join o una RPC que devuelva el último mensaje por
+    // conversación. Se dejó fuera del fix de los últimos 100 a propósito.
     const { data: recentMessages } = await supabase
       .from("messages")
       .select("conversation_id, body, direction, created_at")

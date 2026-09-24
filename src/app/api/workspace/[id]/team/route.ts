@@ -72,7 +72,11 @@ export async function GET(
     .order("created_at", { ascending: true });
 
   if (error) {
-    return NextResponse.json({ error: error.message }, { status: 500 });
+    console.error("[GET /api/workspace/[id]/team] list error:", error.message);
+    return NextResponse.json(
+      { error: "No se pudo cargar el equipo. Intenta de nuevo." },
+      { status: 500 },
+    );
   }
 
   // Flatten nested users join into a flat member shape
@@ -136,10 +140,14 @@ export async function POST(
       password: password || undefined,
     });
   } catch (err) {
+    console.error(
+      "[POST /api/workspace/[id]/team] provision error:",
+      err instanceof Error ? err.message : String(err),
+    );
     return NextResponse.json(
       {
         error:
-          err instanceof Error ? err.message : "No se pudo crear el usuario",
+          "No se pudo crear el usuario. Revisa el correo y la contraseña e intenta de nuevo.",
       },
       { status: 400 },
     );
@@ -158,7 +166,14 @@ export async function POST(
   );
 
   if (memberError) {
-    return NextResponse.json({ error: memberError.message }, { status: 500 });
+    console.error(
+      "[POST /api/workspace/[id]/team] membership error:",
+      memberError.message,
+    );
+    return NextResponse.json(
+      { error: "No se pudo agregar al usuario al equipo. Intenta de nuevo." },
+      { status: 500 },
+    );
   }
 
   return NextResponse.json({
@@ -211,8 +226,13 @@ export async function PATCH(
     .eq("workspace_id", workspaceId)
     .eq("user_id", userId);
 
-  if (error)
-    return NextResponse.json({ error: error.message }, { status: 500 });
+  if (error) {
+    console.error("[PATCH /api/workspace/[id]/team] update error:", error.message);
+    return NextResponse.json(
+      { error: "No se pudo actualizar el miembro. Intenta de nuevo." },
+      { status: 500 },
+    );
+  }
 
   return NextResponse.json({ ok: true });
 }
@@ -253,8 +273,13 @@ export async function DELETE(
     .eq("workspace_id", workspaceId)
     .eq("user_id", userId);
 
-  if (error)
-    return NextResponse.json({ error: error.message }, { status: 500 });
+  if (error) {
+    console.error("[DELETE /api/workspace/[id]/team] remove error:", error.message);
+    return NextResponse.json(
+      { error: "No se pudo quitar al miembro. Intenta de nuevo." },
+      { status: 500 },
+    );
+  }
 
   return NextResponse.json({ ok: true });
 }

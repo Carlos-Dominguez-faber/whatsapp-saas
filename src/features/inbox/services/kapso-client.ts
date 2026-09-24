@@ -9,13 +9,18 @@ const KAPSO_WA_BASE = "https://api.kapso.ai/meta/whatsapp/v24.0";
 const KAPSO_PLATFORM_BASE = "https://api.kapso.ai/platform/v1";
 
 export class KapsoError extends Error {
+  readonly status: number;
+  readonly body: unknown;
+
   constructor(
-    public readonly status: number,
-    public readonly body: unknown,
+    status: number,
+    body: unknown,
     message: string,
   ) {
     super(message);
     this.name = "KapsoError";
+    this.status = status;
+    this.body = body;
   }
 }
 
@@ -213,8 +218,15 @@ export async function fetchKapsoTemplates(
   apiKey: string,
   wabaId: string,
 ): Promise<unknown[]> {
+  // `rejected_reason` is NOT in Graph's default field set for this edge, so it
+  // has to be asked for explicitly — without it the sync can never show the
+  // operator why Meta rejected a template. Asking for fields means listing every
+  // field the sync reads (see syncTemplatesFromKapso).
+  const fields =
+    "id,name,language,category,status,components,rejected_reason";
+
   const data = await kapsoFetch(
-    `${KAPSO_WA_BASE}/${encodeURIComponent(wabaId)}/message_templates?limit=100`,
+    `${KAPSO_WA_BASE}/${encodeURIComponent(wabaId)}/message_templates?limit=100&fields=${fields}`,
     apiKey,
     { method: "GET" },
     "fetchTemplates",

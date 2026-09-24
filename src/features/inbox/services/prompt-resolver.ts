@@ -120,22 +120,33 @@ export async function resolveSystemPrompt(
  * Publishes a specific prompt version.
  * Sets the version to published, updates active_version_id on the prompt,
  * and marks all other versions of that prompt as draft.
+ *
+ * `workspaceId` is required and filters every write: this function runs
+ * with `service_role` (no RLS), so the tenant scoping has to happen here or
+ * a caller could publish a version belonging to another workspace.
+ *
+ * Returns `false` (without touching `prompts` or demoting other versions)
+ * if `promptId`/`versionId` don't belong to `workspaceId` — the caller
+ * should treat that as "not found", not attempt the rest of the publish.
  */
 export async function publishPromptVersion(
+  workspaceId: string,
   promptId: string,
   versionId: string,
-): Promise<void> {
+): Promise<boolean> {
   const supabase = svc();
 
   // Mark the target version as published
-  const { error: versionError } = await supabase
+  const { data: versionRows, error: versionError } = await supabase
     .from("prompt_versions")
     .update({
       state: "published",
       published_at: new Date().toISOString(),
     })
     .eq("id", versionId)
-    .eq("prompt_id", promptId);
+    .eq("prompt_id", promptId)
+    .eq("workspace_id", workspaceId)
+    .select("id");
 
   if (versionError) {
     throw new Error(
@@ -143,11 +154,16 @@ export async function publishPromptVersion(
     );
   }
 
+  if (!versionRows || versionRows.length === 0) {
+    return false;
+  }
+
   // Set active_version_id on the parent prompt
   const { error: promptError } = await supabase
     .from("prompts")
     .update({ active_version_id: versionId })
-    .eq("id", promptId);
+    .eq("id", promptId)
+    .eq("workspace_id", workspaceId);
 
   if (promptError) {
     throw new Error(
@@ -160,6 +176,7 @@ export async function publishPromptVersion(
     .from("prompt_versions")
     .update({ state: "draft" })
     .eq("prompt_id", promptId)
+    .eq("workspace_id", workspaceId)
     .neq("id", versionId);
 
   if (demoteError) {
@@ -169,6 +186,8 @@ export async function publishPromptVersion(
       demoteError,
     );
   }
+
+  return true;
 }
 
 /**
@@ -221,11 +240,22 @@ export async function createPromptVersion(
 }
 
 /**
- * Lists all prompts for a workspace, joining their active version body.
+ * Lists all prompts for a workspace, joining **all** their versions — drafts
+ * included, no solo la activa. Esa es la razón del hint `!prompt_id` de abajo:
+ * el otro hint posible (`!active_version_id`) devolvería únicamente la activa.
+ *
+ * Las versiones embebidas vienen SIN orden garantizado; hoy no hay ningún
+ * consumidor de este endpoint, así que el orden se decide cuando aparezca el
+ * primero (`.order("version", { referencedTable: "prompt_versions" })`).
  */
 export async function listPrompts(workspaceId: string): Promise<unknown[]> {
   const supabase = svc();
 
+  // El `!prompt_id` NO es decorativo: hay dos FK entre `prompts` y
+  // `prompt_versions` (`prompt_versions.prompt_id` y `prompts.active_version_id`,
+  // las dos de `20260608000000_foundation.sql`), así que sin el hint PostgREST
+  // no sabe cuál usar y responde PGRST201 — la consulta entera falla. Es la
+  // relación padre→hijo la que se quiere: todas las versiones del prompt.
   const { data, error } = await supabase
     .from("prompts")
     .select(
@@ -236,7 +266,7 @@ export async function listPrompts(workspaceId: string): Promise<unknown[]> {
       scope_ref,
       active_version_id,
       created_at,
-      prompt_versions (
+      prompt_versions!prompt_id (
         id,
         version,
         state,

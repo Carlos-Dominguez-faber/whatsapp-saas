@@ -182,7 +182,12 @@ export async function PUT(
     { onConflict: "workspace_id,provider" },
   );
 
-  if (error)
-    return NextResponse.json({ error: error.message }, { status: 500 });
+  if (error) {
+    console.error("[PUT /api/workspace/[id]/integrations] upsert error:", error.message);
+    return NextResponse.json(
+      { error: "No se pudo guardar la integración. Intenta de nuevo." },
+      { status: 500 },
+    );
+  }
   return NextResponse.json({ ok: true });
 }
