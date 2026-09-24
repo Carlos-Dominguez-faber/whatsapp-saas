@@ -315,6 +315,22 @@ export interface GenerateWithToolsResult {
   inputTokens: number;
   outputTokens: number;
   toolCallsExecuted: number;
+  /**
+   * Qué herramienta se ejecutó y qué devolvió, para cada tool-call del turno,
+   * en orden.
+   *
+   * `output` es el `ToolResult` que `registry.runTool` entregó como `output`
+   * del `tool-result` del step (AI SDK v6: `StepResult.toolResults[]` =
+   * `{ type: "tool-result", toolCallId, toolName, input, output }`); `toolName`
+   * es el mismo metadato genérico del AI SDK, sin decoración.
+   *
+   * Canal deliberadamente genérico: este módulo no sabe —ni tiene que saber—
+   * qué herramienta dejó qué marca. Quien llama (hoy `buffer.ts`, para el
+   * traspaso diferido de `handoff_human`) es el que interpreta el contenido,
+   * y necesita `toolName` para no confiar en cualquier tool dinámica que
+   * imite la forma de la marca (n8n).
+   */
+  toolResults: { toolName: string; output: unknown }[];
 }
 
 /**
@@ -428,6 +444,9 @@ export async function generateWithTools(
     toolCallsExecuted: (result.steps ?? []).reduce(
       (n, step) => n + (step.toolCalls?.length ?? 0),
       0,
+    ),
+    toolResults: (result.steps ?? []).flatMap((step) =>
+      (step.toolResults ?? []).map((r) => ({ toolName: r.toolName, output: r.output })),
     ),
   };
 }

@@ -6,6 +6,7 @@ import { cancelHighLevelTool } from "./tools/cancel-highlevel";
 import { rescheduleHighLevelTool } from "./tools/reschedule-highlevel";
 import { checkAvailabilityTool } from "./tools/check-availability";
 import { customWebhookTool } from "./tools/custom-webhook";
+import { handoffHumanTool } from "./tools/handoff-human";
 
 registry.register(echoTool);
 registry.register(scheduleLinkTool);
@@ -14,6 +15,7 @@ registry.register(cancelHighLevelTool);
 registry.register(rescheduleHighLevelTool);
 registry.register(checkAvailabilityTool);
 registry.register(customWebhookTool);
+registry.register(handoffHumanTool);
 
 export { registry };
 export type {
