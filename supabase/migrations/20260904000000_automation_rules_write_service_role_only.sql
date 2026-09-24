@@ -1,0 +1,40 @@
+-- ============================================================
+-- Migration: 20260904000000_automation_rules_write_service_role_only
+-- Motor de automatizaciones — cierra el bypass de escritura de RLS sobre
+-- public.automation_rules.
+--
+-- POR QUÉ
+-- El tope de 20 reglas activas por workspace vive en código de aplicación
+-- (`src/features/automations/services/rule-cap.ts`) y NO en SQL: se acepta a
+-- propósito que dos escrituras simultáneas dejen 21 reglas activas, así que el
+-- tope es un read-then-write sin constraint, sin trigger y sin lock. Esta
+-- migración NO agrega esa enforcement.
+--
+-- Lo que cierra es otra cosa. La policy "ws admins manage automations"
+-- (20260609000002_automation_rules.sql) era FOR ALL: cualquier admin o manager
+-- del workspace podía hacer POST/PATCH/DELETE directo a
+-- /rest/v1/automation_rules con la anon key y su propio JWT — un quinto camino
+-- de escritura que nunca pasa por `assertActiveRuleCap`, ni por la validación
+-- de `rule-schema`, ni por los checks de rol de la ruta. Los grants de tabla
+-- de Supabase están abiertos para `authenticated`, así que la policy era el
+-- único freno: el tope quedaba instalado solo en el camino que un atacante no
+-- necesita usar.
+--
+-- Si el tope solo existe en la aplicación, entonces TODA escritura tiene que
+-- pasar por un camino que lo corra. Ese camino es `service_role`, que salta
+-- RLS: los cuatro escritores (POST/PATCH/DELETE de
+-- `api/workspace/[id]/automations` y las server actions
+-- `saveAutomationRule`/`toggleAutomationRule`/`deleteAutomationRule`) usan el
+-- cliente service-role y todos corren el tope antes de escribir.
+--
+-- CÓMO: se borra la policy de escritura y no se pone ninguna en su lugar —
+-- mismo patrón que `automation_events` y `automation_runs` en
+-- 20260903000000_automation_engine.sql, que tampoco tienen policy de escritura
+-- a propósito. Con RLS activa y sin policy de INSERT/UPDATE/DELETE, un rol que
+-- no salta RLS no escribe.
+--
+-- LA LECTURA NO CAMBIA: "ws members read automations" (FOR SELECT) queda
+-- intacta y los miembros del workspace siguen leyendo con su sesión.
+-- ============================================================
+
+DROP POLICY IF EXISTS "ws admins manage automations" ON public.automation_rules;
