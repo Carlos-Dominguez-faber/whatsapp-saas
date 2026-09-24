@@ -1,16 +1,19 @@
 // Handoff notifications — what happens once a conversation lands in
 // `handoff_pending`.
 //
-// Today this only covers the acknowledgement sent to the CONTACT ("someone will
-// be with you shortly"). That message is free text, which is legal here because
-// the contact just wrote in, so the 24h window is open and both the app-level
-// guard in dispatchText() and the DB trigger check_outbound_24h_window() let it
-// through.
+// Este módulo cubre el acuse que se le manda al CLIENTE ("alguien te va a
+// atender"). Ese mensaje es texto libre, y es legal acá porque el contacto
+// acaba de escribir: la ventana de 24h está abierta y tanto el guard de
+// dispatchText() como el trigger check_outbound_24h_window() lo dejan pasar.
 //
-// Notifying the TEAM over WhatsApp is deliberately NOT implemented yet: team
-// numbers never messaged us, so there is no open window and Meta requires an
-// approved HSM template. A workspace cannot have one until its WABA exists and
-// is verified. See docs/handoff-notifications.md.
+// El aviso al EQUIPO vive en team-notifier.ts y sale por EMAIL. Se dispara
+// desde acá (ver notifyHandoffPending) porque este es el único punto por el que
+// pasan los cinco caminos de handoff.
+//
+// Avisarle al equipo por WHATSAPP sigue sin implementarse a propósito: los
+// números del equipo nunca nos escribieron, así que no hay ventana abierta y
+// Meta exige una plantilla HSM aprobada, que un workspace no puede tener hasta
+// que su WABA exista y esté verificada.
 //
 // Hard rule for everything in this module: a failed notification must never
 // break or revert the handoff. Every path swallows its error and records it in
@@ -27,6 +30,40 @@ function svc() {
     process.env.NEXT_PUBLIC_SUPABASE_URL!,
     process.env.SUPABASE_SERVICE_ROLE_KEY!,
   );
+}
+
+/**
+ * True cuando ya se registró un evento de este `type` para la conversación en
+ * los últimos `windowMinutes`. Compartido por el ACK al cliente
+ * (`handoff_ack_sent`) y el aviso al equipo (`handoff_team_notified`) — misma
+ * consulta, mismo motivo: una conversación entra y sale de handoff_pending
+ * varias veces y cada vuelta no debe repetir el aviso.
+ *
+ * El filtro por `workspace_id` es parte del dedupe, no un adorno: la policy
+ * `events_insert` deja que cualquier operador inserte una fila con SU propio
+ * workspace y el `conversation_id` de una conversación ajena. Sin este
+ * filtro, ese evento cruzado calla el aviso real del workspace dueño de la
+ * conversación durante toda la ventana.
+ */
+export async function wasRecentlyLogged(
+  workspaceId: string,
+  conversationId: string,
+  type: string,
+  windowMinutes: number,
+): Promise<boolean> {
+  const supabase = svc();
+  const since = new Date(Date.now() - windowMinutes * 60_000).toISOString();
+
+  const { data } = await supabase
+    .from("events")
+    .select("id")
+    .eq("workspace_id", workspaceId)
+    .eq("conversation_id", conversationId)
+    .eq("type", type)
+    .gte("created_at", since)
+    .limit(1);
+
+  return Boolean(data?.length);
 }
 
 /** Don't send a second acknowledgement within this window. */
@@ -68,32 +105,7 @@ export async function getHandoffAckConfig(
   };
 }
 
-/**
- * True when this conversation already got an acknowledgement in the last
- * ACK_DEDUPE_MINUTES. A conversation can bounce in and out of handoff_pending
- * (contact keeps writing, an agent hands it back to the AI), and each bounce
- * would otherwise re-send the same line.
- */
-async function wasRecentlyAcknowledged(
-  conversationId: string,
-): Promise<boolean> {
-  const supabase = svc();
-  const since = new Date(
-    Date.now() - ACK_DEDUPE_MINUTES * 60_000,
-  ).toISOString();
-
-  const { data } = await supabase
-    .from("events")
-    .select("id")
-    .eq("conversation_id", conversationId)
-    .eq("type", "handoff_ack_sent")
-    .gte("created_at", since)
-    .limit(1);
-
-  return Boolean(data?.length);
-}
-
-async function logEvent(
+export async function logEvent(
   workspaceId: string,
   conversationId: string,
   type: string,
@@ -133,17 +145,35 @@ export async function notifyHandoffPending(
 ): Promise<void> {
   const { workspaceId, conversationId, trigger } = params;
 
+  // El aviso al EQUIPO va ACÁ, antes de los tres cortes de abajo
+  // (config.enabled, prefijo "tool:", dedupe del ACK): esos tres son del ACK
+  // al CLIENTE, no del aviso al equipo. Un ACK apagado, una despedida que el
+  // agente ya mandó, o un ACK reciente no significan que ya hay una persona
+  // mirando la conversación — el equipo tiene que enterarse en los tres
+  // casos igual. Import dinámico para no crear un ciclo estático con
+  // team-notifier.ts, que sí importa este archivo (mismo patrón que usa
+  // decision-engine.ts para importar este módulo).
+  try {
+    const { notifyTeamHandoff } = await import("./team-notifier");
+    await notifyTeamHandoff({ workspaceId, conversationId, trigger });
+  } catch (err) {
+    console.error(
+      "[handoff-notifier] team notify failed:",
+      err instanceof Error ? err.message : err,
+    );
+  }
+
   try {
     const config = await getHandoffAckConfig(workspaceId);
 
     if (!config.enabled) return;
 
     // El corte aplica SOLO al prefijo "tool:", que significa "la despedida
-    // del agente ya salió" (dispatch exitoso en buffer.ts). Mandar igual el
-    // ACK genérico ahí duplicaría el mensaje. "tool_unsent:" — el dispatch
-    // falló o nunca se intentó (rama dead-letter) — cae a propósito al camino
-    // normal de abajo: el cliente no recibió nada del agente, así que sí
-    // necesita el ACK genérico.
+    // del agente ya salió" (dispatch de 10a exitoso en buffer.ts). Mandar
+    // igual el ACK genérico ahí duplicaría el mensaje. "tool_unsent:" — el
+    // dispatch falló o nunca se intentó (rama dead-letter) — cae a propósito
+    // al camino normal de abajo: el cliente no recibió nada del agente, así
+    // que sí necesita el ACK genérico.
     if (trigger.startsWith("tool:")) {
       await logEvent(workspaceId, conversationId, "handoff_ack_skipped", "info", {
         reason: "agent_farewell",
@@ -152,7 +182,14 @@ export async function notifyHandoffPending(
       return;
     }
 
-    if (await wasRecentlyAcknowledged(conversationId)) {
+    if (
+      await wasRecentlyLogged(
+        workspaceId,
+        conversationId,
+        "handoff_ack_sent",
+        ACK_DEDUPE_MINUTES,
+      )
+    ) {
       await logEvent(workspaceId, conversationId, "handoff_ack_skipped", "info", {
         reason: "deduped",
         within_minutes: ACK_DEDUPE_MINUTES,
