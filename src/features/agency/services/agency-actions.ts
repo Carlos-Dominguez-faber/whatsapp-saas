@@ -3,11 +3,14 @@
 import { createClient } from "@/lib/supabase/server";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { z } from "zod";
-import { provisionWorkspaceUser } from "@/lib/auth/provision-user";
+import { provisionWorkspaceUser, generatePassword } from "@/lib/auth/provision-user";
 import type {
   ClientCredentials,
   CreateWorkspaceResult,
   GetWorkspacesResult,
+  GetWorkspaceMembersResult,
+  ResetMemberPasswordResult,
+  WorkspaceMember,
   WorkspaceWithStats,
 } from "../types";
 
@@ -382,4 +385,89 @@ export async function getAllWorkspacesWithStats(): Promise<GetWorkspacesResult> 
   }));
 
   return { workspaces: result };
+}
+
+export async function getWorkspaceMembers(
+  workspaceId: string,
+): Promise<GetWorkspaceMembersResult> {
+  const userId = await assertSuperAdmin();
+  if (!userId) return { error: "No autorizado" };
+
+  const service = svc();
+  const { data, error } = await service
+    .from("memberships")
+    .select("user_id, role, is_active, users(email, full_name)")
+    .eq("workspace_id", workspaceId);
+
+  if (error) {
+    console.error("[agency] fetch members error:", error);
+    return { error: "No se pudieron cargar los miembros" };
+  }
+
+  const members: WorkspaceMember[] = (
+    (data as unknown as {
+      user_id: string;
+      role: string;
+      is_active: boolean;
+      users: { email: string; full_name: string | null } | null;
+    }[]) ?? []
+  ).map((row) => ({
+    userId: row.user_id,
+    email: row.users?.email ?? "",
+    fullName: row.users?.full_name ?? null,
+    role: row.role,
+    isActive: row.is_active,
+  }));
+
+  return { members };
+}
+
+export async function resetMemberPassword(
+  workspaceId: string,
+  userId: string,
+): Promise<ResetMemberPasswordResult> {
+  const adminId = await assertSuperAdmin();
+  if (!adminId) return { error: "No autorizado" };
+
+  const service = svc();
+
+  const { data: membership, error: membershipError } = await service
+    .from("memberships")
+    .select("user_id")
+    .eq("workspace_id", workspaceId)
+    .eq("user_id", userId)
+    .eq("is_active", true)
+    .maybeSingle();
+
+  if (membershipError || !membership) {
+    console.error(
+      "[agency] reset target is not an active member of the workspace:",
+      membershipError,
+    );
+    return { error: "No se pudo resetear la clave" };
+  }
+
+  const { data: userRow, error: userError } = await service
+    .from("users")
+    .select("email")
+    .eq("id", userId)
+    .single();
+
+  if (userError || !userRow) {
+    console.error("[agency] resolve user for reset error:", userError);
+    return { error: "No se pudo resetear la clave" };
+  }
+
+  const password = generatePassword();
+  const { error: updateError } = await service.auth.admin.updateUserById(
+    userId,
+    { password },
+  );
+
+  if (updateError) {
+    console.error("[agency] password reset error:", updateError);
+    return { error: "No se pudo resetear la clave" };
+  }
+
+  return { email: (userRow as { email: string }).email, password };
 }

@@ -41,3 +41,19 @@ export type CreateWorkspaceResult =
 export type GetWorkspacesResult =
   | { workspaces: WorkspaceWithStats[]; error?: never }
   | { workspaces?: never; error: string };
+
+export interface WorkspaceMember {
+  userId: string;
+  email: string;
+  fullName: string | null;
+  role: string;
+  isActive: boolean;
+}
+
+export type GetWorkspaceMembersResult =
+  | { members: WorkspaceMember[]; error?: never }
+  | { members?: never; error: string };
+
+export type ResetMemberPasswordResult =
+  | { email: string; password: string; error?: never }
+  | { email?: never; password?: never; error: string };
