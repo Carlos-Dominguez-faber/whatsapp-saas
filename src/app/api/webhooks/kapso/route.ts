@@ -35,7 +35,13 @@ import { decryptCredentials } from "@/shared/lib/integration-secrets";
 
 // Keep the function alive long enough for the best-effort fast path below
 // (sleep through the buffer window + AI generation). The cron is the fallback.
-export const maxDuration = 60;
+//
+// The budget is SHARED: the fast path first sleeps the whole silence window
+// (30s by default, up to 120s) and only then runs the agent turn. With 60 the
+// generation had under 30s left, so every turn that called a tool timed out and
+// fell back to the reconciler — the user got the reply ~8 minutes later. A turn
+// that only checks availability already takes ~33s on its own.
+export const maxDuration = 120;
 
 function svc() {
   return createSbClient(

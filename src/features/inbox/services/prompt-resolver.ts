@@ -240,11 +240,22 @@ export async function createPromptVersion(
 }
 
 /**
- * Lists all prompts for a workspace, joining their active version body.
+ * Lists all prompts for a workspace, joining **all** their versions — drafts
+ * included, no solo la activa. Esa es la razón del hint `!prompt_id` de abajo:
+ * el otro hint posible (`!active_version_id`) devolvería únicamente la activa.
+ *
+ * Las versiones embebidas vienen SIN orden garantizado; hoy no hay ningún
+ * consumidor de este endpoint, así que el orden se decide cuando aparezca el
+ * primero (`.order("version", { referencedTable: "prompt_versions" })`).
  */
 export async function listPrompts(workspaceId: string): Promise<unknown[]> {
   const supabase = svc();
 
+  // El `!prompt_id` NO es decorativo: hay dos FK entre `prompts` y
+  // `prompt_versions` (`prompt_versions.prompt_id` y `prompts.active_version_id`,
+  // las dos de `20260608000000_foundation.sql`), así que sin el hint PostgREST
+  // no sabe cuál usar y responde PGRST201 — la consulta entera falla. Es la
+  // relación padre→hijo la que se quiere: todas las versiones del prompt.
   const { data, error } = await supabase
     .from("prompts")
     .select(
@@ -255,7 +266,7 @@ export async function listPrompts(workspaceId: string): Promise<unknown[]> {
       scope_ref,
       active_version_id,
       created_at,
-      prompt_versions (
+      prompt_versions!prompt_id (
         id,
         version,
         state,
