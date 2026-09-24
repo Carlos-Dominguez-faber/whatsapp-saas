@@ -6,6 +6,7 @@
  */
 
 import { useState, useTransition, KeyboardEvent } from "react";
+import { useRouter } from "next/navigation";
 import { User, RefreshCw, Save, ChevronDown, ChevronUp, X } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
@@ -20,7 +21,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { updateContact, syncContactHL } from "../services/contact-actions";
+import { updateContact, syncContactCrm } from "../services/contact-actions";
 import type { ContactRow } from "@/features/inbox/types";
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -74,6 +75,7 @@ export function CrmPanel({
   conversationId: _conversationId,
 }: CrmPanelProps) {
   const [isPending, startTransition] = useTransition();
+  const router = useRouter();
 
   // Local editable state
   const [name, setName] = useState(contact.name ?? "");
@@ -130,14 +132,16 @@ export function CrmPanel({
     });
   }
 
-  // ── HL Sync ──────────────────────────────────────────────────────────────────
+  // ── CRM Sync ─────────────────────────────────────────────────────────────────
 
-  function handleSyncHL() {
+  function handleSyncCrm() {
     startTransition(async () => {
-      const result = await syncContactHL(contact.id, contact.workspace_id);
-
+      const result = await syncContactCrm(contact.id);
       if (result.ok) {
-        toast.success(`Sincronizado con HighLevel (ID: ${result.data.hl_id})`);
+        toast.success(`Sincronizado con ${result.data.provider === "hubspot" ? "HubSpot" : "HighLevel"}`);
+        // El pull de HubSpot puede rellenar nombre/email en el servidor; sin esto, el panel
+        // seguía mostrando el snapshot viejo hasta recargar la página a mano.
+        router.refresh();
       } else {
         toast.error(result.error ?? "Error al sincronizar");
       }
@@ -310,12 +314,12 @@ export function CrmPanel({
         <Button
           size="sm"
           variant="outline"
-          onClick={handleSyncHL}
+          onClick={handleSyncCrm}
           disabled={isPending}
           className="w-full h-7 text-xs gap-1.5"
         >
           <RefreshCw className="h-3.5 w-3.5" />
-          Sync HighLevel
+          Sincronizar CRM
         </Button>
       </div>
 

@@ -4,6 +4,7 @@ import { useState, useEffect, useCallback, useTransition } from "react";
 import {
   MessageCircle,
   Clock,
+  CalendarClock,
   AlertTriangle,
   Users,
   Star,
@@ -63,6 +64,11 @@ const TRIGGER_META: Record<
     label: "Palabra clave",
     Icon: Search,
     className: "text-muted-foreground bg-muted",
+  },
+  appointment_upcoming: {
+    label: "Antes de una cita",
+    Icon: CalendarClock,
+    className: "text-emerald-400 bg-emerald-400/10",
   },
 };
 

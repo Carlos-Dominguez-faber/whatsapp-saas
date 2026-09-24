@@ -10,7 +10,7 @@
 //   env            Generate secrets + write/update .env.local from pasted keys
 //   db-push [ref]  supabase link (ref derived from the URL) + db push
 //   set-app-url U  Set NEXT_PUBLIC_APP_URL to the prod URL (run after deploy)
-//   cron-sql       Fill supabase/cron/schedule-buffer-flush.sql with real values
+//   cron-sql       Fill the cron jobs' SQL templates with real values (buffer-flush, automations)
 //   vercel-env     Push .env.local vars to Vercel production (best effort)
 //   doctor         Check prerequisites + which keys are still missing
 //   help           Show this usage
@@ -25,8 +25,20 @@ import { fileURLToPath } from "node:url";
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const ENV_PATH = resolve(ROOT, ".env.local");
 const EXAMPLE_PATH = resolve(ROOT, ".env.local.example");
-const CRON_TPL = resolve(ROOT, "supabase/cron/schedule-buffer-flush.sql");
-const CRON_FILLED = resolve(ROOT, "supabase/cron/schedule-buffer-flush.filled.sql");
+// Un job por endpoint de cron. Agregar uno acá es todo lo que hace falta para
+// que cron-sql y cron-apply lo tomen.
+const CRON_JOBS = [
+  {
+    name: "buffer-flush",
+    tpl: resolve(ROOT, "supabase/cron/schedule-buffer-flush.sql"),
+    filled: resolve(ROOT, "supabase/cron/schedule-buffer-flush.filled.sql"),
+  },
+  {
+    name: "automations",
+    tpl: resolve(ROOT, "supabase/cron/schedule-automations.sql"),
+    filled: resolve(ROOT, "supabase/cron/schedule-automations.filled.sql"),
+  },
+];
 const SUPABASE_API = "https://api.supabase.com"; // Management API base
 
 // Secrets we generate locally — never asked for, never rotated on re-run.
@@ -157,9 +169,9 @@ function cronInputs() {
   return { env, appUrl, secret };
 }
 
-function fillCronSql(appUrl, secret) {
-  if (!existsSync(CRON_TPL)) fail(`No encuentro la plantilla ${CRON_TPL}`);
-  return readFileSync(CRON_TPL, "utf8")
+function fillCronSql(job, appUrl, secret) {
+  if (!existsSync(job.tpl)) fail(`No encuentro la plantilla ${job.tpl}`);
+  return readFileSync(job.tpl, "utf8")
     .replaceAll("__APP_URL__", appUrl)
     .replaceAll("__CRON_SECRET__", secret);
 }
@@ -216,7 +228,7 @@ function cmdDbPush(args) {
   run(`supabase link --project-ref ${ref}`);
   run("supabase db push");
   ok("Migraciones aplicadas (incluye pg_cron + pg_net).");
-  log("➡️  Después del deploy: set-app-url <url> y luego cron-sql para agendar el buffer-flush.");
+  log("➡️  Después del deploy: set-app-url <url> y luego cron-sql para agendar los crons (buffer-flush y automations).");
 }
 
 function cmdSetAppUrl(args) {
@@ -231,11 +243,13 @@ function cmdSetAppUrl(args) {
 
 function cmdCronSql() {
   const { appUrl, secret } = cronInputs();
-  const filled = fillCronSql(appUrl, secret);
-  writeFileSync(CRON_FILLED, filled);
-  ok(`SQL del cron generado: ${CRON_FILLED}`);
-  log("➡️  Pega el siguiente SQL en Supabase → SQL Editor → Run:\n");
-  log(filled);
+  for (const job of CRON_JOBS) {
+    const filled = fillCronSql(job, appUrl, secret);
+    writeFileSync(job.filled, filled);
+    ok(`SQL del cron '${job.name}' generado: ${job.filled}`);
+    log("➡️  Pega el siguiente SQL en Supabase → SQL Editor → Run:\n");
+    log(filled);
+  }
 }
 
 async function cmdCronApply() {
@@ -247,14 +261,18 @@ async function cmdCronApply() {
     log("   node scripts/setup.mjs cron-sql   (y pega el SQL en el SQL Editor)");
     return;
   }
-  const r1 = await remoteSql(ref, fillCronSql(appUrl, secret));
-  if (!r1.ok) fail(`No pude agendar el cron ${r1.status}: ${JSON.stringify(r1.data)}`);
-  const r2 = await remoteSql(
-    ref,
-    "select jobname, schedule, active from cron.job where jobname = 'buffer-flush';",
-  );
-  ok("Cron buffer-flush agendado vía Management API.");
-  log(`Verificación: ${JSON.stringify(r2.data)}`);
+  for (const job of CRON_JOBS) {
+    const r1 = await remoteSql(ref, fillCronSql(job, appUrl, secret));
+    if (!r1.ok) {
+      fail(`No pude agendar el cron '${job.name}' ${r1.status}: ${JSON.stringify(r1.data)}`);
+    }
+    const r2 = await remoteSql(
+      ref,
+      `select jobname, schedule, active from cron.job where jobname = '${job.name}';`,
+    );
+    ok(`Cron '${job.name}' agendado vía Management API.`);
+    log(`Verificación: ${JSON.stringify(r2.data)}`);
+  }
 }
 
 async function cmdSiteUrl() {
@@ -339,8 +357,8 @@ Uso: node scripts/setup.mjs <comando>
   env            Genera secrets + escribe .env.local desde las keys pegadas
   db-push [ref]  supabase link (ref derivado de la URL) + db push
   set-app-url U  Setea NEXT_PUBLIC_APP_URL a la URL de prod (post-deploy)
-  cron-sql       Imprime el SQL del cron para pegar en el SQL Editor (manual)
-  cron-apply     Agenda el cron vía Management API (necesita SUPABASE_ACCESS_TOKEN)
+  cron-sql       Imprime el SQL de los crons (buffer-flush y automations) para pegar en el SQL Editor
+  cron-apply     Agenda los crons vía Management API (necesita SUPABASE_ACCESS_TOKEN)
   site-url       Setea Site URL + Redirect en Supabase vía Management API (idem)
   vercel-env     Empuja las vars de .env.local a Vercel production
   doctor         Revisa prerequisitos y qué keys faltan

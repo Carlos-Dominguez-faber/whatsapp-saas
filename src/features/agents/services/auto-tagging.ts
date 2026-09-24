@@ -87,16 +87,34 @@ export async function maybeAutoProcess(opts: {
         .filter(Boolean)
         .slice(0, 3);
       if (newTags.length > 0) {
-        const { data: contact } = await db
-          .from("contacts")
-          .select("tags")
-          .eq("id", contactId)
-          .maybeSingle();
-        const existing = Array.isArray(contact?.tags)
-          ? (contact?.tags as string[])
-          : [];
-        const merged = Array.from(new Set([...existing, ...newTags]));
-        await db.from("contacts").update({ tags: merged }).eq("id", contactId);
+        // Una sola llamada con las hasta 3 etiquetas: la RPC hace el merge
+        // dentro del propio UPDATE (con la fila bloqueada), así que no hay
+        // ventana entre leer `tags` y escribirlas. El read-modify-write que
+        // había acá borraba las etiquetas que el motor de automatizaciones
+        // acababa de poner.
+        const { data: tagsData, error: tagsError } = await db.rpc(
+          "append_contact_tags",
+          {
+            p_workspace_id: workspaceId,
+            p_contact_id: contactId,
+            p_tags: newTags,
+          },
+        );
+        if (tagsError) {
+          console.error("[auto-tagging] append_contact_tags:", tagsError.message);
+        } else if (
+          (tagsData as { contact_found: boolean }[] | null)?.[0]?.contact_found ===
+          false
+        ) {
+          // Best-effort a propósito (no se lanza ni se cambia el flujo): pero un
+          // contacto borrado, o de otro workspace, se quedaba sin etiquetas EN
+          // SILENCIO. Esto vuelve visible un bug de scoping entre tenants que
+          // antes solo se notaba porque las etiquetas nunca aparecían.
+          console.warn(
+            "[auto-tagging] append_contact_tags: contact_found=false",
+            { workspaceId, contactId },
+          );
+        }
       }
     }
 

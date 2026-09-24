@@ -1,6 +1,7 @@
 // F7: Business info loader — loads structured + free_text data to inject into system prompts.
 
 import { createClient as createSbClient } from "@supabase/supabase-js";
+import { DEFAULT_TIMEZONE } from "../types/timezone";
 
 function svc() {
   return createSbClient(
@@ -54,19 +55,93 @@ function offsetFor(timeZone: string, now: Date): string {
 }
 
 /**
- * Current date/time context for the system prompt, so the agent can resolve
- * "hoy", "mañana", "esta semana" and build correct ISO times when checking
- * availability / booking. Timezone is per-workspace (defaults to CDMX).
+ * Renders the next 7 calendar days in `timeZone` as "- <día>: YYYY-MM-DD" lines.
+ *
+ * Anchors "today" once via Intl (the only place `timeZone`-aware wall-clock
+ * conversion happens), then advances by pure calendar-day arithmetic in UTC
+ * space (`Date.UTC` normalizes day-of-month overflow). This is immune to
+ * `timeZone`'s DST transitions — adding fixed 24h instants is not, because a
+ * DST shift changes how many wall-clock hours a UTC day spans locally, which
+ * can skip or duplicate a calendar date (see business-info.test.ts's DST
+ * regression test).
  */
-export function buildNowContext(timeZone = "America/Mexico_City"): string {
+export function buildUpcomingDaysTable(timeZone: string, now: Date): string {
+  const lines: string[] = ["## Próximos 7 días"];
+  const todayIso = now.toLocaleDateString("en-CA", { timeZone }); // "YYYY-MM-DD" anchor
+  const [year, month, day] = todayIso.split("-").map(Number);
+  for (let i = 0; i < 7; i++) {
+    const dayDate = new Date(Date.UTC(year, month - 1, day + i));
+    const isoDate = dayDate.toISOString().slice(0, 10);
+    // The weekday for a calendar date doesn't depend on the viewing timezone
+    // once the date itself is correct — format against UTC to avoid a second
+    // timeZone-aware conversion.
+    const dayName = dayDate.toLocaleDateString("es-MX", {
+      timeZone: "UTC",
+      weekday: "long",
+    });
+    // Noon UTC of this calendar date is safely past every real-world DST
+    // transition time (which happens in the small hours local), so it
+    // always resolves to the offset that applies for the rest of that local
+    // day — unlike reusing "now"'s offset, which is wrong for a date on the
+    // other side of a DST change.
+    const dayOffset = offsetFor(
+      timeZone,
+      new Date(Date.UTC(year, month - 1, day + i, 12)),
+    );
+    lines.push(`- ${dayName}: ${isoDate} (offset ${dayOffset})`);
+  }
+  return lines.join("\n");
+}
+
+
+/**
+ * True when `tz` is a timezone the runtime's Intl implementation can
+ * resolve. `Intl.DateTimeFormat` throws RangeError synchronously for an
+ * unrecognized IANA zone — this is the standard way to validate one.
+ */
+function isValidTimeZone(tz: string): boolean {
+  try {
+    new Intl.DateTimeFormat(undefined, { timeZone: tz });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * A workspace admin can save an arbitrary string as the business timezone
+ * (business_info.structured.timezone has no server-side IANA validation).
+ * An invalid one used to throw uncaught here, dead-lettering every message
+ * in the workspace after 3 retries — fall back to the default instead.
+ */
+export function buildNowContext(timeZone = DEFAULT_TIMEZONE): string {
+  const tz = isValidTimeZone(timeZone) ? timeZone : DEFAULT_TIMEZONE;
+  if (tz !== timeZone) {
+    console.warn(
+      `[business-info] buildNowContext: invalid timezone "${timeZone}", falling back to ${DEFAULT_TIMEZONE}`,
+    );
+  }
   const now = new Date();
   const human = now.toLocaleString("es-MX", {
-    timeZone,
+    timeZone: tz,
     dateStyle: "full",
     timeStyle: "short",
   });
-  const offset = offsetFor(timeZone, now);
-  return `## Fecha actual\nHoy es ${human} (zona horaria ${timeZone}, offset ${offset}). Usa esta fecha para interpretar "hoy", "mañana", "esta semana", etc. al consultar disponibilidad o agendar. Cuando agendes, construye las horas en ISO con el offset ${offset} (ej: 2026-06-12T10:00:00${offset}), y pasa la zona horaria ${timeZone} a la herramienta de disponibilidad.`;
+  const offset = offsetFor(tz, now);
+  const upcoming = buildUpcomingDaysTable(tz, now);
+  return `## Fecha actual\nHoy es ${human} (zona horaria ${tz}, offset ${offset}).\n\n${upcoming}\n\nUsa esta tabla para resolver referencias como "el martes", "mañana", "en 3 días", etc. — copia la fecha exacta de la tabla, no la calcules tú. Cuando agendes, construye las horas en ISO con el offset que aparece junto a esa fecha en la tabla (no siempre es el mismo que el de "Hoy es...", puede cambiar por horario de verano), y pasa la zona horaria ${tz} a la herramienta de disponibilidad.`;
+}
+
+/**
+ * Resolves the workspace's configured timezone from its business info,
+ * falling back to the default when unset or invalid — the same fallback
+ * `buildNowContext` uses, exposed here for callers (like the HighLevel
+ * fallback appointment lookup) that need just the timezone, not the full
+ * prompt-context string.
+ */
+export function resolveTimeZone(info: BusinessInfo | null): string {
+  const tz = (info?.structured as { timezone?: string } | undefined)?.timezone;
+  return tz && isValidTimeZone(tz) ? tz : DEFAULT_TIMEZONE;
 }
 
 /**

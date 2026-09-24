@@ -103,6 +103,18 @@ class ToolRegistry {
       return { ok: false, output: null, error: parsed.error.message };
     }
 
+    // Normalize once, here, for every tool and every caller (including the
+    // agent test-chat playground, which has no real conversation/contact and
+    // sends "" as a placeholder): "" is not a valid UUID and must never reach
+    // a tool's DB writes/filters as a literal string, only as null.
+    // Normalizing at this single choke point covers every current and
+    // future tool instead of relying on each one to guard itself.
+    ctx = {
+      ...ctx,
+      conversationId: ctx.conversationId || null,
+      contactId: ctx.contactId || null,
+    };
+
     // SEC-01: sensitive tools require human confirmation — skip execution
     if (tool.sensitivity === "sensitive") {
       const pendingResult: ToolResult = {
@@ -116,7 +128,11 @@ class ToolRegistry {
     }
 
     const timeoutMs = opts?.timeoutMs ?? 10_000;
-    const retries = opts?.retries ?? 1;
+    // A "write" tool's side effect (e.g. booking/cancelling an appointment)
+    // may have already succeeded even when the HTTP call that reported it
+    // times out or throws — retrying would risk repeating the mutation.
+    // "sensitive" tools never reach this loop (see the early return above).
+    const retries = tool.sensitivity === "write" ? 0 : (opts?.retries ?? 1);
 
     const attempt = () =>
       runWithTimeout(() => tool.run(parsed.data, ctx, opts), timeoutMs);

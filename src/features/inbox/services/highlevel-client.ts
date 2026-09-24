@@ -35,6 +35,11 @@ export interface HLConfig {
   pipelineId: string | null;
   /** Stage within the pipeline for new opportunities; null when not configured. */
   pipelineStageId: string | null;
+  /**
+   * IANA timezone for availability queries when the model does not pass a
+   * valid one. Defaults to "UTC".
+   */
+  timezone: string;
 }
 
 export interface HLPipeline {
@@ -73,7 +78,7 @@ function hlHeaders(token: string): HeadersInit {
   };
 }
 
-function splitName(fullName: string | null): {
+export function splitName(fullName: string | null): {
   firstName: string;
   lastName: string;
 } {
@@ -125,6 +130,7 @@ export async function getHLConfig(
     calendarId: str(calendarId),
     pipelineId: str(pipelineId),
     pipelineStageId: str(pipelineStageId),
+    timezone: str(config.timezone) ?? "UTC",
   };
 }
 
@@ -195,6 +201,7 @@ export async function syncContactToHL(
     .from("contacts")
     .select("id, name, phone, email, tags, hl_contact_id")
     .eq("id", contactId)
+    .eq("workspace_id", workspaceId)
     .single();
 
   if (contactError || !contactData) {
@@ -265,7 +272,8 @@ export async function syncContactToHL(
   const { error: updateError } = await supabase
     .from("contacts")
     .update({ hl_contact_id: hlId, updated_at: new Date().toISOString() })
-    .eq("id", contactId);
+    .eq("id", contactId)
+    .eq("workspace_id", workspaceId);
 
   if (updateError) {
     console.error("[HL] Failed to save hl_contact_id:", updateError.message);
@@ -414,6 +422,7 @@ export async function createHLOpportunity(
     .from("contacts")
     .select("id, name, phone, email, hl_contact_id")
     .eq("id", contactId)
+    .eq("workspace_id", workspaceId)
     .single();
 
   if (contactError || !contactData) {
@@ -445,7 +454,8 @@ export async function createHLOpportunity(
           hl_contact_id: hlContactId,
           updated_at: new Date().toISOString(),
         })
-        .eq("id", contactId);
+        .eq("id", contactId)
+        .eq("workspace_id", workspaceId);
     }
   }
   if (!hlContactId) {
@@ -489,6 +499,138 @@ export async function createHLOpportunity(
     return id ? { id } : null;
   } catch (err) {
     console.error("[HL] createHLOpportunity error:", err);
+    return null;
+  }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Appointments — fallback lookup when the local `appointments` row is missing
+// ──────────────────────────────────────────────────────────────────────────────
+
+export interface HLAppointmentEvent {
+  id: string;
+  status: string;
+  startTime: string;
+}
+
+/**
+ * Formats a Date instant as HighLevel's own timestamp shape, "YYYY-MM-DD
+ * HH:mm:ss", in the given IANA timezone — the calendar's own local wall
+ * clock, with no offset. Comparing two such strings lexicographically is a
+ * correct, precise (to-the-second) chronological comparison as long as both
+ * sides share the same timezone.
+ */
+function formatHLLocal(date: Date, timeZone: string): string {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hourCycle: "h23",
+  }).formatToParts(date);
+  const get = (type: string) =>
+    parts.find((p) => p.type === type)?.value ?? "00";
+  return `${get("year")}-${get("month")}-${get("day")} ${get("hour")}:${get("minute")}:${get("second")}`;
+}
+
+/**
+ * Finds the contact's earliest active (booked/confirmed) appointment
+ * directly from HighLevel via GET /contacts/:contactId/appointments
+ * (requires header Version: "v3" — a different API version than the rest of
+ * this client, verified against the live docs).
+ *
+ * Used as a fallback by cancel_highlevel/reschedule_highlevel when the local
+ * `appointments` row is missing — e.g. the row's insert failed after a
+ * successful HighLevel booking. HighLevel is the source of truth here, not
+ * the local table. Returns null on any failure or when there's no active
+ * appointment — never throws. Requires the workspace's timezone (see
+ * business-info.ts's resolveTimeZone) to compare against "now" precisely —
+ * HighLevel's startTime has no offset of its own.
+ */
+export async function findActiveHLAppointmentByContact(
+  cfg: HLConfig,
+  hlContactId: string,
+  timeZone: string,
+): Promise<HLAppointmentEvent | null> {
+  try {
+    const res = await fetch(
+      `${HL_BASE_URL}/contacts/${hlContactId}/appointments`,
+      {
+        headers: {
+          Authorization: `Bearer ${cfg.token}`,
+          Version: "v3",
+        },
+      },
+    );
+    if (!res.ok) {
+      console.error(
+        "[HL] findActiveHLAppointmentByContact failed:",
+        res.status,
+        (await res.text()).slice(0, 200),
+      );
+      return null;
+    }
+    const json = (await res.json()) as {
+      events?: Array<{
+        id: string;
+        status: string;
+        startTime: string;
+        calendarId?: string | null;
+      }>;
+    };
+    // HighLevel's startTime has no timezone offset — it's the calendar's own
+    // local wall clock (verified against the live v3 docs,
+    // https://marketplace.gohighlevel.com/docs/ghl/contacts/get-appointments-for-contact/:
+    // "startTime": "2021-07-16 11:00:00"). Formatting "now" into that exact
+    // shape, in the workspace's configured timezone, makes both sides
+    // directly and precisely comparable as plain strings — correct to the
+    // second, not just the calendar date, and immune to UTC/local
+    // date-boundary drift (a negative-offset business's evening can already
+    // be "tomorrow" in UTC while still "today" locally).
+    // Date.now() rather than new Date() so tests that mock Date.now control it.
+    const nowLocal = formatHLLocal(new Date(Date.now()), timeZone);
+    // Appointments that started up to this long ago stay eligible as a
+    // fallback — HighLevel may not have marked one non-active yet even
+    // though it's realistically still in progress. This is NOT
+    // timezone-uncertainty slack (the real timezone is known) — just "how
+    // long a single appointment could plausibly still be running."
+    const RECENT_PAST_GRACE_MS = 6 * 60 * 60 * 1000;
+    const cutoff = formatHLLocal(
+      new Date(Date.now() - RECENT_PAST_GRACE_MS),
+      timeZone,
+    );
+    const candidates = (json.events ?? []).filter(
+      (e) =>
+        (e.status === "booked" || e.status === "confirmed") &&
+        e.startTime >= cutoff &&
+        // A contact can have appointments on more than one HighLevel
+        // calendar under the same account (e.g. different services). When
+        // this workspace has a configured default calendar, only consider
+        // appointments on it — cancelling/rescheduling a different
+        // calendar's appointment would be silently mutating the wrong
+        // booking. With no calendarId configured there is no way to
+        // disambiguate, so every calendar is considered.
+        (cfg.calendarId ? e.calendarId === cfg.calendarId : true),
+    );
+    // Prefer the soonest appointment that hasn't happened yet; only fall
+    // back to the most recent one within the grace window — e.g. one that
+    // started a few minutes ago and is still in progress — when there's no
+    // upcoming one at all.
+    const upcoming = candidates
+      .filter((e) => e.startTime >= nowLocal)
+      .sort((a, b) => a.startTime.localeCompare(b.startTime));
+    const recentPast = candidates
+      .filter((e) => e.startTime < nowLocal)
+      .sort((a, b) => b.startTime.localeCompare(a.startTime));
+    const active = upcoming[0] ?? recentPast[0];
+    return active
+      ? { id: active.id, status: active.status, startTime: active.startTime }
+      : null;
+  } catch (err) {
+    console.error("[HL] findActiveHLAppointmentByContact error:", err);
     return null;
   }
 }

@@ -1,6 +1,7 @@
 import { createClient as createSbClient } from "@supabase/supabase-js";
 import { z } from "zod";
 import type { Tool, ToolContext, ToolResult } from "../core/tool";
+import { resolveCalendarId } from "../lib/calendar-id.ts";
 
 const schema = z.object({
   datetime_iso: z
@@ -41,7 +42,7 @@ interface HLAppointmentResponse {
 
 async function run(args: Args, ctx: ToolContext): Promise<ToolResult> {
   const { getHLConfig, upsertHLContactByPhone } =
-    await import("../../inbox/services/highlevel-client");
+    await import("../../inbox/services/highlevel-client.ts");
 
   const cfg = await getHLConfig(ctx.workspaceId);
   if (!cfg) {
@@ -52,7 +53,7 @@ async function run(args: Args, ctx: ToolContext): Promise<ToolResult> {
     };
   }
 
-  const calendarId = args.calendar_id ?? cfg.calendarId;
+  const calendarId = resolveCalendarId(cfg.calendarId, args.calendar_id);
   if (!calendarId) {
     return {
       ok: false,
@@ -144,10 +145,45 @@ async function run(args: Args, ctx: ToolContext): Promise<ToolResult> {
   }
 
   const data = (await res.json()) as HLAppointmentResponse;
+  const appointmentId = data.id ?? data.appointment?.id ?? null;
+
+  const { error: insertError } = await supabase.from("appointments").insert({
+    workspace_id: ctx.workspaceId,
+    contact_id: dbContactId,
+    conversation_id: ctx.conversationId,
+    scheduled_at: args.datetime_iso,
+    status: "booked",
+    hl_appointment_id: appointmentId,
+  });
+  if (insertError) {
+    // The booking already exists in HighLevel and can't be undone by this
+    // failure alone — don't error out to the user over a cita that actually
+    // did get booked. But do surface it visibly (not just console.warn):
+    // without the local row, cancel_highlevel / reschedule_highlevel have
+    // to fall back to asking HighLevel for this contact's appointment.
+    console.warn(
+      "[schedule_highlevel] failed to persist appointment:",
+      insertError,
+    );
+    await supabase.from("events").insert({
+      type: "appointment_persist_failed",
+      level: "error",
+      workspace_id: ctx.workspaceId,
+      conversation_id: ctx.conversationId,
+      payload: {
+        provider: "highlevel",
+        hl_appointment_id: appointmentId,
+        contact_id: dbContactId,
+        scheduled_at: args.datetime_iso,
+        error: insertError.message,
+      },
+    });
+  }
+
   return {
     ok: true,
     output: {
-      appointment_id: data.id ?? data.appointment?.id,
+      appointment_id: appointmentId,
       datetime: args.datetime_iso,
     },
   };

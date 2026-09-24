@@ -19,6 +19,17 @@ export const TEMPLATE_LANGUAGE = "es" as const;
 export const TEMPLATE_CATEGORIES = ["utility", "marketing"] as const;
 export type TemplateCategory = (typeof TEMPLATE_CATEGORIES)[number];
 
+/**
+ * Normaliza una categoría que viene de afuera (Meta/Kapso la devuelven en
+ * MAYÚSCULAS: "UTILITY", "MARKETING", "AUTHENTICATION") al formato en que se
+ * guarda acá: minúsculas. Sin esto, un `=== "authentication"` no matchea nunca y
+ * una plantilla de autenticación se reenvía a Meta como UTILITY.
+ * Devuelve "" si no hay un string usable — el llamador decide el defecto.
+ */
+export function normalizeCategory(raw: unknown): string {
+  return typeof raw === "string" ? raw.trim().toLowerCase() : "";
+}
+
 export const CATEGORY_LABELS: Record<TemplateCategory, string> = {
   utility: "Utilidad",
   marketing: "Marketing",

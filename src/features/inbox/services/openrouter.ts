@@ -277,6 +277,51 @@ export interface GenerateWithToolsResult {
 }
 
 /**
+ * Heads-up sent to the customer BEFORE a slow calendar tool runs.
+ *
+ * It has to live here and not in the prompt: whatever the model writes before a
+ * tool call stays in an intermediate step, and generateText only hands back
+ * `result.text` — the final one. Without this the contact stares at silence
+ * while we wait on HighLevel/Cal.com.
+ *
+ * Only two moments: checking the calendar and booking. Reschedule and cancel
+ * deliberately stay quiet.
+ */
+const TOOL_HEADS_UP: Record<string, string> = {
+  check_availability: "Dame un segundo, reviso la agenda 📅",
+  check_availability_calcom: "Dame un segundo, reviso la agenda 📅",
+  schedule_highlevel: "Perfecto, estoy agendando tu cita ⏳",
+  schedule_calcom: "Perfecto, estoy agendando tu cita ⏳",
+};
+
+async function sendToolHeadsUp(
+  toolName: string,
+  ctx: ToolContext,
+  announced: Set<string>,
+): Promise<void> {
+  const body = TOOL_HEADS_UP[toolName];
+  // conversationId is null in the agent test-chat playground — no one to tell.
+  if (!body || !ctx.conversationId || announced.has(toolName)) return;
+  announced.add(toolName);
+
+  try {
+    const { dispatchText } = await import("./dispatch");
+    await dispatchText({
+      workspaceId: ctx.workspaceId,
+      conversationId: ctx.conversationId,
+      body,
+    });
+  } catch (err) {
+    // Best-effort by design: a heads-up that fails to send must never take down
+    // the real turn behind it. The detail stays server-side.
+    console.error(
+      "[openrouter] tool heads-up failed:",
+      err instanceof Error ? err.message : "unknown",
+    );
+  }
+}
+
+/**
  * Generates a reply with optional AI SDK v6 tool-calling.
  *
  * Bridges Forge Tool definitions into AI SDK v6 Tool objects using
@@ -308,12 +353,17 @@ export async function generateWithTools(
   // execute returns Promise<unknown> to satisfy ToolSet's output constraint.
   const aiTools: ToolSet = {};
 
+  // One turn = one heads-up per tool: the model can call the same tool twice in
+  // a multi-step loop, and the customer should not read the same line twice.
+  const announced = new Set<string>();
+
   for (const forgeTool of params.availableTools ?? []) {
     const ctx = params.toolContext;
     aiTools[forgeTool.name] = tool({
       description: forgeTool.description,
       inputSchema: zodSchema(forgeTool.schema),
       execute: async (args: unknown): Promise<unknown> => {
+        await sendToolHeadsUp(forgeTool.name, ctx, announced);
         return registry.run(forgeTool.name, args, ctx);
       },
     });
