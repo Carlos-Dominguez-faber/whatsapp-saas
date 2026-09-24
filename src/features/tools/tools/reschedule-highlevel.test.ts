@@ -314,9 +314,8 @@ test("fails clearly without querying when there is no contactId (playground)", a
   globalThis.fetch = fn as typeof fetch;
   const playgroundCtx: ToolContext = {
     workspaceId: "ws_1",
-    // The agent test-chat playground's sentinel for "no real contact".
-    conversationId: "",
-    contactId: "",
+    conversationId: null,
+    contactId: null,
   };
 
   try {

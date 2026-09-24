@@ -75,6 +75,7 @@ mock.module("../services/ssrf-guard.ts", {
 const { customWebhookTool } = await import("./custom-webhook.ts");
 
 const ctx: ToolContext = { workspaceId: "ws_1", conversationId: "conv_1", contactId: "contact_1" };
+const playgroundCtx: ToolContext = { workspaceId: "ws_1", conversationId: null, contactId: null };
 
 function reset() {
   responseQueue = [];
@@ -194,6 +195,32 @@ test("refuses to send when validation returns no resolved IP to pin to", async (
     assert.equal(result.ok, false);
     assert.equal(fetchCalled, false);
     assert.equal(pinnedIps.length, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("skips the contacts lookup in the test-chat playground (contactId: null)", async () => {
+  reset();
+  responseQueue = [
+    { data: { id: "tool_1" }, error: null },
+    { data: { config: { webhook_url: "https://hooks.example/wh" } }, error: null },
+    { data: { body: "hola" }, error: null }, // last inbound message (no contacts entry queued)
+    { data: null, error: null }, // business_info
+  ];
+  const originalFetch = globalThis.fetch;
+  let capturedBody: unknown;
+  globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
+    capturedBody = init?.body ? JSON.parse(String(init.body)) : null;
+    return new Response("{}", { status: 200 });
+  }) as typeof fetch;
+  try {
+    const result = await customWebhookTool.run({}, playgroundCtx);
+    assert.equal(result.ok, true);
+    assert.deepEqual(capturedBody, {
+      workspace_id: "ws_1",
+      payload: { contact_name: "", contact_phone: "", last_user_message: "hola", note: "" },
+    });
   } finally {
     globalThis.fetch = originalFetch;
   }

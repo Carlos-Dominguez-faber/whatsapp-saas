@@ -103,6 +103,18 @@ class ToolRegistry {
       return { ok: false, output: null, error: parsed.error.message };
     }
 
+    // Normalize once, here, for every tool and every caller (including the
+    // agent test-chat playground, which has no real conversation/contact and
+    // sends "" as a placeholder): "" is not a valid UUID and must never reach
+    // a tool's DB writes/filters as a literal string, only as null.
+    // Normalizing at this single choke point covers every current and
+    // future tool instead of relying on each one to guard itself.
+    ctx = {
+      ...ctx,
+      conversationId: ctx.conversationId || null,
+      contactId: ctx.contactId || null,
+    };
+
     // SEC-01: sensitive tools require human confirmation — skip execution
     if (tool.sensitivity === "sensitive") {
       const pendingResult: ToolResult = {

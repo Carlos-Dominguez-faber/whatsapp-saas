@@ -84,3 +84,52 @@ test("retries a non-write tool up to the configured retry count (pre-existing be
     globalThis.fetch = originalFetch;
   }
 });
+
+test("normalizes empty-string conversationId/contactId (playground sentinel) to null before the tool ever sees them", async () => {
+  const captured: { ctx: ToolContext | null } = { ctx: null };
+  const tool: Tool = {
+    name: "test_captures_ctx",
+    description: "test tool that records the ctx it received",
+    sensitivity: "write",
+    schema: z.object({}),
+    enabledFor: () => true,
+    run: async (_args, receivedCtxArg) => {
+      captured.ctx = receivedCtxArg;
+      return { ok: true, output: null };
+    },
+  };
+  registry.register(tool);
+
+  const playgroundCtx: ToolContext = {
+    workspaceId: "ws_1",
+    conversationId: "",
+    contactId: "",
+  };
+  const result = await registry.run("test_captures_ctx", {}, playgroundCtx);
+
+  assert.equal(result.ok, true);
+  assert.equal(captured.ctx?.conversationId, null);
+  assert.equal(captured.ctx?.contactId, null);
+});
+
+test("leaves a real conversationId/contactId untouched", async () => {
+  const captured: { ctx: ToolContext | null } = { ctx: null };
+  const tool: Tool = {
+    name: "test_captures_real_ctx",
+    description: "test tool that records the ctx it received",
+    sensitivity: "write",
+    schema: z.object({}),
+    enabledFor: () => true,
+    run: async (_args, receivedCtxArg) => {
+      captured.ctx = receivedCtxArg;
+      return { ok: true, output: null };
+    },
+  };
+  registry.register(tool);
+
+  const result = await registry.run("test_captures_real_ctx", {}, ctx);
+
+  assert.equal(result.ok, true);
+  assert.equal(captured.ctx?.conversationId, "conv_1");
+  assert.equal(captured.ctx?.contactId, "contact_1");
+});

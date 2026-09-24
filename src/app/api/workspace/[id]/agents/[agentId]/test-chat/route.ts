@@ -174,8 +174,8 @@ export async function POST(
       tools,
       toolContext: {
         workspaceId,
-        conversationId: "",
-        contactId: "",
+        conversationId: null,
+        contactId: null,
       },
     });
 

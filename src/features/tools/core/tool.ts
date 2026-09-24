@@ -4,8 +4,12 @@ export type ToolSensitivity = "read" | "write" | "sensitive";
 
 export interface ToolContext {
   workspaceId: string;
-  conversationId: string;
-  contactId: string;
+  // null when there is no real conversation/contact backing this call (the
+  // agent test-chat playground) — normalized from "" by ToolRegistry.run()
+  // in registry.ts, the single place every call funnels through, so no tool
+  // ever needs to guard against an empty-string UUID sentinel itself.
+  conversationId: string | null;
+  contactId: string | null;
   // SEC-01: identity anchored server-side — LLM cannot override these
 }
 

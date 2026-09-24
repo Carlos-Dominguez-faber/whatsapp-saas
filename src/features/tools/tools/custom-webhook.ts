@@ -71,7 +71,7 @@ async function loadVariableValues(
     "contact.email": contact?.email ?? "",
     last_user_message: lastMsg?.body ?? "",
     "business.name": structured?.name ?? "",
-    "conversation.id": ctx.conversationId,
+    "conversation.id": ctx.conversationId ?? "",
     note,
   };
 }
