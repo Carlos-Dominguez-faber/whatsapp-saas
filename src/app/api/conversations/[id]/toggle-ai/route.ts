@@ -12,7 +12,7 @@ import { z } from "zod";
 import { createClient } from "@/lib/supabase/server";
 import {
   readJsonBody,
-  requireWorkspaceMember,
+  requireConversationUpdate,
 } from "@/lib/auth/workspace-access";
 import { applyTransition } from "@/features/inbox/services/decision-engine";
 
@@ -62,22 +62,12 @@ export async function PATCH(
       );
     }
 
-    // 3b. applyTransition writes with the service role, bypassing the
-    // conversations UPDATE policy. Enforce that policy here: an active member
-    // of the workspace who is admin/manager, or the member the conversation is
-    // assigned to. Read access alone (any member, e.g. a viewer) is not enough.
-    const auth = await requireWorkspaceMember(conv.workspace_id as string);
+    // 3b. applyTransition writes with the service role; enforce the
+    // conversations UPDATE policy here instead.
+    const auth = await requireConversationUpdate(
+      conv as { workspace_id: string; assigned_to: string | null },
+    );
     if (!auth.ok) return auth.response;
-    if (
-      auth.role !== "admin" &&
-      auth.role !== "manager" &&
-      conv.assigned_to !== auth.userId
-    ) {
-      return NextResponse.json(
-        { error: "No tienes permiso para cambiar la IA de esta conversación" },
-        { status: 403 },
-      );
-    }
 
     const currentState = conv.state as string;
     const target = ai_enabled ? "ai_active" : "human_active";
