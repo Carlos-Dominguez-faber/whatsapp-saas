@@ -206,9 +206,34 @@ export async function patchMessageMedia(
   mediaMeta: MediaMeta,
 ): Promise<void> {
   const supabase = svc();
+
+  // Load existing to merge — `meta` also holds what the normalizer wrote
+  // (`from_name`, `origin`, …) and overwriting the column would drop it.
+  // Read-modify-write sin lock — dos jobs concurrentes sobre el mismo
+  // mensaje pueden pisarse. Deuda conocida: en la práctica solo corre este job
+  // por mensaje; si eso cambia, mover el merge a un UPDATE con `meta || jsonb`.
+  const { data: existing, error: readError } = await supabase
+    .from("messages")
+    .select("meta")
+    .eq("id", messageId)
+    .eq("workspace_id", workspaceId)
+    .maybeSingle();
+
+  // Si la lectura falló no sabemos qué había en `meta`: escribir ahora
+  // reemplazaría el objeto entero y borraría lo que el normalizer dejó
+  // (from_name, origin…). Mejor perder el patch de media que perder el meta.
+  if (readError) {
+    console.error(
+      "[media-handler] patchMessageMedia: no se pudo leer el meta actual:",
+      readError.message,
+      messageId,
+    );
+    return;
+  }
+
   const { error } = await supabase
     .from("messages")
-    .update({ meta: mediaMeta })
+    .update({ meta: { ...((existing?.meta as object) ?? {}), ...mediaMeta } })
     .eq("id", messageId)
     .eq("workspace_id", workspaceId);
 

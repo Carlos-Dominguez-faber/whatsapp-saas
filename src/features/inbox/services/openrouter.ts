@@ -228,7 +228,14 @@ export async function generateChatReply(params: {
         description: forgeTool.description,
         inputSchema: zodSchema(forgeTool.schema),
         execute: async (args: unknown): Promise<unknown> =>
-          registry.run(forgeTool.name, args, ctx),
+          registry.runTool(
+            forgeTool,
+            args,
+            ctx,
+            forgeTool.preferredTimeoutMs !== undefined
+              ? { timeoutMs: forgeTool.preferredTimeoutMs }
+              : undefined,
+          ),
       });
     }
   }
@@ -274,6 +281,22 @@ export interface GenerateWithToolsResult {
   inputTokens: number;
   outputTokens: number;
   toolCallsExecuted: number;
+  /**
+   * Qué herramienta se ejecutó y qué devolvió, para cada tool-call del turno,
+   * en orden.
+   *
+   * `output` es el `ToolResult` que `registry.runTool` entregó como `output`
+   * del `tool-result` del step (AI SDK v6: `StepResult.toolResults[]` =
+   * `{ type: "tool-result", toolCallId, toolName, input, output }`); `toolName`
+   * es el mismo metadato genérico del AI SDK, sin decoración.
+   *
+   * Canal deliberadamente genérico: este módulo no sabe —ni tiene que saber—
+   * qué herramienta dejó qué marca. Quien llama (hoy `buffer.ts`, para el
+   * traspaso diferido de `handoff_human`) es el que interpreta el contenido,
+   * y necesita `toolName` para no confiar en cualquier tool dinámica que
+   * imite la forma de la marca (n8n).
+   */
+  toolResults: { toolName: string; output: unknown }[];
 }
 
 /**
@@ -306,6 +329,9 @@ export async function generateWithTools(
   // Build AI SDK v6 ToolSet from available Forge tools.
   // Each entry uses inputSchema (zodSchema wrapper) + execute — the correct v6 shape.
   // execute returns Promise<unknown> to satisfy ToolSet's output constraint.
+  // runTool (not run by name) so dynamic n8n tools — resolved per-workspace
+  // by getEnabledTools, never registered in the shared registry Map — work
+  // the same way static tools do.
   const aiTools: ToolSet = {};
 
   for (const forgeTool of params.availableTools ?? []) {
@@ -314,7 +340,14 @@ export async function generateWithTools(
       description: forgeTool.description,
       inputSchema: zodSchema(forgeTool.schema),
       execute: async (args: unknown): Promise<unknown> => {
-        return registry.run(forgeTool.name, args, ctx);
+        return registry.runTool(
+          forgeTool,
+          args,
+          ctx,
+          forgeTool.preferredTimeoutMs !== undefined
+            ? { timeoutMs: forgeTool.preferredTimeoutMs }
+            : undefined,
+        );
       },
     });
   }
@@ -338,5 +371,8 @@ export async function generateWithTools(
     inputTokens: result.usage?.inputTokens ?? 0,
     outputTokens: result.usage?.outputTokens ?? 0,
     toolCallsExecuted: result.steps?.length ?? 0,
+    toolResults: (result.steps ?? []).flatMap((step) =>
+      (step.toolResults ?? []).map((r) => ({ toolName: r.toolName, output: r.output })),
+    ),
   };
 }
