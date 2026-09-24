@@ -3,15 +3,32 @@ import { test, mock } from "node:test";
 import { NextRequest } from "next/server";
 
 let currentUser: { id: string } | null = { id: "user_1" };
-let convRow: { state: string; workspace_id: string } | null = {
+let convRow: {
+  state: string;
+  workspace_id: string;
+  assigned_to?: string | null;
+} | null = {
   state: "human_active",
   workspace_id: "ws_1",
 };
 const directUpdates: unknown[] = [];
+// Role of the caller in the conversation's workspace; null = not a member.
+let memberRole: string | null = "admin";
+
+const membershipChain: any = {
+  eq: () => membershipChain,
+  maybeSingle: async () => ({
+    data: memberRole ? { role: memberRole } : null,
+    error: null,
+  }),
+};
 
 const fakeSupabase = {
   auth: { getUser: async () => ({ data: { user: currentUser } }) },
-  from: () => ({
+  from: (table: string) =>
+    table === "memberships"
+      ? { select: () => membershipChain }
+      : {
     select: () => ({
       eq: () => ({
         single: async () =>
@@ -24,7 +41,7 @@ const fakeSupabase = {
       directUpdates.push(row);
       return { eq: () => ({ select: () => ({ single: async () => ({ data: row, error: null }) }) }) };
     },
-  }),
+  },
 };
 mock.module("@/lib/supabase/server.ts", {
   exports: { createClient: async () => fakeSupabase },
@@ -95,6 +112,59 @@ test("404 when the conversation is not visible to the caller", async () => {
   const res = await PATCH(makeReq({ ai_enabled: true }), params);
   assert.equal(res.status, 404);
   assert.equal(transitions.length, 0);
+});
+
+// The route transitions with the service role, so it must enforce the
+// conversations UPDATE policy itself: admin/manager of the workspace, or the
+// member the conversation is assigned to.
+test("403 for a viewer not assigned to the conversation, without a transition", async () => {
+  transitions.length = 0;
+  memberRole = "viewer";
+  convRow = { state: "ai_active", workspace_id: "ws_1", assigned_to: null };
+  const res = await PATCH(makeReq({ ai_enabled: false }), params);
+  assert.equal(res.status, 403);
+  assert.equal(transitions.length, 0);
+  memberRole = "admin";
+});
+
+test("403 for an agent not assigned to the conversation", async () => {
+  transitions.length = 0;
+  memberRole = "agent";
+  convRow = { state: "ai_active", workspace_id: "ws_1", assigned_to: "user_2" };
+  const res = await PATCH(makeReq({ ai_enabled: false }), params);
+  assert.equal(res.status, 403);
+  assert.equal(transitions.length, 0);
+  memberRole = "admin";
+});
+
+test("403 when the caller is no longer an active member", async () => {
+  transitions.length = 0;
+  memberRole = null;
+  convRow = { state: "ai_active", workspace_id: "ws_1", assigned_to: "user_1" };
+  const res = await PATCH(makeReq({ ai_enabled: false }), params);
+  assert.equal(res.status, 403);
+  assert.equal(transitions.length, 0);
+  memberRole = "admin";
+});
+
+test("200 for a manager not assigned to the conversation", async () => {
+  transitions.length = 0;
+  memberRole = "manager";
+  convRow = { state: "ai_active", workspace_id: "ws_1", assigned_to: "user_2" };
+  const res = await PATCH(makeReq({ ai_enabled: false }), params);
+  assert.equal(res.status, 200);
+  assert.equal(transitions.length, 1);
+  memberRole = "admin";
+});
+
+test("200 for an agent the conversation is assigned to", async () => {
+  transitions.length = 0;
+  memberRole = "agent";
+  convRow = { state: "ai_active", workspace_id: "ws_1", assigned_to: "user_1" };
+  const res = await PATCH(makeReq({ ai_enabled: false }), params);
+  assert.equal(res.status, 200);
+  assert.equal(transitions.length, 1);
+  memberRole = "admin";
 });
 
 test("400 when ai_enabled is not a boolean", async () => {

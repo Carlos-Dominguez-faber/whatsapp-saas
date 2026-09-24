@@ -10,7 +10,10 @@
 import { type NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
 import { createClient } from "@/lib/supabase/server";
-import { readJsonBody } from "@/lib/auth/workspace-access";
+import {
+  readJsonBody,
+  requireWorkspaceMember,
+} from "@/lib/auth/workspace-access";
 import { applyTransition } from "@/features/inbox/services/decision-engine";
 
 const toggleAiSchema = z.object({
@@ -48,7 +51,7 @@ export async function PATCH(
     const { id } = await params;
     const { data: conv, error: convError } = await supabase
       .from("conversations")
-      .select("state, workspace_id")
+      .select("state, workspace_id, assigned_to")
       .eq("id", id)
       .single();
 
@@ -56,6 +59,23 @@ export async function PATCH(
       return NextResponse.json(
         { error: "Conversación no encontrada" },
         { status: 404 },
+      );
+    }
+
+    // 3b. applyTransition writes with the service role, bypassing the
+    // conversations UPDATE policy. Enforce that policy here: an active member
+    // of the workspace who is admin/manager, or the member the conversation is
+    // assigned to. Read access alone (any member, e.g. a viewer) is not enough.
+    const auth = await requireWorkspaceMember(conv.workspace_id as string);
+    if (!auth.ok) return auth.response;
+    if (
+      auth.role !== "admin" &&
+      auth.role !== "manager" &&
+      conv.assigned_to !== auth.userId
+    ) {
+      return NextResponse.json(
+        { error: "No tienes permiso para cambiar la IA de esta conversación" },
+        { status: 403 },
       );
     }
 
