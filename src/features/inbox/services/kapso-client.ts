@@ -218,8 +218,15 @@ export async function fetchKapsoTemplates(
   apiKey: string,
   wabaId: string,
 ): Promise<unknown[]> {
+  // `rejected_reason` is NOT in Graph's default field set for this edge, so it
+  // has to be asked for explicitly — without it the sync can never show the
+  // operator why Meta rejected a template. Asking for fields means listing every
+  // field the sync reads (see syncTemplatesFromKapso).
+  const fields =
+    "id,name,language,category,status,components,rejected_reason";
+
   const data = await kapsoFetch(
-    `${KAPSO_WA_BASE}/${encodeURIComponent(wabaId)}/message_templates?limit=100`,
+    `${KAPSO_WA_BASE}/${encodeURIComponent(wabaId)}/message_templates?limit=100&fields=${fields}`,
     apiKey,
     { method: "GET" },
     "fetchTemplates",

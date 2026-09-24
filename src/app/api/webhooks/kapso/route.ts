@@ -12,6 +12,12 @@ import {
   processInbound,
   processOutboundEcho,
 } from "@/features/inbox/services/normalizer";
+import {
+  formatErrorForLog,
+  recordMessageError,
+  type WhatsAppError,
+} from "@/features/inbox/services/whatsapp-errors";
+import { retryLookup, unwrapResult } from "@/features/inbox/services/retry";
 import { checkRateLimits } from "@/features/inbox/services/cost-tracker";
 import {
   upsertBatch,
@@ -45,14 +51,31 @@ type MessageStatus = OrderedStatus | "failed";
 
 async function handleStatusUpdate(
   supabase: ReturnType<typeof svc>,
+  workspaceId: string,
   wamid: string,
   newStatus: string,
+  waError: WhatsAppError | null,
 ): Promise<void> {
-  const { data: msg } = await supabase
-    .from("messages")
-    .select("id, status")
-    .eq("wamid", wamid)
-    .single();
+  // WH-04: `dispatch` envía y recién después inserta la fila, porque el wamid
+  // solo existe tras la respuesta del POST. Un status puede ganarle a ese
+  // insert; sin reintento se descartaría en silencio y un `failed` perdería su
+  // motivo. Los 3 intentos cubren esa ventana, no una caída de la base.
+  //
+  // El filtro por workspace_id NO es opcional: la unicidad del wamid es
+  // (workspace_id, wamid), así que el wamid no es una identidad global. Esto
+  // corre con service role (sin RLS), de modo que sin ese filtro un evento
+  // firmado por el workspace A podría pisar un mensaje del workspace B.
+  const msg = await retryLookup(async () =>
+    unwrapResult(
+      await supabase
+        .from("messages")
+        .select("id, status")
+        .eq("workspace_id", workspaceId)
+        .eq("wamid", wamid)
+        .maybeSingle(),
+      "messages lookup",
+    ),
+  );
 
   // Message not found — can happen for outbound we didn't track
   if (!msg) return;
@@ -61,12 +84,41 @@ async function handleStatusUpdate(
 
   // 'failed' is terminal — always apply regardless of current state
   if (newStatus === "failed") {
-    await supabase
-      .from("messages")
-      .update({ status: "failed" })
-      .eq("id", msg.id);
+    // El detalle técnico (inglés, fbtrace, status HTTP) vive SOLO en el log del
+    // servidor. Al operador le llega el texto en español de error_message.
+    if (waError) {
+      console.error("[webhook] message failed:", formatErrorForLog(waError));
+    }
+    // Si el update falla, lanzar: la ruta lo convierte en 500 y Kapso reintenta.
+    // Responder 200 con el estado sin escribir perdería el fallo para siempre.
+    unwrapResult(
+      await supabase
+        .from("messages")
+        .update({
+          status: "failed",
+          error_message: waError?.message ?? null,
+        })
+        .eq("id", msg.id)
+        .eq("workspace_id", workspaceId),
+      "messages failed update",
+    );
+    // El detalle técnico va a message_errors (RLS sin políticas), nunca al meta:
+    // el meta viaja al cliente por Realtime y por el select("*") del inbox.
+    if (waError) {
+      await recordMessageError(supabase, waError, workspaceId, msg.id);
+    }
     return;
   }
+
+  // `failed` es terminal de verdad: no está en STATUS_ORDER, así que su índice
+  // sería -1 y CUALQUIER status ordenado posterior lo revertiría — incluido un
+  // replay del webhook, que la firma de Kapso (sin timestamp) permite. Eso
+  // borraría el fallo de la vista del operador.
+  //
+  // Esto es SOLO un corto-circuito: `current` se leyó antes del update, así que
+  // un `failed` y un `sent` del mismo mensaje en paralelo leerían ambos `queued`
+  // y el `sent` pisaría al `failed`. La garantía real viaja en el WHERE de abajo.
+  if (current === "failed") return;
 
   // For ordered statuses: only advance, never go back
   const currentIdx = current
@@ -75,10 +127,20 @@ async function handleStatusUpdate(
   const newIdx = STATUS_ORDER.indexOf(newStatus as OrderedStatus);
 
   if (newIdx > currentIdx) {
-    await supabase
-      .from("messages")
-      .update({ status: newStatus })
-      .eq("id", msg.id);
+    unwrapResult(
+      await supabase
+        .from("messages")
+        .update({ status: newStatus })
+        .eq("id", msg.id)
+        .eq("workspace_id", workspaceId)
+        // El guard de `failed` va acá, no en memoria: la fila la evalúa Postgres
+        // en el momento del UPDATE, así que un `failed` concurrente que escribió
+        // primero deja esta condición falsa y el update no toca nada.
+        // `status` es NULLABLE y `NULL <> 'failed'` es NULL (no matchea), por eso
+        // el `is.null` explícito: sin él nunca se avanzaría desde un status vacío.
+        .or("status.is.null,status.neq.failed"),
+      "messages status update",
+    );
   }
   // else: same or lower status — ignore (monotonic guarantee)
 }
@@ -211,7 +273,13 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
     if (isStatusUpdate) {
       const statusData = parseStatusUpdate(body, eventName);
       if (statusData) {
-        await handleStatusUpdate(supabase, statusData.wamid, statusData.status);
+        await handleStatusUpdate(
+          supabase,
+          ws.workspace_id,
+          statusData.wamid,
+          statusData.status,
+          statusData.error,
+        );
       }
       return NextResponse.json({ received: true });
     }

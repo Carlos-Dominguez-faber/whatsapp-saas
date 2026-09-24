@@ -6,10 +6,19 @@
  */
 
 import { createClient as createSbClient } from "@supabase/supabase-js";
-import { sendText, sendTemplate } from "./kapso-client";
+import { sendText, sendTemplate, KapsoError } from "./kapso-client";
 import type { TemplateParams } from "./kapso-client";
 import { formatWhatsAppMarkdown } from "./text-formatter";
 import { decryptCredentials } from "@/shared/lib/integration-secrets";
+import {
+  parseWhatsAppError,
+  formatErrorForLog,
+  recordMessageError,
+  GENERIC_SEND_ERROR,
+  WINDOW_EXPIRED_MESSAGE,
+  OPT_OUT_MESSAGE,
+  type WhatsAppError,
+} from "./whatsapp-errors";
 
 function svc() {
   return createSbClient(
@@ -45,7 +54,29 @@ export interface DispatchTemplateParams {
 export interface DispatchResult {
   ok: boolean;
   wamid?: string;
+  /** Texto en español para el operador. Nunca detalle técnico. */
   error?: string;
+  /**
+   * Código estable para que los callers ramifiquen. Antes se ramificaba por el
+   * prefijo del texto (`error.startsWith("WINDOW_EXPIRED")`), lo que ataba el
+   * mensaje al operador al flujo de control.
+   */
+  errorCode?:
+    | "WINDOW_EXPIRED"
+    | "OPT_OUT"
+    | "SEND_FAILED"
+    | "DB_ERROR"
+    | "NOT_FOUND";
+}
+
+/**
+ * Traduce el fallo de un envío: KapsoError trae el body completo (Graph o el
+ * string suelto de Kapso); `sendErr.message` solo traía el título.
+ */
+function toWhatsAppError(sendErr: unknown): WhatsAppError {
+  return sendErr instanceof KapsoError
+    ? parseWhatsAppError(sendErr.body, sendErr.status)
+    : parseWhatsAppError(null);
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -146,10 +177,15 @@ async function loadConversationAndPhone(
   };
 }
 
-const NOT_FOUND: DispatchResult = { ok: false, error: "CONVERSATION_NOT_FOUND" };
+const NOT_FOUND: DispatchResult = {
+  ok: false,
+  error: "No se encontró la conversación.",
+  errorCode: "NOT_FOUND",
+};
 const OPT_OUT: DispatchResult = {
   ok: false,
-  error: "OPT_OUT: contact has opted out of WhatsApp messages",
+  error: OPT_OUT_MESSAGE,
+  errorCode: "OPT_OUT",
 };
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -190,7 +226,11 @@ export async function dispatchText(
     new Date() > new Date(window_expires_at) &&
     !overrideAdmin
   ) {
-    return { ok: false, error: "WINDOW_EXPIRED" };
+    return {
+      ok: false,
+      error: WINDOW_EXPIRED_MESSAGE,
+      errorCode: "WINDOW_EXPIRED",
+    };
   }
 
   // 3. Load Kapso credentials
@@ -216,23 +256,47 @@ export async function dispatchText(
       });
       wamid = sent.wamid || undefined;
     } catch (sendErr) {
-      const errMsg =
-        sendErr instanceof Error ? sendErr.message : String(sendErr);
-      console.error("[dispatch] Kapso sendText error:", errMsg);
+      const waError = toWhatsAppError(sendErr);
+      // Detalle técnico: SOLO acá. Ni a la respuesta HTTP ni al cliente.
+      console.error(
+        "[dispatch] Kapso sendText error:",
+        formatErrorForLog(waError),
+      );
 
-      // Persist failed message for audit
-      await supabase.from("messages").insert({
-        workspace_id: workspaceId,
-        conversation_id: conversationId,
-        direction: "out",
-        type: "text",
-        body,
-        status: "failed",
-        sender_user_id: senderUserId ?? null,
-        meta: { error: errMsg, override_admin: overrideAdmin || undefined },
-      });
+      // Persist failed message for audit. El detalle técnico va aparte, a
+      // message_errors: el meta viaja al cliente por Realtime y por el
+      // select("*") del inbox.
+      const { data: failed, error: failedInsertError } = await supabase
+        .from("messages")
+        .insert({
+          workspace_id: workspaceId,
+          conversation_id: conversationId,
+          direction: "out",
+          type: "text",
+          body,
+          status: "failed",
+          error_message: waError.message,
+          sender_user_id: senderUserId ?? null,
+          meta: {
+            override_admin: overrideAdmin || undefined,
+          },
+        })
+        .select("id")
+        .maybeSingle();
 
-      return { ok: false, error: errMsg };
+      if (failed?.id) {
+        await recordMessageError(supabase, waError, workspaceId, failed.id);
+      } else {
+        // El envío ya falló; acá se pierde solo el rastro en el inbox. Se deja
+        // en el log del servidor y se sigue devolviendo el motivo real del
+        // fallo de envío, que es más útil al operador que un "error de base".
+        console.error(
+          "[dispatch] failed-message insert error:",
+          failedInsertError?.message ?? "insert devolvió 0 filas",
+        );
+      }
+
+      return { ok: false, error: waError.message, errorCode: "SEND_FAILED" };
     }
   }
 
@@ -256,9 +320,15 @@ export async function dispatchText(
   });
 
   if (insertError) {
-    // Surface DB trigger errors (WINDOW_EXPIRED raised by trigger)
+    // El trigger trg_messages_24h_window levanta 'WINDOW_EXPIRED: free text…'
+    // en inglés: se traduce, nunca se devuelve crudo al operador.
     console.error("[dispatch] message insert error:", insertError.message);
-    return { ok: false, error: insertError.message };
+    const isWindow = insertError.message.includes("WINDOW_EXPIRED");
+    return {
+      ok: false,
+      error: isWindow ? WINDOW_EXPIRED_MESSAGE : GENERIC_SEND_ERROR,
+      errorCode: isWindow ? "WINDOW_EXPIRED" : "DB_ERROR",
+    };
   }
 
   // 6. Refresh conversation last_message_at
@@ -307,8 +377,9 @@ export async function dispatchTemplate(
 
   // 3. Send template via Kapso
   let wamid: string | undefined;
+  const realSend = Boolean(apiKey && apiKey !== "placeholder");
 
-  if (apiKey && apiKey !== "placeholder") {
+  if (realSend) {
     try {
       const sent = await sendTemplate({
         apiKey,
@@ -320,22 +391,44 @@ export async function dispatchTemplate(
       });
       wamid = sent.wamid;
     } catch (sendErr) {
-      const errMsg =
-        sendErr instanceof Error ? sendErr.message : String(sendErr);
-      console.error("[dispatch] Kapso sendTemplate error:", errMsg);
+      const waError = toWhatsAppError(sendErr);
+      console.error(
+        "[dispatch] Kapso sendTemplate error:",
+        formatErrorForLog(waError),
+      );
 
-      await supabase.from("messages").insert({
-        workspace_id: workspaceId,
-        conversation_id: conversationId,
-        direction: "out",
-        type: "template",
-        body: templateName,
-        status: "failed",
-        sender_user_id: senderUserId ?? null,
-        meta: { error: errMsg, template_name: templateName },
-      });
+      // Igual que en dispatchText: el detalle técnico va a message_errors, no
+      // al meta que el cliente sí puede leer.
+      const { data: failed, error: failedInsertError } = await supabase
+        .from("messages")
+        .insert({
+          workspace_id: workspaceId,
+          conversation_id: conversationId,
+          direction: "out",
+          type: "template",
+          body: templateName,
+          status: "failed",
+          error_message: waError.message,
+          sender_user_id: senderUserId ?? null,
+          meta: {
+            template_name: templateName,
+          },
+        })
+        .select("id")
+        .maybeSingle();
 
-      return { ok: false, error: errMsg };
+      if (failed?.id) {
+        await recordMessageError(supabase, waError, workspaceId, failed.id);
+      } else {
+        // Mismo criterio que dispatchText: el fallo de escritura se loguea
+        // server-side y el resultado sigue contando el fallo real de envío.
+        console.error(
+          "[dispatch] failed-template insert error:",
+          failedInsertError?.message ?? "insert devolvió 0 filas",
+        );
+      }
+
+      return { ok: false, error: waError.message, errorCode: "SEND_FAILED" };
     }
   }
 
@@ -347,18 +440,20 @@ export async function dispatchTemplate(
     type: "template",
     body: templateName,
     wamid: wamid ?? null,
-    status: wamid ? "queued" : "queued",
+    // Mismo criterio que dispatchText: un envío real ya fue aceptado por Kapso
+    // ('sent'); solo la api key placeholder del modo dev queda en 'queued'.
+    status: realSend ? "sent" : "queued",
     sender_user_id: senderUserId ?? null,
     meta: {
       template_name: templateName,
       template_language: templateLanguage,
-      dev_mode: !wamid || undefined,
+      dev_mode: realSend ? undefined : true,
     },
   });
 
   if (insertError) {
     console.error("[dispatch] template insert error:", insertError.message);
-    return { ok: false, error: insertError.message };
+    return { ok: false, error: GENERIC_SEND_ERROR, errorCode: "DB_ERROR" };
   }
 
   // 5. Refresh conversation last_message_at

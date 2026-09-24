@@ -117,7 +117,7 @@ test("dispatchTemplate: a conversation from another workspace is not sent nor pe
     templateName: "welcome",
   });
   assert.equal(res.ok, false);
-  assert.equal(res.error, "CONVERSATION_NOT_FOUND");
+  assert.equal(res.errorCode, "NOT_FOUND");
   assert.equal(sends.length, 0);
   assert.equal(inserted.length, 0);
 });
@@ -142,7 +142,7 @@ test("dispatchText: a conversation from another workspace is not sent nor persis
     body: "hola",
   });
   assert.equal(res.ok, false);
-  assert.equal(res.error, "CONVERSATION_NOT_FOUND");
+  assert.equal(res.errorCode, "NOT_FOUND");
   assert.equal(sends.length, 0);
   assert.equal(inserted.length, 0);
 });
@@ -156,7 +156,7 @@ test("dispatchText: an opted-out contact is not sent to", async () => {
     body: "hola",
   });
   assert.equal(res.ok, false);
-  assert.match(res.error ?? "", /^OPT_OUT/);
+  assert.equal(res.errorCode, "OPT_OUT");
   assert.equal(sends.length, 0);
   assert.equal(inserted.length, 0);
 });
