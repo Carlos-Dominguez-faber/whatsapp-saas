@@ -88,7 +88,7 @@ export function resolveTemplate(
 
 // ── Config schemas (validated at the save boundary) ────────────────────────────
 
-const HTTPS_URL = z
+export const HTTPS_URL = z
   .string()
   .trim()
   .url("Debe ser una URL válida")

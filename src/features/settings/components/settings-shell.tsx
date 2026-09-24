@@ -7,6 +7,7 @@ import { IntegrationsTab } from "./integrations-tab";
 import { TeamTab } from "./team-tab";
 import { TemplatesTab } from "./templates-tab";
 import { AutomationsTab } from "./automations-tab";
+import { N8nToolsTab } from "./n8n-tools-tab";
 import { KbTab } from "./kb-tab";
 import { AgentsTab } from "@/features/agents/components/agents-tab";
 import type { AgentDto } from "@/features/agents/types";
@@ -59,6 +60,7 @@ export function SettingsShell({
             <TabsTrigger value="integraciones">Integraciones</TabsTrigger>
             <TabsTrigger value="negocio">Negocio</TabsTrigger>
             <TabsTrigger value="tools">Tools</TabsTrigger>
+            <TabsTrigger value="n8n">n8n</TabsTrigger>
             <TabsTrigger value="templates">Templates</TabsTrigger>
             <TabsTrigger value="knowledge-base">Knowledge Base</TabsTrigger>
             <TabsTrigger value="equipo">Equipo</TabsTrigger>
@@ -96,6 +98,12 @@ export function SettingsShell({
               workspaceId={workspaceId}
               initialTools={initialTools}
             />
+          </div>
+        </TabsContent>
+
+        <TabsContent value="n8n">
+          <div className="p-6 space-y-6 rounded-lg border border-border/60 bg-card">
+            <N8nToolsTab workspaceId={workspaceId} />
           </div>
         </TabsContent>
 
