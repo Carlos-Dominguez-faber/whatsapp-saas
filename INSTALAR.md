@@ -146,6 +146,17 @@ node scripts/seed-admin.mjs
 
 (Crea SOLO el super admin. Los workspaces de clientes se crean desde la app, paso 10.)
 
+**8b. Cierra el registro público en Supabase (manual, 10 segundos).** Guía al usuario:
+
+> Supabase → **Authentication → Sign In / Providers** → desactiva **"Allow new users
+> to sign up"** → Save.
+
+El formulario `/signup` de la app ya es invite-only, pero ese control vive solo en
+la app: la API de Supabase Auth (`/auth/v1/signup`) sigue aceptando registros con la
+anon key pública, que viaja en el frontend. Con el registro apagado, el super admin
+(paso 8) y los usuarios que se crean desde el panel siguen funcionando, porque usan
+la Admin API con `service_role`.
+
 **9. Agenda el cron del buffer (automático).**
 
 ```bash
