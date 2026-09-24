@@ -333,6 +333,8 @@ mock.module("./conversation-history.ts", {
   },
 });
 mock.module("./setter.ts", { exports: { getSetterConfig: async () => null, evaluateLead: async () => null } });
+mock.module("./hubspot-client.ts", { exports: { createHubSpotDeal: async () => null } });
+mock.module("./crm-sync.ts", { exports: { crmStatus: async () => "inactive" } });
 mock.module("./highlevel-client.ts", {
   exports: {
     syncContactToHL: async () => undefined,
