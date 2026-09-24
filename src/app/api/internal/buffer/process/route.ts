@@ -3,6 +3,9 @@ import { NextResponse } from "next/server";
 import { createClient as createSbClient } from "@supabase/supabase-js";
 import { processNextBatch } from "@/features/inbox/services/buffer";
 
+// One targeted batch = one LLM turn + tools. Same budget as the cron.
+export const maxDuration = 300;
+
 // ──────────────────────────────────────────────────────────────────────────────
 // SEC-05: Internal buffer process endpoint
 //
@@ -80,7 +83,10 @@ export async function POST(request: Request): Promise<NextResponse> {
       .from("message_batches")
       .select("id, workspace_id, status")
       .eq("id", batchId)
-      .in("status", ["buffering", "processing"])
+      // Only a batch nobody holds can be re-armed. Reviving one in
+      // 'processing' would let claim_next_batch() hand it to a second worker
+      // while the first is still generating → double reply.
+      .eq("status", "buffering")
       .maybeSingle();
 
     if (batchError) {

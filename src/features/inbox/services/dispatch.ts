@@ -67,6 +67,13 @@ export interface DispatchResult {
     | "SEND_FAILED"
     | "DB_ERROR"
     | "NOT_FOUND";
+  /**
+   * Solo con errorCode "SEND_FAILED": true cuando Meta/Kapso indica que
+   * reintentar el mismo envío tiene sentido (rate limit, caída transitoria).
+   * Refleja WhatsAppError.retryable para que el buffer reencole en vez de
+   * dar la respuesta por perdida.
+   */
+  retryable?: boolean;
 }
 
 /**
@@ -74,9 +81,15 @@ export interface DispatchResult {
  * string suelto de Kapso); `sendErr.message` solo traía el título.
  */
 function toWhatsAppError(sendErr: unknown): WhatsAppError {
-  return sendErr instanceof KapsoError
-    ? parseWhatsAppError(sendErr.body, sendErr.status)
-    : parseWhatsAppError(null);
+  if (sendErr instanceof KapsoError) {
+    return parseWhatsAppError(sendErr.body, sendErr.status);
+  }
+  // No es KapsoError: sendText/sendTemplate falló antes de recibir una
+  // respuesta HTTP (red caída, DNS, timeout) — el patrón de caída más común.
+  // Tratarlo como retryable para que el buffer realmente reencole en vez
+  // de dar la respuesta por perdida; un KapsoError con status permanente real
+  // sigue yendo por el catálogo de arriba.
+  return { ...parseWhatsAppError(null), retryable: true };
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -296,7 +309,12 @@ export async function dispatchText(
         );
       }
 
-      return { ok: false, error: waError.message, errorCode: "SEND_FAILED" };
+      return {
+        ok: false,
+        error: waError.message,
+        errorCode: "SEND_FAILED",
+        retryable: waError.retryable,
+      };
     }
   }
 
@@ -428,7 +446,12 @@ export async function dispatchTemplate(
         );
       }
 
-      return { ok: false, error: waError.message, errorCode: "SEND_FAILED" };
+      return {
+        ok: false,
+        error: waError.message,
+        errorCode: "SEND_FAILED",
+        retryable: waError.retryable,
+      };
     }
   }
 

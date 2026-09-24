@@ -8,10 +8,11 @@ mock.module("@/features/inbox/services/buffer.ts", {
       processCalls.push(1);
       return { processed: false };
     },
+    reconcileOrphanedMessages: async () => 0,
   },
 });
 
-const { GET } = await import("./route.ts");
+const { GET, maxDuration } = await import("./route.ts");
 
 function req(auth?: string) {
   return new Request("http://localhost/api/cron/buffer-flush", {
@@ -40,6 +41,10 @@ test("runs the drain with the right bearer", async () => {
   processCalls.length = 0;
   const res = await GET(req("Bearer s3cret"));
   assert.equal(res.status, 200);
-  assert.deepEqual(await res.json(), { ok: true, processed: 0 });
+  assert.deepEqual(await res.json(), { ok: true, processed: 0, recovered: 0 });
   assert.equal(processCalls.length, 1);
+});
+
+test("declares a maxDuration long enough for 10 LLM turns", () => {
+  assert.equal(maxDuration, 300);
 });

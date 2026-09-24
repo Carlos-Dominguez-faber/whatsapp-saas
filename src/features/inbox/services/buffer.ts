@@ -1,6 +1,6 @@
 import { createClient as createSbClient } from "@supabase/supabase-js";
 import { generateWithTools, getWorkspaceModel } from "./openrouter";
-import { recordLlmUsage } from "./cost-tracker";
+import { recordLlmUsage, checkRateLimits } from "./cost-tracker";
 import { dispatchText, dispatchTemplate } from "./dispatch";
 import { decide, applyTransition } from "./decision-engine";
 import type { ToolContext } from "@/features/tools/core/tool";
@@ -79,94 +79,174 @@ function svc() {
 
 // ──────────────────────────────────────────────────────────────────────────────
 // upsertBatch
-// Creates a new buffering batch for a conversation, or extends an existing one.
-// On extend: push flush_at forward by silence_ms, increment message_count, link msg.
-// On create: insert batch, then link message.
-// Returns the batch ID.
+// Creates a new buffering batch for a conversation, or extends an existing
+// one — atomically, via the upsert_batch_and_link_message() SQL function.
+// Extending/creating the batch and linking
+// the message to it happen in the SAME Postgres transaction, so no external
+// claim_next_batch() call can interpose between them. Returns the batch ID.
 // ──────────────────────────────────────────────────────────────────────────────
-export async function upsertBatch(opts: {
-  workspaceId: string;
-  conversationId: string;
-  messageId: string;
-  silenceMs?: number;
-}): Promise<string> {
+export async function upsertBatch(
+  opts: {
+    workspaceId: string;
+    conversationId: string;
+    messageId: string;
+    silenceMs?: number;
+    /** Skip joining any in-flight batch — always create a standalone one.
+     * Only reconcileOrphanedMessages sets this: a revived orphan is, by
+     * definition, temporally unrelated to whatever else is buffering for
+     * this conversation right now. */
+    forceNewBatch?: boolean;
+  },
+  retryOpts: {
+    attempts?: number;
+    delayMs?: number;
+    sleep?: (ms: number) => Promise<void>;
+  } = {},
+): Promise<string> {
   const {
     workspaceId,
     conversationId,
     messageId,
     silenceMs = DEFAULT_SILENCE_MS,
+    forceNewBatch = false,
   } = opts;
   const supabase = svc();
+  const {
+    attempts = 3,
+    delayMs = 300,
+    sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms)),
+  } = retryOpts;
 
-  // 1. Look for an active buffering batch for this conversation
-  const { data: existing } = await supabase
-    .from("message_batches")
-    .select("id, message_count, flush_at")
-    .eq("workspace_id", workspaceId)
-    .eq("conversation_id", conversationId)
-    .eq("status", "buffering")
-    .order("created_at", { ascending: false })
-    .limit(1)
-    .maybeSingle();
+  let lastError: { message?: string } | null = null;
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    const { data, error } = await supabase.rpc("upsert_batch_and_link_message", {
+      p_workspace_id: workspaceId,
+      p_conversation_id: conversationId,
+      p_message_id: messageId,
+      p_silence_ms: silenceMs,
+      p_force_new_batch: forceNewBatch,
+    });
 
-  let batchId: string;
+    if (!error && data) return data as string;
 
-  if (existing) {
-    // Extend: push flush_at forward and increment count
-    const newFlushAt = new Date(Date.now() + silenceMs).toISOString();
-    const { error: updateError } = await supabase
-      .from("message_batches")
-      .update({
-        flush_at: newFlushAt,
-        message_count: existing.message_count + 1,
-        updated_at: new Date().toISOString(),
-      })
-      .eq("id", existing.id)
-      .eq("status", "buffering"); // Guard: only extend if still buffering
-
-    if (updateError) {
-      console.error("[buffer] extend batch error:", updateError);
-      throw new Error(`Failed to extend batch: ${updateError.message}`);
-    }
-
-    batchId = existing.id as string;
-  } else {
-    // Create a new buffering batch
-    const flushAt = new Date(Date.now() + silenceMs).toISOString();
-    const { data: created, error: insertError } = await supabase
-      .from("message_batches")
-      .insert({
-        workspace_id: workspaceId,
-        conversation_id: conversationId,
-        status: "buffering",
-        silence_ms: silenceMs,
-        flush_at: flushAt,
-        message_count: 1,
-        meta: {},
-      })
-      .select("id")
-      .single();
-
-    if (insertError || !created) {
-      console.error("[buffer] create batch error:", insertError);
-      throw new Error(`Failed to create batch: ${insertError?.message}`);
-    }
-
-    batchId = created.id as string;
+    lastError = error;
+    // Espera fija — cubre un blip transitorio de la RPC, no un
+    // servicio caído (mismo patrón que recordLlmUsage en cost-tracker.ts).
+    if (attempt < attempts - 1) await sleep(delayMs);
   }
 
-  // 2. Link the message to the batch
-  const { error: linkError } = await supabase
+  console.error(
+    "[buffer] upsert_batch_and_link_message RPC error after retries:",
+    lastError,
+  );
+  throw new Error(`Failed to upsert batch: ${lastError?.message}`);
+}
+
+const ORPHAN_MESSAGE_AGE_MS = 2 * 60_000; // 2 minutos — más que suficiente
+// margen para que los 3 reintentos de upsertBatch (~1s en el peor
+// caso) ya se hayan resuelto en un sentido u otro.
+const MAX_ORPHANS_PER_RUN = 20;
+// Without an upper bound on age, every inbound the
+// webhook deliberately left unbatched (AI off, rate-limited) stayed a
+// candidate forever, and re-enabling the AI days later made the agent answer
+// the whole backlog one message at a time. Anything older than this is not a
+// transient upsertBatch() failure any more — it is history.
+const ORPHAN_MESSAGE_MAX_AGE_MS = 15 * 60_000;
+
+// ──────────────────────────────────────────────────────────────────────────────
+// reconcileOrphanedMessages (exported)
+// Red de seguridad para el caso que los reintentos de upsertBatch() no
+// cierran: un mensaje entrante cuya RPC de linkeo falló de forma
+// persistente. Kapso deduplica su reentrega por wamid (índice único en
+// messages), así que una vez que la fila del mensaje existe nunca vuelve a
+// pasar por upsertBatch() — sin esto, se queda con batch_id NULL para
+// siempre y jamás recibe respuesta de IA. Se llama desde el cron buffer-flush (ya corre cada
+// minuto) antes de drenar batches.
+// ──────────────────────────────────────────────────────────────────────────────
+export async function reconcileOrphanedMessages(
+  retryOpts: {
+    attempts?: number;
+    delayMs?: number;
+    sleep?: (ms: number) => Promise<void>;
+  } = {},
+): Promise<number> {
+  const supabase = svc();
+  const now = Date.now();
+  const cutoff = new Date(now - ORPHAN_MESSAGE_AGE_MS).toISOString();
+  const oldest = new Date(now - ORPHAN_MESSAGE_MAX_AGE_MS).toISOString();
+
+  // `!inner` + the embedded filter make PostgREST drop AI-off conversations
+  // server-side, so they no longer consume the LIMIT budget.
+  const { data, error } = await supabase
     .from("messages")
-    .update({ batch_id: batchId })
-    .eq("id", messageId);
+    .select("id, workspace_id, conversation_id, conversations!inner(ai_enabled, contact_id)")
+    .is("batch_id", null)
+    .eq("direction", "in")
+    .gt("created_at", oldest)
+    .lt("created_at", cutoff)
+    .eq("conversations.ai_enabled", true)
+    .limit(MAX_ORPHANS_PER_RUN);
 
-  if (linkError) {
-    // Non-fatal: batch still works; log and continue
-    console.warn("[buffer] failed to link message to batch:", linkError);
+  if (error) {
+    console.error("[buffer] reconcileOrphanedMessages lookup error:", error);
+    return 0;
   }
 
-  return batchId;
+  const orphans = ((data ?? []) as unknown[]).map(
+    (row) =>
+      row as {
+        id: string;
+        workspace_id: string;
+        conversation_id: string;
+        conversations: { ai_enabled: boolean; contact_id: string } | null;
+      },
+  );
+
+  let recovered = 0;
+  for (const row of orphans) {
+    // Re-verifica en vivo, no confía en un marcador escrito en el pasado: si
+    // la conversación tiene la IA apagada o el contacto sigue rate-limited
+    // AHORA, el mensaje se deja sin batch, igual que hizo el webhook cuando
+    // llegó. Elimina la dependencia de una escritura que puede fallar (un
+    // marcador best-effort escrito por el webhook).
+    if (!row.conversations?.ai_enabled) continue;
+
+    const rate = await checkRateLimits(
+      row.workspace_id,
+      row.conversations.contact_id,
+    );
+    if (!rate.allowed) continue;
+
+    try {
+      // silenceMs=0 + forceNewBatch=true: un huérfano recuperado nunca debe
+      // unirse a un batch en curso, ni absorber uno nuevo. Sin
+      // forceNewBatch, un mensaje nuevo no relacionado (p. ej. un simple
+      // "Hola") que llegue mientras el cron no ha reclamado este batch
+      // podría pegársele — o, al revés, este reconcile podría meterse en un
+      // batch que un mensaje nuevo acaba de crear. La RPC
+      // (20260825000000_isolate_reconciled_orphan_batches) fuerza un batch
+      // aislado y lo deja con flush_at = NOW() para que claim_next_batch()
+      // lo recoja en la misma pasada del cron.
+      await upsertBatch(
+        {
+          workspaceId: row.workspace_id,
+          conversationId: row.conversation_id,
+          messageId: row.id,
+          silenceMs: 0,
+          forceNewBatch: true,
+        },
+        retryOpts,
+      );
+      recovered++;
+    } catch (err) {
+      console.error("[buffer] reconcileOrphanedMessages upsertBatch error:", {
+        messageId: row.id,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  return recovered;
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -394,9 +474,29 @@ export async function processNextBatch(): Promise<ProcessBatchResult> {
 
     if (costPolicy.policy === "cut") {
       console.warn(
-        "[buffer] SEC-06 cost cut — aborting AI for workspace",
+        "[buffer] SEC-06 cost cut — escalating to human for workspace",
         batch.workspace_id,
       );
+      // The customer used to get silence. Hand the
+      // thread to a human: notifyHandoffPending tells the team and ACKs the
+      // contact once, and decide() abstains on later batches (state is no
+      // longer ai_active), so the budget stays protected without spamming.
+      // Non-fatal: if the transition fails we still close the batch — the
+      // next batch for this conversation will try again.
+      try {
+        await applyTransition(batch.conversation_id, "handoff_pending", {
+          trigger: "cost_cut",
+          workspaceId: batch.workspace_id,
+        });
+      } catch (transitionErr) {
+        console.error("[buffer] cost-cut handoff transition failed:", {
+          conversationId: batch.conversation_id,
+          error:
+            transitionErr instanceof Error
+              ? transitionErr.message
+              : String(transitionErr),
+        });
+      }
       await markBatchProcessed(batch.id, mergedText, supabase);
       return { processed: true, conversationId: batch.conversation_id };
     }
@@ -417,15 +517,43 @@ export async function processNextBatch(): Promise<ProcessBatchResult> {
       history,
     });
 
-    // ── 8. Record LLM usage ──────────────────────────────────────────────────
-    await recordLlmUsage({
-      workspaceId: batch.workspace_id,
-      conversationId: batch.conversation_id,
-      contactId: conversation.contact_id as string,
-      model,
-      promptTokens: reply.inputTokens,
-      completionTokens: reply.outputTokens,
-    });
+    // With stopWhen(stepCountIs(5)) a turn that
+    // burns every step on tool calls comes back with text "". Kapso rejects an
+    // empty body (131009) and the batch would end as processed with a failed
+    // message. Treat it as a batch error so the retry path regenerates.
+    if (!reply.text.trim()) {
+      throw new Error(
+        `LLM returned an empty reply (toolCallsExecuted=${reply.toolCallsExecuted ?? 0})`,
+      );
+    }
+
+    // ── 8. Record LLM usage — una falla aquí NO debe reencolar el batch más
+    // abajo: el LLM ya se llamó y ya se pagó, así que reencolar volvería a
+    // llamarlo. Se loguea
+    // y se sigue — el usuario igual recibe su respuesta y el batch se marca
+    // procesado, no reencolado. Efecto aceptado: una reserva con los 3
+    // reintentos internos agotados queda en total_tokens=0 para siempre,
+    // subestimando ese turno en el presupuesto diario — caso raro (3 fallas
+    // seguidas de un solo UPDATE) y mejor que pagar el LLM de nuevo.
+    try {
+      await recordLlmUsage({
+        reservationId: decisionResult.reservationId,
+        workspaceId: batch.workspace_id,
+        conversationId: batch.conversation_id,
+        contactId: conversation.contact_id as string,
+        model,
+        promptTokens: reply.inputTokens,
+        completionTokens: reply.outputTokens,
+      });
+    } catch (usageErr) {
+      console.error(
+        "[buffer] recordLlmUsage failed, continuing without retrying the LLM call:",
+        {
+          batchId: batch.id,
+          error: usageErr instanceof Error ? usageErr.message : String(usageErr),
+        },
+      );
+    }
 
     // ── 9. Load Kapso integration credentials ──────────────────────────────
     const { data: integration, error: intError } = await supabase
@@ -442,6 +570,41 @@ export async function processNextBatch(): Promise<ProcessBatchResult> {
       throw new Error(`Kapso integration not found: ${intError?.message}`);
     }
 
+    // ── 9b. Live state re-check ───────────────────────────────────────────────
+    // The LLM turn above can take 10-20 s. If a human took the thread in the
+    // meantime (Business App echo → processOutboundEcho → human_active, or
+    // the inbox "take"), replying now would talk over them. decide() checked
+    // the state before the turn; check it again right before the send.
+    // El early-return de abajo también salta los pasos 10c/10d (auto-tag,
+    // resumen y evaluación de setter): es deliberado, el humano ya tiene el
+    // hilo y esos pasos describen un turno de la IA que no ocurrió.
+    // Si la relectura falla se despacha igual (fail-open): un blip transitorio
+    // no debe dejar al cliente sin respuesta. Se loguea para que el guard no
+    // pueda degradarse a no-op en silencio.
+    const { data: liveConv, error: liveErr } = await supabase
+      .from("conversations")
+      .select("state")
+      .eq("id", batch.conversation_id)
+      .single();
+
+    if (liveErr || !liveConv) {
+      console.error("[buffer] live state re-check failed, dispatching anyway", {
+        batchId: batch.id,
+        conversationId: batch.conversation_id,
+        error: liveErr?.message,
+      });
+    }
+
+    if (liveConv && liveConv.state !== "ai_active") {
+      console.info("[buffer] skipping dispatch: conversation left ai_active during generation", {
+        batchId: batch.id,
+        conversationId: batch.conversation_id,
+        state: liveConv.state,
+      });
+      await markBatchProcessed(batch.id, mergedText, supabase);
+      return { processed: true, conversationId: batch.conversation_id };
+    }
+
     // ── 10a. Dispatch via single exit point (SEC-04) ────────────────────────
     const dispatchResult = await dispatchText({
       workspaceId: batch.workspace_id,
@@ -451,7 +614,22 @@ export async function processNextBatch(): Promise<ProcessBatchResult> {
     });
 
     if (!dispatchResult.ok) {
-      console.error("[buffer] dispatchText failed:", dispatchResult.error);
+      if (dispatchResult.retryable) {
+        // Un fallo transitorio de Kapso terminaba acá
+        // con el batch marcado como procesado — el LLM pagado, nada enviado y
+        // sin reintento. Lanzar entrega el batch al camino de retry/backoff de
+        // más abajo, que lo reencola con retry_count+1 y lo manda a
+        // dead-letter tras MAX_BATCH_RETRIES. El turno del LLM se regenera en
+        // el reintento; ese es el precio aceptado de no perder la respuesta al
+        // cliente.
+        throw new Error(
+          `dispatchText failed (retryable): ${dispatchResult.error ?? "unknown"}`,
+        );
+      }
+      // Fallo permanente (número inválido, ventana vencida, cuenta
+      // restringida): dispatch ya guardó el mensaje como 'failed' en el inbox
+      // con un motivo legible. No hay nada que reintentar.
+      console.error("[buffer] dispatchText failed (permanent):", dispatchResult.error);
     }
 
     // ── 10b. Mark batch as processed ────────────────────────────────────────
@@ -524,6 +702,19 @@ export async function processNextBatch(): Promise<ProcessBatchResult> {
 
     // Revert to 'buffering' with incremented retry count so it gets picked up again
     // Use a short backoff: flush_at = now + 30s * retry_count
+    //
+    // Known limitation (accepted): un batch aislado por
+    // reconcileOrphanedMessages (forceNewBatch:true) que falla acá pierde su
+    // aislación al volver a 'buffering' — este UPDATE no marca de ninguna
+    // forma que el batch es "isolated", así que un mensaje real que llegue
+    // durante el backoff puede volver a pegársele (mismo bug original, vía
+    // el camino de retry en vez del de creación). Requiere un pipeline error
+    // real en la ventana exacta del backoff sobre un batch que además viene
+    // de un huérfano reconciliado — compuesto y poco frecuente. Fix
+    // propuesto y no implementado: persistir `meta.isolated = true` al crear
+    // el batch con forceNewBatch, y excluirlo también en el match normal de
+    // upsert_batch_and_link_message (20260825000000), ya que meta sobrevive
+    // el spread de este mismo UPDATE.
     const backoffMs = 30_000 * newRetryCount;
     await supabase
       .from("message_batches")
@@ -597,11 +788,17 @@ async function runSetterEvaluation(params: SetterEvalParams): Promise<void> {
     if (!cfg) return; // no enabled setter config → dormant
 
     // Load contact for the idempotency guard + tag merge in one read.
-    const { data: contactRow } = await supabase
+    const { data: contactRow, error: contactError } = await supabase
       .from("contacts")
       .select("tags, custom_fields, stage")
       .eq("id", contactId)
       .maybeSingle();
+
+    if (contactError) {
+      throw new Error(
+        `[buffer] runSetterEvaluation contact lookup error: ${contactError.message}`,
+      );
+    }
 
     const customFields =
       (contactRow?.custom_fields as Record<string, unknown> | null) ?? {};
