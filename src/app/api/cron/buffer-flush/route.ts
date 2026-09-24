@@ -1,5 +1,5 @@
-import { timingSafeEqual } from "node:crypto";
 import { NextResponse } from "next/server";
+import { isAuthorized } from "@/lib/cron-auth";
 import {
   processNextBatch,
   reconcileOrphanedMessages,
@@ -21,16 +21,6 @@ export const maxDuration = 300;
 
 // Max batches to drain per cron tick — protects against burst accumulation
 const MAX_BATCHES_PER_RUN = 10;
-
-function isAuthorized(header: string | null): boolean {
-  const secret = process.env.CRON_SECRET;
-  // Fail closed: a missing secret must never turn into `Bearer undefined`.
-  if (!secret || !header) return false;
-  const expected = Buffer.from(`Bearer ${secret}`);
-  const provided = Buffer.from(header);
-  if (expected.length !== provided.length) return false;
-  return timingSafeEqual(expected, provided);
-}
 
 export async function GET(request: Request): Promise<NextResponse> {
   if (!isAuthorized(request.headers.get("Authorization"))) {
