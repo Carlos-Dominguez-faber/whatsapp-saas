@@ -18,10 +18,17 @@ import { Textarea } from "@/components/ui/textarea";
 import { DEFAULT_HANDOFF_ACK } from "@/features/inbox/types/handoff";
 import { DEFAULT_TIMEZONE } from "@/features/inbox/types/timezone";
 import { ModelPicker } from "@/features/agents/components/model-picker";
+import {
+  crmBlockedBy,
+  crmBlockedMessage,
+  crmControls,
+  crmDisableBody,
+  hubSpotSaveBody,
+} from "@/features/settings/lib/crm-integration";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
-type Provider = "kapso" | "openrouter" | "highlevel" | "caldotcom";
+type Provider = "kapso" | "openrouter" | "highlevel" | "caldotcom" | "hubspot";
 
 type IntegrationData = {
   provider: Provider;
@@ -581,10 +588,13 @@ function OpenRouterSection({
 function HighLevelSection({
   workspaceId,
   initial,
+  blockedBy,
   onSaved,
 }: {
   workspaceId: string;
   initial: IntegrationData | undefined;
+  /** CRM que ya está activo; un solo CRM por workspace. */
+  blockedBy: string | null;
   onSaved: () => void;
 }) {
   const [pit, setPit] = useState(initial?.credentials?.highlevel_pit ?? "");
@@ -715,12 +725,52 @@ function HighLevelSection({
     }
   }
 
+  const controls = crmControls({ blockedBy, enabled: Boolean(initial?.enabled), saving, testing });
+
+  async function handleDisable() {
+    // Mientras HubSpot no tenga agenda propia,
+    // desactivar HighLevel también apaga el agendamiento de citas — no es un efecto obvio del
+    // botón "Desactivar CRM", así que se avisa antes de ejecutarlo.
+    if (
+      !window.confirm(
+        "Desactivar HighLevel también apaga el agendamiento de citas por HighLevel. HubSpot todavía no agenda citas (llega en la próxima entrega). ¿Desactivar igual?",
+      )
+    ) {
+      return;
+    }
+    setSaving(true);
+    try {
+      const res = await fetch(`/api/workspace/${workspaceId}/integrations`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(crmDisableBody("highlevel")),
+      });
+      const json = (await res.json()) as { ok?: boolean; error?: string };
+      if (json.ok) {
+        toast.success("HighLevel desactivado");
+        onSaved();
+      } else {
+        toast.error(json.error ?? "No se pudo desactivar");
+      }
+    } catch {
+      toast.error("Error de red al desactivar");
+    } finally {
+      setSaving(false);
+    }
+  }
+
   return (
     <Section
       title="HighLevel"
       description="Conecta tu CRM con un Private Integration Token (PIT). Requerido para sincronizar contactos y agendar en el calendario."
     >
       <div className="grid gap-4">
+        {blockedBy && (
+          <p className="text-sm text-destructive" role="status">
+            {crmBlockedMessage(blockedBy, "highlevel")}
+          </p>
+        )}
+
         <div className="space-y-2">
           <Label htmlFor="hl-pit">Private Integration Token (PIT)</Label>
           <Input
@@ -852,7 +902,7 @@ function HighLevelSection({
             variant="outline"
             size="sm"
             onClick={handleTest}
-            disabled={testing}
+            disabled={!controls.canTest}
             aria-busy={testing}
           >
             {testing && (
@@ -864,7 +914,7 @@ function HighLevelSection({
             type="button"
             size="sm"
             onClick={handleSave}
-            disabled={saving}
+            disabled={!controls.canSave}
             aria-busy={saving}
           >
             {saving && (
@@ -872,6 +922,305 @@ function HighLevelSection({
             )}
             Guardar
           </Button>
+          {controls.showDisable && (
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              onClick={() => void handleDisable()}
+              disabled={saving}
+            >
+              Desactivar
+            </Button>
+          )}
+        </div>
+      </div>
+    </Section>
+  );
+}
+
+// ─── HubSpot section ──────────────────────────────────────────────────────────
+
+function HubSpotSection({
+  workspaceId,
+  initial,
+  blockedBy,
+  onSaved,
+}: {
+  workspaceId: string;
+  initial: IntegrationData | undefined;
+  /** CRM que ya está activo; un solo CRM por workspace. */
+  blockedBy: string | null;
+  onSaved: () => void;
+}) {
+  // El GET devuelve la credencial enmascarada ("••••••"). Solo se envía si el usuario la edita.
+  const [token, setToken] = useState(initial?.credentials?.hubspot_token ?? "");
+  const [tokenDirty, setTokenDirty] = useState(false);
+  const [pipelineId, setPipelineId] = useState(
+    (initial?.config?.pipeline_id as string | undefined) ?? "",
+  );
+  const [stageId, setStageId] = useState(
+    (initial?.config?.deal_stage_id as string | undefined) ?? "",
+  );
+  const isConnected = Boolean(initial?.enabled && initial?.credentials?.hubspot_token);
+  const propertiesReady = initial?.config?.properties_ready === true;
+  const [pipelines, setPipelines] = useState<HLPipelineOption[]>([]);
+  const [loadingPipelines, setLoadingPipelines] = useState(isConnected && propertiesReady);
+  const [pipelinesError, setPipelinesError] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [testing, setTesting] = useState(false);
+  const controls = crmControls({ blockedBy, enabled: Boolean(initial?.enabled), saving, testing, tokenDirty });
+
+  const loadPipelines = useCallback(async () => {
+    setLoadingPipelines(true);
+    setPipelinesError(null);
+    try {
+      const res = await fetch(
+        `/api/workspace/${workspaceId}/integrations/hubspot/pipelines`,
+      );
+      const json = (await res.json()) as {
+        ok: boolean;
+        error?: string;
+        pipelines?: HLPipelineOption[];
+      };
+      if (json.ok && json.pipelines) {
+        setPipelines(json.pipelines);
+      } else {
+        setPipelinesError(json.error ?? "No se pudieron cargar los pipelines");
+      }
+    } catch {
+      setPipelinesError("Error de red al cargar los pipelines");
+    } finally {
+      setLoadingPipelines(false);
+    }
+  }, [workspaceId]);
+
+  useEffect(() => {
+    if (!isConnected || !propertiesReady) return;
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- intentional: loadPipelines resets loading/error before each (re)fetch
+    loadPipelines();
+  }, [isConnected, propertiesReady, loadPipelines]);
+
+  const selectedPipeline = pipelines.find((p) => p.id === pipelineId);
+  const stages = selectedPipeline?.stages ?? [];
+
+  function handlePipelineChange(nextPipelineId: string) {
+    setPipelineId(nextPipelineId);
+    const next = pipelines.find((p) => p.id === nextPipelineId);
+    if (!next?.stages.some((s) => s.id === stageId)) {
+      setStageId(next?.stages[0]?.id ?? "");
+    }
+  }
+
+  async function put(body: unknown, okMessage: string) {
+    setSaving(true);
+    try {
+      const res = await fetch(`/api/workspace/${workspaceId}/integrations`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const json = (await res.json()) as { ok?: boolean; error?: string };
+      if (json.ok) {
+        toast.success(okMessage);
+        setTokenDirty(false);
+        onSaved();
+      } else {
+        toast.error(json.error ?? "No se pudo guardar");
+      }
+    } catch {
+      toast.error("Error de red al guardar");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function handleTest() {
+    setTesting(true);
+    try {
+      const res = await fetch(
+        `/api/workspace/${workspaceId}/integrations/hubspot/test`,
+        { method: "POST" },
+      );
+      const json = (await res.json()) as {
+        ok: boolean;
+        error?: string;
+        portalChanged?: boolean;
+      };
+      if (json.ok) {
+        toast.success(
+          json.portalChanged
+            ? "HubSpot conectado a otra cuenta. Los contactos se volverán a enlazar solos."
+            : "HubSpot conectado. Las propiedades del agente quedaron listas.",
+        );
+        onSaved();
+        void loadPipelines();
+      } else {
+        toast.error(json.error ?? "Error al probar la conexión");
+      }
+    } catch {
+      toast.error("Error de red al probar la conexión");
+    } finally {
+      setTesting(false);
+    }
+  }
+
+  return (
+    <Section
+      title="HubSpot"
+      description="Conecta tu CRM con el token de una app privada. Sincroniza contactos, etiquetas, negocios y el resumen de cada conversación."
+    >
+      <div className="grid gap-4">
+        {blockedBy && (
+          <p className="text-sm text-destructive" role="status">
+            {crmBlockedMessage(blockedBy, "hubspot")}
+          </p>
+        )}
+
+        <div className="space-y-2">
+          <Label htmlFor="hs-token">Token de la app privada</Label>
+          <Input
+            id="hs-token"
+            type="password"
+            placeholder="pat-..."
+            value={token}
+            onChange={(e) => {
+              setToken(e.target.value);
+              setTokenDirty(true);
+            }}
+            autoComplete="off"
+          />
+          <p className="text-xs text-muted-foreground">
+            HubSpot → Configuración → Integraciones → Apps privadas: crea una
+            app con permisos de contactos, negocios, propiedades de contactos
+            y comunicaciones, y copia su token.
+          </p>
+          {isConnected && !propertiesReady && (
+            <p className="text-xs text-warning">
+              Falta probar la conexión: ahí se validan la cuenta y las
+              propiedades que usa el agente.
+            </p>
+          )}
+        </div>
+
+        <Separator />
+
+        <div className="space-y-3">
+          <div>
+            <Label>Pipeline de negocios (modo setter)</Label>
+            <p className="mt-0.5 text-xs text-muted-foreground">
+              Cuando un lead califica con la acción “Crear negocio en
+              HubSpot”, se crea en este pipeline y etapa.
+            </p>
+          </div>
+
+          {loadingPipelines ? (
+            <div className="flex items-center gap-2 text-sm text-muted-foreground">
+              <Loader2 className="h-4 w-4 animate-spin" aria-hidden />
+              Cargando pipelines…
+            </div>
+          ) : pipelinesError ? (
+            <div className="space-y-2">
+              <p className="text-sm text-destructive">{pipelinesError}</p>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={() => void loadPipelines()}
+              >
+                Reintentar
+              </Button>
+            </div>
+          ) : pipelines.length === 0 ? (
+            <p className="text-sm text-muted-foreground">
+              Guarda tu token y prueba la conexión; los pipelines aparecen
+              acá.
+            </p>
+          ) : (
+            <div className="grid gap-4">
+              <div className="space-y-2">
+                <Label htmlFor="hs-pipeline">Pipeline</Label>
+                <select
+                  id="hs-pipeline"
+                  value={pipelineId}
+                  onChange={(e) => handlePipelineChange(e.target.value)}
+                  className={SELECT_CLASS}
+                >
+                  <option value="">— Selecciona un pipeline —</option>
+                  {pipelines.map((p) => (
+                    <option key={p.id} value={p.id}>
+                      {p.name}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              <div className="space-y-2">
+                <Label htmlFor="hs-stage">Etapa</Label>
+                <select
+                  id="hs-stage"
+                  value={stageId}
+                  onChange={(e) => setStageId(e.target.value)}
+                  disabled={!selectedPipeline}
+                  className={SELECT_CLASS}
+                >
+                  <option value="">— Selecciona una etapa —</option>
+                  {stages.map((s) => (
+                    <option key={s.id} value={s.id}>
+                      {s.name}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            </div>
+          )}
+        </div>
+
+        <div className="flex items-center gap-2 pt-2">
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            onClick={handleTest}
+            disabled={!controls.canTest}
+            aria-busy={testing}
+          >
+            {testing && (
+              <Loader2 className="h-4 w-4 mr-2 animate-spin" aria-hidden />
+            )}
+            Probar conexión
+          </Button>
+          <Button
+            type="button"
+            size="sm"
+            onClick={() =>
+              void put(
+                hubSpotSaveBody({ token, tokenDirty, pipelineId, stageId }),
+                "Configuración de HubSpot guardada.",
+              )
+            }
+            disabled={!controls.canSave}
+            aria-busy={saving}
+          >
+            {saving && (
+              <Loader2 className="h-4 w-4 mr-2 animate-spin" aria-hidden />
+            )}
+            Guardar
+          </Button>
+          {controls.showDisable && (
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              onClick={() => void put(crmDisableBody("hubspot"), "HubSpot desactivado")}
+              disabled={saving}
+            >
+              Desactivar
+            </Button>
+          )}
+          {controls.testHint && (
+            <p className="text-xs text-muted-foreground">{controls.testHint}</p>
+          )}
         </div>
       </div>
     </Section>
@@ -1044,6 +1393,7 @@ export function IntegrationsTab({ workspaceId, initialIntegrations }: Props) {
   const kapso = findIntegration(integrations, "kapso");
   const openrouter = findIntegration(integrations, "openrouter");
   const highlevel = findIntegration(integrations, "highlevel");
+  const hubspot = findIntegration(integrations, "hubspot");
   const caldotcom = findIntegration(integrations, "caldotcom");
 
   return (
@@ -1063,6 +1413,14 @@ export function IntegrationsTab({ workspaceId, initialIntegrations }: Props) {
       <HighLevelSection
         workspaceId={workspaceId}
         initial={highlevel}
+        blockedBy={crmBlockedBy(integrations, "highlevel")}
+        onSaved={refresh}
+      />
+      <Separator />
+      <HubSpotSection
+        workspaceId={workspaceId}
+        initial={hubspot}
+        blockedBy={crmBlockedBy(integrations, "hubspot")}
         onSaved={refresh}
       />
       <Separator />

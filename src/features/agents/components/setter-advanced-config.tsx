@@ -18,6 +18,7 @@ type KnockoutAction = "disqualify" | "continue" | "handoff";
 type PostActionType =
   | "send_template"
   | "create_hl_opportunity"
+  | "create_hubspot_deal"
   | "handoff"
   | "add_tag";
 
@@ -71,6 +72,7 @@ const KNOCKOUT_ACTION_LABELS: Record<KnockoutAction, string> = {
 const POST_ACTION_LABELS: Record<PostActionType, string> = {
   send_template: "Enviar template",
   create_hl_opportunity: "Crear oportunidad en HL",
+  create_hubspot_deal: "Crear negocio en HubSpot",
   handoff: "Handoff a humano",
   add_tag: "Agregar etiqueta",
 };
