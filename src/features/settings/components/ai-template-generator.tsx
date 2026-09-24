@@ -13,6 +13,11 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import {
+  CATEGORY_LABELS,
+  TEMPLATE_CATEGORIES,
+  type TemplateCategory,
+} from "@/features/settings/lib/template-form";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -21,7 +26,6 @@ interface Props {
   onGenerated: (body: string) => void;
 }
 
-type Category = "marketing" | "utility" | "authentication";
 type UseCase = "ventas" | "soporte" | "agendamiento" | "notificacion";
 
 const USE_CASE_LABELS: Record<UseCase, string> = {
@@ -29,12 +33,6 @@ const USE_CASE_LABELS: Record<UseCase, string> = {
   soporte: "Soporte al cliente",
   agendamiento: "Agendamiento / Citas",
   notificacion: "Notificación / Aviso",
-};
-
-const CATEGORY_LABELS: Record<Category, string> = {
-  marketing: "Marketing",
-  utility: "Utilidad",
-  authentication: "Autenticación",
 };
 
 // ── Skeleton ──────────────────────────────────────────────────────────────────
@@ -59,7 +57,7 @@ function GeneratingSkeleton() {
 
 export function AiTemplateGenerator({ workspaceId, onGenerated }: Props) {
   const [description, setDescription] = useState("");
-  const [category, setCategory] = useState<Category>("utility");
+  const [category, setCategory] = useState<TemplateCategory>("utility");
   const [useCase, setUseCase] = useState<UseCase>("notificacion");
   const [isLoading, setIsLoading] = useState(false);
   const [preview, setPreview] = useState<string | null>(null);
@@ -148,14 +146,14 @@ export function AiTemplateGenerator({ workspaceId, onGenerated }: Props) {
           </Label>
           <Select
             value={category}
-            onValueChange={(v) => setCategory(v as Category)}
+            onValueChange={(v) => setCategory(v as TemplateCategory)}
             disabled={isLoading}
           >
             <SelectTrigger id="ai-category" className="h-9 text-sm">
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
-              {(Object.keys(CATEGORY_LABELS) as Category[]).map((c) => (
+              {TEMPLATE_CATEGORIES.map((c) => (
                 <SelectItem key={c} value={c}>
                   {CATEGORY_LABELS[c]}
                 </SelectItem>

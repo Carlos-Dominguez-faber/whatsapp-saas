@@ -3,6 +3,9 @@ import { NextResponse } from "next/server";
 import { createClient as createSbClient } from "@supabase/supabase-js";
 import { processNextBatch } from "@/features/inbox/services/buffer";
 
+// One targeted batch = one LLM turn + tools. Same budget as the cron.
+export const maxDuration = 300;
+
 // ──────────────────────────────────────────────────────────────────────────────
 // SEC-05: Internal buffer process endpoint
 //
@@ -80,7 +83,10 @@ export async function POST(request: Request): Promise<NextResponse> {
       .from("message_batches")
       .select("id, workspace_id, status")
       .eq("id", batchId)
-      .in("status", ["buffering", "processing"])
+      // Only a batch nobody holds can be re-armed. Reviving one in
+      // 'processing' would let claim_next_batch() hand it to a second worker
+      // while the first is still generating → double reply.
+      .eq("status", "buffering")
       .maybeSingle();
 
     if (batchError) {
@@ -101,26 +107,48 @@ export async function POST(request: Request): Promise<NextResponse> {
       );
     }
 
-    // Force the batch into 'buffering' with flush_at = now so processNextBatch
-    // can claim it immediately via the RPC
-    await supabase
+    // Set flush_at = now so processNextBatch can claim it immediately via the
+    // RPC. The UPDATE repeats the status guard: between the SELECT above and
+    // this write the cron may have claimed the batch, and re-arming it then
+    // would hand it to a second worker → double reply.
+    const { data: rearmed, error: rearmError } = await supabase
       .from("message_batches")
       .update({
-        status: "buffering",
         flush_at: new Date().toISOString(),
         updated_at: new Date().toISOString(),
       })
       .eq("id", batchId)
-      .eq("workspace_id", batch.workspace_id); // explicit workspace guard
+      .eq("workspace_id", batch.workspace_id) // explicit workspace guard
+      .eq("status", "buffering")
+      .select("id");
+
+    if (rearmError) {
+      console.error("[internal/buffer/process] batch re-arm error:", rearmError);
+      return NextResponse.json(
+        { error: "No se pudo preparar el lote" },
+        { status: 500 },
+      );
+    }
+
+    if (!rearmed || rearmed.length === 0) {
+      return NextResponse.json(
+        { error: "El lote ya está siendo procesado" },
+        { status: 409 },
+      );
+    }
   }
 
   // ── 3b. Process next ready batch (or the one we just primed above) ────────
   const result = await processNextBatch();
 
+  if (result.error) {
+    console.error("[internal/buffer/process] processing error:", result.error);
+  }
+
   return NextResponse.json({
     ok: true,
     processed: result.processed,
     batchId: batchId ?? undefined,
-    ...(result.error ? { error: result.error } : {}),
+    ...(result.error ? { error: "No se pudo procesar el lote" } : {}),
   });
 }

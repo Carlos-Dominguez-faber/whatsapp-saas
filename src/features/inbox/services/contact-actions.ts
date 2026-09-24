@@ -6,6 +6,7 @@
 
 import { z } from "zod";
 import { createClient } from "@/lib/supabase/server";
+import { checkWorkspaceMember } from "@/lib/auth/workspace-access";
 import { syncContactToHL } from "./highlevel-client";
 import type { ContactRow } from "@/features/inbox/types";
 
@@ -118,13 +119,10 @@ export async function syncContactHL(
   contactId: string,
   workspaceId: string,
 ): Promise<ActionResult<{ hl_id: string }>> {
-  const supabase = await createClient();
-  const {
-    data: { user },
-    error: authError,
-  } = await supabase.auth.getUser();
-
-  if (authError || !user) {
+  // workspaceId comes from the client: verify membership here, with the role
+  // the contacts write policy requires.
+  const access = await checkWorkspaceMember(workspaceId, { minRole: "agent" });
+  if (!access.ok) {
     return { ok: false, error: "No autorizado" };
   }
 
