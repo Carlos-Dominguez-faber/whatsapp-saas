@@ -1,4 +1,8 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
+import {
+  extractWebhookError,
+  type WhatsAppError,
+} from "./whatsapp-errors";
 
 /**
  * Verifies a Kapso webhook signature.
@@ -349,6 +353,11 @@ const STATUS_EVENTS: Record<string, string> = {
 export interface ParsedStatus {
   wamid: string;
   status: string;
+  /**
+   * Solo en `failed`: por qué falló, ya traducido para el operador.
+   * Nunca null en un failed — el extractor cae a un texto genérico.
+   */
+  error: WhatsAppError | null;
 }
 
 /**
@@ -372,7 +381,14 @@ export function parseStatusUpdate(
     const wamid = asString(message?.id) ?? asString(event.message_id);
     if (!wamid) return null;
 
-    return { wamid, status };
+    // Un `failed` sin motivo es el ícono rojo mudo que el operador no puede
+    // resolver. El extractor recorre los candidatos del sobre de Kapso y, si no
+    // encuentra ninguno, devuelve el texto genérico en vez de romper.
+    return {
+      wamid,
+      status,
+      error: status === "failed" ? extractWebhookError(event) : null,
+    };
   } catch {
     return null;
   }

@@ -1,0 +1,174 @@
+import assert from "node:assert/strict";
+import { test, mock } from "node:test";
+import { createHmac } from "node:crypto";
+
+process.env.NEXT_PUBLIC_SUPABASE_URL = "https://fake.supabase.co";
+process.env.SUPABASE_SERVICE_ROLE_KEY = "fake-service-key";
+process.env.BUFFER_PROCESS_SECRET = "buf-secret";
+
+const filterCalls: Array<[string, string, unknown]> = [];
+const updates: unknown[] = [];
+let lookupRow: Record<string, unknown> | null = null;
+let processCalls = 0;
+const updateFilters: Array<[string, unknown]> = [];
+// Rows the re-arm UPDATE reports as affected; [] = someone else claimed it first.
+let updatedRows: unknown[] = [{ id: "batch_1" }];
+let updateError: unknown = null;
+let processResult: { processed: boolean; error?: string } = { processed: true };
+
+const fakeSvc = {
+  from: () => ({
+    select: () => {
+      const chain: any = {
+        eq(col: string, val: unknown) {
+          filterCalls.push(["eq", col, val]);
+          return chain;
+        },
+        in(col: string, val: unknown) {
+          filterCalls.push(["in", col, val]);
+          return chain;
+        },
+        maybeSingle: async () => ({ data: lookupRow, error: null }),
+      };
+      return chain;
+    },
+    update: (patch: unknown) => {
+      updates.push(patch);
+      const chain: any = {
+        eq(col: string, val: unknown) {
+          updateFilters.push([col, val]);
+          return chain;
+        },
+        select: async () => ({ data: updatedRows, error: updateError }),
+        then: (r: any) => r({ error: updateError }),
+      };
+      return chain;
+    },
+  }),
+};
+mock.module("@supabase/supabase-js", {
+  exports: { createClient: () => fakeSvc },
+});
+mock.module("@/features/inbox/services/buffer.ts", {
+  exports: {
+    processNextBatch: async () => {
+      processCalls++;
+      return processResult;
+    },
+  },
+});
+
+const { POST, maxDuration } = await import("./route.ts");
+
+function signed(body: string, secret = "buf-secret") {
+  const sig = createHmac("sha256", secret).update(body).digest("hex");
+  return new Request("http://localhost/api/internal/buffer/process", {
+    method: "POST",
+    body,
+    headers: { Authorization: `Bearer ${sig}` },
+  });
+}
+
+function reset() {
+  filterCalls.length = 0;
+  updates.length = 0;
+  lookupRow = null;
+  processCalls = 0;
+  updateFilters.length = 0;
+  updatedRows = [{ id: "batch_1" }];
+  updateError = null;
+  processResult = { processed: true };
+}
+
+test("a targeted batchId only revives batches still in 'buffering', never one in flight", async () => {
+  reset();
+  const res = await POST(signed(JSON.stringify({ batchId: "batch_1" })));
+  assert.equal(res.status, 404);
+  assert.ok(
+    filterCalls.some(([op, col, val]) => op === "eq" && col === "status" && val === "buffering"),
+    `expected .eq("status","buffering"), got ${JSON.stringify(filterCalls)}`,
+  );
+  assert.ok(!filterCalls.some(([op]) => op === "in"), "must not use .in('status', [...processing])");
+  assert.equal(updates.length, 0, "a batch that is not buffering must not be re-armed");
+  assert.equal(processCalls, 0);
+});
+
+test("a buffering batch is re-armed and processed", async () => {
+  reset();
+  lookupRow = { id: "batch_1", workspace_id: "ws_1", status: "buffering" };
+  const res = await POST(signed(JSON.stringify({ batchId: "batch_1" })));
+  assert.equal(res.status, 200);
+  assert.equal(updates.length, 1);
+  assert.equal(processCalls, 1);
+});
+
+test("the re-arm UPDATE is conditioned on status 'buffering' too", async () => {
+  reset();
+  lookupRow = { id: "batch_1", workspace_id: "ws_1", status: "buffering" };
+  await POST(signed(JSON.stringify({ batchId: "batch_1" })));
+  assert.ok(
+    updateFilters.some(([col, val]) => col === "status" && val === "buffering"),
+    `expected the UPDATE to filter status=buffering, got ${JSON.stringify(updateFilters)}`,
+  );
+});
+
+test("409 without processing when the batch was claimed between the lookup and the re-arm", async () => {
+  reset();
+  lookupRow = { id: "batch_1", workspace_id: "ws_1", status: "buffering" };
+  updatedRows = []; // the cron claimed it: the conditional UPDATE matched nothing
+  const res = await POST(signed(JSON.stringify({ batchId: "batch_1" })));
+  assert.equal(res.status, 409);
+  assert.equal(processCalls, 0);
+});
+
+test("500 without processing when the re-arm UPDATE fails", async () => {
+  reset();
+  lookupRow = { id: "batch_1", workspace_id: "ws_1", status: "buffering" };
+  updateError = { message: "connection reset" };
+  const res = await POST(signed(JSON.stringify({ batchId: "batch_1" })));
+  assert.equal(res.status, 500);
+  assert.ok(!JSON.stringify(await res.json()).includes("connection reset"));
+  assert.equal(processCalls, 0);
+});
+
+test("a processing error is logged server-side and replaced by a generic message in the body", async () => {
+  reset();
+  const raw = "LLM returned an empty reply (toolCallsExecuted=5)";
+  processResult = { processed: false, error: raw };
+  const logs: unknown[][] = [];
+  const originalError = console.error;
+  console.error = (...args: unknown[]) => {
+    logs.push(args);
+  };
+  try {
+    const res = await POST(signed("{}"));
+    assert.equal(res.status, 200);
+    const body = (await res.json()) as { processed: boolean; error?: string };
+    assert.equal(body.processed, false);
+    assert.ok(body.error, "the caller still learns that processing failed");
+    assert.ok(!JSON.stringify(body).includes(raw), `raw error leaked: ${JSON.stringify(body)}`);
+    assert.ok(logs.some((a) => a.map(String).join(" ").includes(raw)));
+  } finally {
+    console.error = originalError;
+  }
+});
+
+test("a successful run returns processed without an error field", async () => {
+  reset();
+  const res = await POST(signed("{}"));
+  assert.equal(res.status, 200);
+  const body = (await res.json()) as Record<string, unknown>;
+  assert.equal(body.processed, true);
+  assert.equal("error" in body, false);
+});
+
+test("rejects a body signed with the wrong secret", async () => {
+  reset();
+  const res = await POST(signed(JSON.stringify({ batchId: "batch_1" }), "wrong"));
+  assert.equal(res.status, 401);
+  assert.equal(processCalls, 0);
+});
+
+test("declares maxDuration", () => {
+  assert.equal(maxDuration, 300);
+});

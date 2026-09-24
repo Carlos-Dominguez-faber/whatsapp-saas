@@ -24,8 +24,11 @@ export async function isSignupOpen(): Promise<boolean> {
     .from("users")
     .select("id", { count: "exact", head: true });
 
-  if (error) return false;
-  return (count ?? 0) === 0;
+  // Fails closed: an error OR a missing count (e.g. no content-range header
+  // in the response) both report signup as closed. `count` only means "zero
+  // users" when we can positively confirm it — never by defaulting a null.
+  if (error || count === null || count === undefined) return false;
+  return count === 0;
 }
 
 /** Promotes the bootstrap user (first registration) to agency super admin. */

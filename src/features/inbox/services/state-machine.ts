@@ -25,10 +25,35 @@ const TRANSITIONS: Record<ConversationState, ConversationState[]> = {
   closed: [], // terminal
 };
 
+export type TransitionErrorCode = "invalid_transition" | "state_mismatch";
+
 export class TransitionError extends Error {
-  constructor(from: ConversationState, to: ConversationState) {
-    super(`Invalid transition: ${from} → ${to}`);
+  /**
+   * `invalid_transition`: la máquina de estados no permite from → to.
+   * `state_mismatch`: el CAS de applyTransition perdió la carrera — otro
+   *   caller movió el estado entre la lectura y el UPDATE, y `from` es el
+   *   estado REAL con el que quedó la fila.
+   * El ejecutor de automatizaciones trata los dos igual (`skipped`
+   * `transition_not_allowed`); el código está para no tener que
+   * distinguirlos por el texto del mensaje.
+   */
+  readonly code: TransitionErrorCode;
+
+  constructor(
+    from: ConversationState,
+    to: ConversationState,
+    code: TransitionErrorCode = "invalid_transition",
+  ) {
+    // El prefijo "Invalid transition:" es CONTRATO con tres rutas que ramifican
+    // por él para responder 422 en vez de 500 (handoff, take, toggle-ai). Los
+    // dos códigos lo conservan a propósito.
+    super(
+      code === "state_mismatch"
+        ? `Invalid transition: ${from} → ${to} (state moved under us)`
+        : `Invalid transition: ${from} → ${to}`,
+    );
     this.name = "TransitionError";
+    this.code = code;
   }
 }
 
@@ -66,6 +91,15 @@ export function aiShouldRespond(state: ConversationState): boolean {
 
 // Phrases that signal the user wants a human agent.
 // Normalized to lowercase + NFD decomposition before matching.
+//
+// Toda frase de acá tiene que pedir una persona de forma inequívoca: el match
+// es por substring y corre ANTES del LLM (decision-engine paso 3), así que un
+// falso positivo deriva la conversación sin que el modelo ni la base de
+// conocimiento alcancen a intervenir. Por eso "agente" a secas no está: derivaba
+// a quien escribía "quiero un agente de WhatsApp para mi negocio", alguien
+// preguntando por un producto, no pidiendo una persona.
+// "agente humano" se queda, y "quiero hablar con un agente" sigue derivando
+// por "hablar con".
 const HANDOFF_PHRASES = [
   "hablar con",
   "hablar con alguien",
@@ -76,12 +110,16 @@ const HANDOFF_PHRASES = [
   "con una persona",
   "con un humano",
   "atiende un humano",
-  "agente",
   "operador",
   "soporte humano",
 ];
 
-function normalizeText(text: string): string {
+/**
+ * Minúsculas + NFD sin diacríticos. Exportada porque el matching de keywords
+ * de las automatizaciones tiene que normalizar exactamente igual que el
+ * detector de handoff — dos normalizadores distintos se desincronizan.
+ */
+export function normalizeText(text: string): string {
   return text
     .toLowerCase()
     .normalize("NFD")
