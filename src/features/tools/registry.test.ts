@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { z } from "zod";
-import { registry } from "./registry.ts";
+import { registry, sanitizeArgs } from "./registry.ts";
 import type { Tool, ToolContext } from "./core/tool";
 
 process.env.NEXT_PUBLIC_SUPABASE_URL = "https://fake.supabase.co";
@@ -83,4 +83,46 @@ test("retries a non-write tool up to the configured retry count (pre-existing be
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+test("runTool executes a Tool object directly, without it being registered", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () =>
+    new Response(null, { status: 204 })) as typeof fetch;
+
+  try {
+    const unregisteredTool: Tool = {
+      name: "never_registered",
+      description: "test tool never added to the registry map",
+      sensitivity: "read",
+      schema: z.object({}),
+      enabledFor: () => true,
+      run: async () => ({ ok: true, output: "direct" }),
+    };
+
+    const result = await registry.runTool(unregisteredTool, {}, ctx);
+
+    assert.equal(result.ok, true);
+    assert.equal(result.output, "direct");
+    assert.equal(
+      registry.get("never_registered"),
+      undefined,
+      "runTool must not have registered the tool as a side effect",
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("sanitizeArgs redacts a key flagged sensitive by the tool, even without a matching secret-name pattern", () => {
+  const result = sanitizeArgs(
+    { codigo_cliente: "1234-5678", note: "hola" },
+    ["codigo_cliente"],
+  );
+  assert.deepEqual(result, { codigo_cliente: "[REDACTED]", note: "hola" });
+});
+
+test("sanitizeArgs still redacts generic secret-shaped keys with no extra flags", () => {
+  const result = sanitizeArgs({ api_token: "shh", city: "Santiago" });
+  assert.deepEqual(result, { api_token: "[REDACTED]", city: "Santiago" });
 });
