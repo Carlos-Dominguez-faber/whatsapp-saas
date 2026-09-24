@@ -66,6 +66,15 @@ export function aiShouldRespond(state: ConversationState): boolean {
 
 // Phrases that signal the user wants a human agent.
 // Normalized to lowercase + NFD decomposition before matching.
+//
+// Toda frase de acá tiene que pedir una persona de forma inequívoca: el match
+// es por substring y corre ANTES del LLM (decision-engine paso 3), así que un
+// falso positivo deriva la conversación sin que el modelo ni la base de
+// conocimiento alcancen a intervenir. Por eso "agente" a secas no está: derivaba
+// a quien escribía "quiero un agente de WhatsApp para mi negocio", alguien
+// preguntando por un producto, no pidiendo una persona.
+// "agente humano" se queda, y "quiero hablar con un agente" sigue derivando
+// por "hablar con".
 const HANDOFF_PHRASES = [
   "hablar con",
   "hablar con alguien",
@@ -76,7 +85,6 @@ const HANDOFF_PHRASES = [
   "con una persona",
   "con un humano",
   "atiende un humano",
-  "agente",
   "operador",
   "soporte humano",
 ];

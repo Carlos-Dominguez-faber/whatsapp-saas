@@ -65,8 +65,16 @@ function updateChain(table: string, resolveValue: () => unknown) {
   return chain;
 }
 
+// Lo que devuelve el SELECT de `listPrompts` en los tests del GET.
+let listResult: { data: unknown; error: unknown } = { data: [], error: null };
+
 const fakeSvc = {
   from: (table: string) => ({
+    select: () => ({
+      eq: () => ({
+        order: async () => listResult,
+      }),
+    }),
     update: () => {
       if (table === "prompt_versions") {
         // Dos updates distintos comparten la tabla: el de publish (con
@@ -87,7 +95,7 @@ mock.module("@supabase/supabase-js", {
   exports: { createClient: () => fakeSvc },
 });
 
-const { PATCH } = await import("./route.ts");
+const { PATCH, GET } = await import("./route.ts");
 
 const WORKSPACE_A = "ws_a";
 const PROMPT_ID = "11111111-1111-4111-8111-111111111111";
@@ -107,6 +115,7 @@ function reset() {
   authUser = { id: "user_1" };
   memberRow = { role: "admin" };
   versionUpdateRows = [{ id: "version_1" }];
+  listResult = { data: [], error: null };
   updatedFilters.prompt_versions.length = 0;
   updatedFilters.prompts.length = 0;
 }
@@ -202,4 +211,56 @@ test("body invalido: promptId no es uuid responde 400", async () => {
     params,
   );
   assert.equal(res.status, 400);
+});
+
+// ── GET ──────────────────────────────────────────────────────────────────────
+// El GET devolvía 500 siempre (embed ambiguo, PGRST201) sin que nadie lo
+// notara: no tenía ningún test y ningún componente lo llama. Estos fijan sus cuatro respuestas.
+
+const getReq = new NextRequest("http://localhost/api/workspace/ws_a/prompts");
+
+test("GET: sin sesión -> 401", async () => {
+  reset();
+  authUser = null;
+  const res = await GET(getReq, params);
+  assert.equal(res.status, 401);
+});
+
+test("GET: usuario sin membresía en el workspace -> 403", async () => {
+  reset();
+  memberRow = null;
+  const res = await GET(getReq, params);
+  assert.equal(res.status, 403);
+});
+
+test("GET: un viewer lee los prompts -> 200", async () => {
+  reset();
+  // A diferencia del POST y el PATCH, leer no exige admin/manager: cualquier
+  // miembro puede, igual que la policy `prompt_versions_select`.
+  memberRow = { role: "viewer" };
+  listResult = { data: [{ id: "prompt_1" }], error: null };
+
+  const res = await GET(getReq, params);
+
+  assert.equal(res.status, 200);
+  assert.deepEqual(await res.json(), { data: [{ id: "prompt_1" }] });
+});
+
+test("GET: si la consulta falla -> 500 sin filtrar el detalle técnico", async () => {
+  reset();
+  listResult = {
+    data: null,
+    error: { message: "Could not embed because more than one relationship" },
+  };
+
+  const res = await GET(getReq, params);
+
+  assert.equal(res.status, 500);
+  const body = (await res.json()) as { error: string };
+  assert.equal(body.error, "Error interno del servidor");
+  assert.doesNotMatch(
+    JSON.stringify(body),
+    /embed|relationship/,
+    "el error de PostgREST no puede viajar al cliente",
+  );
 });

@@ -31,7 +31,10 @@ test("transition throws TransitionError with a descriptive message when invalid"
     assert.fail("expected transition to throw");
   } catch (err) {
     assert.ok(err instanceof TransitionError);
-    assert.equal((err as Error).message, "Invalid transition: closed → ai_active");
+    assert.equal(
+      (err as Error).message,
+      "Invalid transition: closed → ai_active",
+    );
   }
 });
 
@@ -54,9 +57,32 @@ test("detectsHandoffTrigger matches a known phrase regardless of case", () => {
 });
 
 test("detectsHandoffTrigger matches a phrase with accents normalized away", () => {
-  assert.equal(detectsHandoffTrigger("AGÉNTE, necesito ayuda"), true);
+  assert.equal(detectsHandoffTrigger("NECESÍTO HABLÁR con un humano"), true);
 });
 
 test("detectsHandoffTrigger returns false when no trigger phrase is present", () => {
-  assert.equal(detectsHandoffTrigger("¿cuál es el horario de atención?"), false);
+  assert.equal(
+    detectsHandoffTrigger("¿cuál es el horario de atención?"),
+    false,
+  );
+});
+
+// Regresión: "agente" a secas estaba en HANDOFF_PHRASES y derivaba a quien
+// preguntaba por un agente de WhatsApp (un producto), antes de que el LLM o la
+// base de conocimiento alcanzaran a responder.
+test("detectsHandoffTrigger no deriva a quien pide un agente de WhatsApp", () => {
+  assert.equal(
+    detectsHandoffTrigger("Quiero un agente de WhatsApp para mi negocio"),
+    false,
+  );
+  assert.equal(detectsHandoffTrigger("cuánto cuesta un agente de IA?"), false);
+});
+
+test("detectsHandoffTrigger sigue derivando a quien pide un agente humano", () => {
+  assert.equal(detectsHandoffTrigger("quiero hablar con un agente"), true);
+  assert.equal(detectsHandoffTrigger("necesito un agente humano"), true);
+  assert.equal(
+    detectsHandoffTrigger("me pueden comunicar con un operador"),
+    true,
+  );
 });
