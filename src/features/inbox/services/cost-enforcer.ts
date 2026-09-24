@@ -43,24 +43,23 @@ export async function enforceCostPolicy(
   const dayStart = new Date();
   dayStart.setUTCHours(0, 0, 0, 0);
 
-  const { data: dailyEvents, error } = await supabase
-    .from("events")
-    .select("payload")
-    .eq("type", "llm_usage")
-    .eq("workspace_id", workspaceId)
-    .gte("created_at", dayStart.toISOString());
+  const { data, error } = await supabase.rpc("sum_daily_llm_tokens", {
+    p_workspace_id: workspaceId,
+    p_day_start: dayStart.toISOString(),
+  });
 
   if (error) {
     console.error("[cost-enforcer] failed to read daily events:", error);
-    // Fail open — don't block on DB errors
-    return { policy: "allow", reason: "db_error_fail_open" };
+    // Fail closed — an unverifiable budget is treated as exceeded, not
+    // allowed. A transient Supabase blip now blocks AI
+    // for this workspace instead of permitting unbounded spend; that
+    // tradeoff is intentional for a money guard.
+    return { policy: "cut", reason: "db_error_fail_closed" };
   }
 
-  const totalTokensToday = (dailyEvents ?? []).reduce((sum, row) => {
-    const payload = row.payload as Record<string, unknown> | null;
-    const t = payload?.total_tokens;
-    return sum + (typeof t === "number" ? t : 0);
-  }, 0);
+  // sum_daily_llm_tokens sums in SQL — no PostgREST
+  // row-cap truncation regardless of how many llm_usage events exist today.
+  const totalTokensToday = Number(data) || 0;
 
   if (totalTokensToday >= DAILY_TOKEN_HARD_LIMIT) {
     console.warn(
