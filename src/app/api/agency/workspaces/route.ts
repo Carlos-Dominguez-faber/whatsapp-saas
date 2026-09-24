@@ -50,6 +50,13 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: result.error }, { status: 400 });
   }
 
+  if (result.needsConfirmation) {
+    return NextResponse.json(
+      { needsConfirmation: true, existingUser: result.existingUser },
+      { status: 409 },
+    );
+  }
+
   return NextResponse.json(
     { workspaceId: result.workspaceId, webhookUrl: result.webhookUrl },
     { status: 201 },

@@ -35,6 +35,11 @@ export interface HLConfig {
   pipelineId: string | null;
   /** Stage within the pipeline for new opportunities; null when not configured. */
   pipelineStageId: string | null;
+  /**
+   * IANA timezone for availability queries when the model does not pass a
+   * valid one. Defaults to "UTC".
+   */
+  timezone: string;
 }
 
 export interface HLPipeline {
@@ -125,6 +130,7 @@ export async function getHLConfig(
     calendarId: str(calendarId),
     pipelineId: str(pipelineId),
     pipelineStageId: str(pipelineStageId),
+    timezone: str(config.timezone) ?? "UTC",
   };
 }
 
@@ -195,6 +201,7 @@ export async function syncContactToHL(
     .from("contacts")
     .select("id, name, phone, email, tags, hl_contact_id")
     .eq("id", contactId)
+    .eq("workspace_id", workspaceId)
     .single();
 
   if (contactError || !contactData) {
@@ -265,7 +272,8 @@ export async function syncContactToHL(
   const { error: updateError } = await supabase
     .from("contacts")
     .update({ hl_contact_id: hlId, updated_at: new Date().toISOString() })
-    .eq("id", contactId);
+    .eq("id", contactId)
+    .eq("workspace_id", workspaceId);
 
   if (updateError) {
     console.error("[HL] Failed to save hl_contact_id:", updateError.message);
@@ -414,6 +422,7 @@ export async function createHLOpportunity(
     .from("contacts")
     .select("id, name, phone, email, hl_contact_id")
     .eq("id", contactId)
+    .eq("workspace_id", workspaceId)
     .single();
 
   if (contactError || !contactData) {
@@ -445,7 +454,8 @@ export async function createHLOpportunity(
           hl_contact_id: hlContactId,
           updated_at: new Date().toISOString(),
         })
-        .eq("id", contactId);
+        .eq("id", contactId)
+        .eq("workspace_id", workspaceId);
     }
   }
   if (!hlContactId) {

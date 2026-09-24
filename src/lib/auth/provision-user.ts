@@ -13,6 +13,34 @@ export function generatePassword(): string {
   return randomBytes(16).toString("base64url");
 }
 
+export interface ExistingUserLookup {
+  id: string;
+  email: string;
+}
+
+/**
+ * Resolves an existing auth user by email via the admin API, or null if none exists.
+ * Paginates through the full user list (listUsers defaults to page 1 / 50 per page —
+ * an existing match past the first page would otherwise go undetected) and compares
+ * case-insensitively (GoTrue stores emails lowercased, but the caller may not send
+ * one already lowercased). Fails closed: a listUsers() error throws instead of
+ * silently reporting "no existing user".
+ */
+export async function findAuthUserByEmail(
+  service: SupabaseClient,
+  email: string,
+): Promise<ExistingUserLookup | null> {
+  const target = email.trim().toLowerCase();
+  for (let page = 1; ; page++) {
+    const { data, error } = await service.auth.admin.listUsers({ page, perPage: 200 });
+    if (error) throw new Error("No se pudo verificar el email");
+    const users = data?.users ?? [];
+    const hit = users.find((u) => u.email?.toLowerCase() === target);
+    if (hit) return { id: hit.id, email: hit.email ?? email };
+    if (users.length < 200) return null;
+  }
+}
+
 export interface ProvisionResult {
   userId: string;
   /** Password to share with the user — only set when a NEW account was created. */
@@ -47,8 +75,8 @@ export async function provisionWorkspaceUser(
 
   if (!userId) {
     // Most likely the email is already registered — resolve the existing user.
-    const { data: list } = await service.auth.admin.listUsers();
-    userId = list?.users?.find((u) => u.email === email)?.id ?? null;
+    const existing = await findAuthUserByEmail(service, email);
+    userId = existing?.id ?? null;
     created = false;
     if (!userId) {
       throw new Error(error?.message ?? "No se pudo crear el usuario");

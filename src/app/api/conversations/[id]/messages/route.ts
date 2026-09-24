@@ -6,7 +6,7 @@ import { z } from "zod";
 import { dispatchText } from "@/features/inbox/services/dispatch";
 import { applyTransition } from "@/features/inbox/services/decision-engine";
 import { getActiveAgent } from "@/features/agents/services/active-agent";
-import { readJsonBody } from "@/lib/auth/workspace-access";
+import { readJsonBody, requireWorkspaceMember } from "@/lib/auth/workspace-access";
 
 const BodySchema = z.object({
   body: z.string().min(1).max(4096),
@@ -46,6 +46,15 @@ export async function POST(
     return NextResponse.json({ error: "Not found" }, { status: 404 });
   }
 
+  // 3b. Role gate. RLS proved membership; the DB
+  // policy "ws agents send messages" limits sending to admin/manager/agent,
+  // but dispatchText runs with service role and would bypass it. Mirror the
+  // policy here so a viewer cannot send from the composer.
+  const auth = await requireWorkspaceMember(conv.workspace_id as string, {
+    minRole: "agent",
+  });
+  if (!auth.ok) return auth.response;
+
   // 4. Dispatch via the single exit point
   const result = await dispatchText({
     workspaceId: conv.workspace_id,
@@ -60,6 +69,9 @@ export async function POST(
 
   // Sleep the bot when a human intervenes (configurable per agent, default on).
   // Transition ai_active → human_active so the AI stops replying this thread.
+  // Authorized by the send gate above (admin/manager/agent), not by the
+  // conversations UPDATE policy: an agent answering an unassigned conversation
+  // must be able to sleep the bot, and the transition assigns it to them.
   if (conv.ai_enabled) {
     try {
       const activeAgent = await getActiveAgent(conv.workspace_id);
@@ -67,6 +79,7 @@ export async function POST(
       if (sleepOnManual) {
         await applyTransition(conversationId, "human_active", {
           userId: user.id,
+          workspaceId: conv.workspace_id as string,
         });
       }
     } catch (e) {

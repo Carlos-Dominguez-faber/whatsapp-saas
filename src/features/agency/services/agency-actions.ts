@@ -3,11 +3,14 @@
 import { createClient } from "@/lib/supabase/server";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { z } from "zod";
-import { provisionWorkspaceUser } from "@/lib/auth/provision-user";
+import { provisionWorkspaceUser, generatePassword, findAuthUserByEmail } from "@/lib/auth/provision-user";
 import type {
   ClientCredentials,
   CreateWorkspaceResult,
   GetWorkspacesResult,
+  GetWorkspaceMembersResult,
+  ResetMemberPasswordResult,
+  WorkspaceMember,
   WorkspaceWithStats,
 } from "../types";
 
@@ -23,6 +26,7 @@ const CreateWorkspaceSchema = z.object({
     .max(72)
     .optional()
     .or(z.literal("")),
+  confirmReuseExistingEmail: z.boolean().optional(),
 });
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -74,9 +78,85 @@ export async function createWorkspaceForClient(
     return { error: parsed.error.issues[0]?.message ?? "Datos inválidos" };
   }
 
-  const { name, useCase, clientEmail, clientPassword } = parsed.data;
+  const { name, useCase, clientEmail, clientPassword, confirmReuseExistingEmail } =
+    parsed.data;
   const service = svc();
+
+  // Reusing an email across workspaces is sometimes legitimate (one person running
+  // two businesses), so we never block it — but it must never happen silently.
+  // Check BEFORE creating anything so an unconfirmed reuse leaves no orphaned rows.
+  if (clientEmail && clientEmail.length > 0 && !confirmReuseExistingEmail) {
+    let existing;
+    try {
+      existing = await findAuthUserByEmail(service, clientEmail);
+    } catch (err) {
+      console.error("[agency] email precheck error:", err);
+      return { error: "No se pudo verificar el email, intenta de nuevo" };
+    }
+    if (existing) {
+      const { data: profile } = await service
+        .from("users")
+        .select("full_name")
+        .eq("id", existing.id)
+        .single();
+      return {
+        needsConfirmation: true,
+        existingUser: {
+          email: existing.email,
+          fullName: (profile as { full_name: string | null } | null)?.full_name ?? null,
+        },
+      };
+    }
+  }
+
   let clientCredentials: ClientCredentials | null = null;
+
+  // Resolve/create the client account BEFORE creating anything else. The
+  // precheck above is only an early UX hint — the atomic check is
+  // provisionWorkspaceUser's own createUser call (unique constraint on
+  // auth.users.email). Doing this first means a race (a concurrent request
+  // created the same email between our precheck and this call) or an
+  // unresolvable confirmed reuse never leaves a workspace to roll back —
+  // there's nothing to undo because nothing was created yet.
+  let provisioned: Awaited<ReturnType<typeof provisionWorkspaceUser>> | null = null;
+  if (clientEmail && clientEmail.length > 0) {
+    try {
+      const result = await provisionWorkspaceUser(service, clientEmail, {
+        password: clientPassword || undefined,
+      });
+
+      if (result.created === false && !confirmReuseExistingEmail) {
+        // Race: the precheck above found no existing user, but by the time we
+        // got here a concurrent request had already created it. Treat this
+        // exactly like an unconfirmed reuse instead of silently adopting the
+        // raced-in account.
+        const { data: profile } = await service
+          .from("users")
+          .select("full_name")
+          .eq("id", result.userId)
+          .single();
+        return {
+          needsConfirmation: true,
+          existingUser: {
+            email: clientEmail,
+            fullName: (profile as { full_name: string | null } | null)?.full_name ?? null,
+          },
+        };
+      }
+
+      provisioned = result;
+    } catch (err) {
+      console.error("[agency] client provisioning error:", err);
+      if (confirmReuseExistingEmail) {
+        // The super admin explicitly confirmed reusing an existing account —
+        // if we can't actually resolve it, this must stop, not silently
+        // report success without the client membership it promised.
+        return { error: "No se pudo verificar el email, intenta de nuevo" };
+      }
+      // Non-fatal — workspace still gets created below, agency can add the
+      // user later (pre-existing behavior for an unrelated creation failure).
+    }
+  }
 
   // Create workspace
   // Short, client-friendly slug: name + 3 random chars to avoid collisions.
@@ -92,6 +172,18 @@ export async function createWorkspaceForClient(
 
   if (wsError || !workspace) {
     console.error("[agency] workspace insert error:", wsError);
+    if (provisioned) {
+      // The client account was already resolved/created above (possibly a
+      // brand-new auth user with a generated password) but the workspace
+      // insert that was going to use it just failed. Leave a trace: the
+      // account isn't lost — the precheck will find it and offer
+      // confirmReuseExistingEmail on the next attempt — but its password
+      // (if newly generated) is now unrecoverable except via a manual reset.
+      console.error(
+        "[agency] client account left without a workspace after insert failure:",
+        provisioned.userId,
+      );
+    }
     return { error: "Error al crear el workspace" };
   }
 
@@ -110,35 +202,23 @@ export async function createWorkspaceForClient(
     console.error("[agency] owner membership insert error:", ownerMemberError);
   }
 
-  // Provision the client account directly (no email/SMTP): create the user with
-  // a known password and hand the credentials to the agency to share. The client
-  // logs in directly — no invite email, no password-reset link needed.
-  if (clientEmail && clientEmail.length > 0) {
-    try {
-      const provisioned = await provisionWorkspaceUser(service, clientEmail, {
-        password: clientPassword || undefined,
-      });
+  if (provisioned && clientEmail) {
+    const { error: memberError } = await service.from("memberships").insert({
+      workspace_id: workspaceId,
+      user_id: provisioned.userId,
+      role: "admin",
+      is_active: true,
+    });
+    if (memberError) {
+      console.error("[agency] membership insert error:", memberError);
+    }
 
-      const { error: memberError } = await service.from("memberships").insert({
-        workspace_id: workspaceId,
-        user_id: provisioned.userId,
-        role: "admin",
-        is_active: true,
-      });
-      if (memberError) {
-        console.error("[agency] membership insert error:", memberError);
-      }
-
-      // Only surface a password when we just created the account.
-      if (provisioned.password) {
-        clientCredentials = {
-          email: clientEmail,
-          password: provisioned.password,
-        };
-      }
-    } catch (err) {
-      console.error("[agency] client provisioning error:", err);
-      // Non-fatal — workspace still created, agency can add the user later.
+    // Only surface a password when we just created the account.
+    if (provisioned.password) {
+      clientCredentials = {
+        email: clientEmail,
+        password: provisioned.password,
+      };
     }
   }
 
@@ -382,4 +462,89 @@ export async function getAllWorkspacesWithStats(): Promise<GetWorkspacesResult> 
   }));
 
   return { workspaces: result };
+}
+
+export async function getWorkspaceMembers(
+  workspaceId: string,
+): Promise<GetWorkspaceMembersResult> {
+  const userId = await assertSuperAdmin();
+  if (!userId) return { error: "No autorizado" };
+
+  const service = svc();
+  const { data, error } = await service
+    .from("memberships")
+    .select("user_id, role, is_active, users(email, full_name)")
+    .eq("workspace_id", workspaceId);
+
+  if (error) {
+    console.error("[agency] fetch members error:", error);
+    return { error: "No se pudieron cargar los miembros" };
+  }
+
+  const members: WorkspaceMember[] = (
+    (data as unknown as {
+      user_id: string;
+      role: string;
+      is_active: boolean;
+      users: { email: string; full_name: string | null } | null;
+    }[]) ?? []
+  ).map((row) => ({
+    userId: row.user_id,
+    email: row.users?.email ?? "",
+    fullName: row.users?.full_name ?? null,
+    role: row.role,
+    isActive: row.is_active,
+  }));
+
+  return { members };
+}
+
+export async function resetMemberPassword(
+  workspaceId: string,
+  userId: string,
+): Promise<ResetMemberPasswordResult> {
+  const adminId = await assertSuperAdmin();
+  if (!adminId) return { error: "No autorizado" };
+
+  const service = svc();
+
+  const { data: membership, error: membershipError } = await service
+    .from("memberships")
+    .select("user_id")
+    .eq("workspace_id", workspaceId)
+    .eq("user_id", userId)
+    .eq("is_active", true)
+    .maybeSingle();
+
+  if (membershipError || !membership) {
+    console.error(
+      "[agency] reset target is not an active member of the workspace:",
+      membershipError,
+    );
+    return { error: "No se pudo resetear la clave" };
+  }
+
+  const { data: userRow, error: userError } = await service
+    .from("users")
+    .select("email")
+    .eq("id", userId)
+    .single();
+
+  if (userError || !userRow) {
+    console.error("[agency] resolve user for reset error:", userError);
+    return { error: "No se pudo resetear la clave" };
+  }
+
+  const password = generatePassword();
+  const { error: updateError } = await service.auth.admin.updateUserById(
+    userId,
+    { password },
+  );
+
+  if (updateError) {
+    console.error("[agency] password reset error:", updateError);
+    return { error: "No se pudo resetear la clave" };
+  }
+
+  return { email: (userRow as { email: string }).email, password };
 }
