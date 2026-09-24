@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useTransition } from "react";
+import { useRef, useState, useTransition } from "react";
 import { toast } from "sonner";
 import {
   Sheet,
@@ -65,6 +65,11 @@ export function CreateWorkspaceSheet({ open, onClose, onCreated }: Props) {
   const [copied, setCopied] = useState(false);
   const [copiedCred, setCopiedCred] = useState(false);
   const [saving, startSave] = useTransition();
+  const emailInputRef = useRef<HTMLInputElement>(null);
+  const [needsConfirmation, setNeedsConfirmation] = useState<{
+    email: string;
+    fullName: string | null;
+  } | null>(null);
 
   function handleClose() {
     if (saving) return;
@@ -76,6 +81,7 @@ export function CreateWorkspaceSheet({ open, onClose, onCreated }: Props) {
     setCredentials(null);
     setCopied(false);
     setCopiedCred(false);
+    setNeedsConfirmation(null);
     onClose();
   }
 
@@ -95,14 +101,14 @@ export function CreateWorkspaceSheet({ open, onClose, onCreated }: Props) {
     setTimeout(() => setCopiedCred(false), 2000);
   }
 
-  function handleSubmit(e: React.FormEvent) {
-    e.preventDefault();
+  function submitWorkspace(confirmReuseExistingEmail: boolean) {
     startSave(async () => {
       const result = await createWorkspaceForClient({
         name,
         useCase,
         clientEmail: clientEmail || undefined,
         clientPassword: clientPassword || undefined,
+        confirmReuseExistingEmail,
       });
 
       if (result.error) {
@@ -110,11 +116,31 @@ export function CreateWorkspaceSheet({ open, onClose, onCreated }: Props) {
         return;
       }
 
+      if (result.needsConfirmation) {
+        setNeedsConfirmation(result.existingUser);
+        return;
+      }
+
+      setNeedsConfirmation(null);
       setWebhookUrl(result.webhookUrl ?? null);
       setCredentials(result.clientCredentials ?? null);
       toast.success("Workspace creado correctamente");
       onCreated();
     });
+  }
+
+  function handleSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    submitWorkspace(false);
+  }
+
+  function handleUseExistingAccount() {
+    submitWorkspace(true);
+  }
+
+  function handleChangeEmail() {
+    setNeedsConfirmation(null);
+    emailInputRef.current?.focus();
   }
 
   return (
@@ -249,9 +275,13 @@ export function CreateWorkspaceSheet({ open, onClose, onCreated }: Props) {
               </Label>
               <Input
                 id="ws-email"
+                ref={emailInputRef}
                 type="email"
                 value={clientEmail}
-                onChange={(e) => setClientEmail(e.target.value)}
+                onChange={(e) => {
+                  setClientEmail(e.target.value);
+                  setNeedsConfirmation(null);
+                }}
                 placeholder="cliente@empresa.com"
                 disabled={saving}
               />
@@ -310,14 +340,50 @@ export function CreateWorkspaceSheet({ open, onClose, onCreated }: Props) {
               </Select>
             </div>
 
-            <Button
-              type="submit"
-              className="w-full"
-              disabled={saving || !name.trim()}
-              aria-busy={saving}
-            >
-              {saving ? "Dando de alta..." : "Dar de alta cliente"}
-            </Button>
+            {needsConfirmation && (
+              <div className="rounded-lg border border-warning/30 bg-warning/5 p-4 space-y-3">
+                <p className="text-sm text-foreground">
+                  El email{" "}
+                  <span className="font-medium">{needsConfirmation.email}</span> ya
+                  es la cuenta de{" "}
+                  <span className="font-medium">
+                    {needsConfirmation.fullName ?? needsConfirmation.email}
+                  </span>
+                  . ¿Usar esta misma cuenta para el workspace nuevo?
+                </p>
+                <div className="flex gap-2">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    className="flex-1"
+                    onClick={handleChangeEmail}
+                    disabled={saving}
+                  >
+                    Cambiar email
+                  </Button>
+                  <Button
+                    type="button"
+                    className="flex-1"
+                    onClick={handleUseExistingAccount}
+                    disabled={saving}
+                    aria-busy={saving}
+                  >
+                    {saving ? "Confirmando..." : "Usar esta cuenta"}
+                  </Button>
+                </div>
+              </div>
+            )}
+
+            {!needsConfirmation && (
+              <Button
+                type="submit"
+                className="w-full"
+                disabled={saving || !name.trim()}
+                aria-busy={saving}
+              >
+                {saving ? "Dando de alta..." : "Dar de alta cliente"}
+              </Button>
+            )}
           </form>
         )}
       </SheetContent>

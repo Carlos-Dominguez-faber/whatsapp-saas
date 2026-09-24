@@ -26,15 +26,25 @@ export interface ClientCredentials {
 
 export type CreateWorkspaceResult =
   | {
+      needsConfirmation: true;
+      existingUser: { email: string; fullName: string | null };
+      workspaceId?: never;
+      webhookUrl?: never;
+      clientCredentials?: never;
+      error?: never;
+    }
+  | {
       workspaceId: string;
       webhookUrl: string;
       clientCredentials?: ClientCredentials | null;
+      needsConfirmation?: never;
       error?: never;
     }
   | {
       workspaceId?: never;
       webhookUrl?: never;
       clientCredentials?: never;
+      needsConfirmation?: never;
       error: string;
     };
 
