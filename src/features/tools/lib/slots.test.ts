@@ -133,9 +133,22 @@ test("un valor no parseable se cuenta como ilegible, no se descarta en silencio"
   assert.equal(unreadable, 3);
 });
 
-test("un objeto en vez de un string se cuenta como ilegible", () => {
+test("acepta el formato de objeto de Cal.com ({ start }) además de strings", () => {
   const { days, unreadable } = groupByDay(
     [{ start: "2026-06-12T15:00:00Z" }, "2026-06-12T16:00:00Z"],
+    "UTC",
+  );
+
+  assert.equal(unreadable, 0);
+  assert.deepEqual(days["2026-06-12"], [
+    "2026-06-12T15:00:00Z",
+    "2026-06-12T16:00:00Z",
+  ]);
+});
+
+test("un objeto sin `start` sigue contándose como ilegible", () => {
+  const { days, unreadable } = groupByDay(
+    [{ time: "2026-06-12T15:00:00Z" }, "2026-06-12T16:00:00Z"],
     "UTC",
   );
 

@@ -12,7 +12,7 @@ import {
 } from "@/shared/lib/integration-secrets";
 
 const IntegrationSchema = z.object({
-  provider: z.enum(["kapso", "openrouter", "highlevel"]),
+  provider: z.enum(["kapso", "openrouter", "highlevel", "caldotcom"]),
   enabled: z.boolean().optional(),
   credentials: z.record(z.string(), z.string()).optional(),
   config: z.record(z.string(), z.unknown()).optional(),
@@ -112,8 +112,10 @@ export async function PUT(
 ) {
   const { id: workspaceId } = await params;
 
+  // Writing credentials mirrors the table's own policy
+  // (integrations_write_admins): admin only, not manager.
   const auth = await requireWorkspaceMember(workspaceId, {
-    minRole: "manager",
+    minRole: "admin",
   });
   if (!auth.ok) return auth.response;
 

@@ -1,5 +1,5 @@
 /**
- * Helpers de la tool de disponibilidad (check_availability, HighLevel).
+ * Helpers compartidos por las tools de disponibilidad (HighLevel y Cal.com).
  */
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -68,7 +68,8 @@ export function groupByDay(
 }
 
 /**
- * ISO de un slot tal como lo devolvió el proveedor (HighLevel manda strings).
+ * ISO de un slot tal como lo devolvió el proveedor. HighLevel manda strings;
+ * Cal.com v2 manda objetos `{ start }`.
  *
  * Un timestamp sin offset (`"2026-09-14T12:00:00"`) se rechaza a propósito:
  * `Date.parse` lo interpretaría en la zona del SERVIDOR, así que el día local
@@ -76,8 +77,14 @@ export function groupByDay(
  * adivinado.
  */
 function toIso(value: unknown): string | null {
-  if (typeof value !== "string" || !HAS_OFFSET.test(value)) return null;
-  return value;
+  const raw =
+    typeof value === "string"
+      ? value
+      : value && typeof value === "object" && "start" in value
+        ? (value as { start: unknown }).start
+        : null;
+  if (typeof raw !== "string" || !HAS_OFFSET.test(raw)) return null;
+  return raw;
 }
 
 /** Día `YYYY-MM-DD` de `instant` en `tz`. Degrada a UTC si la zona no sirve. */
@@ -125,7 +132,7 @@ export interface AvailabilityOutput {
 }
 
 /**
- * Output de la tool de disponibilidad.
+ * Output común de las dos tools de disponibilidad.
  *
  * Regla dura: **un dato ilegible nunca se convierte en "no hay horarios"**.
  * Si hubo descartes, el mensaje no puede afirmar ausencia de cupos — esa es la

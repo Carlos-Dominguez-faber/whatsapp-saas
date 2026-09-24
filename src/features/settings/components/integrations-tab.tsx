@@ -20,7 +20,7 @@ import { ModelPicker } from "@/features/agents/components/model-picker";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
-type Provider = "kapso" | "openrouter" | "highlevel";
+type Provider = "kapso" | "openrouter" | "highlevel" | "caldotcom";
 
 type IntegrationData = {
   provider: Provider;
@@ -877,6 +877,147 @@ function HighLevelSection({
   );
 }
 
+// ─── Cal.com section ──────────────────────────────────────────────────────────
+
+function CalDotComSection({
+  workspaceId,
+  initial,
+  onSaved,
+}: {
+  workspaceId: string;
+  initial: IntegrationData | undefined;
+  onSaved: () => void;
+}) {
+  const [apiKey, setApiKey] = useState(
+    initial?.credentials?.calcom_api_key ?? "",
+  );
+  const [timezone, setTimezone] = useState(
+    (initial?.config?.timezone as string | undefined) ?? "America/Santiago",
+  );
+  const [saving, setSaving] = useState(false);
+  const [testing, setTesting] = useState(false);
+
+  async function handleSave() {
+    setSaving(true);
+    try {
+      const res = await fetch(`/api/workspace/${workspaceId}/integrations`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          provider: "caldotcom",
+          enabled: true,
+          credentials: { calcom_api_key: apiKey },
+          config: { timezone },
+        }),
+      });
+      const json = (await res.json()) as { ok?: boolean; error?: string };
+      if (json.ok) {
+        toast.success("Configuración de Cal.com guardada");
+        onSaved();
+      } else {
+        toast.error(json.error ?? "Error al guardar");
+      }
+    } catch {
+      toast.error("Error de red al guardar");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function handleTest() {
+    setTesting(true);
+    try {
+      const res = await fetch(
+        `/api/workspace/${workspaceId}/integrations/calcom/test`,
+        { method: "POST" },
+      );
+      const json = (await res.json()) as {
+        ok: boolean;
+        error?: string;
+        eventTypeCount?: number;
+      };
+      if (json.ok) {
+        toast.success(
+          `Cal.com conectado — ${json.eventTypeCount ?? 0} tipos de evento`,
+        );
+      } else {
+        toast.error(json.error ?? "Error al probar la conexión");
+      }
+    } catch {
+      toast.error("Error de red al probar la conexión");
+    } finally {
+      setTesting(false);
+    }
+  }
+
+  return (
+    <Section
+      title="Cal.com"
+      description="Conecta tu cuenta de Cal.com con una API key para agendar citas."
+    >
+      <div className="grid gap-4">
+        <div className="space-y-2">
+          <Label htmlFor="calcom-api-key">API Key</Label>
+          <Input
+            id="calcom-api-key"
+            type="password"
+            placeholder="cal_..."
+            value={apiKey}
+            onChange={(e) => setApiKey(e.target.value)}
+            autoComplete="off"
+          />
+          <p className="text-xs text-muted-foreground">
+            Cal.com → Settings → Security → API Keys.
+          </p>
+        </div>
+
+        <div className="space-y-2">
+          <Label htmlFor="calcom-timezone">Zona horaria</Label>
+          <Input
+            id="calcom-timezone"
+            placeholder="America/Santiago"
+            value={timezone}
+            onChange={(e) => setTimezone(e.target.value)}
+            className="font-mono text-sm"
+          />
+          <p className="text-xs text-muted-foreground">
+            Zona IANA usada para consultar disponibilidad y agendar (ej.
+            America/Santiago, America/Mexico_City).
+          </p>
+        </div>
+
+        <div className="flex items-center gap-2 pt-2">
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            onClick={handleTest}
+            disabled={testing}
+            aria-busy={testing}
+          >
+            {testing && (
+              <Loader2 className="h-4 w-4 mr-2 animate-spin" aria-hidden />
+            )}
+            Probar conexión
+          </Button>
+          <Button
+            type="button"
+            size="sm"
+            onClick={handleSave}
+            disabled={saving}
+            aria-busy={saving}
+          >
+            {saving && (
+              <Loader2 className="h-4 w-4 mr-2 animate-spin" aria-hidden />
+            )}
+            Guardar
+          </Button>
+        </div>
+      </div>
+    </Section>
+  );
+}
+
 // ─── Main component ───────────────────────────────────────────────────────────
 
 interface Props {
@@ -902,6 +1043,7 @@ export function IntegrationsTab({ workspaceId, initialIntegrations }: Props) {
   const kapso = findIntegration(integrations, "kapso");
   const openrouter = findIntegration(integrations, "openrouter");
   const highlevel = findIntegration(integrations, "highlevel");
+  const caldotcom = findIntegration(integrations, "caldotcom");
 
   return (
     <div className="space-y-6">
@@ -920,6 +1062,12 @@ export function IntegrationsTab({ workspaceId, initialIntegrations }: Props) {
       <HighLevelSection
         workspaceId={workspaceId}
         initial={highlevel}
+        onSaved={refresh}
+      />
+      <Separator />
+      <CalDotComSection
+        workspaceId={workspaceId}
+        initial={caldotcom}
         onSaved={refresh}
       />
     </div>
