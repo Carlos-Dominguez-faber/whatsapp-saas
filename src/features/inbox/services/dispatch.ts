@@ -74,6 +74,13 @@ export interface DispatchResult {
    * dar la respuesta por perdida.
    */
   retryable?: boolean;
+  /**
+   * Código numérico de Meta (`waError.code`), solo con errorCode "SEND_FAILED".
+   * Uso interno del motor (ej. distinguir 132015 = plantilla pausada): NUNCA
+   * mostrarlo en UI, toast, respuesta HTTP ni columna que lea un miembro del
+   * workspace. undefined si Meta no lo mandó o no era numérico.
+   */
+  providerCode?: number;
 }
 
 /**
@@ -129,7 +136,19 @@ async function loadIntegration(
     );
   }
 
-  const row = data as IntegrationRow;
+  return kapsoCredentials(workspaceId, data as IntegrationRow);
+}
+
+/**
+ * Las dos credenciales de Kapso de una fila de `integrations`. Un solo lugar
+ * porque `loadIntegration` y `prepareTemplateDispatch` las leen igual y
+ * desincronizarlas es cómo se rompe el envío de una de las dos rutas.
+ * Lanza si una credencial cifrada no se puede descifrar.
+ */
+async function kapsoCredentials(
+  workspaceId: string,
+  row: IntegrationRow,
+): Promise<{ apiKey: string; phoneNumberId: string }> {
   const creds = await decryptCredentials(row.credentials, workspaceId, "kapso");
   return {
     apiKey: (creds.kapso_api_key as string | undefined) ?? "",
@@ -139,56 +158,86 @@ async function loadIntegration(
   };
 }
 
+type LoadFailure =
+  | { ok: false; errorCode: "DB_ERROR"; error: string }
+  | { ok: false; errorCode: "CONFIG_ERROR"; error: string };
+
 /**
- * Loads the conversation window and the contact's phone/opt-in, scoped to
- * `workspaceId`. This runs with the service role (no RLS), so the tenant
- * filter must live here: without it a conversationId from another workspace
- * would load and its contact would receive the message with this workspace's
- * credentials. Returns null when the conversation or contact is not in the
- * workspace; throws only on a database error.
+ * Núcleo de la carga: conversación + teléfono + opt-in, filtrando por workspace
+ * y SIN lanzar.
+ *
+ * Antes recargaba la conversación solo por id, y esto corre con service role
+ * (sin RLS): un conversationId de otro tenant cargaba igual y su teléfono
+ * recibía el mensaje. Y colapsaba "error de base" con "fila ausente" en un
+ * `throw`, que es justo lo que impide al motor de automatizaciones distinguir
+ * "configuración rota" de "base caída" ANTES de marcar el despacho.
  */
-async function loadConversationAndPhone(
+async function loadConversationAndPhoneResult(
   conversationId: string,
   workspaceId: string,
   supabase: ReturnType<typeof svc>,
-): Promise<{
-  window_expires_at: string | null;
-  toPhone: string;
-  optIn: boolean;
-} | null> {
+): Promise<
+  | {
+      ok: true;
+      window_expires_at: string | null;
+      contactId: string;
+      toPhone: string;
+      optIn: boolean;
+    }
+  | LoadFailure
+> {
   const { data: conv, error: convError } = await supabase
     .from("conversations")
     .select("window_expires_at, contact_id")
     .eq("id", conversationId)
+    // Esto corre con service role (sin RLS): sin el filtro, un conversationId
+    // de otro tenant cargaría igual y su teléfono recibiría el mensaje.
     .eq("workspace_id", workspaceId)
     .maybeSingle();
 
+  // Error de base ≠ fila ausente. El primero se reintenta, el segundo no se
+  // arregla solo.
   if (convError) {
-    throw new Error(`[dispatch] conversation lookup failed: ${convError.message}`);
+    return { ok: false, errorCode: "DB_ERROR", error: convError.message };
   }
-  if (!conv) return null;
+  if (!conv) {
+    return { ok: false, errorCode: "CONFIG_ERROR", error: "conversation_not_found" };
+  }
 
   const convRow = conv as ConversationWindowRow;
 
   const { data: contact, error: contactError } = await supabase
     .from("contacts")
+    // El opt_in viene ACÁ para que el chequeo de opt-out no necesite una
+    // SEGUNDA consulta a conversations + contacts.
     .select("phone, opt_in")
     .eq("id", convRow.contact_id)
     .eq("workspace_id", workspaceId)
     .maybeSingle();
 
   if (contactError) {
-    throw new Error(`[dispatch] contact lookup failed: ${contactError.message}`);
+    return { ok: false, errorCode: "DB_ERROR", error: contactError.message };
   }
-  if (!contact) return null;
+  if (!contact) {
+    return { ok: false, errorCode: "CONFIG_ERROR", error: "contact_not_found" };
+  }
 
   const contactRow = contact as ContactPhoneRow;
   return {
+    ok: true,
     window_expires_at: convRow.window_expires_at,
+    contactId: convRow.contact_id,
     toPhone: contactRow.phone,
     optIn: contactRow.opt_in !== false,
   };
 }
+
+/**
+ * Motivos de `loadConversationAndPhoneResult` que significan "no está en este
+ * workspace" (o no existe). Para `dispatchText`/`dispatchTemplate` eso es
+ * NOT_FOUND; el motor los sigue viendo como CONFIG_ERROR con su código.
+ */
+const NOT_FOUND_REASONS = new Set(["conversation_not_found", "contact_not_found"]);
 
 const NOT_FOUND: DispatchResult = {
   ok: false,
@@ -222,12 +271,16 @@ export async function dispatchText(
   const supabase = svc();
 
   // 1. Load conversation window + contact phone (scoped to the workspace)
-  const loaded = await loadConversationAndPhone(
+  const loaded = await loadConversationAndPhoneResult(
     conversationId,
     workspaceId,
     supabase,
   );
-  if (!loaded) return NOT_FOUND;
+  if (!loaded.ok) {
+    if (NOT_FOUND_REASONS.has(loaded.error)) return NOT_FOUND;
+    // Base caída: mismo contrato de siempre (lanza); el caller lo loguea.
+    throw new Error(`[dispatch] ${loaded.errorCode}: ${loaded.error}`);
+  }
   const { window_expires_at, toPhone } = loaded;
 
   // SEC-10: Block outbound to opted-out contacts
@@ -361,9 +414,44 @@ export async function dispatchText(
 // ──────────────────────────────────────────────────────────────────────────────
 // dispatchTemplate — sends an approved template (bypasses 24h window)
 // ──────────────────────────────────────────────────────────────────────────────
-export async function dispatchTemplate(
+/**
+ * Todo lo que hay que LEER para mandar una plantilla, en un solo lugar y sin
+ * lanzar nunca.
+ *
+ * Existe para que el motor de automatizaciones pueda escribir `dispatched_at`
+ * INMEDIATAMENTE antes del POST y no antes de estas lecturas. Con el orden
+ * anterior (marcar → dispatchTemplate → releer conversación, teléfono e
+ * integración), una caída transitoria de la base después de marcar cerraba el
+ * run como fallo sin reintento aunque jamás hubiera existido un request
+ * externo: evitaba duplicados perdiendo mensajes legítimos.
+ *
+ * `retryable` distingue "se cayó la base" (sí) de "la integración no está
+ * configurada" (no). Mirarlo acá es seguro porque todavía no se marcó nada.
+ */
+export interface PreparedTemplateDispatch {
+  workspaceId: string;
+  conversationId: string;
+  templateName: string;
+  templateLanguage: string;
+  components?: TemplateParams["components"];
+  senderUserId?: string;
+  toPhone: string;
+  apiKey: string;
+  phoneNumberId: string;
+}
+
+export type PrepareTemplateResult =
+  | { ok: true; prepared: PreparedTemplateDispatch }
+  | {
+      ok: false;
+      error: string;
+      errorCode: "OPT_OUT" | "DB_ERROR" | "CONFIG_ERROR";
+      retryable: boolean;
+    };
+
+export async function prepareTemplateDispatch(
   params: DispatchTemplateParams,
-): Promise<DispatchResult> {
+): Promise<PrepareTemplateResult> {
   const {
     workspaceId,
     conversationId,
@@ -375,25 +463,157 @@ export async function dispatchTemplate(
 
   const supabase = svc();
 
-  // 1. Load contact phone (templates bypass the window guard entirely)
-  const loaded = await loadConversationAndPhone(
+  // 1. Conversación + teléfono + opt-in, en una sola pasada (las plantillas se
+  //    saltan el guard de ventana entero, pero NO el de opt-out).
+  const loaded = await loadConversationAndPhoneResult(
     conversationId,
     workspaceId,
     supabase,
   );
-  if (!loaded) return NOT_FOUND;
-  const { toPhone } = loaded;
+  if (!loaded.ok) {
+    return {
+      ok: false,
+      error: loaded.error,
+      errorCode: loaded.errorCode,
+      retryable: loaded.errorCode === "DB_ERROR",
+    };
+  }
 
-  // SEC-10: Block outbound to opted-out contacts
-  if (!loaded.optIn) return OPT_OUT;
+  // Bloquear salientes a contactos con opt-out.
+  if (!loaded.optIn) {
+    return {
+      ok: false,
+      error: OPT_OUT_MESSAGE,
+      errorCode: "OPT_OUT",
+      retryable: false,
+    };
+  }
 
-  // 2. Load Kapso credentials
-  const { apiKey, phoneNumberId } = await loadIntegration(
+  // 2. Credenciales de Kapso.
+  //
+  // Credenciales faltantes = configuración rota, NO modo desarrollo.
+  // `loadIntegration` rellena con "" y el camino viejo interpretaba ese vacío
+  // como "modo dev": encolaba el mensaje y devolvía ok. Un motor desatendido no
+  // puede tratar eso como un envío: el run quedaba `done` sin WhatsApp.
+  const { data: integration, error: integrationError } = await supabase
+    .from("integrations")
+    .select("credentials, config")
+    .eq("workspace_id", workspaceId)
+    .eq("provider", "kapso")
+    .eq("enabled", true)
+    .maybeSingle();
+
+  // Error de base ≠ integración ausente: la primera se reintenta.
+  if (integrationError) {
+    return {
+      ok: false,
+      error: integrationError.message,
+      errorCode: "DB_ERROR",
+      retryable: true,
+    };
+  }
+  if (!integration) {
+    return {
+      ok: false,
+      errorCode: "CONFIG_ERROR",
+      error: "kapso_integration_not_found",
+      retryable: false,
+    };
+  }
+
+  let apiKey: string;
+  let phoneNumberId: string;
+  try {
+    ({ apiKey, phoneNumberId } = await kapsoCredentials(
+      workspaceId,
+      integration as IntegrationRow,
+    ));
+  } catch (err) {
+    // El detalle técnico va SOLO al log, nunca al `error` que lee el panel.
+    console.error("[dispatch] Kapso credentials could not be decrypted", {
+      workspaceId,
+      message: err instanceof Error ? err.message : String(err),
+    });
+    return {
+      ok: false,
+      errorCode: "CONFIG_ERROR",
+      error: "credentials_unreadable",
+      retryable: false,
+    };
+  }
+
+  if (!apiKey.trim() || !phoneNumberId.trim()) {
+    console.error("[dispatch] Kapso integration enabled without credentials", {
+      workspaceId,
+      hasApiKey: Boolean(apiKey.trim()),
+      hasPhoneNumberId: Boolean(phoneNumberId.trim()),
+    });
+    return {
+      ok: false,
+      errorCode: "CONFIG_ERROR",
+      error: "missing_kapso_credentials",
+      retryable: false,
+    };
+  }
+
+  // Mismo criterio, un paso más allá: el centinela "placeholder" hace
+  // que `sendPreparedTemplate` NO llame a Kapso y escriba el mensaje como
+  // `queued` devolviendo ok. Eso es modo desarrollo, no un envío: fuera de
+  // desarrollo el motor de automatizaciones cerraría el run como `done` sin que
+  // saliera ningún WhatsApp. En desarrollo sigue encolando como siempre.
+  //
+  // `dispatchText` queda igual a propósito: la ruta de texto libre no la usa
+  // el motor.
+  if (apiKey === "placeholder" && process.env.NODE_ENV !== "development") {
+    console.error("[dispatch] Kapso api key placeholder outside development", {
+      workspaceId,
+    });
+    return {
+      ok: false,
+      errorCode: "CONFIG_ERROR",
+      error: "missing_kapso_credentials",
+      retryable: false,
+    };
+  }
+
+  return {
+    ok: true,
+    prepared: {
+      workspaceId,
+      conversationId,
+      templateName,
+      templateLanguage,
+      components,
+      senderUserId,
+      toPhone: loaded.toPhone,
+      apiKey,
+      phoneNumberId,
+    },
+  };
+}
+
+/**
+ * El efecto externo y su persistencia: POST a Kapso + insert del mensaje. No
+ * lee nada de la base antes del POST, que es lo que permite que el caller marque
+ * `dispatched_at` justo antes de llamarla.
+ */
+export async function sendPreparedTemplate(
+  prepared: PreparedTemplateDispatch,
+): Promise<DispatchResult> {
+  const {
     workspaceId,
-    supabase,
-  );
+    conversationId,
+    templateName,
+    templateLanguage,
+    components,
+    senderUserId,
+    toPhone,
+    apiKey,
+    phoneNumberId,
+  } = prepared;
 
-  // 3. Send template via Kapso
+  const supabase = svc();
+
   let wamid: string | undefined;
   const realSend = Boolean(apiKey && apiKey !== "placeholder");
 
@@ -451,6 +671,8 @@ export async function dispatchTemplate(
         error: waError.message,
         errorCode: "SEND_FAILED",
         retryable: waError.retryable,
+        providerCode:
+          typeof waError.code === "number" ? waError.code : undefined,
       };
     }
   }
@@ -483,7 +705,33 @@ export async function dispatchTemplate(
   await supabase
     .from("conversations")
     .update({ last_message_at: new Date().toISOString() })
-    .eq("id", conversationId);
+    .eq("id", conversationId)
+    .eq("workspace_id", workspaceId);
 
   return { ok: true, wamid };
+}
+
+/**
+ * Envoltorio que conserva el contrato de siempre para los callers que no
+ * necesitan la costura: `executeSetterPostAction` (buffer.ts) y
+ * `sendTemplateAction` (template-actions.ts). Ninguno de los dos cambia.
+ */
+export async function dispatchTemplate(
+  params: DispatchTemplateParams,
+): Promise<DispatchResult> {
+  const prep = await prepareTemplateDispatch(params);
+  if (!prep.ok) {
+    // Conversación/contacto de otro workspace (o inexistente): NOT_FOUND, sin
+    // tocar Kapso ni la tabla messages.
+    if (NOT_FOUND_REASONS.has(prep.error)) return NOT_FOUND;
+    return {
+      ok: false,
+      // Detalle técnico SOLO server-side: al operador le llega el motivo del
+      // opt-out (que sí es accionable) o el mensaje genérico.
+      error: prep.errorCode === "OPT_OUT" ? prep.error : GENERIC_SEND_ERROR,
+      errorCode: prep.errorCode === "OPT_OUT" ? "OPT_OUT" : "DB_ERROR",
+      retryable: prep.retryable,
+    };
+  }
+  return sendPreparedTemplate(prep.prepared);
 }

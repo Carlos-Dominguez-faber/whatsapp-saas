@@ -45,6 +45,18 @@ function extractKapsoErrorMessage(body: unknown): string | null {
   return null;
 }
 
+/**
+ * Techo por llamada a Kapso. El cron corta entre filas, pero eso no protege de
+ * UNA fila colgada: sin este signal, un fetch sin respuesta consume el
+ * maxDuration completo y deja `processing` a toda la cola de atrás.
+ * 20 s es holgado para un POST de mensaje (Kapso responde en <2 s).
+ *
+ * Se EXPORTA para que el test pueda afirmar el número, y no solo la presencia
+ * de un AbortSignal: un signal de 1 ms también sería "un AbortSignal" y
+ * rompería todos los envíos.
+ */
+export const KAPSO_TIMEOUT_MS = 20_000;
+
 /** Single place where every Kapso call parses its response and raises. */
 async function kapsoFetch(
   url: string,
@@ -54,6 +66,8 @@ async function kapsoFetch(
 ): Promise<Record<string, unknown>> {
   const response = await fetch(url, {
     ...init,
+    // Un `signal` explícito del caller gana; hoy ninguno lo pasa.
+    signal: init.signal ?? AbortSignal.timeout(KAPSO_TIMEOUT_MS),
     headers: {
       ...(init.body ? { "Content-Type": "application/json" } : {}),
       "X-API-Key": apiKey,

@@ -9,6 +9,7 @@ import {
   listAllPhoneNumbers,
   getMediaUrl,
   KapsoError,
+  KAPSO_TIMEOUT_MS,
 } from "./kapso-client.ts";
 
 function jsonResponse(status: number, body: unknown): Response {
@@ -23,6 +24,7 @@ interface FetchCall {
   method: string;
   headers: Record<string, string>;
   body: unknown;
+  signal: AbortSignal | null | undefined;
 }
 
 function stubFetch(response: Response): { calls: FetchCall[] } {
@@ -33,6 +35,7 @@ function stubFetch(response: Response): { calls: FetchCall[] } {
       method: init?.method ?? "GET",
       headers: (init?.headers as Record<string, string>) ?? {},
       body: init?.body ? JSON.parse(String(init.body)) : null,
+      signal: init?.signal,
     });
     return response;
   }) as typeof fetch;
@@ -42,6 +45,12 @@ function stubFetch(response: Response): { calls: FetchCall[] } {
 const originalFetch = globalThis.fetch;
 function restoreFetch() {
   globalThis.fetch = originalFetch;
+}
+
+/** Un fetch que revienta antes de que exista respuesta HTTP (red, abort). */
+function stubFetchRejecting(err: unknown): { restore: () => void } {
+  globalThis.fetch = (() => Promise.reject(err)) as typeof fetch;
+  return { restore: restoreFetch };
 }
 
 test("sendText posts to the Meta-mirrored endpoint with the phone_number_id in the path and extracts the wamid", async () => {
@@ -237,5 +246,68 @@ test("getMediaUrl resolves the download URL, falling back to url when download_u
     });
   } finally {
     restoreFetch();
+  }
+});
+
+// ── Techo por llamada ───────────────────────────────────────────────────
+
+test("cada llamada a Kapso lleva AbortSignal.timeout con los 20 s de KAPSO_TIMEOUT_MS", async () => {
+  const { calls } = stubFetch(jsonResponse(200, { messages: [{ id: "wamid_1" }] }));
+  const realTimeout = AbortSignal.timeout;
+  const timeoutArgs: number[] = [];
+  AbortSignal.timeout = ((ms: number) => {
+    timeoutArgs.push(ms);
+    return realTimeout.call(AbortSignal, ms);
+  }) as typeof AbortSignal.timeout;
+
+  try {
+    await sendTemplate({
+      apiKey: "key_1",
+      phoneNumberId: "pn_1",
+      to: "+15550000001",
+      templateName: "bienvenida",
+      language: "es",
+    });
+
+    assert.ok(
+      calls[0].signal instanceof AbortSignal,
+      "sin signal, un fetch colgado bloquea la corrida entera del motor",
+    );
+    assert.equal(calls[0].signal!.aborted, false);
+    assert.deepEqual(
+      timeoutArgs,
+      [KAPSO_TIMEOUT_MS],
+      "un timeout de otro valor es otro bug: 1 ms rompe todos los envíos y 300 s no protege nada",
+    );
+    assert.equal(KAPSO_TIMEOUT_MS, 20_000);
+  } finally {
+    AbortSignal.timeout = realTimeout;
+    restoreFetch();
+  }
+});
+
+test("un Kapso que se cuelga aborta y sale como error de envío, no como éxito", async () => {
+  // La otra cara: qué hace el sistema cuando el timeout SÍ dispara. Se stubea un
+  // fetch que rechaza con el error que produce un signal vencido.
+  const { restore } = stubFetchRejecting(
+    Object.assign(new Error("The operation was aborted due to timeout"), {
+      name: "TimeoutError",
+    }),
+  );
+  try {
+    await assert.rejects(
+      () =>
+        sendTemplate({
+          apiKey: "key_1",
+          phoneNumberId: "pn_1",
+          to: "+15550000001",
+          templateName: "bienvenida",
+          language: "es",
+        }),
+      /aborted|Timeout/i,
+      "el abort sale como excepción; el ejecutor la cierra failed/outcome_unknown, nunca done",
+    );
+  } finally {
+    restore();
   }
 });

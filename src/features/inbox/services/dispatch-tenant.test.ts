@@ -60,7 +60,14 @@ const fakeClient = {
         inserted.push({ table, row });
         return Promise.resolve({ error: null });
       },
-      update: () => ({ eq: () => Promise.resolve({ error: null }) }),
+      // Encadenable: sendPreparedTemplate filtra el UPDATE por id Y workspace.
+      update() {
+        const chain: any = {
+          eq: () => chain,
+          then: (resolve: (v: unknown) => void) => resolve({ error: null }),
+        };
+        return chain;
+      },
     };
   },
 };
