@@ -416,6 +416,7 @@ export async function createHLOpportunity(
     .from("contacts")
     .select("id, name, phone, email, hl_contact_id")
     .eq("id", contactId)
+    .eq("workspace_id", workspaceId)
     .single();
 
   if (contactError || !contactData) {
@@ -447,7 +448,8 @@ export async function createHLOpportunity(
           hl_contact_id: hlContactId,
           updated_at: new Date().toISOString(),
         })
-        .eq("id", contactId);
+        .eq("id", contactId)
+        .eq("workspace_id", workspaceId);
     }
   }
   if (!hlContactId) {
