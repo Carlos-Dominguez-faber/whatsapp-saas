@@ -347,3 +347,23 @@ test("before the migration (no state_version column) it compares on state only",
     ["state", "ai_active"],
   ]);
 });
+
+test("si el INSERT del evento state_change falla, queda registrado server-side", async () => {
+  reset();
+  responseQueue = [
+    { data: { state: "ai_active", workspace_id: "ws_1" }, error: null },
+    { error: null }, // UPDATE
+    { error: { code: "57014", message: "connection string leaked" } }, // INSERT: falla
+  ];
+  const logged: unknown[][] = [];
+  const original = console.error;
+  console.error = (...a: unknown[]) => logged.push(a);
+  try {
+    await applyTransition("conv_1", "handoff_pending");
+  } finally {
+    console.error = original;
+  }
+  assert.ok(logged.some((a) => String(a[0]).includes("state_change insert failed")));
+  // Y no se filtra el mensaje crudo del error.
+  assert.ok(logged.every((a) => !JSON.stringify(a).includes("connection string")));
+});
