@@ -27,7 +27,7 @@ import { phoneString } from "@/features/inbox/services/phone";
 import { workspaceCountryCode } from "@/features/inbox/services/country-code";
 
 const IntegrationSchema = z.object({
-  provider: z.enum(["ycloud", "kapso", "openrouter", "highlevel"]),
+  provider: z.enum(["ycloud", "kapso", "openrouter", "highlevel", "caldotcom"]),
   enabled: z.boolean().optional(),
   credentials: z.record(z.string(), z.string()).optional(),
   config: z.record(z.string(), z.unknown()).optional(),
