@@ -1,7 +1,15 @@
 // F3-T2: Agent takes a conversation — handoff_pending → human_active.
+//
+// Authorization is deliberately NOT the conversations UPDATE policy: that
+// policy only lets an agent update conversations already assigned to them,
+// and taking is precisely how an agent gets a pending, unassigned
+// conversation assigned. Instead it mirrors the operator set of the other
+// write policies (admin/manager/agent): any active operator of the workspace
+// may take a pending handoff. A viewer is read-only and may not.
 
 import { NextRequest, NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
+import { requireWorkspaceMember } from "@/lib/auth/workspace-access";
 import { applyTransition } from "@/features/inbox/services/decision-engine";
 
 export async function POST(
@@ -19,10 +27,10 @@ export async function POST(
 
   const { id: conversationId } = await params;
 
-  // 2. Validate current state is handoff_pending
+  // 2. Load through RLS — a non-member sees nothing (404).
   const { data: conv, error: convError } = await supabase
     .from("conversations")
-    .select("state")
+    .select("state, workspace_id")
     .eq("id", conversationId)
     .single();
 
@@ -32,6 +40,10 @@ export async function POST(
       { status: 404 },
     );
   }
+
+  const workspaceId = conv.workspace_id as string;
+  const auth = await requireWorkspaceMember(workspaceId, { minRole: "agent" });
+  if (!auth.ok) return auth.response;
 
   if (conv.state !== "handoff_pending") {
     return NextResponse.json(
@@ -44,7 +56,10 @@ export async function POST(
 
   try {
     // 3. Transition to human_active, assign to current user
-    await applyTransition(conversationId, "human_active", { userId: user.id });
+    await applyTransition(conversationId, "human_active", {
+      userId: user.id,
+      workspaceId,
+    });
 
     return NextResponse.json({ ok: true, state: "human_active" });
   } catch (err) {
@@ -52,7 +67,10 @@ export async function POST(
     console.error("[POST /api/conversations/[id]/take]:", message);
 
     if (message.startsWith("Invalid transition:")) {
-      return NextResponse.json({ error: message }, { status: 422 });
+      return NextResponse.json(
+        { error: "La conversación no admite ese cambio en su estado actual" },
+        { status: 422 },
+      );
     }
 
     return NextResponse.json(

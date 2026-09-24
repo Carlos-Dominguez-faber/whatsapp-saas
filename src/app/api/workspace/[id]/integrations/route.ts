@@ -12,7 +12,7 @@ import {
 } from "@/shared/lib/integration-secrets";
 
 const IntegrationSchema = z.object({
-  provider: z.enum(["kapso", "openrouter", "highlevel"]),
+  provider: z.enum(["kapso", "openrouter", "highlevel", "caldotcom"]),
   enabled: z.boolean().optional(),
   credentials: z.record(z.string(), z.string()).optional(),
   config: z.record(z.string(), z.unknown()).optional(),
@@ -112,8 +112,10 @@ export async function PUT(
 ) {
   const { id: workspaceId } = await params;
 
+  // Writing credentials mirrors the table's own policy
+  // (integrations_write_admins): admin only, not manager.
   const auth = await requireWorkspaceMember(workspaceId, {
-    minRole: "manager",
+    minRole: "admin",
   });
   if (!auth.ok) return auth.response;
 
@@ -182,7 +184,12 @@ export async function PUT(
     { onConflict: "workspace_id,provider" },
   );
 
-  if (error)
-    return NextResponse.json({ error: error.message }, { status: 500 });
+  if (error) {
+    console.error("[PUT /api/workspace/[id]/integrations] upsert error:", error.message);
+    return NextResponse.json(
+      { error: "No se pudo guardar la integración. Intenta de nuevo." },
+      { status: 500 },
+    );
+  }
   return NextResponse.json({ ok: true });
 }

@@ -4,6 +4,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
 import { createClient } from "@/lib/supabase/server";
 import { generateReply } from "@/features/inbox/services/openrouter";
+import { TEMPLATE_CATEGORIES } from "@/features/settings/lib/template-form";
 
 // ── Shared auth helper ────────────────────────────────────────────────────────
 
@@ -23,12 +24,16 @@ async function resolveMember(
 
 // ── Validation ────────────────────────────────────────────────────────────────
 
+// `authentication` is still accepted by the schema only so we can answer with a
+// clear reason: Meta requires those templates to come from Cloud API's template
+// library (one-time-password button, no URLs/media/emojis), which this generator
+// does not build — sending free text under that category is a guaranteed reject.
 const GenerateSchema = z.object({
   description: z
     .string()
     .min(10, "La descripción debe tener al menos 10 caracteres")
     .max(500),
-  category: z.enum(["marketing", "utility", "authentication"]),
+  category: z.enum([...TEMPLATE_CATEGORIES, "authentication"]),
   useCase: z.string().min(1).max(100),
 });
 
@@ -83,6 +88,16 @@ export async function POST(
   }
 
   const { description, category, useCase } = parsed.data;
+
+  if (category === "authentication") {
+    return NextResponse.json(
+      {
+        error:
+          "Las plantillas de autenticación (códigos de verificación) las tiene que crear WhatsApp desde su biblioteca oficial, no se pueden redactar con IA. Elige Utilidad o Marketing.",
+      },
+      { status: 400 },
+    );
+  }
 
   const userMessage = `Crea una plantilla de WhatsApp para: ${description}. Categoría: ${category}. Caso de uso: ${useCase}. Devuelve SOLO el texto de la plantilla, sin explicaciones.`;
 

@@ -6,6 +6,7 @@ import { createClient } from "@/lib/supabase/server";
 import { createClient as createSbClient } from "@supabase/supabase-js";
 import { listTemplates } from "@/features/inbox/services/templates";
 import {
+  TEMPLATE_CATEGORIES,
   templateButtonSchema,
   templateVariableSchema,
 } from "@/features/settings/lib/template-form";
@@ -56,7 +57,7 @@ const CreateSchema = z.object({
     .max(512)
     .regex(NAME_REGEX, "Solo minúsculas, números y guiones bajos"),
   language: z.literal("es").default("es"),
-  category: z.enum(["marketing", "utility", "authentication"]),
+  category: z.enum(TEMPLATE_CATEGORIES),
   body_template: z.string().min(1).max(1024),
   components: z.record(z.string(), z.unknown()).default({}),
   ...RICH_FIELDS,
@@ -71,7 +72,7 @@ const UpdateSchema = z.object({
     .regex(NAME_REGEX, "Solo minúsculas, números y guiones bajos")
     .optional(),
   language: z.literal("es").optional(),
-  category: z.enum(["marketing", "utility", "authentication"]).optional(),
+  category: z.enum(TEMPLATE_CATEGORIES).optional(),
   body_template: z.string().min(1).max(1024).optional(),
   components: z.record(z.string(), z.unknown()).optional(),
   header_type: z.enum(["none", "text"]).optional(),

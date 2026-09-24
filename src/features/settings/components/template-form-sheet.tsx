@@ -20,6 +20,7 @@ import {
   CATEGORY_LABELS,
   TEMPLATE_CATEGORIES,
   detectBodyVariables,
+  normalizeCategory,
   type TemplateButton,
   type TemplateCategory,
   type TemplateVariable,
@@ -98,7 +99,12 @@ export function TemplateFormSheet({
     /* eslint-disable react-hooks/set-state-in-effect -- sync form from props on open */
     if (template) {
       setName(template.name ?? "");
-      setCategory(template.category === "marketing" ? "marketing" : "utility");
+      // Las filas viejas del sync pueden traer la categoría en MAYÚSCULAS.
+      setCategory(
+        normalizeCategory(template.category) === "marketing"
+          ? "marketing"
+          : "utility",
+      );
       setHeaderType(template.header_type === "text" ? "text" : "none");
       setHeaderText(template.header_text ?? "");
       setBody(template.body_template ?? "");

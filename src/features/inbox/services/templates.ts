@@ -5,6 +5,11 @@
 import { createClient as createSbClient } from "@supabase/supabase-js";
 import { fetchKapsoTemplates } from "./kapso-client";
 import { decryptCredentials } from "@/shared/lib/integration-secrets";
+import {
+  extractRejectionReason,
+  templateStatusPatch,
+} from "./template-sync";
+import { normalizeCategory } from "@/features/settings/lib/template-form";
 
 function svc() {
   return createSbClient(
@@ -57,6 +62,8 @@ interface KapsoTemplate {
   language?: string;
   category?: string;
   status?: string;
+  // Meta reports the rejection motive here, and sends "NONE" when there is none.
+  rejected_reason?: string;
   components?: KapsoTemplateComponent[];
   [key: string]: unknown;
 }
@@ -159,6 +166,16 @@ export async function syncTemplatesFromKapso(
   // 2. Fetch templates from Kapso
   const records = await fetchKapsoTemplates(apiKey, wabaId);
 
+  // What we already stored, keyed by the real template identity (name+language).
+  // Needed to keep a rejection motive Meta no longer reports and to keep
+  // `approved_at` on the first approval instead of moving it on every sync.
+  const previous = new Map(
+    (await listTemplates(workspaceId)).map((t) => [
+      `${t.name}|${t.language}`,
+      t,
+    ]),
+  );
+
   let synced = 0;
   let errors = 0;
 
@@ -168,13 +185,17 @@ export async function syncTemplatesFromKapso(
       const t = raw as KapsoTemplate;
       const name = typeof t.name === "string" ? t.name : "";
       const language = typeof t.language === "string" ? t.language : "es";
-      const category = typeof t.category === "string" ? t.category : "UTILITY";
+      // Kapso espeja a Meta y devuelve la categoría en MAYÚSCULAS. Se normaliza
+      // acá, en el borde: la columna tiene un CHECK en minúsculas y todo el
+      // resto del código (guard de authentication, UI, submit) compara así.
+      const category = normalizeCategory(t.category) || "utility";
       const status = mapKapsoStatus(
         typeof t.status === "string" ? t.status : "PENDING",
       );
       const components = Array.isArray(t.components) ? t.components : [];
       const bodyTemplate = extractBodyText(components);
       const variables = extractTemplateVariables(bodyTemplate);
+      const now = new Date().toISOString();
 
       const { error: upsertError } = await supabase.from("templates").upsert(
         {
@@ -187,8 +208,13 @@ export async function syncTemplatesFromKapso(
           components: t.components ?? {},
           variables,
           provider_template_id: typeof t.id === "string" ? t.id : null,
-          rejection_reason: null,
-          updated_at: new Date().toISOString(),
+          ...templateStatusPatch(
+            status,
+            extractRejectionReason(t.rejected_reason),
+            previous.get(`${name}|${language}`),
+            now,
+          ),
+          updated_at: now,
         },
         {
           onConflict: "workspace_id,name,language",

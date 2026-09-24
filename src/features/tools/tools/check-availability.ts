@@ -1,5 +1,12 @@
 import { z } from "zod";
 import type { Tool, ToolContext, ToolResult } from "../core/tool";
+import { resolveCalendarId } from "../lib/calendar-id";
+import {
+  buildAvailabilityOutput,
+  groupByDay,
+  resolveTimeZone,
+  zonedDayRange,
+} from "../lib/slots";
 
 const schema = z.object({
   date_from: z
@@ -21,24 +28,41 @@ const schema = z.object({
 type Args = z.infer<typeof schema>;
 
 // GHL free-slots returns an object keyed by date: { "2026-06-12": { slots: [...] }, ... }
-// plus non-date keys (e.g. traceId) we must ignore.
+// plus non-date keys (e.g. traceId) treated as metadata. Cualquier otra
+// clave significa que la respuesta no es la que conocemos: ver readSlots.
+const DATE_KEY = /^\d{4}-\d{2}-\d{2}$/;
+const META_KEYS = new Set(["traceId"]);
+
 interface FreeSlotsResponse {
   [key: string]: { slots?: string[] } | unknown;
 }
 
-function collectSlots(data: FreeSlotsResponse): string[] {
-  const out: string[] = [];
-  for (const value of Object.values(data)) {
-    if (
-      value &&
-      typeof value === "object" &&
-      "slots" in value &&
-      Array.isArray((value as { slots?: unknown }).slots)
-    ) {
-      out.push(...((value as { slots: string[] }).slots ?? []));
-    }
+/**
+ * Slots de la respuesta de GHL, o `null` si la respuesta **no se entendió**.
+ *
+ * El criterio es positivo a propósito: enumerar formas ilegibles desde abajo
+ * siempre deja alguna capa más arriba que convierte un cuerpo desconocido en
+ * "No hay horarios disponibles". Acá la tool solo puede afirmar ausencia de
+ * cupos si RECONOCIÓ la respuesta: un objeto cuyas claves son días
+ * `YYYY-MM-DD` con `{ slots: [] }`, más metadatos conocidos. Cualquier otra
+ * cosa —un 200 con `{status:"error"}`, los días dentro de otra envoltura, un
+ * `slots` que no es arreglo— es un error explícito, no una agenda vacía.
+ *
+ * Residuo conocido: un cuerpo sin ningún día y sin claves inesperadas (`{}` o
+ * solo `traceId`) se lee como vacío: no se distingue de un rango legítimamente
+ * sin cupos.
+ */
+function readSlots(data: unknown): unknown[] | null {
+  if (!data || typeof data !== "object" || Array.isArray(data)) return null;
+  const slots: unknown[] = [];
+  for (const [key, value] of Object.entries(data)) {
+    if (META_KEYS.has(key)) continue;
+    if (!DATE_KEY.test(key)) return null;
+    const inner = (value as { slots?: unknown } | null)?.slots;
+    if (!Array.isArray(inner)) return null;
+    slots.push(...inner);
   }
-  return out;
+  return slots;
 }
 
 async function run(args: Args, ctx: ToolContext): Promise<ToolResult> {
@@ -53,7 +77,7 @@ async function run(args: Args, ctx: ToolContext): Promise<ToolResult> {
     };
   }
 
-  const calendarId = args.calendar_id ?? cfg.calendarId;
+  const calendarId = resolveCalendarId(cfg.calendarId, args.calendar_id);
   if (!calendarId) {
     return {
       ok: false,
@@ -62,20 +86,23 @@ async function run(args: Args, ctx: ToolContext): Promise<ToolResult> {
     };
   }
 
-  const startMs = Date.parse(args.date_from);
-  let endMs = Date.parse(args.date_to);
-  if (Number.isNaN(startMs) || Number.isNaN(endMs)) {
+  // El rango se interpreta en la zona del workspace (o la que pida el LLM):
+  // `date_to` queda inclusivo hasta el final de ese día, en hora local.
+  // La zona del LLM es texto libre: si no es una zona IANA válida se cae a la
+  // del workspace y el output lo declara, en vez de etiquetar una zona que no
+  // se usó (el bot ofrecía "12:00" que en Santiago eran las 09:00).
+  const tz = resolveTimeZone(args.timezone, cfg.timezone);
+  const range = zonedDayRange(args.date_from, args.date_to, tz);
+  if (!range) {
     return { ok: false, output: null, error: "Fechas inválidas" };
   }
-  // Make date_to inclusive through the end of that day, so a single-day query
-  // (date_from === date_to) still spans a real range instead of being empty.
-  endMs = Math.max(endMs + 24 * 60 * 60 * 1000 - 1, startMs);
+  const { startMs, endMs } = range;
 
   const params = new URLSearchParams({
     startDate: String(startMs),
     endDate: String(endMs),
+    timezone: tz,
   });
-  if (args.timezone) params.set("timezone", args.timezone);
 
   const res = await fetch(
     `https://services.leadconnectorhq.com/calendars/${calendarId}/free-slots?${params.toString()}`,
@@ -98,18 +125,21 @@ async function run(args: Args, ctx: ToolContext): Promise<ToolResult> {
   }
 
   const data = (await res.json()) as FreeSlotsResponse;
-  const slots = collectSlots(data).slice(0, 20); // cap to keep the prompt lean
+  const all = readSlots(data);
 
+  if (all === null) {
+    return {
+      ok: false,
+      output: null,
+      error:
+        "El calendario respondió en un formato que no se pudo interpretar; no se sabe si hay horarios libres",
+    };
+  }
+
+  const grouped = groupByDay(all, tz);
   return {
     ok: true,
-    output: {
-      slots,
-      count: slots.length,
-      message:
-        slots.length === 0
-          ? "No hay horarios disponibles en ese rango."
-          : `Hay ${slots.length} horarios disponibles.`,
-    },
+    output: buildAvailabilityOutput(grouped, tz, args.timezone),
   };
 }
 

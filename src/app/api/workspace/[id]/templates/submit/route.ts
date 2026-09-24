@@ -17,11 +17,16 @@ import {
 import {
   buildKapsoPayload,
   createTemplateSchema,
+  normalizeCategory,
   type CreateTemplateInput,
   type TemplateButton,
   type TemplateVariable,
 } from "@/features/settings/lib/template-form";
 import { decryptCredentials } from "@/shared/lib/integration-secrets";
+import {
+  formatErrorForLog,
+  parseTemplateError,
+} from "@/features/inbox/services/whatsapp-errors";
 
 function svc() {
   return createSbClient(
@@ -112,8 +117,23 @@ export async function POST(
   const buttons = (
     Array.isArray(row.buttons) ? row.buttons : []
   ) as TemplateButton[];
-  const category =
-    (row.category as string) === "marketing" ? "marketing" : "utility";
+  // Rows created before `authentication` was dropped would otherwise be sent to
+  // Meta as UTILITY with free text, which is rejected every time.
+  // La comparación va sobre la categoría NORMALIZADA: las filas que llegaron por
+  // el sync traían el valor de Meta ("AUTHENTICATION") y un `=== "authentication"`
+  // las dejaba pasar como UTILITY.
+  const rowCategory = normalizeCategory(row.category);
+  if (rowCategory === "authentication") {
+    return NextResponse.json(
+      {
+        error:
+          "Las plantillas de autenticación no se pueden enviar desde aquí: WhatsApp exige crearlas desde su biblioteca oficial. Cambia la categoría a Utilidad o Marketing.",
+      },
+      { status: 400 },
+    );
+  }
+
+  const category = rowCategory === "marketing" ? "marketing" : "utility";
 
   const input: CreateTemplateInput = {
     name: row.name as string,
@@ -199,11 +219,15 @@ export async function POST(
     return NextResponse.json({ data: updated });
   } catch (err) {
     if (err instanceof KapsoError) {
-      console.error("[templates/submit] Kapso error:", err.status, err.body);
-      return NextResponse.json(
-        { error: `Kapso rechazó la plantilla: ${err.message}` },
-        { status: 502 },
+      // `err.message` trae el texto crudo de Meta ("(#100) Invalid parameter…"):
+      // va SOLO al log del servidor. Al operador le llega el texto del catálogo.
+      const waError = parseTemplateError(err.body, err.status);
+      console.error(
+        "[templates/submit] Kapso error:",
+        formatErrorForLog(waError),
+        err.message,
       );
+      return NextResponse.json({ error: waError.message }, { status: 502 });
     }
     console.error("[templates/submit] error:", err);
     return NextResponse.json(
