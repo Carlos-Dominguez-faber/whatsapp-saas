@@ -9,13 +9,18 @@ const KAPSO_WA_BASE = "https://api.kapso.ai/meta/whatsapp/v24.0";
 const KAPSO_PLATFORM_BASE = "https://api.kapso.ai/platform/v1";
 
 export class KapsoError extends Error {
+  readonly status: number;
+  readonly body: unknown;
+
   constructor(
-    public readonly status: number,
-    public readonly body: unknown,
+    status: number,
+    body: unknown,
     message: string,
   ) {
     super(message);
     this.name = "KapsoError";
+    this.status = status;
+    this.body = body;
   }
 }
 
