@@ -138,6 +138,20 @@ export async function notifyHandoffPending(
 
     if (!config.enabled) return;
 
+    // El corte aplica SOLO al prefijo "tool:", que significa "la despedida
+    // del agente ya salió" (dispatch exitoso en buffer.ts). Mandar igual el
+    // ACK genérico ahí duplicaría el mensaje. "tool_unsent:" — el dispatch
+    // falló o nunca se intentó (rama dead-letter) — cae a propósito al camino
+    // normal de abajo: el cliente no recibió nada del agente, así que sí
+    // necesita el ACK genérico.
+    if (trigger.startsWith("tool:")) {
+      await logEvent(workspaceId, conversationId, "handoff_ack_skipped", "info", {
+        reason: "agent_farewell",
+        trigger,
+      });
+      return;
+    }
+
     if (await wasRecentlyAcknowledged(conversationId)) {
       await logEvent(workspaceId, conversationId, "handoff_ack_skipped", "info", {
         reason: "deduped",

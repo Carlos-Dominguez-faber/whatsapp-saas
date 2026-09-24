@@ -3,6 +3,7 @@ import { generateWithTools, getWorkspaceModel } from "./openrouter";
 import { recordLlmUsage, checkRateLimits } from "./cost-tracker";
 import { dispatchText, dispatchTemplate } from "./dispatch";
 import { decide, applyTransition } from "./decision-engine";
+import { TransitionError } from "./state-machine";
 import type { ToolContext } from "@/features/tools/core/tool";
 import { resolveSystemPrompt } from "./prompt-resolver";
 import { buildSystemPrompt } from "./prompt-builder";
@@ -29,6 +30,89 @@ import { syncContactToHL, createHLOpportunity } from "./highlevel-client";
 
 const DEFAULT_SILENCE_MS = 30_000; // 30 seconds silence window
 const MAX_BATCH_RETRIES = 3;
+
+/** Motivos que acepta la tool handoff_human (ver handoff-human.ts). */
+const HANDOFF_REASONS = new Set(["customer_request", "agent_stuck"]);
+
+/** Nombre de la única tool que puede pedir el traspaso (ver handoff-human.ts). */
+const HANDOFF_HUMAN_TOOL_NAME = "handoff_human";
+
+/**
+ * Busca la marca de traspaso entre los resultados de las tools del turno.
+ *
+ * `generateWithTools` devuelve un canal genérico (`toolResults`, con
+ * `toolName` + `output` por cada tool ejecutada). Filtra primero por
+ * `toolName === "handoff_human"`: las tools de n8n son dinámicas y definidas
+ * por el tenant, y una que devolviera por su cuenta `{handoff:true,
+ * reason:"customer_request"}` no puede derivar la conversación aunque
+ * handoff_human esté deshabilitada en Settings. Recién sobre esas entradas se
+ * valida `ok`/`output.handoff`/`reason` — defensa en profundidad, no el único
+ * filtro. Si el modelo la invoca dos veces en el mismo turno se deriva una
+ * sola vez: devolvemos el primer motivo válido, no una lista.
+ */
+function findHandoffReason(
+  toolResults: { toolName: string; output: unknown }[] | undefined,
+): string | null {
+  for (const entry of toolResults ?? []) {
+    if (entry.toolName !== HANDOFF_HUMAN_TOOL_NAME) continue;
+    const result = entry.output as { ok?: unknown; output?: unknown } | null;
+    if (!result || result.ok !== true) continue;
+    const output = result.output as
+      | { handoff?: unknown; reason?: unknown }
+      | null;
+    if (!output || output.handoff !== true) continue;
+    if (typeof output.reason === "string" && HANDOFF_REASONS.has(output.reason)) {
+      return output.reason;
+    }
+  }
+  return null;
+}
+
+/**
+ * Aplica el traspaso pedido por handoff_human. No relanza nunca: relanzar
+ * reencolaría el batch, el turno se regeneraría y el cliente recibiría el
+ * mensaje dos veces — peor que perder el traspaso, que además el próximo
+ * batch puede volver a pedir.
+ *
+ * `farewellDelivered` decide el prefijo del trigger, no una heurística en
+ * el notifier: cuando es `true` el agente ya le escribió su despedida al
+ * cliente en este mismo turno (el dispatch de 10a salió bien), así que el
+ * trigger es `` `tool:${reason}` `` y notifyHandoffPending saltea el ACK
+ * genérico. Cuando es `false` — despacho fallido o rama dead-letter, donde
+ * nunca se llegó a intentar el envío — el cliente no recibió nada, así que el
+ * trigger lleva el prefijo `tool_unsent:` para que el sistema SÍ mande el ACK
+ * genérico.
+ */
+async function applyToolHandoff(
+  workspaceId: string,
+  conversationId: string,
+  batchId: string,
+  reason: string,
+  farewellDelivered: boolean,
+): Promise<void> {
+  const trigger = farewellDelivered ? `tool:${reason}` : `tool_unsent:${reason}`;
+  try {
+    await applyTransition(conversationId, "handoff_pending", {
+      trigger,
+      workspaceId,
+    });
+  } catch (handoffErr) {
+    if (handoffErr instanceof TransitionError) {
+      // No-op esperado: la conversación ya estaba derivada o cerrada.
+      console.info("[buffer] handoff_human sin efecto (ya derivada o cerrada)", {
+        conversationId,
+      });
+      return;
+    }
+    console.error("[buffer] handoff_human falló al derivar la conversación:", {
+      batchId,
+      conversationId,
+      farewellDelivered,
+      error:
+        handoffErr instanceof Error ? handoffErr.message : String(handoffErr),
+    });
+  }
+}
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Internal types
@@ -348,6 +432,11 @@ export async function processNextBatch(): Promise<ProcessBatchResult> {
 
   const retryCount = (batch.meta?.retry_count as number | undefined) ?? 0;
 
+  // Vive fuera del try para que la rama dead-letter del catch (más abajo)
+  // también pueda aplicar el traspaso: un fallo transitorio de dispatchText
+  // agotado hasta MAX_BATCH_RETRIES no puede perder el pedido de handoff_human.
+  let pendingHandoffReason: string | null = null;
+
   try {
     // ── 3. Consolidate messages into one string ──────────────────────────────
     const mergedText = await consolidateBatch(batch.id, supabase);
@@ -517,6 +606,12 @@ export async function processNextBatch(): Promise<ProcessBatchResult> {
       history,
     });
 
+    // Se lee acá, apenas vuelve generateWithTools, no en 10b-bis — así la
+    // rama dead-letter del catch también la tiene disponible. Leerla no aplica
+    // el traspaso; eso sigue ocurriendo solo en 10b-bis (camino feliz) o en el
+    // dead-letter de abajo.
+    pendingHandoffReason = findHandoffReason(reply.toolResults);
+
     // ── 8. Record LLM usage — va ANTES de cualquier chequeo de la respuesta:
     // una respuesta vacía también se pagó y tiene que contar en el presupuesto
     // diario aunque el batch falle y se reintente.
@@ -638,6 +733,28 @@ export async function processNextBatch(): Promise<ProcessBatchResult> {
     // ── 10b. Mark batch as processed ────────────────────────────────────────
     await markBatchProcessed(batch.id, mergedText, supabase);
 
+    // ── 10b-bis. Traspaso a humano pedido por la tool handoff_human ─────────
+    // Va DESPUÉS del dispatchText de 10a, nunca antes: el guard de 9b descarta
+    // la respuesta si la conversación dejó de estar en `ai_active`, así que
+    // derivar primero borraría la despedida que el agente acaba de escribir
+    // (el cliente pide un humano y recibe silencio).
+    //
+    // Un fallo permanente de despacho NO cancela el traspaso: si el mensaje no
+    // se pudo entregar, más razón todavía para que una persona mire el hilo.
+    //
+    // applyToolHandoff no relanza nunca: relanzar reencolaría el batch, el
+    // turno se regeneraría y el cliente recibiría el mensaje dos veces — peor
+    // que perder el traspaso, que además el próximo batch puede volver a pedir.
+    if (pendingHandoffReason) {
+      await applyToolHandoff(
+        batch.workspace_id,
+        batch.conversation_id,
+        batch.id,
+        pendingHandoffReason,
+        dispatchResult.ok,
+      );
+    }
+
     // ── 10c. v1.5 opt-in: AI auto-tagging + summary (fire-and-forget) ────────
     if (
       activeAgent &&
@@ -695,6 +812,21 @@ export async function processNextBatch(): Promise<ProcessBatchResult> {
           error: errorMsg,
         },
       });
+
+      // Un fallo transitorio de dispatchText (bloque 10a) lanza y salta
+      // directo a este catch, así que 10b-bis nunca corre. Sin esto, un
+      // handoff_human pedido justo antes del fallo se perdería para siempre en
+      // dead-letter: si el mensaje no se pudo entregar, más razón todavía para
+      // que una persona mire el hilo.
+      if (pendingHandoffReason) {
+        await applyToolHandoff(
+          batch.workspace_id,
+          batch.conversation_id,
+          batch.id,
+          pendingHandoffReason,
+          false,
+        );
+      }
 
       return {
         processed: false,

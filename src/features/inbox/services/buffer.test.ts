@@ -119,11 +119,20 @@ let decisionResult: {
 } = { decision: "respond", reason: "normal", availableTools: [] };
 const applyTransitionCalls: unknown[][] = [];
 let applyTransitionShouldThrow = false;
+// Error específico que lanza applyTransition (p. ej. TransitionError para
+// "ya derivada o cerrada"); tiene prioridad sobre applyTransitionShouldThrow.
+let applyTransitionError: Error | null = null;
+// Orden real de los efectos del turno. El traspaso de handoff_human tiene que
+// ocurrir DESPUÉS del despacho (guard de 9b): sin esta traza, un test que solo
+// cuenta llamadas pasaría igual si alguien mueve el traspaso más arriba.
+const callOrder: string[] = [];
 mock.module("./decision-engine.ts", {
   exports: {
     decide: async () => decisionResult,
     applyTransition: async (...args: unknown[]) => {
       applyTransitionCalls.push(args);
+      callOrder.push("applyTransition");
+      if (applyTransitionError) throw applyTransitionError;
       if (applyTransitionShouldThrow) {
         throw new Error("transition failed");
       }
@@ -174,13 +183,19 @@ mock.module("./dispatch.ts", {
   exports: {
     dispatchText: async (opts: unknown) => {
       dispatchTextCalls.push(opts);
+      callOrder.push("dispatchText");
       return dispatchTextResult;
     },
     dispatchTemplate: async () => ({ ok: true }),
   },
 });
 
-let generateWithToolsResult = {
+let generateWithToolsResult: {
+  text: string;
+  inputTokens: number;
+  outputTokens: number;
+  toolResults?: unknown[];
+} = {
   text: "hola!",
   inputTokens: 100,
   outputTokens: 20,
@@ -250,6 +265,7 @@ mock.module("./highlevel-client.ts", {
 
 const { upsertBatch, processNextBatch, reconcileOrphanedMessages } =
   await import("./buffer.ts");
+const { TransitionError } = await import("./state-machine.ts");
 
 function reset() {
   responseQueue = [];
@@ -266,6 +282,8 @@ function reset() {
   decisionResult = { decision: "respond", reason: "normal", availableTools: [] };
   applyTransitionCalls.length = 0;
   applyTransitionShouldThrow = false;
+  applyTransitionError = null;
+  callOrder.length = 0;
   costPolicyResult = { policy: "allow", reason: "within_budget" };
   generateWithToolsResult = { text: "hola!", inputTokens: 100, outputTokens: 20 };
   activeAgentResult = null;
@@ -972,6 +990,9 @@ test("processNextBatch dead-letters the batch after MAX_BATCH_RETRIES", async ()
   const result = await processNextBatch();
   assert.equal(result.processed, false);
   assert.match(result.error ?? "", /cancelled after 3 retries/);
+  // El batch murió antes de generateWithTools: no puede existir una marca de
+  // handoff_human que aplicar en la rama dead-letter.
+  assert.equal(applyTransitionCalls.length, 0);
 });
 
 // ── setter evaluation (runSetterEvaluation / executeSetterPostAction) ─────
@@ -1070,4 +1091,356 @@ test("processNextBatch's setter evaluation logs an error event and does not thro
       (i.row as { level: string }).level === "error",
   );
   assert.equal(errorEvents.length, 1);
+});
+
+// ── handoff_human: traspaso diferido después del despacho ───────────────
+
+/** Lo que devuelve generateWithTools cuando el modelo llamó a handoff_human. */
+function handoffMarker(reason: string) {
+  return {
+    toolName: "handoff_human",
+    output: { ok: true, output: { handoff: true, reason } },
+  };
+}
+
+/** Los `trigger` con que el turno llamó a applyTransition(…, "handoff_pending"). */
+function handoffTriggers(): string[] {
+  return applyTransitionCalls
+    .filter((args) => args[1] === "handoff_pending")
+    .map((args) => (args[2] as { trigger: string }).trigger);
+}
+
+test("un turno que pidió handoff deriva la conversación DESPUÉS de despachar la respuesta", async () => {
+  primeHappyPathUntilDispatch();
+  generateWithToolsResult = {
+    text: "Te contacta alguien del equipo en un rato 🙌",
+    inputTokens: 10,
+    outputTokens: 5,
+    toolResults: [handoffMarker("agent_stuck")],
+  };
+
+  const result = await processNextBatch();
+
+  assert.deepEqual(result, { processed: true, conversationId: "conv_1" });
+  // La respuesta SÍ sale: es la regresión que este diseño existe para evitar.
+  assert.equal(dispatchTextCalls.length, 1);
+  assert.equal(
+    (dispatchTextCalls[0] as { body: string }).body,
+    "Te contacta alguien del equipo en un rato 🙌",
+  );
+  assert.deepEqual(applyTransitionCalls, [
+    ["conv_1", "handoff_pending", { trigger: "tool:agent_stuck", workspaceId: "ws_1" }],
+  ]);
+  // Si alguien mueve el traspaso antes del dispatchText, el guard de 9b
+  // descartaría la despedida y el cliente recibiría silencio.
+  assert.deepEqual(callOrder, ["dispatchText", "applyTransition"]);
+});
+
+test("un turno sin marca de handoff nunca deriva", async () => {
+  primeHappyPathUntilDispatch();
+  generateWithToolsResult = {
+    text: "hola!",
+    inputTokens: 10,
+    outputTokens: 5,
+    toolResults: [
+      { toolName: "check_availability", output: { ok: true, output: "disponible 10am" } },
+    ],
+  };
+
+  const result = await processNextBatch();
+
+  assert.deepEqual(result, { processed: true, conversationId: "conv_1" });
+  assert.equal(dispatchTextCalls.length, 1);
+  assert.equal(applyTransitionCalls.length, 0);
+});
+
+test("una marca con motivo desconocido o de una tool fallida no deriva", async () => {
+  primeHappyPathUntilDispatch();
+  generateWithToolsResult = {
+    text: "hola!",
+    inputTokens: 10,
+    outputTokens: 5,
+    toolResults: [
+      handoffMarker("porque si"),
+      {
+        toolName: "handoff_human",
+        output: { ok: false, output: { handoff: true, reason: "agent_stuck" } },
+      },
+      {
+        toolName: "handoff_human",
+        output: { ok: true, output: { handoff: "true", reason: "agent_stuck" } },
+      },
+      { toolName: "handoff_human", output: null },
+    ],
+  };
+
+  await processNextBatch();
+
+  assert.equal(applyTransitionCalls.length, 0);
+});
+
+test("una tool de n8n que imita la marca de handoff_human no deriva (filtro por toolName)", async () => {
+  primeHappyPathUntilDispatch();
+  generateWithToolsResult = {
+    text: "hola!",
+    inputTokens: 10,
+    outputTokens: 5,
+    toolResults: [
+      {
+        toolName: "alguna_tool_de_n8n",
+        output: { ok: true, output: { handoff: true, reason: "customer_request" } },
+      },
+    ],
+  };
+
+  await processNextBatch();
+
+  assert.equal(
+    applyTransitionCalls.length,
+    0,
+    "solo handoff_human puede derivar la conversación",
+  );
+});
+
+test("un fallo permanente de despacho no cancela el traspaso", async () => {
+  primeHappyPathUntilDispatch();
+  dispatchTextResult = {
+    ok: false,
+    error: "Número inválido",
+    errorCode: "SEND_FAILED",
+    retryable: false,
+  };
+  generateWithToolsResult = {
+    text: "adiós",
+    inputTokens: 10,
+    outputTokens: 5,
+    toolResults: [handoffMarker("customer_request")],
+  };
+
+  const result = await processNextBatch();
+
+  assert.deepEqual(result, { processed: true, conversationId: "conv_1" });
+  assert.deepEqual(
+    handoffTriggers(),
+    ["tool_unsent:customer_request"],
+    "el cliente no recibió la despedida: el ACK genérico tiene que salir igual",
+  );
+});
+
+test("un fallo transitorio de despacho reencola el batch y NO deriva en ese intento", async () => {
+  primeHappyPathUntilDispatch();
+  dispatchTextResult = {
+    ok: false,
+    error: "Kapso caído",
+    errorCode: "SEND_FAILED",
+    retryable: true,
+  };
+  generateWithToolsResult = {
+    text: "adiós",
+    inputTokens: 10,
+    outputTokens: 5,
+    toolResults: [handoffMarker("customer_request")],
+  };
+
+  const result = await processNextBatch();
+
+  assert.equal(result.processed, false);
+  assert.equal(applyTransitionCalls.length, 0);
+});
+
+test("una TransitionError (ya derivada o cerrada) cierra el batch normal, sin error", async () => {
+  primeHappyPathUntilDispatch();
+  applyTransitionError = new TransitionError("handoff_pending", "handoff_pending");
+  generateWithToolsResult = {
+    text: "adiós",
+    inputTokens: 10,
+    outputTokens: 5,
+    toolResults: [handoffMarker("customer_request")],
+  };
+
+  const errorLogs: unknown[][] = [];
+  const originalError = console.error;
+  console.error = (...args: unknown[]) => errorLogs.push(args);
+  try {
+    const result = await processNextBatch();
+    assert.deepEqual(result, { processed: true, conversationId: "conv_1" });
+    assert.ok(
+      updates.some(
+        (u) =>
+          u.table === "message_batches" &&
+          (u.row as { status?: string }).status === "processed",
+      ),
+    );
+    assert.ok(
+      !updates.some((u) => (u.row as { status?: string }).status === "buffering"),
+      "un no-op esperado no puede reencolar el batch",
+    );
+    assert.ok(
+      !errorLogs.some((args) => String(args[0]).includes("handoff_human falló")),
+      "un no-op esperado no es un error",
+    );
+  } finally {
+    console.error = originalError;
+  }
+});
+
+test("un traspaso que LANZA no reencola el batch: reenviar duplicaría el mensaje", async () => {
+  primeHappyPathUntilDispatch();
+  applyTransitionError = new Error("db down");
+  generateWithToolsResult = {
+    text: "adiós",
+    inputTokens: 10,
+    outputTokens: 5,
+    toolResults: [handoffMarker("agent_stuck")],
+  };
+
+  const errorLogs: unknown[][] = [];
+  const originalError = console.error;
+  console.error = (...args: unknown[]) => errorLogs.push(args);
+  try {
+    const result = await processNextBatch();
+    assert.deepEqual(result, { processed: true, conversationId: "conv_1" });
+    assert.equal(dispatchTextCalls.length, 1);
+    assert.ok(
+      !updates.some((u) => (u.row as { status?: string }).status === "buffering"),
+      "el batch no puede volver a la cola con el mensaje ya enviado",
+    );
+    assert.ok(
+      errorLogs.some((args) => String(args[0]).includes("handoff_human falló")),
+      "el fallo tiene que quedar en el log server-side",
+    );
+  } finally {
+    console.error = originalError;
+  }
+});
+
+test("dos invocaciones de handoff_human en el mismo turno derivan una sola vez", async () => {
+  primeHappyPathUntilDispatch();
+  generateWithToolsResult = {
+    text: "adiós",
+    inputTokens: 10,
+    outputTokens: 5,
+    toolResults: [
+      handoffMarker("customer_request"),
+      handoffMarker("agent_stuck"),
+    ],
+  };
+
+  await processNextBatch();
+
+  assert.deepEqual(handoffTriggers(), ["tool:customer_request"]);
+});
+
+// ── el traspaso no se pierde cuando el batch va a dead-letter ──
+
+/** Fixture compartida: un batch reclamado con retry_count ya en el tope,
+ *  camino feliz hasta el dispatch (que este test hará fallar de forma
+ *  retryable) — mismo orden de queue que primeHappyPathUntilDispatch, pero
+ *  sin el último item de markBatchProcessed: el dead-letter branch inserta un
+ *  evento en su lugar. */
+function primeDeadLetterAfterDispatch() {
+  reset();
+  decisionResult = {
+    decision: "respond",
+    reason: "normal",
+    availableTools: [],
+    reservationId: "res_1",
+  };
+  rpcQueue = [
+    {
+      data: [
+        {
+          id: "batch_1",
+          workspace_id: "ws_1",
+          conversation_id: "conv_1",
+          status: "processing",
+          meta: { retry_count: 3 },
+        },
+      ],
+      error: null,
+    },
+  ];
+  responseQueue = [
+    { data: [], error: null }, // consolidateBatch
+    { data: { id: "conv_1", workspace_id: "ws_1", contact_id: "contact_1", ai_enabled: true }, error: null },
+    { data: null, error: null }, // kapso config lookup
+    { data: { credentials: {}, config: {} }, error: null }, // kapso integration
+    { data: { state: "ai_active" }, error: null }, // live state re-check
+    { error: null }, // batch_dead_letter event insert
+  ];
+  rpcQueue.push({ data: null, error: null }); // cancel_batch RPC
+  dispatchTextResult = {
+    ok: false,
+    error: "Kapso caído",
+    errorCode: "SEND_FAILED",
+    retryable: true,
+  };
+}
+
+test("un fallo transitorio de dispatchText agotado hasta MAX_BATCH_RETRIES deriva el handoff en la rama dead-letter", async () => {
+  primeDeadLetterAfterDispatch();
+  generateWithToolsResult = {
+    text: "adiós",
+    inputTokens: 10,
+    outputTokens: 5,
+    toolResults: [handoffMarker("customer_request")],
+  };
+
+  const result = await processNextBatch();
+
+  assert.equal(result.processed, false);
+  assert.match(result.error ?? "", /cancelled after 3 retries/);
+  assert.deepEqual(
+    handoffTriggers(),
+    ["tool_unsent:customer_request"],
+    "en dead-letter nunca se despachó nada: el trigger tiene que decirlo",
+  );
+});
+
+test("el mismo dead-letter sin marca de handoff nunca deriva", async () => {
+  primeDeadLetterAfterDispatch();
+  generateWithToolsResult = {
+    text: "adiós",
+    inputTokens: 10,
+    outputTokens: 5,
+    toolResults: [],
+  };
+
+  const result = await processNextBatch();
+
+  assert.equal(result.processed, false);
+  assert.equal(applyTransitionCalls.length, 0);
+});
+
+// ── un humano toma el hilo justo cuando el turno pidió handoff ──
+
+test("guard 9b + marca de handoff: ni despacha ni deriva, y el batch queda procesado", async () => {
+  primeHappyPathUntilDispatch();
+  const idx = responseQueue.findIndex(
+    (e) => (e.data as { state?: string } | null)?.state === "ai_active",
+  );
+  responseQueue[idx] = { data: { state: "human_active" }, error: null };
+  generateWithToolsResult = {
+    text: "Te contacta alguien del equipo en un rato 🙌",
+    inputTokens: 10,
+    outputTokens: 5,
+    toolResults: [handoffMarker("agent_stuck")],
+  };
+
+  const result = await processNextBatch();
+
+  assert.deepEqual(result, { processed: true, conversationId: "conv_1" });
+  assert.equal(dispatchTextCalls.length, 0, "un humano ya tiene el hilo");
+  assert.equal(
+    applyTransitionCalls.length,
+    0,
+    "el guard 9b corta antes de llegar a 10b-bis",
+  );
+  assert.ok(
+    updates.some(
+      (u) =>
+        u.table === "message_batches" &&
+        (u.row as { status?: string }).status === "processed",
+    ),
+  );
 });
