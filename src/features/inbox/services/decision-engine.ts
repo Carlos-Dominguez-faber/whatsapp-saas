@@ -303,6 +303,29 @@ export async function applyTransition(
   // 5. Side effects of the new state. Deliberately last and deliberately
   //    non-throwing: the transition above is already committed and must stand
   //    even if notifying anyone fails.
+  //
+  // Traspaso y cierre se ENCOLAN para el timeline de HubSpot. Acá va solo un
+  // INSERT barato e idempotente (UNIQUE conversation_id + from_state_version) y la RPC decide si
+  // HubSpot es el CRM activo. NUNCA se llama a HubSpot en este camino: lo hace la fase
+  // hubspotLogs de cron/automations, con deadline. Un fallo no revierte ni rompe la transición.
+  // Va ANTES del aviso por email (Resend, llamada externa): si el aviso se cuelga y la función
+  // muere por maxDuration, el encolado ya quedó hecho.
+  if (to === "handoff_pending" || to === "closed") {
+    try {
+      const { error: enqueueError } = await supabase.rpc("enqueue_hubspot_conversation_log", {
+        p_workspace_id: conv.workspace_id,
+        p_conversation_id: conversationId,
+        p_from_state_version: currentVersion,
+        p_reason: to === "closed" ? "closed" : "handoff",
+      });
+      if (enqueueError) {
+        console.error("[decision-engine] hubspot_log_enqueue_failed", { conversationId });
+      }
+    } catch {
+      console.error("[decision-engine] hubspot_log_enqueue_failed", { conversationId });
+    }
+  }
+
   if (to === "handoff_pending") {
     try {
       const { notifyHandoffPending } = await import("./handoff-notifier");

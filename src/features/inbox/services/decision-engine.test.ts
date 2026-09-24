@@ -16,6 +16,11 @@ let inserts: Array<{ table: string; row: unknown }> = [];
 // relectura tras perder el CAS). Sin esto el fake tragaba los args de .eq()
 // y borrar el scope de workspace en el re-read del CAS seguía en verde.
 let selects: Array<{ eqArgs: unknown[][] }> = [];
+const rpcCalls: Array<{ fn: string; args: unknown }> = [];
+let rpcResponse: { data: unknown; error: unknown } = { data: true, error: null };
+let rpcShouldThrow = false;
+/** Orden de los efectos secundarios de applyTransition (rpc + notificación). */
+const sideEffectOrder: string[] = [];
 
 function nextResponse(): QueueEntry {
   return responseQueue.shift() ?? { data: null, error: null };
@@ -70,6 +75,12 @@ const fakeClient = {
       },
     };
   },
+  rpc(fn: string, args: unknown) {
+    rpcCalls.push({ fn, args });
+    sideEffectOrder.push(fn);
+    if (rpcShouldThrow) throw new Error("rpc boom");
+    return Promise.resolve(rpcResponse);
+  },
 };
 
 mock.module("@supabase/supabase-js", {
@@ -98,6 +109,7 @@ mock.module("./handoff-notifier.ts", {
   exports: {
     notifyHandoffPending: async (params: unknown) => {
       notifyCalls.push(params);
+      sideEffectOrder.push("notifyHandoffPending");
       if (notifyShouldReject) throw new Error("notify boom");
     },
   },
@@ -114,6 +126,10 @@ function reset() {
   notifyShouldReject = false;
   rateLimitResult = { allowed: true };
   enabledTools = [];
+  rpcCalls.length = 0;
+  rpcResponse = { data: true, error: null };
+  rpcShouldThrow = false;
+  sideEffectOrder.length = 0;
 }
 
 // ── decide() ────────────────────────────────────────────────────────────
@@ -612,4 +628,86 @@ test("perder la carrera relee el estado con el mismo scope de workspaceId que el
     ["id", "conv_1"],
     ["workspace_id", "ws_1"],
   ]);
+});
+
+// ── El traspaso y el cierre se ENCOLAN para HubSpot; nunca se espera a HubSpot acá ──
+
+function winTransitionQueue() {
+  responseQueue = [
+    { data: { state: "ai_active", workspace_id: "ws_1", state_version: 4 }, error: null },
+    { data: { id: "conv_1" }, error: null }, // UPDATE: ganó el CAS
+    { error: null }, // evento state_change
+  ];
+}
+
+test("handoff_pending encola con la identidad de la transición (versión leída)", async () => {
+  reset();
+  winTransitionQueue();
+  await applyTransition("conv_1", "handoff_pending", { trigger: "manual" });
+  assert.deepEqual(rpcCalls, [
+    {
+      fn: "enqueue_hubspot_conversation_log",
+      args: { p_workspace_id: "ws_1", p_conversation_id: "conv_1", p_from_state_version: 4, p_reason: "handoff" },
+    },
+  ]);
+});
+
+test("handoff_pending encola ANTES de notificar al equipo (un Resend colgado no pierde el encolado)", async () => {
+  reset();
+  winTransitionQueue();
+  await applyTransition("conv_1", "handoff_pending", { trigger: "manual" });
+  assert.deepEqual(sideEffectOrder, ["enqueue_hubspot_conversation_log", "notifyHandoffPending"]);
+});
+
+test("closed encola con reason closed", async () => {
+  reset();
+  winTransitionQueue();
+  await applyTransition("conv_1", "closed");
+  assert.equal((rpcCalls[0].args as { p_reason: string }).p_reason, "closed");
+});
+
+test("otras transiciones no encolan nada", async () => {
+  reset();
+  winTransitionQueue();
+  await applyTransition("conv_1", "human_active", { userId: "user_1" });
+  assert.equal(rpcCalls.length, 0);
+});
+
+test("perder la carrera contra la misma transición no encola (sin duplicados)", async () => {
+  reset();
+  responseQueue = [
+    { data: { state: "ai_active", workspace_id: "ws_1", state_version: 4 }, error: null },
+    { data: null, error: null }, // UPDATE: perdió el CAS
+    { data: { state: "closed" }, error: null }, // relectura: el ganador ya escribió "closed"
+  ];
+  await applyTransition("conv_1", "closed");
+  assert.equal(rpcCalls.length, 0);
+});
+
+test("un error o una excepción al encolar no rompen ni revierten la transición", async () => {
+  for (const mode of ["error", "throw"] as const) {
+    reset();
+    winTransitionQueue();
+    const rawMessage = mode === "error" ? "boom" : "rpc boom";
+    if (mode === "error") rpcResponse = { data: null, error: { message: rawMessage } };
+    else rpcShouldThrow = true;
+    const logged: unknown[][] = [];
+    const original = console.error;
+    console.error = (...a: unknown[]) => logged.push(a);
+    try {
+      await applyTransition("conv_1", "closed");
+    } finally {
+      console.error = original;
+    }
+    assert.equal(updates.length, 1, "la transición quedó escrita");
+    // Se registra el código, no el texto crudo del error.
+    assert.ok(
+      logged.some((a) => String(a[0]).includes("hubspot_log_enqueue_failed")),
+      `modo ${mode}: falta el código hubspot_log_enqueue_failed`,
+    );
+    assert.ok(
+      logged.every((a) => !JSON.stringify(a).includes(rawMessage)),
+      `modo ${mode}: se filtró el texto crudo del error`,
+    );
+  }
 });

@@ -15,7 +15,7 @@
 
 import { createClient as createSbClient } from "@supabase/supabase-js";
 import { applyTransition, TransitionError } from "./decision-engine";
-import { syncContactToHL } from "./highlevel-client";
+import { syncContactToCrm } from "./crm-sync";
 
 function svc() {
   return createSbClient(
@@ -46,8 +46,8 @@ interface AppendTagsRow {
 }
 
 /**
- * Agrega una etiqueta al contacto y empuja el cambio a HighLevel best-effort
- * (no-op si HL no está conectado).
+ * Agrega una etiqueta al contacto y empuja el cambio al CRM activo best-effort
+ * (no-op sin CRM).
  *
  * Es una sola llamada a `append_contact_tags` (migración 20260903000000) y no
  * un read-modify-write: leer `tags`, calcular la unión y escribir el array
@@ -56,9 +56,9 @@ interface AppendTagsRow {
  * resuelve el agregado dentro del propio UPDATE, con la fila bloqueada.
  *
  * Devuelve `true` cuando REALMENTE agregó la etiqueta y `false` cuando el
- * contacto ya la tenía. Los dos son ÉXITO; el booleano solo decide el sync a
- * HL, porque sincronizar cuando no cambió nada es tráfico inútil en cada vuelta
- * del motor.
+ * contacto ya la tenía. Los dos son ÉXITO; el booleano solo decide el sync al
+ * CRM, porque sincronizar cuando no cambió nada es tráfico inútil en cada
+ * vuelta del motor.
  */
 export async function addTagToContact(params: {
   workspaceId: string;
@@ -94,12 +94,11 @@ export async function addTagToContact(params: {
   // tags_added = 0 ⇒ ya la tenía. Éxito idempotente y sin sync: nada cambió.
   if (row.tags_added <= 0) return false;
 
-  // Best-effort: si HL no está conectado es un no-op. syncContactToHL lanza en
-  // más de un camino (highlevel-client.ts); sin el .catch, un caller worker
-  // (el ejecutor del motor) vería una unhandled rejection por un sync que ni siquiera bloquea
-  // el resultado de esta función.
-  void syncContactToHL(params.workspaceId, params.contactId).catch((e) =>
-    console.warn("[conversation-actions] syncContactToHL:", e),
+  // Best-effort: sin CRM conectado es un no-op. Lleva el delta, no el arreglo: HubSpot agrega la
+  // etiqueta sin pisar las que el equipo puso allá. Sin el .catch, un caller worker (el ejecutor
+  // del motor) vería una unhandled rejection por un sync que no bloquea el resultado de esta función.
+  void syncContactToCrm(params.workspaceId, params.contactId, { addTags: [tag] }).catch((e) =>
+    console.warn("[conversation-actions] syncContactToCrm:", e),
   );
   return true;
 }

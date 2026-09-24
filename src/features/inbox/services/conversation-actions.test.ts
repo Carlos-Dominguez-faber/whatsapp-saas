@@ -62,11 +62,13 @@ mock.module("./decision-engine.ts", {
 });
 
 const hlSyncs: string[] = [];
-mock.module("./highlevel-client.ts", {
+const crmSyncOpts: unknown[] = [];
+mock.module("./crm-sync.ts", {
   exports: {
-    syncContactToHL: async (_ws: string, contactId: string) => {
+    syncContactToCrm: async (_ws: string, contactId: string, opts?: unknown) => {
       hlSyncs.push(contactId);
-      return null;
+      crmSyncOpts.push(opts);
+      return { ok: false, reason: "no_crm" };
     },
   },
 });
@@ -82,6 +84,7 @@ function reset() {
   transitions.length = 0;
   transitionThrows = null;
   hlSyncs.length = 0;
+  crmSyncOpts.length = 0;
 }
 
 // ── Camino correcto ──────────────────────────────────────────────────────────
@@ -112,6 +115,7 @@ test("addTagToContact delega en la RPC atómica, nunca en un read-modify-write",
     "leer las tags y volver a escribirlas pierde etiquetas bajo concurrencia",
   );
   assert.deepEqual(hlSyncs, ["contact_1"]);
+  assert.deepEqual(crmSyncOpts, [{ addTags: ["interesado"] }], "el CRM recibe el delta, no el arreglo");
 });
 
 test("una etiqueta que ya estaba es ÉXITO idempotente: false, sin sync y sin lanzar", async () => {

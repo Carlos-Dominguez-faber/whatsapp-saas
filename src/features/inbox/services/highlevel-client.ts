@@ -78,7 +78,7 @@ function hlHeaders(token: string): HeadersInit {
   };
 }
 
-function splitName(fullName: string | null): {
+export function splitName(fullName: string | null): {
   firstName: string;
   lastName: string;
 } {

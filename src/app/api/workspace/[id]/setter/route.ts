@@ -1,11 +1,12 @@
 // G5: Setter mode API — CRUD for setter_configs table.
+//
+// Autorización por requireWorkspaceMember: el authGuard inline que
+// había no filtraba `is_active`. Leer: cualquier miembro activo. Crear/editar: manager o más.
 
 import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
-import { createClient } from "@/lib/supabase/server";
 import { createClient as createSvcClient } from "@supabase/supabase-js";
-
-// ── Schemas ───────────────────────────────────────────────────────────────────
+import { requireWorkspaceMember, readJsonBody } from "@/lib/auth/workspace-access";
 
 const QuestionSchema = z.object({
   id: z.string().min(1),
@@ -25,13 +26,13 @@ const ScoringSchema = z.object({
   max_score: z.number().min(1).max(100),
 });
 
+/**
+ * Los tipos viven en tres lugares, a propósito sin tipo compartido: este schema, PostActionType en
+ * setter-advanced-config.tsx y el switch de executeSetterPostAction en buffer.ts. Uno nuevo se
+ * agrega en los tres.
+ */
 const PostActionSchema = z.object({
-  type: z.enum([
-    "send_template",
-    "create_hl_opportunity",
-    "handoff",
-    "add_tag",
-  ]),
+  type: z.enum(["send_template", "create_hl_opportunity", "create_hubspot_deal", "handoff", "add_tag"]),
   tag: z.string().max(100).optional(),
   template_name: z.string().max(200).optional(),
 });
@@ -55,215 +56,81 @@ const PatchSchema = z.object({
   post_action: PostActionSchema.optional(),
 });
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
+const SELECT_COLUMNS = "id, name, enabled, questions, knockout_rules, scoring, post_action";
 
 function svc() {
-  return createSvcClient(
-    process.env.NEXT_PUBLIC_SUPABASE_URL!,
-    process.env.SUPABASE_SERVICE_ROLE_KEY!,
-  );
+  return createSvcClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!);
 }
 
-async function resolveWorkspaceMember(
-  supabase: Awaited<ReturnType<typeof createClient>>,
-  workspaceId: string,
-  userId: string,
-) {
-  const { data } = await supabase
-    .from("memberships")
-    .select("role")
-    .eq("workspace_id", workspaceId)
-    .eq("user_id", userId)
-    .maybeSingle();
-  return data;
+function internalError(route: string, error: unknown) {
+  console.error(`[${route} /api/workspace/[id]/setter]:`, error);
+  return NextResponse.json({ error: "Error interno del servidor" }, { status: 500 });
 }
 
-async function authGuard(
-  supabase: Awaited<ReturnType<typeof createClient>>,
-  workspaceId: string,
-  requireManagerOrAbove = false,
-) {
-  const {
-    data: { user },
-    error: authError,
-  } = await supabase.auth.getUser();
-
-  if (authError || !user) {
-    return { user: null, member: null, error: "No autorizado", status: 401 };
-  }
-
-  const member = await resolveWorkspaceMember(supabase, workspaceId, user.id);
-  if (!member) {
-    return { user, member: null, error: "Acceso denegado", status: 403 };
-  }
-
-  if (
-    requireManagerOrAbove &&
-    !["admin", "manager"].includes(member.role as string)
-  ) {
-    return {
-      user,
-      member,
-      error: "Se requiere rol admin o manager",
-      status: 403,
-    };
-  }
-
-  return { user, member, error: null, status: 200 };
-}
-
-// ── GET /api/workspace/[id]/setter ────────────────────────────────────────────
-
-export async function GET(
-  _req: NextRequest,
-  { params }: { params: Promise<{ id: string }> },
-) {
+export async function GET(_req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   const { id: workspaceId } = await params;
-  const supabase = await createClient();
+  const auth = await requireWorkspaceMember(workspaceId);
+  if (!auth.ok) return auth.response;
 
-  const guard = await authGuard(supabase, workspaceId);
-  if (guard.error) {
-    return NextResponse.json({ error: guard.error }, { status: guard.status });
-  }
-
-  const db = svc();
-  const { data, error } = await db
+  const { data, error } = await svc()
     .from("setter_configs")
-    .select(
-      "id, name, enabled, questions, knockout_rules, scoring, post_action",
-    )
+    .select(SELECT_COLUMNS)
     .eq("workspace_id", workspaceId)
     .order("created_at", { ascending: false })
     .limit(1)
     .maybeSingle();
-
-  if (error) {
-    console.error("[GET /api/workspace/[id]/setter]:", error);
-    return NextResponse.json(
-      { error: "Error interno del servidor" },
-      { status: 500 },
-    );
-  }
-
+  if (error) return internalError("GET", error);
   return NextResponse.json({ data: data ?? null });
 }
 
-// ── POST /api/workspace/[id]/setter ──────────────────────────────────────────
-
-export async function POST(
-  req: NextRequest,
-  { params }: { params: Promise<{ id: string }> },
-) {
+export async function POST(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   const { id: workspaceId } = await params;
-  const supabase = await createClient();
+  const auth = await requireWorkspaceMember(workspaceId, { minRole: "manager" });
+  if (!auth.ok) return auth.response;
 
-  const guard = await authGuard(supabase, workspaceId, true);
-  if (guard.error) {
-    return NextResponse.json({ error: guard.error }, { status: guard.status });
-  }
+  const body = await readJsonBody(req);
+  if (!body.ok) return body.response;
+  const parsed = CreateSchema.safeParse(body.body);
+  if (!parsed.success) return NextResponse.json({ error: parsed.error.flatten() }, { status: 400 });
 
-  let body: unknown;
-  try {
-    body = await req.json();
-  } catch {
-    return NextResponse.json({ error: "Body inválido" }, { status: 400 });
-  }
-
-  const parsed = CreateSchema.safeParse(body);
-  if (!parsed.success) {
-    return NextResponse.json(
-      { error: parsed.error.flatten() },
-      { status: 400 },
-    );
-  }
-
-  const db = svc();
-  const { data, error } = await db
+  const { data, error } = await svc()
     .from("setter_configs")
-    .insert({
-      workspace_id: workspaceId,
-      ...parsed.data,
-    })
-    .select(
-      "id, name, enabled, questions, knockout_rules, scoring, post_action",
-    )
+    .insert({ workspace_id: workspaceId, ...parsed.data })
+    .select(SELECT_COLUMNS)
     .single();
-
-  if (error || !data) {
-    console.error("[POST /api/workspace/[id]/setter]:", error);
-    return NextResponse.json(
-      { error: "Error interno del servidor" },
-      { status: 500 },
-    );
-  }
-
+  if (error || !data) return internalError("POST", error);
   return NextResponse.json({ data }, { status: 201 });
 }
 
-// ── PATCH /api/workspace/[id]/setter ─────────────────────────────────────────
-
-export async function PATCH(
-  req: NextRequest,
-  { params }: { params: Promise<{ id: string }> },
-) {
+export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   const { id: workspaceId } = await params;
-  const supabase = await createClient();
+  const auth = await requireWorkspaceMember(workspaceId, { minRole: "manager" });
+  if (!auth.ok) return auth.response;
 
-  const guard = await authGuard(supabase, workspaceId, true);
-  if (guard.error) {
-    return NextResponse.json({ error: guard.error }, { status: guard.status });
-  }
-
-  let body: unknown;
-  try {
-    body = await req.json();
-  } catch {
-    return NextResponse.json({ error: "Body inválido" }, { status: 400 });
-  }
-
-  const parsed = PatchSchema.safeParse(body);
-  if (!parsed.success) {
-    return NextResponse.json(
-      { error: parsed.error.flatten() },
-      { status: 400 },
-    );
-  }
+  const body = await readJsonBody(req);
+  if (!body.ok) return body.response;
+  const parsed = PatchSchema.safeParse(body.body);
+  if (!parsed.success) return NextResponse.json({ error: parsed.error.flatten() }, { status: 400 });
 
   const { id, ...updates } = parsed.data;
-
   const db = svc();
-
-  // Verify the config belongs to this workspace before updating
-  const { data: existing } = await db
+  const { data: existing, error: existingError } = await db
     .from("setter_configs")
     .select("id")
     .eq("id", id)
     .eq("workspace_id", workspaceId)
     .maybeSingle();
+  if (existingError) return internalError("PATCH pre-check", existingError);
+  if (!existing) return NextResponse.json({ error: "Configuración no encontrada" }, { status: 404 });
 
-  if (!existing) {
-    return NextResponse.json(
-      { error: "Configuración no encontrada" },
-      { status: 404 },
-    );
-  }
-
+  // El UPDATE también filtra por workspace: una escritura con service_role filtra el tenant ella misma.
   const { data, error } = await db
     .from("setter_configs")
     .update(updates)
     .eq("id", id)
-    .select(
-      "id, name, enabled, questions, knockout_rules, scoring, post_action",
-    )
+    .eq("workspace_id", workspaceId)
+    .select(SELECT_COLUMNS)
     .single();
-
-  if (error || !data) {
-    console.error("[PATCH /api/workspace/[id]/setter]:", error);
-    return NextResponse.json(
-      { error: "Error interno del servidor" },
-      { status: 500 },
-    );
-  }
-
+  if (error || !data) return internalError("PATCH", error);
   return NextResponse.json({ data });
 }

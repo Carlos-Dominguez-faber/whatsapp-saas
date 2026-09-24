@@ -55,6 +55,19 @@ mock.module("@/features/automations/services/executor.ts", {
   },
 });
 
+const hubspotLogCalls: Array<{ deadline: number; at: number }> = [];
+let hubspotLogsResult: Record<string, unknown> = { done: 1, retry: 0, failed: 0, cancelled: 0 };
+let hubspotLogsShouldThrow = false;
+mock.module("@/features/inbox/services/hubspot-log-queue.ts", {
+  exports: {
+    drainHubSpotConversationLogs: async (deadline: number) => {
+      hubspotLogCalls.push({ deadline, at: Date.now() });
+      if (hubspotLogsShouldThrow) throw new Error("connection refused en la cola de HubSpot");
+      return hubspotLogsResult;
+    },
+  },
+});
+
 const { GET, maxDuration, RUN_BUDGET_MS } = await import("./route.ts");
 
 function req(auth?: string) {
@@ -74,6 +87,9 @@ function reset() {
   expandPhaseError = undefined;
   drainShouldThrow = false;
   drainPhaseError = undefined;
+  hubspotLogCalls.length = 0;
+  hubspotLogsResult = { done: 1, retry: 0, failed: 0, cancelled: 0 };
+  hubspotLogsShouldThrow = false;
 }
 
 // ── Camino correcto ──────────────────────────────────────────────────────────
@@ -88,6 +104,7 @@ test("con el bearer correcto escanea, expande y después drena, con la forma exa
     scanned: { events: 2, errors: 0 },
     expanded: { events: 3, runs: 5, errors: 0 },
     executed: { done: 4, failed: 1, skipped: 0, retry: 0, lost: 0 },
+    hubspotLogs: { done: 1, retry: 0, failed: 0, cancelled: 0 },
   });
   assert.equal(scanCalls.length, 1);
   assert.equal(expandCalls.length, 1);
@@ -100,6 +117,8 @@ test("con el bearer correcto escanea, expande y después drena, con la forma exa
     expandCalls[0].at <= drainCalls[0].at,
     "expandir ANTES de drenar: si no, los eventos de este tick esperan al siguiente",
   );
+  assert.ok(drainCalls[0].at <= hubspotLogCalls[0].at, "la cola de HubSpot va DESPUÉS del drenaje del motor");
+  assert.equal(hubspotLogCalls[0].deadline, drainCalls[0].deadline, "mismo deadline de la corrida");
 });
 
 test("el presupuesto cabe dentro del intervalo del cron", () => {
@@ -326,4 +345,35 @@ test("si drainAutomationRuns lanza, la ruta no revienta pero responde 500 con ok
     !JSON.stringify(body).includes("connection refused"),
     "la respuesta no puede exponer el mensaje crudo de la excepción",
   );
+});
+
+test("la fase hubspotLogs que DEVUELVE su código responde 500 y conserva el resto del tally", async () => {
+  reset();
+  process.env.CRON_SECRET = "s3cret";
+  hubspotLogsResult = { done: 0, retry: 0, failed: 0, cancelled: 0, error: "hubspot_logs_claim_failed" };
+  const res = await GET(req("Bearer s3cret"));
+  assert.equal(res.status, 500);
+  const body = (await res.json()) as { ok: boolean; executed: unknown; hubspotLogs: { error: string } };
+  assert.equal(body.ok, false);
+  assert.equal(body.hubspotLogs.error, "hubspot_logs_claim_failed");
+  assert.deepEqual(body.executed, { done: 4, failed: 1, skipped: 0, retry: 0, lost: 0 });
+});
+
+test("si la fase hubspotLogs lanza, la ruta no revienta: 500 con hubspot_logs_threw y sin el mensaje", async () => {
+  reset();
+  process.env.CRON_SECRET = "s3cret";
+  hubspotLogsShouldThrow = true;
+  const res = await GET(req("Bearer s3cret"));
+  assert.equal(res.status, 500);
+  const text = await res.text();
+  assert.ok(text.includes("hubspot_logs_threw"));
+  assert.ok(!text.includes("connection refused"));
+});
+
+test("si el motor se cae, la cola de HubSpot igual corre", async () => {
+  reset();
+  process.env.CRON_SECRET = "s3cret";
+  drainShouldThrow = true;
+  await GET(req("Bearer s3cret"));
+  assert.equal(hubspotLogCalls.length, 1);
 });

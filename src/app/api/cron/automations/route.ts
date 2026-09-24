@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { scanTimeTriggers } from "@/features/automations/services/scan-time";
 import { expandAutomationEvents } from "@/features/automations/services/expand";
 import { drainAutomationRuns } from "@/features/automations/services/executor";
+import { drainHubSpotConversationLogs, type HubSpotLogTally } from "@/features/inbox/services/hubspot-log-queue";
 import { isAuthorized } from "@/lib/cron-auth";
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -10,14 +11,15 @@ import { isAuthorized } from "@/lib/cron-auth";
 // `Authorization: Bearer ${CRON_SECRET}`. No hay Vercel Cron para esta ruta; no
 // agregar uno: sería un segundo disparador.
 //
-// Cada tick hace tres cosas en orden: 0) escanea los triggers por TIEMPO
+// Cada tick hace cuatro cosas en orden: 0) escanea los triggers por TIEMPO
 // (`appointment_upcoming`) e inserta los eventos que le tocan en
 // `automation_events`, 1) expande TODOS los eventos pendientes —los que puso el
 // scan y los que dejaron los triggers de Postgres— a filas de
 // `automation_runs`, 2) reclama y ejecuta hasta MAX_RUNS_PER_TICK filas, en
-// round-robin por workspace (el orden lo pone la RPC, no esta ruta). Cada
-// ejecución puede mandar un WhatsApp; el presupuesto de 50 s se fija ACÁ, antes
-// del scan, y cubre LAS TRES ETAPAS. Si aun así se corta, el reclamo de
+// round-robin por workspace (el orden lo pone la RPC, no esta ruta).
+// 3) procesa la cola del timeline de HubSpot con el presupuesto sobrante.
+// Cada ejecución puede mandar un WhatsApp; el presupuesto de 50 s se fija ACÁ, antes
+// del scan, y cubre TODAS LAS ETAPAS. Si aun así se corta, el reclamo de
 // atascadas de claim_next_automation_run() retoma las filas a los 7 minutos.
 //
 // El trío de tiempos es deliberado y va junto:
@@ -141,8 +143,21 @@ export async function GET(request: Request): Promise<NextResponse> {
     executed = { done: 0, failed: 0, skipped: 0, retry: 0, lost: 0, error: "drain_threw" };
   }
 
-  // El catch de arriba es la red que evita que la ruta se cuelgue, pero no
-  // puede firmar como sano un tick que no ejecutó nada. `200` + `ok:true` es LA
+  // Cola del timeline de HubSpot, DESPUÉS del motor y con el MISMO deadline. Si
+  // el motor se comió el presupuesto, no reclama nada y queda para el tick
+  // siguiente. Misma semántica de fase: si lanza o devuelve su código, 500 ok:false.
+  let hubspotLogs: HubSpotLogTally = { done: 0, retry: 0, failed: 0, cancelled: 0 };
+  try {
+    hubspotLogs = await drainHubSpotConversationLogs(deadline);
+    if (hubspotLogs.error) phaseFailed = true;
+  } catch (err) {
+    console.error("[cron/automations] hubspot logs error:", err instanceof Error ? err.message : err);
+    phaseFailed = true;
+    hubspotLogs = { done: 0, retry: 0, failed: 0, cancelled: 0, error: "hubspot_logs_threw" };
+  }
+
+  // Los catch de arriba son la red que evita que la ruta se cuelgue, pero no
+  // pueden firmar como sano un tick que no ejecutó nada. `200` + `ok:true` es LA
   // definición de tick sano: si una fase se cayó —lanzando o devolviendo su
   // código—, la respuesta lo dice con un 500 y `ok:false`, y el body conserva el
   // código por fase (nunca el mensaje de la excepción ni el de PostgREST)
@@ -150,7 +165,7 @@ export async function GET(request: Request): Promise<NextResponse> {
   // reintento: pg_net solo registra la respuesta en net._http_response y no hay
   // Vercel Cron para esta ruta.
   return NextResponse.json(
-    { ok: !phaseFailed, scanned, expanded, executed },
+    { ok: !phaseFailed, scanned, expanded, executed, hubspotLogs },
     { status: phaseFailed ? 500 : 200 },
   );
 }

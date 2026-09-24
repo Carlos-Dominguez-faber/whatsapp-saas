@@ -27,6 +27,11 @@ import {
 } from "./conversation-history";
 import { getSetterConfig, evaluateLead } from "./setter";
 import { createHLOpportunity } from "./highlevel-client";
+import { createHubSpotDeal } from "./hubspot-client";
+import { crmStatus } from "./crm-sync";
+
+/** Motivo para el operador cuando falló la LECTURA del CRM activo: no es "no activo". */
+const CRM_READ_FAILED_REASON = "no se pudo verificar cuál es el CRM activo (falló la lectura de la base)";
 
 const DEFAULT_SILENCE_MS = 30_000; // 30 seconds silence window
 const MAX_BATCH_RETRIES = 3;
@@ -928,9 +933,9 @@ async function runSetterEvaluation(params: SetterEvalParams): Promise<void> {
 
 // ──────────────────────────────────────────────────────────────────────────────
 // executeSetterPostAction (private)
-// Runs the configured post_action for a qualified lead. Reuses existing
-// executors; create_hl_opportunity is stubbed (logs a pending event) until HL
-// pipeline/stage config exists.
+// Runs the configured post_action for a qualified lead. create_hl_opportunity (HighLevel) and
+// create_hubspot_deal (HubSpot) are twins and each one acts ONLY when its CRM is THE active
+// one: with the other CRM active, or both enabled, it writes a failed event and calls nobody.
 // ──────────────────────────────────────────────────────────────────────────────
 
 interface PostActionParams {
@@ -1019,6 +1024,24 @@ async function executeSetterPostAction(p: PostActionParams): Promise<void> {
       }
 
       case "create_hl_opportunity": {
+        const hlStatus = await crmStatus(p.workspaceId, "highlevel");
+        if (hlStatus !== "active") {
+          await p.supabase.from("events").insert({
+            type: "setter_post_action_failed",
+            level: "warn",
+            workspace_id: p.workspaceId,
+            conversation_id: p.conversationId,
+            payload: {
+              action: "create_hl_opportunity",
+              contact_id: p.contactId,
+              reason:
+                hlStatus === "error"
+                  ? CRM_READ_FAILED_REASON
+                  : "HighLevel no es el CRM activo de este espacio de trabajo",
+            },
+          });
+          break;
+        }
         // Creates the opportunity in the workspace's configured HL pipeline/stage.
         // Returns null when HL isn't connected or pipeline/stage is unconfigured.
         const result = await createHLOpportunity(p.workspaceId, p.contactId);
@@ -1036,6 +1059,44 @@ async function executeSetterPostAction(p: PostActionParams): Promise<void> {
                   reason:
                     "no se pudo crear la oportunidad (revisa PIT, pipeline y etapa de HighLevel)",
                 }),
+          },
+        });
+        break;
+      }
+
+      case "create_hubspot_deal": {
+        const hsStatus = await crmStatus(p.workspaceId, "hubspot");
+        if (hsStatus !== "active") {
+          await p.supabase.from("events").insert({
+            type: "setter_post_action_failed",
+            level: "warn",
+            workspace_id: p.workspaceId,
+            conversation_id: p.conversationId,
+            payload: {
+              action: "create_hubspot_deal",
+              contact_id: p.contactId,
+              reason:
+                hsStatus === "error"
+                  ? CRM_READ_FAILED_REASON
+                  : "HubSpot no es el CRM activo de este espacio de trabajo",
+            },
+          });
+          break;
+        }
+        // null = HubSpot sin configurar o la API falló; el código técnico ya quedó en `events`
+        // (crm_sync_failed) desde hubspot-client.
+        const result = await createHubSpotDeal(p.workspaceId, p.contactId);
+        await p.supabase.from("events").insert({
+          type: result ? "setter_post_action" : "setter_post_action_failed",
+          level: result ? "info" : "warn",
+          workspace_id: p.workspaceId,
+          conversation_id: p.conversationId,
+          payload: {
+            action: "create_hubspot_deal",
+            contact_id: p.contactId,
+            ...(result
+              ? { deal_id: result.id }
+              : { reason: "no se pudo crear el negocio (revisa el token, el pipeline y la etapa de HubSpot)" }),
           },
         });
         break;

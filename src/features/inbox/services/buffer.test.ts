@@ -273,10 +273,35 @@ mock.module("./setter.ts", {
     evaluateLead: async () => evaluateLeadResult,
   },
 });
+let hlOpportunityResult: { id: string } | null = null;
+const hlOpportunityCalls: unknown[][] = [];
 mock.module("./highlevel-client.ts", {
   exports: {
     syncContactToHL: async () => {},
-    createHLOpportunity: async () => null,
+    createHLOpportunity: async (...args: unknown[]) => {
+      hlOpportunityCalls.push(args);
+      return hlOpportunityResult;
+    },
+  },
+});
+
+let hubspotDealResult: { id: string } | null = null;
+const hubspotDealCalls: unknown[][] = [];
+mock.module("./hubspot-client.ts", {
+  exports: {
+    createHubSpotDeal: async (...args: unknown[]) => {
+      hubspotDealCalls.push(args);
+      return hubspotDealResult;
+    },
+  },
+});
+
+/** CRM que `crmStatus` reporta como EL activo; null = ninguno o conflicto; "error" = lectura fallida. */
+let activeCrmName: "highlevel" | "hubspot" | "error" | null = null;
+mock.module("./crm-sync.ts", {
+  exports: {
+    crmStatus: async (_ws: string, name: string) =>
+      activeCrmName === "error" ? "error" : name === activeCrmName ? "active" : "inactive",
   },
 });
 
@@ -1308,4 +1333,115 @@ test("un send_template exitoso NO escribe ningún evento de fallo", async () => 
     ).length,
     0,
   );
+});
+
+// ── Acciones de CRM del setter: cada una actúa solo si su CRM es EL activo ──
+
+function qualifiedSetterRun(postAction: Record<string, unknown>) {
+  activeAgentResult = { type: "setter", name: "Setter", config: {} };
+  setterConfigResult = { id: "cfg_1", post_action: postAction };
+  evaluateLeadResult = { score: 90, qualified: true, knocked_out: false, summary: "Interesado", knockout_reason: undefined };
+  rpcQueue = [
+    { data: [{ id: "batch_1", workspace_id: "ws_1", conversation_id: "conv_1", status: "processing", meta: {} }], error: null },
+  ];
+  responseQueue = [
+    { data: [], error: null },
+    { data: { id: "conv_1", workspace_id: "ws_1", contact_id: "contact_1", ai_enabled: true }, error: null },
+    { data: null, error: null },
+    { data: { credentials: {}, config: {} }, error: null },
+    { data: { state: "ai_active" }, error: null },
+    { error: null }, // markBatchProcessed
+    { data: { tags: [], custom_fields: {}, stage: "lead" }, error: null },
+    { error: null }, // contacts update
+    { error: null }, // setter_evaluation
+    { error: null }, // setter_post_action(_failed)
+  ];
+}
+
+function setterEvents(type: string): Array<Record<string, unknown>> {
+  return inserts
+    .filter((i) => i.table === "events" && (i.row as { type: string }).type === type)
+    .map((i) => (i.row as { payload: Record<string, unknown> }).payload);
+}
+
+function resetCrmMocks() {
+  hubspotDealCalls.length = 0;
+  hlOpportunityCalls.length = 0;
+  hubspotDealResult = null;
+  hlOpportunityResult = null;
+}
+
+test("create_hubspot_deal con HubSpot activo crea el negocio y deja el evento de éxito", async () => {
+  reset();
+  resetCrmMocks();
+  activeCrmName = "hubspot";
+  hubspotDealResult = { id: "deal_1" };
+  qualifiedSetterRun({ type: "create_hubspot_deal" });
+  await processNextBatch();
+  assert.deepEqual(hubspotDealCalls, [["ws_1", "contact_1"]]);
+  assert.deepEqual(setterEvents("setter_post_action"), [{ action: "create_hubspot_deal", contact_id: "contact_1", deal_id: "deal_1" }]);
+});
+
+test("un create_hubspot_deal fallido deja el motivo para el operador", async () => {
+  reset();
+  resetCrmMocks();
+  activeCrmName = "hubspot";
+  qualifiedSetterRun({ type: "create_hubspot_deal" });
+  await processNextBatch();
+  assert.deepEqual(setterEvents("setter_post_action_failed"), [
+    { action: "create_hubspot_deal", contact_id: "contact_1", reason: "no se pudo crear el negocio (revisa el token, el pipeline y la etapa de HubSpot)" },
+  ]);
+});
+
+test("create_hubspot_deal sin HubSpot como CRM activo (HighLevel activo o conflicto) no llama a HubSpot", async () => {
+  for (const active of ["highlevel", null] as const) {
+    reset();
+    resetCrmMocks();
+    activeCrmName = active;
+    qualifiedSetterRun({ type: "create_hubspot_deal" });
+    await processNextBatch();
+    assert.equal(hubspotDealCalls.length, 0);
+    assert.deepEqual(setterEvents("setter_post_action_failed"), [
+      { action: "create_hubspot_deal", contact_id: "contact_1", reason: "HubSpot no es el CRM activo de este espacio de trabajo" },
+    ]);
+  }
+});
+
+test("create_hl_opportunity sin HighLevel como CRM activo no llama a HighLevel", async () => {
+  for (const active of ["hubspot", null] as const) {
+    reset();
+    resetCrmMocks();
+    activeCrmName = active;
+    qualifiedSetterRun({ type: "create_hl_opportunity" });
+    await processNextBatch();
+    assert.equal(hlOpportunityCalls.length, 0);
+    assert.deepEqual(setterEvents("setter_post_action_failed"), [
+      { action: "create_hl_opportunity", contact_id: "contact_1", reason: "HighLevel no es el CRM activo de este espacio de trabajo" },
+    ]);
+  }
+});
+
+test("si no se pudo leer el CRM activo, ni el negocio ni la oportunidad se crean y el motivo lo dice", async () => {
+  for (const action of ["create_hubspot_deal", "create_hl_opportunity"] as const) {
+    reset();
+    resetCrmMocks();
+    activeCrmName = "error";
+    qualifiedSetterRun({ type: action });
+    await processNextBatch();
+    assert.equal(hubspotDealCalls.length + hlOpportunityCalls.length, 0);
+    assert.deepEqual(setterEvents("setter_post_action_failed"), [
+      { action, contact_id: "contact_1", reason: "no se pudo verificar cuál es el CRM activo (falló la lectura de la base)" },
+    ]);
+  }
+});
+
+test("create_hl_opportunity con HighLevel activo sigue funcionando como antes", async () => {
+  reset();
+  resetCrmMocks();
+  activeCrmName = "highlevel";
+  hlOpportunityResult = { id: "opp_1" };
+  qualifiedSetterRun({ type: "create_hl_opportunity" });
+  await processNextBatch();
+  assert.deepEqual(hlOpportunityCalls, [["ws_1", "contact_1"]]);
+  assert.deepEqual(setterEvents("setter_post_action"), [{ action: "create_hl_opportunity", contact_id: "contact_1", opportunity_id: "opp_1" }]);
 });
