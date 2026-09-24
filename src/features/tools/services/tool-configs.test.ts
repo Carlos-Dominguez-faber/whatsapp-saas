@@ -85,7 +85,10 @@ test("includes a synthetic Tool per enabled n8n_tools row, with the right schema
   const [tool] = tools;
   assert.equal(tool.name, "n8n_catalog");
   assert.equal(tool.sensitivity, "read");
-  assert.equal(tool.preferredTimeoutMs, 9000);
+  // 500ms margin over the row's timeout_ms so the external registry timeout
+  // never wins the race against the internal fetchPinned deadline — see the
+  // comment on EXTERNAL_TIMEOUT_MARGIN_MS in tool-configs.ts.
+  assert.equal(tool.preferredTimeoutMs, 9500);
   assert.deepEqual(tool.sensitiveArgKeys, []);
   assert.equal(tool.schema.safeParse({ query: "x" }).success, true);
   assert.equal(tool.schema.safeParse({}).success, false);

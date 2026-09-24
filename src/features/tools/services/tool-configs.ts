@@ -35,6 +35,15 @@ async function getStaticEnabledTools(workspaceId: string): Promise<Tool[]> {
   return registry.list().filter((t) => enabledKeys.has(t.name));
 }
 
+// The registry's external timeout (registry.ts `runWithTimeout`) races
+// against tool.run() starting at t=0; the internal deadline inside
+// n8n-tool-runner.ts's fetchPinned call only has row.timeout_ms to work
+// with once DNS validation finishes, landing at the same instant at best.
+// Padding the external budget makes the internal one the one that actually
+// fires first, so registry.runTool gets a clean {ok:false} instead of
+// racing the timeout and retrying on top of a webhook call still in flight.
+const EXTERNAL_TIMEOUT_MARGIN_MS = 500;
+
 async function getDynamicN8nTools(workspaceId: string): Promise<Tool[]> {
   const supabase = svc();
 
@@ -51,7 +60,7 @@ async function getDynamicN8nTools(workspaceId: string): Promise<Tool[]> {
     schema: buildZodSchema(row.parameters),
     enabledFor: () => true,
     run: buildN8nToolRun(row),
-    preferredTimeoutMs: row.timeout_ms,
+    preferredTimeoutMs: row.timeout_ms + EXTERNAL_TIMEOUT_MARGIN_MS,
     sensitiveArgKeys: sensitiveArgKeys(row.parameters),
   }));
 }

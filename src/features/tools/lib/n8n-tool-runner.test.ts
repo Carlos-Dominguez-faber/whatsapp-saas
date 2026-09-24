@@ -105,7 +105,16 @@ test("async mode ignores the body and requests it be discarded via maxResponseBy
   fetchPinnedImpl = async () => ({ status: 202, bodyText: "", truncated: true });
   const run = buildN8nToolRun({ ...baseRow, mode: "async", sensitivity: "write" });
   const result = await run({}, ctx);
-  assert.deepEqual(result, { ok: true, output: { status: "queued" } });
+  assert.deepEqual(result, {
+    ok: true,
+    output: {
+      status: "queued",
+      result: "unknown",
+      note:
+        "La acción quedó encolada en n8n y todavía no hay resultado. " +
+        "No le confirmes al cliente que se completó: dile que quedó registrada y que se le avisará.",
+    },
+  });
   assert.equal(fetchPinnedCalls[0].opts.maxResponseBytes, 0);
 });
 
@@ -140,11 +149,35 @@ test("adds the configured auth header when present", async () => {
   assert.equal(fetchPinnedCalls[0].opts.headers.Authorization, "Bearer secret-token");
 });
 
-test("passes the row's timeout_ms and resolved IP straight through to fetchPinned", async () => {
+test("passes the resolved IP and the full timeout budget through when DNS is instant", async () => {
   reset();
   validateImpl = async () => ({ error: null, resolvedIp: "1.2.3.4" });
   const run = buildN8nToolRun({ ...baseRow, mode: "sync", sensitivity: "read", timeout_ms: 12000 });
   await run({}, ctx);
   assert.equal(fetchPinnedCalls[0].resolvedIp, "1.2.3.4");
-  assert.equal(fetchPinnedCalls[0].opts.timeoutMs, 12000);
+  assert.ok(
+    fetchPinnedCalls[0].opts.timeoutMs > 11_900 &&
+      fetchPinnedCalls[0].opts.timeoutMs <= 12_000,
+    `expected ~12000ms, got ${fetchPinnedCalls[0].opts.timeoutMs}`,
+  );
+});
+
+test("discounts the time spent validating the URL from the HTTP timeout budget", async () => {
+  reset();
+  // registry.runTool races this whole run() against timeout_ms starting at t=0,
+  // so handing fetchPinned the full timeout_ms would put the inner deadline
+  // strictly after the outer one: the outer always wins, and for a "read" tool
+  // that triggers a retry while the first POST is still in flight — two POSTs
+  // to the n8n workflow for one agent invocation.
+  const DNS_MS = 60;
+  validateImpl = async () => {
+    await new Promise((r) => setTimeout(r, DNS_MS));
+    return { error: null, resolvedIp: "1.2.3.4" };
+  };
+  const run = buildN8nToolRun({ ...baseRow, mode: "sync", sensitivity: "read", timeout_ms: 1000 });
+  await run({}, ctx);
+  assert.ok(
+    fetchPinnedCalls[0].opts.timeoutMs <= 1000 - DNS_MS,
+    `expected the DNS time to be discounted, got ${fetchPinnedCalls[0].opts.timeoutMs}`,
+  );
 });
