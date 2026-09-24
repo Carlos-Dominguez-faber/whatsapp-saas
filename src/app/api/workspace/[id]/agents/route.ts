@@ -105,8 +105,13 @@ export async function PATCH(
       .update(updates)
       .eq("id", agentId)
       .eq("workspace_id", workspaceId);
-    if (error)
-      return NextResponse.json({ error: error.message }, { status: 403 });
+    if (error) {
+      console.error("[agents] deactivate error:", error.message);
+      return NextResponse.json(
+        { error: "No se pudo cambiar el agente activo. Intenta de nuevo." },
+        { status: 500 },
+      );
+    }
   }
 
   if (setActive === true) {
