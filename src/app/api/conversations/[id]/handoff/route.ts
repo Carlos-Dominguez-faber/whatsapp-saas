@@ -3,12 +3,17 @@
 // Security: the conversation is loaded with the
 // caller's RLS client BEFORE anything runs with service role. A conversation
 // the caller cannot see is a 404 — the same answer as "does not exist", so
-// the endpoint cannot be used to probe other tenants' ids.
+// the endpoint cannot be used to probe other tenants' ids. Visibility is not
+// permission: both actions flip the AI on or off, so the caller must also pass
+// the conversations UPDATE policy, which the service-role write would skip.
 
 import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
 import { createClient } from "@/lib/supabase/server";
-import { readJsonBody } from "@/lib/auth/workspace-access";
+import {
+  readJsonBody,
+  requireConversationUpdate,
+} from "@/lib/auth/workspace-access";
 import { applyTransition } from "@/features/inbox/services/decision-engine";
 
 const bodySchema = z.object({
@@ -45,7 +50,7 @@ export async function POST(
   // 3. Load the conversation through RLS — a non-member sees nothing.
   const { data: conv, error: convError } = await supabase
     .from("conversations")
-    .select("workspace_id")
+    .select("workspace_id, assigned_to")
     .eq("id", conversationId)
     .single();
 
@@ -55,6 +60,11 @@ export async function POST(
       { status: 404 },
     );
   }
+
+  const auth = await requireConversationUpdate(
+    conv as { workspace_id: string; assigned_to: string | null },
+  );
+  if (!auth.ok) return auth.response;
 
   try {
     // 4. Determine target state

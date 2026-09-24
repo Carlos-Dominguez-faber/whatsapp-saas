@@ -3,22 +3,35 @@ import { test, mock } from "node:test";
 import { NextRequest } from "next/server";
 
 // ── Fakes ────────────────────────────────────────────────────────────────────
-type ConvRow = { workspace_id: string } | null;
+type ConvRow = { workspace_id: string; assigned_to?: string | null } | null;
 let currentUser: { id: string } | null = { id: "user_1" };
 let convRow: ConvRow = { workspace_id: "ws_1" };
+// Role of the caller in the conversation's workspace; null = not an active member.
+let memberRole: string | null = "admin";
+
+const membershipChain: any = {
+  eq: () => membershipChain,
+  maybeSingle: async () => ({
+    data: memberRole ? { role: memberRole } : null,
+    error: null,
+  }),
+};
 
 const fakeSupabase = {
   auth: { getUser: async () => ({ data: { user: currentUser } }) },
-  from: () => ({
-    select: () => ({
-      eq: () => ({
-        single: async () =>
-          convRow
-            ? { data: convRow, error: null }
-            : { data: null, error: { message: "0 rows" } },
-      }),
-    }),
-  }),
+  from: (table: string) =>
+    table === "memberships"
+      ? { select: () => membershipChain }
+      : {
+          select: () => ({
+            eq: () => ({
+              single: async () =>
+                convRow
+                  ? { data: convRow, error: null }
+                  : { data: null, error: { message: "0 rows" } },
+            }),
+          }),
+        },
 };
 mock.module("@/lib/supabase/server.ts", {
   exports: { createClient: async () => fakeSupabase },
@@ -81,4 +94,66 @@ test("passes the workspace scope through to applyTransition on success", async (
     "ai_active",
     { userId: "user_1", trigger: "manual", workspaceId: "ws_1" },
   ]);
+});
+
+// applyTransition writes with the service role, so the route itself must
+// enforce the conversations UPDATE policy: admin/manager of the workspace, or
+// the member the conversation is assigned to.
+for (const action of ["request", "cancel"] as const) {
+  test(`403 for a viewer not assigned to the conversation (${action}), without a transition`, async () => {
+    transitions.length = 0;
+    memberRole = "viewer";
+    convRow = { workspace_id: "ws_1", assigned_to: null };
+    const res = await POST(makeReq({ action }), params);
+    assert.equal(res.status, 403);
+    assert.equal(transitions.length, 0);
+    memberRole = "admin";
+  });
+}
+
+test("403 for an agent the conversation is assigned to someone else", async () => {
+  transitions.length = 0;
+  memberRole = "agent";
+  convRow = { workspace_id: "ws_1", assigned_to: "user_2" };
+  const res = await POST(makeReq({ action: "request" }), params);
+  assert.equal(res.status, 403);
+  assert.equal(transitions.length, 0);
+  memberRole = "admin";
+});
+
+test("403 when the caller is no longer an active member", async () => {
+  transitions.length = 0;
+  memberRole = null;
+  convRow = { workspace_id: "ws_1", assigned_to: "user_1" };
+  const res = await POST(makeReq({ action: "request" }), params);
+  assert.equal(res.status, 403);
+  assert.equal(transitions.length, 0);
+  memberRole = "admin";
+});
+
+test("200 for a manager not assigned to the conversation", async () => {
+  transitions.length = 0;
+  memberRole = "manager";
+  convRow = { workspace_id: "ws_1", assigned_to: "user_2" };
+  const res = await POST(makeReq({ action: "request" }), params);
+  assert.equal(res.status, 200);
+  assert.equal(transitions.length, 1);
+  memberRole = "admin";
+});
+
+test("200 for a viewer the conversation is assigned to (the policy allows the assignee)", async () => {
+  transitions.length = 0;
+  memberRole = "viewer";
+  convRow = { workspace_id: "ws_1", assigned_to: "user_1" };
+  const res = await POST(makeReq({ action: "request" }), params);
+  assert.equal(res.status, 200);
+  assert.equal(transitions.length, 1);
+  memberRole = "admin";
+});
+
+test("400 when the action is not request or cancel", async () => {
+  transitions.length = 0;
+  const res = await POST(makeReq({ action: "steal" }), params);
+  assert.equal(res.status, 400);
+  assert.equal(transitions.length, 0);
 });

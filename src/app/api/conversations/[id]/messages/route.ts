@@ -69,6 +69,9 @@ export async function POST(
 
   // Sleep the bot when a human intervenes (configurable per agent, default on).
   // Transition ai_active → human_active so the AI stops replying this thread.
+  // Authorized by the send gate above (admin/manager/agent), not by the
+  // conversations UPDATE policy: an agent answering an unassigned conversation
+  // must be able to sleep the bot, and the transition assigns it to them.
   if (conv.ai_enabled) {
     try {
       const activeAgent = await getActiveAgent(conv.workspace_id);
@@ -76,6 +79,7 @@ export async function POST(
       if (sleepOnManual) {
         await applyTransition(conversationId, "human_active", {
           userId: user.id,
+          workspaceId: conv.workspace_id as string,
         });
       }
     } catch (e) {

@@ -127,6 +127,42 @@ export async function requireWorkspaceMember(
   };
 }
 
+/**
+ * Route-level mirror of the conversations UPDATE policy ("ws agents update
+ * conversations"): an active member of the conversation's workspace who is
+ * admin/manager, or the member the conversation is assigned to.
+ *
+ * Needed wherever a route changes a conversation through applyTransition(),
+ * which writes with the service role and therefore bypasses that policy.
+ * Read access (any member, e.g. a viewer) is not enough.
+ *
+ * Known window: membership is read here and the write happens afterwards as a
+ * separate statement, so a member deactivated in between still gets that one
+ * write through. Closing it needs the check and the UPDATE in the same
+ * statement (an RPC evaluating the policy), not a route-level change.
+ */
+export async function requireConversationUpdate(conv: {
+  workspace_id: string;
+  assigned_to?: string | null;
+}): Promise<MemberOk | MemberFail> {
+  const auth = await requireWorkspaceMember(conv.workspace_id);
+  if (!auth.ok) return auth;
+  if (
+    auth.role === "admin" ||
+    auth.role === "manager" ||
+    conv.assigned_to === auth.userId
+  ) {
+    return auth;
+  }
+  return {
+    ok: false,
+    response: NextResponse.json(
+      { error: "No tienes permiso para modificar esta conversación" },
+      { status: 403 },
+    ),
+  };
+}
+
 type JsonOk<T> = { ok: true; body: T };
 type JsonFail = { ok: false; response: NextResponse };
 
