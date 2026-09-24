@@ -66,8 +66,12 @@ export async function GET(
     const agents = await listAgents(supabase, workspaceId);
     return NextResponse.json({ agents });
   } catch (err) {
+    console.error(
+      "[agents] list error:",
+      err instanceof Error ? err.message : String(err),
+    );
     return NextResponse.json(
-      { error: err instanceof Error ? err.message : "Error" },
+      { error: "No se pudieron cargar los agentes. Intenta de nuevo." },
       { status: 500 },
     );
   }
@@ -150,8 +154,13 @@ export async function PATCH(
       p_workspace: workspaceId,
       p_agent: agentId,
     });
-    if (rpcError)
-      return NextResponse.json({ error: rpcError.message }, { status: 500 });
+    if (rpcError) {
+      console.error("[agents] set_active_agent error:", rpcError.message);
+      return NextResponse.json(
+        { error: "No se pudo cambiar el agente activo. Intenta de nuevo." },
+        { status: 500 },
+      );
+    }
   }
 
   // Return the fresh row (with prompt body).
@@ -162,8 +171,12 @@ export async function PATCH(
       return NextResponse.json({ error: "No encontrado" }, { status: 404 });
     return NextResponse.json({ agent });
   } catch (err) {
+    console.error(
+      "[agents] reload error:",
+      err instanceof Error ? err.message : String(err),
+    );
     return NextResponse.json(
-      { error: err instanceof Error ? err.message : "Error" },
+      { error: "Se guardaron los cambios, pero no se pudo recargar el agente." },
       { status: 500 },
     );
   }
