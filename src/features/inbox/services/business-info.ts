@@ -1,6 +1,7 @@
 // F7: Business info loader — loads structured + free_text data to inject into system prompts.
 
 import { createClient as createSbClient } from "@supabase/supabase-js";
+import { DEFAULT_TIMEZONE } from "../types/timezone";
 
 function svc() {
   return createSbClient(
@@ -92,7 +93,6 @@ export function buildUpcomingDaysTable(timeZone: string, now: Date): string {
   return lines.join("\n");
 }
 
-const DEFAULT_TIMEZONE = "America/Mexico_City";
 
 /**
  * True when `tz` is a timezone the runtime's Intl implementation can

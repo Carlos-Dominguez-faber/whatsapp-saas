@@ -16,6 +16,7 @@ import { Separator } from "@/components/ui/separator";
 import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
 import { DEFAULT_HANDOFF_ACK } from "@/features/inbox/types/handoff";
+import { DEFAULT_TIMEZONE } from "@/features/inbox/types/timezone";
 import { ModelPicker } from "@/features/agents/components/model-picker";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -892,7 +893,7 @@ function CalDotComSection({
     initial?.credentials?.calcom_api_key ?? "",
   );
   const [timezone, setTimezone] = useState(
-    (initial?.config?.timezone as string | undefined) ?? "America/Santiago",
+    (initial?.config?.timezone as string | undefined) ?? DEFAULT_TIMEZONE,
   );
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
@@ -975,7 +976,7 @@ function CalDotComSection({
           <Label htmlFor="calcom-timezone">Zona horaria</Label>
           <Input
             id="calcom-timezone"
-            placeholder="America/Santiago"
+            placeholder={DEFAULT_TIMEZONE}
             value={timezone}
             onChange={(e) => setTimezone(e.target.value)}
             className="font-mono text-sm"
