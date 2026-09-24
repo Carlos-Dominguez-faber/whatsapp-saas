@@ -4,9 +4,12 @@
  * Both production (buffer.ts) and the in-UI playground (test-chat) MUST use this
  * so they never drift. Pure string assembly — no DB, no "use server".
  *
- * Order (guardrails go LAST — models obey end-of-prompt instructions most):
+ * Order (guardrails go LAST — models obey end-of-prompt instructions most;
+ * tool-honesty note goes after even that, so no workspace guardrail can
+ * override it):
  *   now → summary → business info → knowledge base → response style →
- *   prompt base → WhatsApp format note → strict rules/restrictions
+ *   prompt base → WhatsApp format note → media capability note →
+ *   strict rules/restrictions → tool-honesty note
  */
 
 export type ResponseStyle = "concise" | "balanced" | "detailed";
@@ -59,6 +62,24 @@ const MEDIA_CAPABILITY_NOTE =
   "imágenes se describen automáticamente: lo que lees ya incluye su contenido. " +
   "Respóndelo con normalidad. NUNCA digas que no puedes escuchar audios/notas " +
   "de voz ni ver imágenes — sí puedes, ya te llegan convertidos a texto.";
+
+// This must be the LAST thing appended in buildSystemPrompt, after
+// guardrailsBlock — a misconfigured workspace guardrail (e.g. "siempre
+// ofrece enviar confirmación por correo") must never be able to override
+// this safety/trust rule.
+const TOOL_HONESTY_NOTE =
+  "## Honestidad sobre tus capacidades\n" +
+  "Solo puedes realizar las acciones para las que tienes una herramienta " +
+  "disponible ahora mismo. NUNCA prometas una acción — enviar un correo, un " +
+  "SMS, notificar a alguien, generar un documento, etc. — a menos que " +
+  "corresponda exactamente a una herramienta que acabas de invocar con " +
+  "éxito. Si el cliente pide algo que ninguna de tus herramientas cubre, " +
+  "dile con claridad que no puedes hacerlo tú directamente y sugiérele " +
+  "contactar al negocio para esa solicitud.\n" +
+  "Esto es REACTIVO: aplica solo cuando el cliente ya pidió algo concreto. " +
+  "NUNCA anuncies, enumeres ni aclares tus limitaciones por tu cuenta, y " +
+  "menos al saludar: un “Hola” se responde saludando y preguntando en qué " +
+  "puedes ayudar, sin listar lo que puedes o no puedes hacer.";
 
 export function substituteVars(text: string, vars?: SystemPromptVars): string {
   if (!vars) return text;
@@ -113,6 +134,7 @@ export function buildSystemPrompt(parts: BuildSystemPromptParts): string {
     WHATSAPP_FORMAT_NOTE,
     MEDIA_CAPABILITY_NOTE,
     guardrailsBlock,
+    TOOL_HONESTY_NOTE,
   ]
     .filter(Boolean)
     .join("\n\n");
