@@ -6,11 +6,17 @@ import {
   aiShouldRespond,
   canTransition,
   detectsHandoffTrigger,
+  TransitionError,
   type ConversationState,
 } from "./state-machine";
 import { reserveLlmTurn } from "./cost-tracker";
 import { getEnabledTools } from "@/features/tools/services/tool-configs";
 import type { Tool } from "@/features/tools/core/tool";
+
+// La clase vive en state-machine (módulo puro), pero el ejecutor de
+// automatizaciones importa `applyTransition` y su error del mismo módulo:
+// re-exportarla evita que cada caller tenga que saber dónde está declarada.
+export { TransitionError };
 
 function svc() {
   return createSbClient(
@@ -138,7 +144,7 @@ export async function applyTransition(
   // 1. Load current state (scoped to the workspace when the caller gives one)
   let lookup = supabase
     .from("conversations")
-    .select("state, workspace_id")
+    .select("state, workspace_id, state_version")
     .eq("id", conversationId);
   if (workspaceId) lookup = lookup.eq("workspace_id", workspaceId);
   const { data: conv, error: convError } = await lookup.single();
@@ -150,10 +156,12 @@ export async function applyTransition(
   }
 
   const currentState = conv.state as ConversationState;
+  // El valor leído ACÁ, no uno releído después: el CAS del paso 3b tiene que
+  // comparar contra la versión que este caller efectivamente vio.
+  const currentVersion = conv.state_version as number;
 
   // 2. Validate transition (throws TransitionError if invalid)
   if (!canTransition(currentState, to)) {
-    const { TransitionError } = await import("./state-machine");
     throw new TransitionError(currentState, to);
   }
 
@@ -168,17 +176,114 @@ export async function applyTransition(
     updatePayload.assigned_to = userId;
   }
 
+  // 3b. UPDATE con COMPARE-AND-SWAP sobre el estado que se leyó en el paso 1.
+  //     Sin el `.eq("state", currentState)`, dos callers concurrentes que leen
+  //     `ai_active` escriben los dos `handoff_pending`; el trigger
+  //     trg_conversations_automation_event emite entonces DOS
+  //     automation_events con state_version distinto, y con una regla
+  //     `handoff_requested -> send_template` eso son dos plantillas cobradas
+  //     por un solo handoff. `dispatched_at` protege cada run individual, no
+  //     el hecho lógico.
+  //
+  //     Se pide `id` de vuelta y nada más: lo único que hay que saber acá es si
+  //     esta transacción ganó la carrera. La versión la calcula el trigger
+  //     trg_conversations_state_version dentro de Postgres.
+  //
+  //     `.eq("state", ...)` solo no basta: es vulnerable a ABA. Con
+  //     A→B→A (la conversación sale de `ai_active` y vuelve), un UPDATE stale
+  //     que todavía tiene `currentState = "ai_active"` en memoria puede ganar
+  //     el CAS contra el estado ACTUAL, que también es `ai_active` pero de otra
+  //     época — y `state_version` es la `occurrence` que el trigger usa para el
+  //     evento `handoff_requested`, así que una transición duplicada cobra un
+  //     segundo envío de plantilla. Se agrega `state_version` al WHERE, con el
+  //     valor leído en el paso 1 (no uno releído después).
+  //
+  //     Se recuerda si este UPDATE llevaba `assigned_to`, porque de eso
+  //     depende si perder la carrera se puede reportar como éxito.
+  const carriedAssignment = updatePayload.assigned_to !== undefined;
+
   let update = supabase
     .from("conversations")
     .update(updatePayload)
-    .eq("id", conversationId);
+    .eq("id", conversationId)
+    .eq("state", currentState)
+    .eq("state_version", currentVersion);
   if (workspaceId) update = update.eq("workspace_id", workspaceId);
-  const { error: updateError } = await update;
+  const { data: updatedRow, error: updateError } = await update
+    .select("id")
+    .maybeSingle();
 
   if (updateError) {
     throw new Error(
       `[decision-engine] failed to apply transition: ${updateError.message}`,
     );
+  }
+
+  // Ninguna fila afectada ⇒ otro caller ganó la carrera. Lo que NO se puede
+  // hacer acá es asumir que ganó escribiendo `to`: desde `ai_active` son
+  // válidos a la vez `handoff_pending`, `human_active`, `waiting_reply`,
+  // `paused` y `closed` (state-machine.ts). Si A cerró la conversación y B
+  // pedía handoff, retornar en silencio hace que el endpoint responda
+  // `{ok:true, state:"handoff_pending"}` sobre una fila que quedó `closed`
+  // (handoff/route.ts). Por eso se RELEE el estado real, con el mismo scope
+  // que la lectura del paso 1.
+  if (!updatedRow) {
+    let recheck = supabase
+      .from("conversations")
+      .select("state")
+      .eq("id", conversationId);
+    if (workspaceId) recheck = recheck.eq("workspace_id", workspaceId);
+    const { data: actual, error: recheckError } = await recheck.maybeSingle();
+
+    if (recheckError || !actual) {
+      // No saber en qué estado quedó no es "quedó como pediste".
+      throw new Error(
+        `[decision-engine] transition lost race and state re-read failed: ${
+          recheckError?.message ?? "conversación no encontrada"
+        }`,
+      );
+    }
+
+    const actualState = (actual as { state: ConversationState }).state;
+
+    if (actualState === to && !carriedAssignment) {
+      // El ganador escribió EXACTAMENTE lo que este caller pedía: idempotente.
+      // Se retorna SIN evento y SIN notificación — anunciar el mismo hecho dos
+      // veces es el bug que el CAS existe para evitar.
+      console.warn("[decision-engine] transition lost race (same target)", {
+        conversationId,
+        from: currentState,
+        to,
+      });
+      return;
+    }
+
+    // El éxito silencioso vale SOLO para transiciones PURAS de estado.
+    // `assigned_to` viaja en el MISMO UPDATE que perdió el CAS, así que si este
+    // caller pedía asignar, ese assigned_to NO se escribió aunque el estado
+    // final coincida. Es el caso de `take`: dos operadores llegan los dos a
+    // `human_active`, pero solo uno queda asignado y el otro tiene que
+    // enterarse en vez de creer que la conversación es suya.
+    if (actualState === to) {
+      console.warn("[decision-engine] transition lost race with assignment", {
+        conversationId,
+        to,
+        userId,
+      });
+      throw new TransitionError(actualState, to, "state_mismatch");
+    }
+
+    // El ganador escribió OTRA cosa. El caller pidió algo que ya no se puede
+    // cumplir y tiene que enterarse: handoff, take y toggle-ai ya traducen el
+    // prefijo "Invalid transition:" a 422 con texto en español, y los callers
+    // de buffer.ts (cost-cut) y normalizer.ts (eco saliente) ya lo capturan y
+    // siguen.
+    console.warn("[decision-engine] transition lost race (state moved)", {
+      conversationId,
+      requested: to,
+      actual: actualState,
+    });
+    throw new TransitionError(actualState, to, "state_mismatch");
   }
 
   // 4. Log the state change to events

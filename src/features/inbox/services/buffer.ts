@@ -3,6 +3,7 @@ import { generateWithTools, getWorkspaceModel } from "./openrouter";
 import { recordLlmUsage, checkRateLimits } from "./cost-tracker";
 import { dispatchText, dispatchTemplate } from "./dispatch";
 import { decide, applyTransition } from "./decision-engine";
+import { addTagToContact, requestHandoff } from "./conversation-actions";
 import type { ToolContext } from "@/features/tools/core/tool";
 import { resolveSystemPrompt } from "./prompt-resolver";
 import { buildSystemPrompt } from "./prompt-builder";
@@ -25,7 +26,7 @@ import {
   type ConversationTurn,
 } from "./conversation-history";
 import { getSetterConfig, evaluateLead } from "./setter";
-import { syncContactToHL, createHLOpportunity } from "./highlevel-client";
+import { createHLOpportunity } from "./highlevel-client";
 
 const DEFAULT_SILENCE_MS = 30_000; // 30 seconds silence window
 const MAX_BATCH_RETRIES = 3;
@@ -64,7 +65,15 @@ interface Integration {
 export interface ProcessBatchResult {
   processed: boolean;
   conversationId?: string;
+  /** Fallo POR ÍTEM: este batch no salió (reintento o dead-letter). El tick
+   *  sigue sano y lo cuenta como `failed`. */
   error?: string;
+  /**
+   * Fallo de FASE: no se pudo ni reclamar un batch, así que el tick no hizo su
+   * trabajo y no puede firmar como sano. Es un CÓDIGO, nunca el texto de
+   * PostgREST.
+   */
+  phaseError?: string;
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -169,7 +178,7 @@ export async function reconcileOrphanedMessages(
     delayMs?: number;
     sleep?: (ms: number) => Promise<void>;
   } = {},
-): Promise<number> {
+): Promise<{ recovered: number; error?: string }> {
   const supabase = svc();
   const now = Date.now();
   const cutoff = new Date(now - ORPHAN_MESSAGE_AGE_MS).toISOString();
@@ -188,8 +197,12 @@ export async function reconcileOrphanedMessages(
     .limit(MAX_ORPHANS_PER_RUN);
 
   if (error) {
+    // Esta es la query que CONSIGUE el trabajo de la fase. Con un 0 pelado, un
+    // lookup roto se leería igual que "no había huérfanos" y el tick saldría
+    // `200 {ok:true}` para siempre. Viaja como CÓDIGO, nunca el texto de
+    // PostgREST; el detalle queda en el log.
     console.error("[buffer] reconcileOrphanedMessages lookup error:", error);
-    return 0;
+    return { recovered: 0, error: "reconcile_failed" };
   }
 
   const orphans = ((data ?? []) as unknown[]).map(
@@ -246,7 +259,9 @@ export async function reconcileOrphanedMessages(
     }
   }
 
-  return recovered;
+  // Un huérfano suelto que no se pudo relinkear es falla por ítem: ya se contó
+  // en el log y no ensucia el estado del tick.
+  return { recovered };
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -335,8 +350,12 @@ export async function processNextBatch(): Promise<ProcessBatchResult> {
     await supabase.rpc("claim_next_batch");
 
   if (claimError) {
+    // El claim es la operación que consigue el trabajo, no una que lo hace.
+    // Contarlo como `failed` haría que la exclusión declarada ("`failed > 0` es
+    // falla por ítem, no del tick") fuera falsa justo para el caso en que la
+    // fase entera está caída.
     console.error("[buffer] claim_next_batch RPC error:", claimError);
-    return { processed: false, error: claimError.message };
+    return { processed: false, error: claimError.message, phaseError: "claim_failed" };
   }
 
   const batch = (claimedRows as MessageBatch[] | null)?.[0] ?? null;
@@ -364,6 +383,10 @@ export async function processNextBatch(): Promise<ProcessBatchResult> {
     }
 
     // ── 5. Decision engine: state check + handoff trigger + rate limits ──────
+    // decide() can throw TransitionError if an operator takes the conversation
+    // mid-decision (CAS race on `state`). Not caught here on purpose: it
+    // self-heals via the retry path (MAX_BATCH_RETRIES), costing one retry and
+    // a log line, not a lost message.
     const decisionResult = await decide({
       workspaceId: batch.workspace_id,
       conversationId: batch.conversation_id,
@@ -790,10 +813,11 @@ async function runSetterEvaluation(params: SetterEvalParams): Promise<void> {
     const cfg = await getSetterConfig(workspaceId);
     if (!cfg) return; // no enabled setter config → dormant
 
-    // Load contact for the idempotency guard + tag merge in one read.
+    // Load contact for the idempotency guard (custom_fields) and the
+    // never-downgrade-a-customer check (stage).
     const { data: contactRow, error: contactError } = await supabase
       .from("contacts")
-      .select("tags, custom_fields, stage")
+      .select("custom_fields, stage")
       .eq("id", contactId)
       .maybeSingle();
 
@@ -880,9 +904,6 @@ async function runSetterEvaluation(params: SetterEvalParams): Promise<void> {
         workspaceId,
         conversationId,
         contactId,
-        existingTags: Array.isArray(contactRow?.tags)
-          ? (contactRow.tags as string[])
-          : [],
         supabase,
       });
     }
@@ -917,7 +938,6 @@ interface PostActionParams {
   workspaceId: string;
   conversationId: string;
   contactId: string;
-  existingTags: string[];
   supabase: ReturnType<typeof svc>;
 }
 
@@ -929,30 +949,30 @@ async function executeSetterPostAction(p: PostActionParams): Promise<void> {
     switch (type) {
       case "handoff": {
         // handoff_pending sets ai_enabled=false; only valid from ai_active.
-        try {
-          await applyTransition(p.conversationId, "handoff_pending", {
-            trigger: "agent",
-          });
-        } catch (e) {
-          console.warn(
-            "[setter] handoff skipped:",
-            e instanceof Error ? e.message : e,
-          );
-        }
+        // requestHandoff traga la TransitionError y devuelve false; cualquier
+        // otro error sube al catch del final de esta función, que loguea y no
+        // tumba el batch.
+        await requestHandoff({
+          workspaceId: p.workspaceId,
+          conversationId: p.conversationId,
+          reason: "agent",
+        });
         break;
       }
 
       case "add_tag": {
         const tag =
-          typeof p.postAction.tag === "string" ? p.postAction.tag.trim() : "";
-        if (!tag) break;
-        const merged = Array.from(new Set([...p.existingTags, tag]));
-        await p.supabase
-          .from("contacts")
-          .update({ tags: merged })
-          .eq("id", p.contactId);
-        // Best-effort push to HighLevel (no-op if HL not connected).
-        void syncContactToHL(p.workspaceId, p.contactId);
+          typeof p.postAction.tag === "string" ? p.postAction.tag : "";
+        // addTagToContact LANZA (etiqueta vacía, contacto inexistente, base
+        // caída) y el catch del final de esta función se encarga: es una
+        // post-acción de un batch ya procesado y no puede tumbarlo. En el
+        // ejecutor del motor NO se traga: ahí la excepción decide failed vs
+        // retry.
+        await addTagToContact({
+          workspaceId: p.workspaceId,
+          contactId: p.contactId,
+          tag,
+        });
         break;
       }
 
@@ -962,12 +982,39 @@ async function executeSetterPostAction(p: PostActionParams): Promise<void> {
             ? p.postAction.template_name
             : "";
         if (!templateName) break;
-        await dispatchTemplate({
+        // El resultado NO se ignora. dispatchTemplate ya escribe el
+        // detalle técnico en message_errors cuando Kapso rechaza el envío
+        // (dispatch.ts, rama SEND_FAILED); lo que faltaba era que el fallo
+        // apareciera en la línea de tiempo, que es donde el operador mira.
+        // Mismo patrón que create_hl_opportunity, justo abajo.
+        const sent = await dispatchTemplate({
           workspaceId: p.workspaceId,
           conversationId: p.conversationId,
           templateName,
           templateLanguage: "es",
         });
+        if (!sent.ok) {
+          console.error(
+            "[setter] post_action send_template failed:",
+            sent.errorCode ?? "-",
+            sent.error ?? "",
+          );
+          await p.supabase.from("events").insert({
+            type: "setter_post_action_failed",
+            level: "warn",
+            workspace_id: p.workspaceId,
+            conversation_id: p.conversationId,
+            payload: {
+              action: "send_template",
+              contact_id: p.contactId,
+              template_name: templateName,
+              // `sent.error` ya es texto en español para el operador
+              // (DispatchResult lo documenta así); el detalle técnico quedó en
+              // el log y en message_errors.
+              reason: sent.error ?? "no se pudo enviar la plantilla",
+            },
+          });
+        }
         break;
       }
 
@@ -995,9 +1042,22 @@ async function executeSetterPostAction(p: PostActionParams): Promise<void> {
       }
     }
   } catch (err) {
-    console.error(
-      "[setter] post_action error:",
-      err instanceof Error ? err.message : err,
-    );
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error("[setter] post_action error:", msg);
+    // Sin esto, un add_tag (o handoff) que lanza no dejaría NINGÚN rastro en la
+    // línea de tiempo, a diferencia de send_template y create_hl_opportunity
+    // (mismo patrón justo arriba). `payload.reason` es texto en español
+    // para el operador; el detalle técnico crudo se queda en el console.error.
+    await p.supabase.from("events").insert({
+      type: "setter_post_action_failed",
+      level: "warn",
+      workspace_id: p.workspaceId,
+      conversation_id: p.conversationId,
+      payload: {
+        action: type,
+        contact_id: p.contactId,
+        reason: "no se pudo completar la acción configurada para el lead calificado",
+      },
+    });
   }
 }

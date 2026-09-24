@@ -86,3 +86,21 @@ test("detectsHandoffTrigger sigue derivando a quien pide un agente humano", () =
     true,
   );
 });
+
+test("TransitionError sin código explícito es invalid_transition", () => {
+  const err = new TransitionError("closed", "ai_active");
+  assert.equal(err.code, "invalid_transition");
+  assert.equal(err.message, "Invalid transition: closed → ai_active");
+});
+
+test("state_mismatch conserva el prefijo del que dependen las rutas para el 422", () => {
+  // Si este test se cae, handoff/take/toggle-ai empiezan a responder 500
+  // "Error interno del servidor" cuando en realidad la conversación se movió.
+  const err = new TransitionError(
+    "human_active",
+    "handoff_pending",
+    "state_mismatch",
+  );
+  assert.equal(err.code, "state_mismatch");
+  assert.ok(err.message.startsWith("Invalid transition:"));
+});

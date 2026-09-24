@@ -131,6 +131,29 @@ mock.module("./decision-engine.ts", {
   },
 });
 
+// Se mockea a propósito: la RPC ya la cubre conversation-actions.test.ts, y sin
+// el mock cada test del setter tendría que encolar a mano la respuesta de
+// append_contact_tags en rpcQueue — una cola posicional más para desincronizar.
+const addTagCalls: unknown[] = [];
+let addTagShouldThrow = false;
+const requestHandoffCalls: unknown[] = [];
+mock.module("./conversation-actions.ts", {
+  exports: {
+    addTagToContact: async (params: unknown) => {
+      addTagCalls.push(params);
+      if (addTagShouldThrow) {
+        throw new Error("append_contact_tags: permission denied");
+      }
+      return true;
+    },
+    requestHandoff: async (params: unknown) => {
+      requestHandoffCalls.push(params);
+      return true;
+    },
+    ConfigError: class ConfigError extends Error {},
+  },
+});
+
 const recordLlmUsageCalls: unknown[] = [];
 let recordLlmUsageShouldThrow = false;
 let checkRateLimitsResult: { allowed: boolean; reason?: string } = {
@@ -163,6 +186,12 @@ mock.module("./cost-enforcer.ts", {
   },
 });
 
+const dispatchTemplateCalls: unknown[] = [];
+let dispatchTemplateResult: {
+  ok: boolean;
+  error?: string;
+  errorCode?: string;
+} = { ok: true };
 const dispatchTextCalls: unknown[] = [];
 let dispatchTextResult: {
   ok: boolean;
@@ -176,7 +205,10 @@ mock.module("./dispatch.ts", {
       dispatchTextCalls.push(opts);
       return dispatchTextResult;
     },
-    dispatchTemplate: async () => ({ ok: true }),
+    dispatchTemplate: async (opts: unknown) => {
+      dispatchTemplateCalls.push(opts);
+      return dispatchTemplateResult;
+    },
   },
 });
 
@@ -266,6 +298,11 @@ function reset() {
   decisionResult = { decision: "respond", reason: "normal", availableTools: [] };
   applyTransitionCalls.length = 0;
   applyTransitionShouldThrow = false;
+  addTagCalls.length = 0;
+  addTagShouldThrow = false;
+  requestHandoffCalls.length = 0;
+  dispatchTemplateCalls.length = 0;
+  dispatchTemplateResult = { ok: true };
   costPolicyResult = { policy: "allow", reason: "within_budget" };
   generateWithToolsResult = { text: "hola!", inputTokens: 100, outputTokens: 20 };
   activeAgentResult = null;
@@ -390,7 +427,7 @@ test("reconcileOrphanedMessages relinks orphaned messages via upsertBatch and re
     { data: "batch_1", error: null },
     { data: "batch_2", error: null },
   ];
-  const recovered = await reconcileOrphanedMessages({
+  const { recovered } = await reconcileOrphanedMessages({
     delayMs: 0,
     sleep: async () => {},
   });
@@ -490,14 +527,14 @@ test("reconcileOrphanedMessages counts only the messages it actually recovers, s
     { data: null, error: { message: "still failing" } },
     { data: null, error: { message: "still failing" } },
   ];
-  const recovered = await reconcileOrphanedMessages({
+  const { recovered } = await reconcileOrphanedMessages({
     delayMs: 0,
     sleep: async () => {},
   });
   assert.equal(recovered, 1);
 });
 
-test("reconcileOrphanedMessages returns 0 and logs when the lookup query errors", async () => {
+test("a failing lookup is a PHASE failure — recovered 0 plus a code, never a bare 0", async () => {
   reset();
   responseQueue = [{ data: null, error: { message: "db down" } }];
   const errorLogs: unknown[][] = [];
@@ -506,12 +543,16 @@ test("reconcileOrphanedMessages returns 0 and logs when the lookup query errors"
     errorLogs.push(args);
   };
   try {
-    const recovered = await reconcileOrphanedMessages({
+    const result = await reconcileOrphanedMessages({
       delayMs: 0,
       sleep: async () => {},
     });
-    assert.equal(recovered, 0);
+    // Without the code, a broken lookup reads exactly like "there were no
+    // orphans" and the tick answers 200 {ok:true} forever.
+    assert.deepEqual(result, { recovered: 0, error: "reconcile_failed" });
     assert.ok(errorLogs.length > 0);
+    // The PostgREST text stays in the log, never in the returned code.
+    assert.ok(!JSON.stringify(result).includes("db down"));
   } finally {
     console.error = originalError;
   }
@@ -532,7 +573,7 @@ test("reconcileOrphanedMessages skips a message whose conversation currently has
       error: null,
     },
   ];
-  const recovered = await reconcileOrphanedMessages({
+  const { recovered } = await reconcileOrphanedMessages({
     delayMs: 0,
     sleep: async () => {},
   });
@@ -556,7 +597,7 @@ test("reconcileOrphanedMessages skips a message whose contact is currently rate-
     },
   ];
   checkRateLimitsResult = { allowed: false, reason: "hourly_cap" };
-  const recovered = await reconcileOrphanedMessages({
+  const { recovered } = await reconcileOrphanedMessages({
     delayMs: 0,
     sleep: async () => {},
   });
@@ -566,11 +607,15 @@ test("reconcileOrphanedMessages skips a message whose contact is currently rate-
 
 // ── processNextBatch ────────────────────────────────────────────────────
 
-test("processNextBatch returns not-processed when claim_next_batch errors", async () => {
+test("a failing claim_next_batch is flagged as a PHASE failure, not as one more failed batch", async () => {
   reset();
   rpcQueue = [{ data: null, error: { message: "db down" } }];
   const result = await processNextBatch();
-  assert.deepEqual(result, { processed: false, error: "db down" });
+  assert.deepEqual(result, {
+    processed: false,
+    error: "db down",
+    phaseError: "claim_failed",
+  });
 });
 
 test("processNextBatch returns not-processed when there is no batch ready", async () => {
@@ -1005,14 +1050,18 @@ test("processNextBatch runs the setter evaluation and tags the contact as qualif
     { data: { tags: [], custom_fields: {}, stage: "lead" }, error: null }, // contact lookup (setter)
     { error: null }, // contacts update (tags/stage)
     { error: null }, // setter_evaluation event insert
-    { error: null }, // contacts update (add_tag post action)
   ];
   const result = await processNextBatch();
   assert.deepEqual(result, { processed: true, conversationId: "conv_1" });
   const contactsUpdates = updates.filter((u) => u.table === "contacts");
-  assert.equal(contactsUpdates.length, 2);
-  const tagUpdate = contactsUpdates[1].row as { tags: string[] };
-  assert.deepEqual(tagUpdate.tags, ["caliente"]);
+  assert.equal(
+    contactsUpdates.length,
+    1,
+    "la etiqueta la escribe la RPC; el único update de contacts es el de stage",
+  );
+  assert.deepEqual(addTagCalls, [
+    { workspaceId: "ws_1", contactId: "contact_1", tag: "caliente" },
+  ]);
 });
 
 test("processNextBatch's setter evaluation is dormant when no setter config exists", async () => {
@@ -1070,4 +1119,193 @@ test("processNextBatch's setter evaluation logs an error event and does not thro
       (i.row as { level: string }).level === "error",
   );
   assert.equal(errorEvents.length, 1);
+});
+
+test("el post_action handoff delega en requestHandoff, con el workspace acotado", async () => {
+  reset();
+  activeAgentResult = { type: "setter", name: "Setter", config: {} };
+  setterConfigResult = { id: "cfg_1", post_action: { type: "handoff" } };
+  evaluateLeadResult = {
+    score: 90,
+    qualified: true,
+    knocked_out: false,
+    summary: "Interesado",
+    knockout_reason: undefined,
+  };
+  rpcQueue = [
+    {
+      data: [
+        { id: "batch_1", workspace_id: "ws_1", conversation_id: "conv_1", status: "processing", meta: {} },
+      ],
+      error: null,
+    },
+  ];
+  responseQueue = [
+    { data: [], error: null }, // consolidateBatch
+    { data: { id: "conv_1", workspace_id: "ws_1", contact_id: "contact_1", ai_enabled: true }, error: null },
+    { data: null, error: null }, // kapso config lookup
+    { data: { credentials: {}, config: {} }, error: null }, // kapso integration
+    { data: { state: "ai_active" }, error: null }, // live state re-check
+    { error: null }, // markBatchProcessed
+    { data: { tags: [], custom_fields: {}, stage: "lead" }, error: null }, // contact lookup
+    { error: null }, // contacts update (stage/custom_fields)
+    { error: null }, // setter_evaluation event insert
+  ];
+  await processNextBatch();
+  assert.deepEqual(requestHandoffCalls, [
+    { workspaceId: "ws_1", conversationId: "conv_1", reason: "agent" },
+  ]);
+  // El UPDATE de conversations lo hace applyTransition dentro de
+  // requestHandoff, nunca este archivo.
+  assert.equal(updates.filter((u) => u.table === "conversations").length, 0);
+});
+
+test("un add_tag que LANZA no tumba el batch ya procesado, y deja rastro en la línea de tiempo", async () => {
+  reset();
+  addTagShouldThrow = true;
+  activeAgentResult = { type: "setter", name: "Setter", config: {} };
+  setterConfigResult = { id: "cfg_1", post_action: { type: "add_tag", tag: "caliente" } };
+  evaluateLeadResult = {
+    score: 90,
+    qualified: true,
+    knocked_out: false,
+    summary: "Interesado",
+    knockout_reason: undefined,
+  };
+  rpcQueue = [
+    {
+      data: [
+        { id: "batch_1", workspace_id: "ws_1", conversation_id: "conv_1", status: "processing", meta: {} },
+      ],
+      error: null,
+    },
+  ];
+  responseQueue = [
+    { data: [], error: null },
+    { data: { id: "conv_1", workspace_id: "ws_1", contact_id: "contact_1", ai_enabled: true }, error: null },
+    { data: null, error: null },
+    { data: { credentials: {}, config: {} }, error: null },
+    { data: { state: "ai_active" }, error: null },
+    { error: null }, // markBatchProcessed
+    { data: { tags: [], custom_fields: {}, stage: "lead" }, error: null },
+    { error: null }, // contacts update
+    { error: null }, // setter_evaluation event insert
+    { error: null }, // setter_evaluation event insert (nivel error, del catch)
+  ];
+  const result = await processNextBatch();
+  assert.deepEqual(result, { processed: true, conversationId: "conv_1" });
+  // Si se borra el `throw` de arriba (addTagShouldThrow = false), esta
+  // aserción debe caer: sin ella el test quedaba verde lance o no lance.
+  const failures = inserts.filter(
+    (i) =>
+      i.table === "events" &&
+      (i.row as { type: string }).type === "setter_post_action_failed",
+  );
+  assert.equal(
+    failures.length,
+    1,
+    "un add_tag que lanza no debe quedar sin rastro en la línea de tiempo",
+  );
+  const failure = failures[0].row as {
+    level: string;
+    payload: Record<string, unknown>;
+  };
+  assert.equal(failure.level, "warn");
+  assert.equal(failure.payload.action, "add_tag");
+});
+
+test("un send_template fallido deja rastro en la línea de tiempo", async () => {
+  reset();
+  dispatchTemplateResult = {
+    ok: false,
+    error: "La ventana de 24 horas está cerrada",
+    errorCode: "WINDOW_EXPIRED",
+  };
+  activeAgentResult = { type: "setter", name: "Setter", config: {} };
+  setterConfigResult = {
+    id: "cfg_1",
+    post_action: { type: "send_template", template_name: "seguimiento" },
+  };
+  evaluateLeadResult = {
+    score: 90,
+    qualified: true,
+    knocked_out: false,
+    summary: "Interesado",
+    knockout_reason: undefined,
+  };
+  rpcQueue = [
+    {
+      data: [
+        { id: "batch_1", workspace_id: "ws_1", conversation_id: "conv_1", status: "processing", meta: {} },
+      ],
+      error: null,
+    },
+  ];
+  responseQueue = [
+    { data: [], error: null },
+    { data: { id: "conv_1", workspace_id: "ws_1", contact_id: "contact_1", ai_enabled: true }, error: null },
+    { data: null, error: null },
+    { data: { credentials: {}, config: {} }, error: null },
+    { data: { state: "ai_active" }, error: null },
+    { error: null }, // markBatchProcessed
+    { data: { tags: [], custom_fields: {}, stage: "lead" }, error: null },
+    { error: null }, // contacts update
+    { error: null }, // setter_evaluation event insert
+    { error: null }, // setter_post_action_failed insert
+  ];
+  await processNextBatch();
+  const failures = inserts.filter(
+    (i) =>
+      i.table === "events" &&
+      (i.row as { type: string }).type === "setter_post_action_failed",
+  );
+  assert.equal(failures.length, 1, "ignorar el resultado dejaba el fallo invisible");
+  const payload = (failures[0].row as { payload: Record<string, unknown> }).payload;
+  assert.equal(payload.action, "send_template");
+  assert.equal(payload.reason, "La ventana de 24 horas está cerrada");
+});
+
+test("un send_template exitoso NO escribe ningún evento de fallo", async () => {
+  reset();
+  activeAgentResult = { type: "setter", name: "Setter", config: {} };
+  setterConfigResult = {
+    id: "cfg_1",
+    post_action: { type: "send_template", template_name: "seguimiento" },
+  };
+  evaluateLeadResult = {
+    score: 90,
+    qualified: true,
+    knocked_out: false,
+    summary: "Interesado",
+    knockout_reason: undefined,
+  };
+  rpcQueue = [
+    {
+      data: [
+        { id: "batch_1", workspace_id: "ws_1", conversation_id: "conv_1", status: "processing", meta: {} },
+      ],
+      error: null,
+    },
+  ];
+  responseQueue = [
+    { data: [], error: null },
+    { data: { id: "conv_1", workspace_id: "ws_1", contact_id: "contact_1", ai_enabled: true }, error: null },
+    { data: null, error: null },
+    { data: { credentials: {}, config: {} }, error: null },
+    { data: { state: "ai_active" }, error: null },
+    { error: null }, // markBatchProcessed
+    { data: { tags: [], custom_fields: {}, stage: "lead" }, error: null },
+    { error: null }, // contacts update
+    { error: null }, // setter_evaluation event insert
+  ];
+  await processNextBatch();
+  assert.equal(dispatchTemplateCalls.length, 1);
+  assert.equal(
+    inserts.filter(
+      (i) =>
+        i.table === "events" &&
+        (i.row as { type: string }).type === "setter_post_action_failed",
+    ).length,
+    0,
+  );
 });
