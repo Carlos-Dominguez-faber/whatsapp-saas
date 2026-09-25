@@ -9,7 +9,7 @@
     "start": "next start",
     "lint": "eslint src/ middleware.ts",
     "typecheck": "tsc --noEmit",
-    "test:unit": "node --experimental-test-module-mocks --import ./scripts/register-alias-hook.mjs --test \"src/**/*.test.ts\"",
+    "test:unit": "node --experimental-test-module-mocks --import ./scripts/register-alias-hook.mjs --import ./scripts/mock-module-compat.mjs --test \"src/**/*.test.ts\"",
     "test:e2e": "playwright test",
     "test:e2e:headed": "playwright test --headed"
   },
