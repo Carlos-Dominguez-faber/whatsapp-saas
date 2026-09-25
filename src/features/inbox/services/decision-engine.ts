@@ -110,6 +110,12 @@ export interface TransitionOptions {
   userId?: string;
   /** What caused it: keyword | agent | manual. Recorded in the event payload. */
   trigger?: string;
+  /**
+   * Scope guard. When set, the conversation must belong to this workspace:
+   * lookup and update both filter by it, so a caller that already verified
+   * membership cannot be tricked into moving another tenant's conversation.
+   */
+  workspaceId?: string;
 }
 
 /**
@@ -126,15 +132,16 @@ export async function applyTransition(
   to: ConversationState,
   opts: TransitionOptions = {},
 ): Promise<void> {
-  const { userId, trigger } = opts;
+  const { userId, trigger, workspaceId } = opts;
   const supabase = svc();
 
-  // 1. Load current state
-  const { data: conv, error: convError } = await supabase
+  // 1. Load current state (scoped to the workspace when the caller gives one)
+  let lookup = supabase
     .from("conversations")
     .select("state, workspace_id")
-    .eq("id", conversationId)
-    .single();
+    .eq("id", conversationId);
+  if (workspaceId) lookup = lookup.eq("workspace_id", workspaceId);
+  const { data: conv, error: convError } = await lookup.single();
 
   if (convError || !conv) {
     throw new Error(
@@ -161,10 +168,12 @@ export async function applyTransition(
     updatePayload.assigned_to = userId;
   }
 
-  const { error: updateError } = await supabase
+  let update = supabase
     .from("conversations")
     .update(updatePayload)
     .eq("id", conversationId);
+  if (workspaceId) update = update.eq("workspace_id", workspaceId);
+  const { error: updateError } = await update;
 
   if (updateError) {
     throw new Error(
@@ -190,11 +199,18 @@ export async function applyTransition(
   //    non-throwing: the transition above is already committed and must stand
   //    even if notifying anyone fails.
   if (to === "handoff_pending") {
-    const { notifyHandoffPending } = await import("./handoff-notifier");
-    await notifyHandoffPending({
-      workspaceId: conv.workspace_id as string,
-      conversationId,
-      trigger: trigger ?? (userId ? "manual" : "agent"),
-    });
+    try {
+      const { notifyHandoffPending } = await import("./handoff-notifier");
+      await notifyHandoffPending({
+        workspaceId: conv.workspace_id as string,
+        conversationId,
+        trigger: trigger ?? (userId ? "manual" : "agent"),
+      });
+    } catch (err) {
+      console.error(
+        "[decision-engine] failed to notify handoff_pending:",
+        err instanceof Error ? err.message : err,
+      );
+    }
   }
 }
