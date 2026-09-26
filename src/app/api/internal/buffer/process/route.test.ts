@@ -58,7 +58,7 @@ mock.module("@/features/inbox/services/buffer.ts", {
   },
 });
 
-const { POST } = await import("./route.ts");
+const { POST, maxDuration } = await import("./route.ts");
 
 function signed(body: string, secret = "buf-secret") {
   const sig = createHmac("sha256", secret).update(body).digest("hex");
@@ -154,4 +154,21 @@ test("rejects a body signed with the wrong secret", async () => {
   const res = await POST(signed(JSON.stringify({ batchId: "batch_1" }), "wrong"));
   assert.equal(res.status, 401);
   assert.equal(processCalls, 0);
+});
+
+test("a targeted batchId only revives batches still in 'buffering', never one in flight", async () => {
+  reset();
+  const res = await POST(signed(JSON.stringify({ batchId: "batch_1" })));
+  assert.equal(res.status, 404);
+  assert.ok(
+    filterCalls.some(([op, col, val]) => op === "eq" && col === "status" && val === "buffering"),
+    `expected .eq("status","buffering"), got ${JSON.stringify(filterCalls)}`,
+  );
+  assert.ok(!filterCalls.some(([op]) => op === "in"), "must not use .in('status', [...processing])");
+  assert.equal(updates.length, 0, "a batch that is not buffering must not be re-armed");
+  assert.equal(processCalls, 0);
+});
+
+test("declares maxDuration below claim_next_batch's 7-minute lease", () => {
+  assert.equal(maxDuration, 300);
 });

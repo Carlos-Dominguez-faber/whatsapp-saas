@@ -351,6 +351,10 @@ export async function generateWithTools(
     text: result.text,
     inputTokens: result.totalUsage?.inputTokens ?? 0,
     outputTokens: result.totalUsage?.outputTokens ?? 0,
-    toolCallsExecuted: result.steps?.length ?? 0,
+    // Tool calls across every step (a plain reply is one step, zero calls).
+    toolCallsExecuted: (result.steps ?? []).reduce(
+      (n, step) => n + (step.toolCalls?.length ?? 0),
+      0,
+    ),
   };
 }

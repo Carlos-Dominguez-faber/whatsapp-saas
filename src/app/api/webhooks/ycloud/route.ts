@@ -24,7 +24,11 @@ import { extractWebhookError } from "@/features/inbox/services/whatsapp-errors";
 
 // Keep the function alive long enough for the best-effort fast path below
 // (sleep through the buffer window + AI generation). The cron is the fallback.
-export const maxDuration = 60;
+//
+// The budget is SHARED: the fast path first sleeps the whole silence window
+// (30 s by default) and only then runs the agent turn. With 60 a turn that
+// called a tool timed out and fell back to the cron, a minute or more later.
+export const maxDuration = 120;
 
 function svc() {
   return createSbClient(

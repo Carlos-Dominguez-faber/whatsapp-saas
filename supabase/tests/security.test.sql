@@ -8,7 +8,7 @@ BEGIN;
 CREATE EXTENSION IF NOT EXISTS pgtap WITH SCHEMA extensions;
 SET search_path = public, extensions;
 
-SELECT plan(75);
+SELECT plan(84);
 
 -- ── public.users: read-only for sessions ────────────────────────────────────
 SELECT ok(NOT has_table_privilege('authenticated', 'public.users', 'UPDATE'),
@@ -35,6 +35,14 @@ SELECT ok(NOT has_function_privilege('authenticated', 'public.check_outbound_24h
   'authenticated cannot execute check_outbound_24h_window()');
 SELECT ok(has_function_privilege('service_role', 'public.claim_next_batch()', 'EXECUTE'),
   'service_role can still execute claim_next_batch()');
+SELECT ok(NOT has_function_privilege('anon',
+  'public.upsert_batch_and_link_message(uuid,uuid,uuid,integer,boolean)', 'EXECUTE'),
+  'anon cannot execute upsert_batch_and_link_message()');
+SELECT ok(NOT has_function_privilege('authenticated',
+  'public.upsert_batch_and_link_message(uuid,uuid,uuid,integer,boolean)', 'EXECUTE'),
+  'authenticated cannot execute upsert_batch_and_link_message()');
+SELECT ok(NOT has_table_privilege('authenticated', 'public.message_errors', 'SELECT'),
+  'sessions cannot read message_errors (technical send detail stays on the server)');
 
 -- ── WhatsApp provider switch: service role only ─────────────────────────────
 SELECT ok(NOT has_function_privilege('anon',
@@ -322,6 +330,65 @@ SELECT lives_ok(
     VALUES ('b0000000-0000-4000-8000-000000000001', 'note_viewed', '{}')$$,
   'a session still inserts other event types in its workspace');
 RESET ROLE;
+
+-- ── the buffer: one batch per conversation, stale leases counted ───────────
+-- Dates far in the past put these batches first in claim_next_batch()'s order,
+-- whatever else the database holds. updated_at is set on INSERT: an UPDATE
+-- would have trg_batches_updated_at reset it to now().
+INSERT INTO public.contacts (id, workspace_id, phone) VALUES
+  ('b0000000-0000-4000-8000-0000000000c2', 'b0000000-0000-4000-8000-000000000001', '+15550002222');
+INSERT INTO public.conversations (id, workspace_id, contact_id) VALUES
+  ('b0000000-0000-4000-8000-0000000000d2', 'b0000000-0000-4000-8000-000000000001',
+   'b0000000-0000-4000-8000-0000000000c2');
+INSERT INTO public.message_batches (id, workspace_id, conversation_id, status, silence_ms, flush_at, message_count, meta, updated_at) VALUES
+  ('b0000000-0000-4000-8000-0000000000b1', 'b0000000-0000-4000-8000-000000000001',
+   'b0000000-0000-4000-8000-0000000000d1', 'processing', 0, '2000-01-01', 1, '{}', now()),
+  ('b0000000-0000-4000-8000-0000000000b2', 'b0000000-0000-4000-8000-000000000001',
+   'b0000000-0000-4000-8000-0000000000d1', 'buffering', 0, '2000-01-02', 1, '{}', now());
+SELECT ok(NOT EXISTS (
+    SELECT 1 FROM public.claim_next_batch() c WHERE c.id = 'b0000000-0000-4000-8000-0000000000b2'),
+  'a due batch waits while another batch of its conversation is being processed');
+
+INSERT INTO public.message_batches (id, workspace_id, conversation_id, status, silence_ms, flush_at, message_count, meta, updated_at) VALUES
+  ('b0000000-0000-4000-8000-0000000000b3', 'b0000000-0000-4000-8000-000000000001',
+   'b0000000-0000-4000-8000-0000000000d2', 'processing', 0, '1999-12-31', 1,
+   '{"retry_count": 1}', now() - interval '8 minutes'),
+  ('b0000000-0000-4000-8000-0000000000b4', 'b0000000-0000-4000-8000-000000000001',
+   'b0000000-0000-4000-8000-0000000000d2', 'processing', 0, '1999-12-30', 1,
+   '{"retry_count": 3}', now() - interval '8 minutes');
+SELECT is(
+  (SELECT (c.meta->>'retry_count')::int FROM public.claim_next_batch() c
+    WHERE c.id = 'b0000000-0000-4000-8000-0000000000b3'),
+  2, 'a stale batch is reclaimed (7-minute lease) and the retry is counted');
+SELECT is(
+  (SELECT status::text FROM public.message_batches WHERE id = 'b0000000-0000-4000-8000-0000000000b4'),
+  'cancelled', 'a stale batch that burned its retries is dead-lettered');
+SELECT ok(EXISTS (
+    SELECT 1 FROM public.events
+     WHERE type = 'batch_dead_letter'
+       AND payload->>'batch_id' = 'b0000000-0000-4000-8000-0000000000b4'),
+  'the dead-letter leaves an event');
+
+INSERT INTO public.messages (id, workspace_id, conversation_id, direction, type, body, wamid) VALUES
+  ('b0000000-0000-4000-8000-0000000000a1', 'b0000000-0000-4000-8000-000000000001',
+   'b0000000-0000-4000-8000-0000000000d1', 'in', 'text', 'orphan', 'wamid.sec.orphan'),
+  ('b0000000-0000-4000-8000-0000000000a2', 'b0000000-0000-4000-8000-000000000001',
+   'b0000000-0000-4000-8000-0000000000d1', 'in', 'text', 'new', 'wamid.sec.new');
+SELECT public.upsert_batch_and_link_message(
+  'b0000000-0000-4000-8000-000000000001', 'b0000000-0000-4000-8000-0000000000d1',
+  'b0000000-0000-4000-8000-0000000000a1', 60000, true);
+SELECT public.upsert_batch_and_link_message(
+  'b0000000-0000-4000-8000-000000000001', 'b0000000-0000-4000-8000-0000000000d1',
+  'b0000000-0000-4000-8000-0000000000a2', 60000, false);
+SELECT is(
+  (SELECT b.meta->>'isolated' FROM public.message_batches b
+     JOIN public.messages m ON m.batch_id = b.id
+    WHERE m.id = 'b0000000-0000-4000-8000-0000000000a1'),
+  'true', 'a reconciled orphan gets an isolated batch');
+SELECT isnt(
+  (SELECT batch_id FROM public.messages WHERE id = 'b0000000-0000-4000-8000-0000000000a2'),
+  (SELECT batch_id FROM public.messages WHERE id = 'b0000000-0000-4000-8000-0000000000a1'),
+  'a new message never joins an isolated batch');
 
 SELECT * FROM finish();
 ROLLBACK;

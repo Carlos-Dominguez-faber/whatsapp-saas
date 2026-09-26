@@ -16,6 +16,10 @@ import { processNextBatch } from "@/features/inbox/services/buffer";
 // workspace_id is NEVER trusted from the request body — always read server-side.
 // ──────────────────────────────────────────────────────────────────────────────
 
+// Same budget as the cron drain: one LLM turn plus tool calls. Must stay below
+// claim_next_batch()'s 7-minute stale lease.
+export const maxDuration = 300;
+
 function svc() {
   return createSbClient(
     process.env.NEXT_PUBLIC_SUPABASE_URL!,
@@ -74,13 +78,14 @@ export async function POST(request: Request): Promise<NextResponse> {
   if (batchId) {
     const supabase = svc();
 
-    // Validate batch exists and is in a processable state
+    // Only a batch still buffering can be primed: one in 'processing' belongs
+    // to a live worker, and reviving it would hand it to a second one.
     // workspace_id is read from DB — never from request body
     const { data: batch, error: batchError } = await supabase
       .from("message_batches")
       .select("id, workspace_id, status")
       .eq("id", batchId)
-      .in("status", ["buffering", "processing"])
+      .eq("status", "buffering")
       .maybeSingle();
 
     if (batchError) {

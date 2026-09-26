@@ -35,19 +35,26 @@ export interface ConversationTurn {
 // separately as the current user message) while still keeping previous outbound
 // messages (batch_id null) and inbound messages from earlier batches.
 //
-// Internal messages (meta.internal === true) are filtered out. Non-text media is
-// rendered with a typed placeholder so the model knows something was sent.
+// Internal messages (meta.internal === true) are filtered out, and so are
+// failed sends: the customer never received them, and a retry that saw its own
+// failed reply would answer "as I said…". Non-text media is rendered with a
+// typed placeholder so the model knows something was sent.
 // ──────────────────────────────────────────────────────────────────────────────
 export async function getConversationHistory(
   conversationId: string,
-  opts: { limit: number; excludeBatchId?: string },
+  opts: { limit: number; excludeBatchId?: string; workspaceId?: string },
 ): Promise<ConversationTurn[]> {
   const supabase = svc();
 
   let query = supabase
     .from("messages")
     .select("direction, type, body, meta, created_at, batch_id")
-    .eq("conversation_id", conversationId);
+    .eq("conversation_id", conversationId)
+    .or("status.is.null,status.neq.failed");
+
+  if (opts.workspaceId) {
+    query = query.eq("workspace_id", opts.workspaceId);
+  }
 
   if (opts.excludeBatchId) {
     query = query.or(`batch_id.is.null,batch_id.neq.${opts.excludeBatchId}`);

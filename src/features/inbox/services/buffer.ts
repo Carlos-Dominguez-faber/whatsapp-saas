@@ -1,6 +1,10 @@
 import { createClient as createSbClient } from "@supabase/supabase-js";
 import { generateWithTools, getWorkspaceModel } from "./openrouter";
-import { recordLlmUsage } from "./cost-tracker";
+import { recordLlmUsage, checkRateLimits } from "./cost-tracker";
+import {
+  isMissingFunctionError,
+  reportMissingFunctionOnce,
+} from "@/shared/lib/db-errors";
 import { dispatchText, dispatchTemplate } from "./dispatch";
 import { decide, applyTransition } from "./decision-engine";
 import {
@@ -88,24 +92,96 @@ function svc() {
 
 // ──────────────────────────────────────────────────────────────────────────────
 // upsertBatch
-// Creates a new buffering batch for a conversation, or extends an existing one.
-// On extend: push flush_at forward by silence_ms, increment message_count, link msg.
-// On create: insert batch, then link message.
-// Returns the batch ID.
+// Creates a new buffering batch for a conversation, or extends an existing one
+// — atomically, via upsert_batch_and_link_message(): extending/creating the
+// batch and linking the message happen in the SAME transaction, so no
+// claim_next_batch() call can consolidate the batch between the two writes and
+// miss the message. Returns the batch ID.
 // ──────────────────────────────────────────────────────────────────────────────
-export async function upsertBatch(opts: {
-  workspaceId: string;
-  conversationId: string;
-  messageId: string;
-  silenceMs?: number;
-}): Promise<string> {
+export async function upsertBatch(
+  opts: {
+    workspaceId: string;
+    conversationId: string;
+    messageId: string;
+    silenceMs?: number;
+    /** Skip joining any in-flight batch — always create a standalone one.
+     * Only reconcileOrphanedMessages sets this: a revived orphan is, by
+     * definition, unrelated to whatever else is buffering right now. */
+    forceNewBatch?: boolean;
+  },
+  retryOpts: {
+    attempts?: number;
+    delayMs?: number;
+    sleep?: (ms: number) => Promise<void>;
+  } = {},
+): Promise<string> {
   const {
     workspaceId,
     conversationId,
     messageId,
     silenceMs = DEFAULT_SILENCE_MS,
+    forceNewBatch = false,
   } = opts;
   const supabase = svc();
+  const {
+    attempts = 3,
+    delayMs = 300,
+    sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms)),
+  } = retryOpts;
+
+  let lastError: { message?: string } | null = null;
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    const { data, error } = await supabase.rpc("upsert_batch_and_link_message", {
+      p_workspace_id: workspaceId,
+      p_conversation_id: conversationId,
+      p_message_id: messageId,
+      p_silence_ms: silenceMs,
+      p_force_new_batch: forceNewBatch,
+    });
+
+    if (!error && data) return data as string;
+
+    // Code deployed before `db-push`: keep batching the old way instead of
+    // failing every inbound message (which would silence the agent).
+    if (isMissingFunctionError(error, "upsert_batch_and_link_message")) {
+      reportMissingFunctionOnce(
+        "upsert_batch_and_link_message",
+        "batching with two separate writes",
+      );
+      return upsertBatchLegacy(supabase, {
+        workspaceId,
+        conversationId,
+        messageId,
+        silenceMs,
+      });
+    }
+
+    lastError = error;
+    // A fixed wait covers a transient blip, not a service outage.
+    if (attempt < attempts - 1) await sleep(delayMs);
+  }
+
+  console.error(
+    "[buffer] upsert_batch_and_link_message RPC error after retries:",
+    lastError,
+  );
+  throw new Error(`Failed to upsert batch: ${lastError?.message}`);
+}
+
+/**
+ * The pre-RPC path: two writes, not atomic. Only used until the migration
+ * that creates upsert_batch_and_link_message() is applied.
+ */
+async function upsertBatchLegacy(
+  supabase: ReturnType<typeof svc>,
+  opts: {
+    workspaceId: string;
+    conversationId: string;
+    messageId: string;
+    silenceMs: number;
+  },
+): Promise<string> {
+  const { workspaceId, conversationId, messageId, silenceMs } = opts;
 
   // 1. Look for an active buffering batch for this conversation
   const { data: existing } = await supabase
@@ -168,7 +244,8 @@ export async function upsertBatch(opts: {
   const { error: linkError } = await supabase
     .from("messages")
     .update({ batch_id: batchId })
-    .eq("id", messageId);
+    .eq("id", messageId)
+    .eq("workspace_id", workspaceId);
 
   if (linkError) {
     // Non-fatal: batch still works; log and continue
@@ -178,6 +255,101 @@ export async function upsertBatch(opts: {
   return batchId;
 }
 
+// More than enough for upsertBatch's 3 attempts (~1 s) to have settled.
+const ORPHAN_MESSAGE_AGE_MS = 2 * 60_000;
+const MAX_ORPHANS_PER_RUN = 20;
+// Anything older is history, not a transient failure: without this bound,
+// re-enabling the AI days later would answer the whole backlog one message at
+// a time (every inbound the webhook left unbatched on purpose — AI off, rate
+// limited — would qualify).
+const ORPHAN_MESSAGE_MAX_AGE_MS = 15 * 60_000;
+
+// ──────────────────────────────────────────────────────────────────────────────
+// reconcileOrphanedMessages (exported)
+// Safety net for what upsertBatch()'s retries don't close: an inbound message
+// whose link kept failing. The provider dedupes its redelivery by wamid, so
+// once the row exists it never reaches upsertBatch() again — it would keep
+// batch_id NULL forever and never get an answer. The buffer-flush cron calls
+// this every minute, before draining batches.
+// ──────────────────────────────────────────────────────────────────────────────
+export async function reconcileOrphanedMessages(
+  retryOpts: {
+    attempts?: number;
+    delayMs?: number;
+    sleep?: (ms: number) => Promise<void>;
+  } = {},
+): Promise<number> {
+  const supabase = svc();
+  const now = Date.now();
+  const cutoff = new Date(now - ORPHAN_MESSAGE_AGE_MS).toISOString();
+  const oldest = new Date(now - ORPHAN_MESSAGE_MAX_AGE_MS).toISOString();
+
+  // `!inner` + the embedded filter drop AI-off conversations server-side, so
+  // they don't use up the LIMIT.
+  const { data, error } = await supabase
+    .from("messages")
+    .select(
+      "id, workspace_id, conversation_id, conversations!inner(ai_enabled, contact_id)",
+    )
+    .is("batch_id", null)
+    .eq("direction", "in")
+    .gt("created_at", oldest)
+    .lt("created_at", cutoff)
+    .eq("conversations.ai_enabled", true)
+    .limit(MAX_ORPHANS_PER_RUN);
+
+  if (error) {
+    console.error("[buffer] reconcileOrphanedMessages lookup error:", error);
+    return 0;
+  }
+
+  const orphans = ((data ?? []) as unknown[]).map(
+    (row) =>
+      row as {
+        id: string;
+        workspace_id: string;
+        conversation_id: string;
+        conversations: { ai_enabled: boolean; contact_id: string } | null;
+      },
+  );
+
+  let recovered = 0;
+  for (const row of orphans) {
+    // Re-check live, like the webhook did when the message arrived: AI off or
+    // a rate-limited contact means the message stays unbatched on purpose.
+    if (!row.conversations?.ai_enabled) continue;
+
+    const rate = await checkRateLimits(
+      row.workspace_id,
+      row.conversations.contact_id,
+    );
+    if (!rate.allowed) continue;
+
+    try {
+      // An isolated batch flushed now: a revived orphan must never join an
+      // unrelated new message, nor absorb one.
+      await upsertBatch(
+        {
+          workspaceId: row.workspace_id,
+          conversationId: row.conversation_id,
+          messageId: row.id,
+          silenceMs: 0,
+          forceNewBatch: true,
+        },
+        retryOpts,
+      );
+      recovered++;
+    } catch (err) {
+      console.error("[buffer] reconcileOrphanedMessages upsertBatch error:", {
+        messageId: row.id,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  return recovered;
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // consolidateBatch (private)
 // Fetches all inbound messages for a batch and joins them into a single string.
@@ -185,13 +357,14 @@ export async function upsertBatch(opts: {
 // when present; otherwise falls back to body text. (Multi-modal extended in F8.)
 // ──────────────────────────────────────────────────────────────────────────────
 async function consolidateBatch(
-  batchId: string,
+  batch: MessageBatch,
   supabase: ReturnType<typeof svc>,
 ): Promise<string> {
   const { data: msgs, error } = await supabase
     .from("messages")
     .select("id, body, meta, type, created_at")
-    .eq("batch_id", batchId)
+    .eq("batch_id", batch.id)
+    .eq("workspace_id", batch.workspace_id)
     .eq("direction", "in")
     .order("created_at", { ascending: true });
 
@@ -245,16 +418,21 @@ async function consolidateBatch(
 // Called by the cron job (/api/cron/buffer-flush) or the internal trigger.
 //
 // Flow:
-//   1. claim_next_batch() RPC — atomic, uses FOR UPDATE SKIP LOCKED
+//   1. claim_next_batch() RPC — one batch per conversation at a time
 //   2. No batch available → return { processed: false }
 //   3. consolidateBatch → mergedText
 //   4. Load conversation (ai_enabled, workspace_id, contact info)
-//   5. decide(): state, handoff keyword, atomic hourly reservation
-//   6. generateReply with consolidated text
-//   7. recordLlmUsage
-//   8. sendText via the workspace's WhatsApp provider (or insert dev_mode outbound)
-//   9. Mark batch 'processed', persist merged_text
+//   5. A reply generated by an earlier attempt → just deliver it again
+//   6. decide(): state, handoff keyword, atomic hourly reservation
+//   7. Jev, WhatsApp provider, daily budget
+//   8. generateWithTools + recordLlmUsage; the reply is saved on the batch
+//   9. Deliver via the workspace's WhatsApp provider, mark 'processed'
 //  10. On error: increment retry counter; if > MAX_BATCH_RETRIES → cancel_batch()
+//
+// Each step that must not be repeated leaves a checkpoint in the batch's meta
+// (turn reservation, Jev verdict, generated reply), so a retry — or a stale
+// batch reclaimed after its worker died — resumes instead of re-running the
+// model and its tools (a second booking, a different reply).
 // ──────────────────────────────────────────────────────────────────────────────
 export async function processNextBatch(): Promise<ProcessBatchResult> {
   const supabase = svc();
@@ -275,28 +453,43 @@ export async function processNextBatch(): Promise<ProcessBatchResult> {
     return { processed: false };
   }
 
-  const retryCount = (batch.meta?.retry_count as number | undefined) ?? 0;
+  batch.meta = batch.meta ?? {};
+  const retryCount = (batch.meta.retry_count as number | undefined) ?? 0;
+  // The inbox shows a failed send once: on the attempt after which the batch
+  // is dead-lettered, not on every retry that re-sends the same text.
+  const isLastAttempt = retryCount >= MAX_BATCH_RETRIES;
 
   try {
     // ── 3. Consolidate messages into one string ──────────────────────────────
-    const mergedText = await consolidateBatch(batch.id, supabase);
+    const mergedText = await consolidateBatch(batch, supabase);
 
     // ── 4. Load conversation record ─────────────────────────────────────────
     const { data: conversation, error: convError } = await supabase
       .from("conversations")
       .select("id, workspace_id, contact_id, ai_enabled, summary")
       .eq("id", batch.conversation_id)
+      .eq("workspace_id", batch.workspace_id)
       .single();
 
     if (convError || !conversation) {
       throw new Error(`Conversation not found: ${convError?.message}`);
     }
 
-    // ── 5. Decision engine: state check + handoff trigger + rate limits ──────
-    // A retry reuses the turn slot its first attempt reserved (kept in the
-    // batch meta below), so failing and retrying never costs a second slot.
+    // ── 5. A reply an earlier attempt already generated (and paid for) ──────
+    const pendingReply =
+      typeof batch.meta.pending_reply === "string"
+        ? batch.meta.pending_reply
+        : null;
+    if (pendingReply) {
+      await deliverReply(supabase, batch, mergedText, pendingReply, isLastAttempt);
+      return { processed: true, conversationId: batch.conversation_id };
+    }
+
+    // ── 6. Decision engine: state check + handoff trigger + rate limits ──────
+    // A retry reuses the turn slot its first attempt reserved, so failing and
+    // retrying never costs a second slot.
     const priorReservationId =
-      typeof batch.meta?.llm_reservation_id === "string"
+      typeof batch.meta.llm_reservation_id === "string"
         ? batch.meta.llm_reservation_id
         : undefined;
     const decisionResult = await decide({
@@ -311,25 +504,24 @@ export async function processNextBatch(): Promise<ProcessBatchResult> {
 
     if (decision !== "respond") {
       console.info("[buffer] not responding:", decision, reason);
-      await markBatchProcessed(batch.id, mergedText, supabase);
+      await markBatchProcessed(batch, mergedText, supabase);
       return { processed: true, conversationId: batch.conversation_id };
     }
 
     if (decisionResult.reservationId) {
-      // The retry path below writes batch.meta back, carrying the slot along.
       batch.meta = {
         ...batch.meta,
         llm_reservation_id: decisionResult.reservationId,
       };
     }
 
-    // ── 5b. Jev, before the workspace's own checks ─────────────────────────
+    // ── 7a. Jev, before the workspace's own checks ─────────────────────────
     // Jev runs on the platform key, outside the workspace budget, and may hand
     // the conversation to a person or suppress the reply — which must keep
     // working on a day the budget is spent, and needs no WhatsApp provider.
     // A retry reuses the verdict of its first attempt instead of judging again.
     // A failure falls through to the existing reply. It never downgrades customer.
-    const cachedJev = batch.meta?.jev_verdict;
+    const cachedJev = batch.meta.jev_verdict;
     const jev: JevBatchEffect = isJevVerdict(cachedJev)
       ? cachedJev
       : await applyJevToBatch(supabase, {
@@ -339,22 +531,24 @@ export async function processNextBatch(): Promise<ProcessBatchResult> {
           mergedText,
         });
     if (jev.suppressReply) {
-      await markBatchProcessed(batch.id, mergedText, supabase);
+      await markBatchProcessed(batch, mergedText, supabase);
       return { processed: true, conversationId: batch.conversation_id };
     }
     batch.meta = { ...batch.meta, jev_verdict: jev };
+    // Checkpoint: a worker that dies from here on leaves the reservation and
+    // the verdict for the attempt that reclaims the batch.
+    await saveBatchMeta(supabase, batch);
 
-    // ── 5c. The workspace must have an active WhatsApp provider ─────────────
-    // Checked before the model and its tools run: the retry below re-runs the
-    // turn, and a reply with nowhere to go must not repeat model spend or tool
-    // side effects (bookings, CRM writes) on every attempt. dispatchText()
-    // loads and decrypts the credentials itself.
+    // ── 7b. The workspace must have an active WhatsApp provider ─────────────
+    // Checked before the model and its tools run: a reply with nowhere to go
+    // must not repeat model spend or tool side effects on every attempt.
+    // dispatchText() loads and decrypts the credentials itself.
     const whatsapp = await loadWhatsAppSettings(supabase, batch.workspace_id);
     if (!whatsapp) {
       throw new Error(`[buffer] ${WHATSAPP_NOT_CONNECTED}`);
     }
 
-    // ── 5d. SEC-06: daily budget, before the KB search and the model ────────
+    // ── 7c. SEC-06: daily budget, before the KB search and the model ────────
     // A cut workspace must not pay for KB embeddings either. A database error
     // throws into the retry path below.
     const costPolicy = await enforceCostPolicy(batch.workspace_id);
@@ -363,18 +557,40 @@ export async function processNextBatch(): Promise<ProcessBatchResult> {
         "[buffer] SEC-06 cost cut — aborting AI for workspace",
         batch.workspace_id,
       );
-      await markBatchProcessed(batch.id, mergedText, supabase);
+      // Opt-in: hand the thread to a person instead of leaving the customer
+      // without a reply until tomorrow. Off by default — a handoff doesn't
+      // come back to the AI by itself when the budget resets.
+      if (
+        (whatsapp.config as { cost_cut_handoff?: boolean }).cost_cut_handoff ===
+        true
+      ) {
+        try {
+          await applyTransition(batch.conversation_id, "handoff_pending", {
+            trigger: "cost_cut",
+            workspaceId: batch.workspace_id,
+          });
+        } catch (transitionErr) {
+          console.error("[buffer] cost-cut handoff failed:", {
+            conversationId: batch.conversation_id,
+            error:
+              transitionErr instanceof Error
+                ? transitionErr.message
+                : String(transitionErr),
+          });
+        }
+      }
+      await markBatchProcessed(batch, mergedText, supabase);
       return { processed: true, conversationId: batch.conversation_id };
     }
 
-    // ── 6. Build ToolContext (SEC-01: anchored server-side, never from client) ─
+    // ── 8a. Build ToolContext (SEC-01: anchored server-side, never from client) ─
     const toolCtx: ToolContext = {
       workspaceId: batch.workspace_id,
       conversationId: batch.conversation_id,
       contactId: conversation.contact_id as string,
     };
 
-    // ── 6c. Resolve conversational memory window (WS2: configurable) ─────────
+    // ── 8b. Resolve conversational memory window (WS2: configurable) ─────────
     // The workspace's WhatsApp integration config carries
     // message_history_window; clamp to [5, 50] and default to 10 when unset or
     // non-numeric.
@@ -386,13 +602,14 @@ export async function processNextBatch(): Promise<ProcessBatchResult> {
       ? Math.min(50, Math.max(5, rawWindow))
       : 10;
 
-    // ── 6d. Load prior conversation turns (WS1: memory injection) ────────────
+    // ── 8c. Load prior conversation turns (WS1: memory injection) ────────────
     const history = await getConversationHistory(batch.conversation_id, {
       limit: historyWindow,
       excludeBatchId: batch.id,
+      workspaceId: batch.workspace_id,
     });
 
-    // ── 7. Build system prompt: KB > custom prompt > business info (F7) ──────
+    // ── 8d. Build system prompt: KB > custom prompt > business info (F7) ─────
     // The active agent (if any) selects its mode-scoped published prompt; the
     // resolver falls back to the global prompt when there is no active agent.
     const activeAgent = await getActiveAgent(batch.workspace_id);
@@ -445,7 +662,7 @@ export async function processNextBatch(): Promise<ProcessBatchResult> {
       },
     });
 
-    // ── 7b. SEC-06: a degraded budget keeps the prompt, switches the model ──
+    // ── 8e. SEC-06: a degraded budget keeps the prompt, switches the model ──
     const { systemPrompt: finalSystemPrompt, model: costModel } =
       await buildCostAwareSystemPrompt(
         batch.workspace_id,
@@ -453,7 +670,7 @@ export async function processNextBatch(): Promise<ProcessBatchResult> {
         costPolicy.policy,
       );
 
-    // ── 8. Generate AI reply with tool-calling support ───────────────────────
+    // ── 8f. Generate AI reply with tool-calling support ─────────────────────
     // Resolve workspace model (falls back to env default or gpt-4o-mini).
     // costModel from SEC-06 takes priority when cost policy is degraded.
     // On the platform key a model outside the catalog is swapped for the
@@ -478,10 +695,10 @@ export async function processNextBatch(): Promise<ProcessBatchResult> {
       history,
     });
 
-    // ── 8. Record LLM usage ──────────────────────────────────────────────────
-    // A failure here must not re-queue the batch: the model was already paid,
-    // and the retry would call it again. recordLlmUsage retries the write
-    // itself; if it still fails, log and deliver the reply.
+    // ── 8g. Record LLM usage — BEFORE judging the reply: an empty reply was
+    // paid for too. A failure here must not re-queue the batch: the model was
+    // already paid, and the retry would call it again. recordLlmUsage retries
+    // the write itself; if it still fails, log and deliver the reply.
     try {
       await recordLlmUsage({
         // Fill in the slot decide() reserved instead of inserting a second row:
@@ -511,22 +728,56 @@ export async function processNextBatch(): Promise<ProcessBatchResult> {
       batch.meta = rest;
     }
 
-    // ── 10a. Dispatch via single exit point (SEC-04) ────────────────────────
-    const dispatchResult = await dispatchText({
-      workspaceId: batch.workspace_id,
-      conversationId: batch.conversation_id,
-      body: reply.text,
-      // AI-generated: no senderUserId
-    });
-
-    if (!dispatchResult.ok) {
-      console.error("[buffer] dispatchText failed:", dispatchResult.error);
+    // ── 8h. An empty reply ───────────────────────────────────────────────────
+    // A turn that spends every step on tool calls comes back with no text.
+    // With no tool run, regenerating is harmless: throw into the retry path.
+    // After a tool ran (a booking, a CRM write), regenerating would run it
+    // again, so a person takes over instead.
+    if (!reply.text.trim()) {
+      if (reply.toolCallsExecuted === 0) {
+        throw new Error("LLM returned an empty reply");
+      }
+      console.warn("[buffer] empty reply after tool calls — handing off", {
+        batchId: batch.id,
+        toolCalls: reply.toolCallsExecuted,
+      });
+      try {
+        await applyTransition(batch.conversation_id, "handoff_pending", {
+          trigger: "empty_reply",
+          workspaceId: batch.workspace_id,
+        });
+      } catch (transitionErr) {
+        console.error("[buffer] empty-reply handoff failed:", {
+          conversationId: batch.conversation_id,
+          error:
+            transitionErr instanceof Error
+              ? transitionErr.message
+              : String(transitionErr),
+        });
+      }
+      await markBatchProcessed(batch, mergedText, supabase);
+      return { processed: true, conversationId: batch.conversation_id };
     }
 
-    // ── 10b. Mark batch as processed ────────────────────────────────────────
-    await markBatchProcessed(batch.id, mergedText, supabase);
+    // ── 8i. Checkpoint the reply before sending it ──────────────────────────
+    // From here on, any retry (or a reclaim after this worker dies) delivers
+    // this same text instead of calling the model and its tools again.
+    batch.meta = { ...batch.meta, pending_reply: reply.text };
+    await saveBatchMeta(supabase, batch);
 
-    // ── 10c. v1.5 opt-in: AI auto-tagging + summary (fire-and-forget) ────────
+    // ── 9. Deliver it and close the batch ───────────────────────────────────
+    const delivered = await deliverReply(
+      supabase,
+      batch,
+      mergedText,
+      reply.text,
+      isLastAttempt,
+    );
+    if (!delivered) {
+      return { processed: true, conversationId: batch.conversation_id };
+    }
+
+    // ── 9b. v1.5 opt-in: AI auto-tagging + summary (fire-and-forget) ─────────
     if (
       activeAgent &&
       (activeAgent.config.autoTag || activeAgent.config.summarize)
@@ -539,7 +790,7 @@ export async function processNextBatch(): Promise<ProcessBatchResult> {
       });
     }
 
-    // ── 10d. F1: Setter qualification (only when the active agent is a setter) ─
+    // ── 9c. F1: Setter qualification (only when the active agent is a setter) ─
     // The user-facing reply was already dispatched above, so this adds no latency
     // to the turn. We AWAIT it (not fire-and-forget) so the post_action reliably
     // runs even if the serverless function is frozen right after the batch. It is
@@ -591,8 +842,9 @@ export async function processNextBatch(): Promise<ProcessBatchResult> {
       };
     }
 
-    // Revert to 'buffering' with incremented retry count so it gets picked up again
-    // Use a short backoff: flush_at = now + 30s * retry_count
+    // Revert to 'buffering' with incremented retry count so it gets picked up
+    // again, with a short backoff: flush_at = now + 30s * retry_count. The
+    // meta keeps every checkpoint (reservation, Jev verdict, pending reply).
     const backoffMs = 30_000 * newRetryCount;
     await supabase
       .from("message_batches")
@@ -607,6 +859,7 @@ export async function processNextBatch(): Promise<ProcessBatchResult> {
         },
       })
       .eq("id", batch.id)
+      .eq("workspace_id", batch.workspace_id)
       .eq("status", "processing");
 
     return {
@@ -614,6 +867,94 @@ export async function processNextBatch(): Promise<ProcessBatchResult> {
       conversationId: batch.conversation_id,
       error: errorMsg,
     };
+  }
+}
+
+/**
+ * Sends `text` as the AI reply for `batch` and closes the batch. Returns
+ * false when nothing was sent on purpose (a person took the conversation
+ * while the reply was being generated). Throws when WhatsApp didn't accept
+ * the message and it is safe to send the same text again: the retry path
+ * re-queues the batch, which still holds the text in `pending_reply`.
+ */
+async function deliverReply(
+  supabase: ReturnType<typeof svc>,
+  batch: MessageBatch,
+  mergedText: string,
+  text: string,
+  isLastAttempt: boolean,
+): Promise<boolean> {
+  // The turn can take 10-20 s. If a human took the thread meanwhile (the
+  // inbox "take", a Business App echo), replying would talk over them.
+  // decide() checked before the turn; check again right before the send. A
+  // failed re-check is logged and dispatches anyway: a blip must not leave
+  // the customer without a reply.
+  const { data: liveConv, error: liveErr } = await supabase
+    .from("conversations")
+    .select("state")
+    .eq("id", batch.conversation_id)
+    .eq("workspace_id", batch.workspace_id)
+    .single();
+
+  if (liveErr || !liveConv) {
+    console.error("[buffer] live state re-check failed, dispatching anyway", {
+      batchId: batch.id,
+      error: liveErr?.message,
+    });
+  } else if (liveConv.state !== "ai_active") {
+    console.info("[buffer] not sending: the conversation left ai_active", {
+      batchId: batch.id,
+      state: liveConv.state,
+    });
+    await markBatchProcessed(batch, mergedText, supabase);
+    return false;
+  }
+
+  // ── Dispatch via single exit point (SEC-04) ──
+  const dispatchResult = await dispatchText({
+    workspaceId: batch.workspace_id,
+    conversationId: batch.conversation_id,
+    body: text,
+    // AI-generated: no senderUserId
+    recordRetryableFailure: isLastAttempt,
+  });
+
+  if (!dispatchResult.ok) {
+    if (dispatchResult.retryable && !isLastAttempt) {
+      // WhatsApp didn't accept it (rate limit): sending the same text again
+      // can't duplicate it.
+      throw new Error(`dispatchText not accepted: ${dispatchResult.error}`);
+    }
+    // Anything else — the number, the 24 h window, or a failure where the
+    // message may have left — is final: dispatch stored it as 'failed' with
+    // the reason for the team. Sending again could reach the customer twice.
+    console.error("[buffer] dispatchText failed:", dispatchResult.errorCode);
+  }
+
+  await markBatchProcessed(batch, mergedText, supabase);
+  return true;
+}
+
+/**
+ * Persists the batch's meta while it is being processed. Best-effort: a
+ * failed write only loses the checkpoint, and the retry path writes the whole
+ * meta again anyway.
+ */
+async function saveBatchMeta(
+  supabase: ReturnType<typeof svc>,
+  batch: MessageBatch,
+): Promise<void> {
+  const { error } = await supabase
+    .from("message_batches")
+    .update({ meta: batch.meta, updated_at: new Date().toISOString() })
+    .eq("id", batch.id)
+    .eq("workspace_id", batch.workspace_id)
+    .eq("status", "processing");
+  if (error) {
+    console.error("[buffer] batch checkpoint failed:", {
+      batchId: batch.id,
+      error: error.message,
+    });
   }
 }
 
@@ -629,7 +970,7 @@ function isJevVerdict(value: unknown): value is JevBatchEffect {
 // Sets status = 'processed' and persists the merged_text for audit.
 // ──────────────────────────────────────────────────────────────────────────────
 async function markBatchProcessed(
-  batchId: string,
+  batch: MessageBatch,
   mergedText: string,
   supabase: ReturnType<typeof svc>,
 ): Promise<void> {
@@ -640,7 +981,8 @@ async function markBatchProcessed(
       merged_text: mergedText,
       updated_at: new Date().toISOString(),
     })
-    .eq("id", batchId);
+    .eq("id", batch.id)
+    .eq("workspace_id", batch.workspace_id);
 
   if (error) {
     console.error("[buffer] markBatchProcessed error:", error);
