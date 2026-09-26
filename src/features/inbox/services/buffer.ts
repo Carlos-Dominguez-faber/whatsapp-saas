@@ -28,7 +28,7 @@ import {
 import { getSetterConfig, evaluateLead } from "./setter";
 import { syncContactToHL, createHLOpportunity } from "./highlevel-client";
 import {
-  loadWhatsAppIntegration,
+  loadWhatsAppSettings,
   WHATSAPP_NOT_CONNECTED,
 } from "./whatsapp-provider";
 
@@ -324,20 +324,29 @@ export async function processNextBatch(): Promise<ProcessBatchResult> {
       contactId: conversation.contact_id as string,
     };
 
-    // ── 6b. Resolve conversational memory window (WS2: configurable) ─────────
+    // ── 6b. The workspace must have an active WhatsApp provider ─────────────
+    // Checked before the model and its tools run: the retry below re-runs the
+    // whole turn, and a reply with nowhere to go must not repeat tool side
+    // effects (bookings, CRM writes) on every attempt. dispatchText() loads
+    // and decrypts the credentials itself.
+    const whatsapp = await loadWhatsAppSettings(supabase, batch.workspace_id);
+    if (!whatsapp) {
+      throw new Error(`[buffer] ${WHATSAPP_NOT_CONNECTED}`);
+    }
+
+    // ── 6c. Resolve conversational memory window (WS2: configurable) ─────────
     // The workspace's WhatsApp integration config carries
     // message_history_window; clamp to [5, 50] and default to 10 when unset or
     // non-numeric.
-    const whatsapp = await loadWhatsAppIntegration(supabase, batch.workspace_id);
     const rawWindow = Number(
-      (whatsapp?.config as { message_history_window?: number } | undefined)
-        ?.message_history_window,
+      (whatsapp.config as { message_history_window?: number })
+        .message_history_window,
     );
     const historyWindow = Number.isFinite(rawWindow)
       ? Math.min(50, Math.max(5, rawWindow))
       : 10;
 
-    // ── 6c. Load prior conversation turns (WS1: memory injection) ────────────
+    // ── 6d. Load prior conversation turns (WS1: memory injection) ────────────
     const history = await getConversationHistory(batch.conversation_id, {
       limit: historyWindow,
       excludeBatchId: batch.id,
@@ -439,13 +448,6 @@ export async function processNextBatch(): Promise<ProcessBatchResult> {
       promptTokens: reply.inputTokens,
       completionTokens: reply.outputTokens,
     });
-
-    // ── 9. The workspace must have an active WhatsApp provider ──────────────
-    // Only an existence check (reusing 6b's lookup) — dispatchText() loads and
-    // decrypts the credentials itself.
-    if (!whatsapp) {
-      throw new Error(`[buffer] ${WHATSAPP_NOT_CONNECTED}`);
-    }
 
     // ── 10a. Dispatch via single exit point (SEC-04) ────────────────────────
     const dispatchResult = await dispatchText({
