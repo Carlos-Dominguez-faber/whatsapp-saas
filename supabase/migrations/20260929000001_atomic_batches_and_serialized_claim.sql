@@ -11,9 +11,11 @@
 -- 1. upsert_batch_and_link_message(): extending/creating the batch and linking
 --    the message happen in ONE transaction, under a per-conversation advisory
 --    lock, idempotent for a message already linked, and refusing a message
---    from another workspace or conversation. A reconciled orphan always gets
---    its own batch (p_force_new_batch) that stays isolated even if it is
---    retried, and a batch past its own flush_at stops absorbing new messages.
+--    from another workspace or conversation. A new message joins the
+--    conversation's unclaimed batch — due or not — unless that batch is
+--    isolated: a reconciled orphan's (p_force_new_batch), or a retry that
+--    already carries a checkpoint of its turn (buffer.ts marks those
+--    `meta.isolated` when it re-queues them, because their reply is decided).
 -- 2. idx_messages_orphaned: supports the reconciler's lookup of inbound
 --    messages the webhook never linked.
 -- 3. claim_next_batch():
@@ -22,9 +24,14 @@
 --    - reclaiming a stale batch counts a retry, and after 3 it is
 --      dead-lettered with an event, so a function killed mid-turn no longer
 --      re-sends the same reply forever;
---    - NEW: one batch per conversation at a time. Before, a batch created
---      while another of the same conversation was being processed could be
---      claimed by a second worker and answered in parallel, out of order.
+--    - NEW: one batch per conversation at a time, oldest first. Only the
+--      conversation's oldest unfinished batch (buffering — including one
+--      waiting out a retry backoff — or processing) can be claimed, so a newer
+--      batch never overtakes a retry or runs in parallel with one in flight.
+--      One candidate per conversation, so a conversation with many blocked
+--      batches can't crowd everyone else out of the candidate list.
+--    - NEW: a dead-lettered batch hands its conversation to a person and
+--      leaves an internal note in the thread, so the missing reply is visible.
 -- ============================================================================
 
 -- ── 1. Atomic batch upsert ──────────────────────────────────────────────────
@@ -81,14 +88,14 @@ BEGIN
   v_flush_at := NOW() + (p_silence_ms || ' milliseconds')::interval;
 
   IF NOT p_force_new_batch THEN
-    -- The conversation's open batch, if it hasn't reached its own deadline and
-    -- isn't a reconciled orphan's (those must stay alone, even on a retry).
+    -- The conversation's unclaimed batch, due or not (a due batch waiting
+    -- behind another of its conversation keeps absorbing messages, so they
+    -- get one reply, not one each), unless it is isolated.
     SELECT id INTO v_existing_id
       FROM public.message_batches
      WHERE workspace_id = p_workspace_id
        AND conversation_id = p_conversation_id
        AND status = 'buffering'
-       AND flush_at > NOW()
        AND COALESCE((meta->>'isolated')::boolean, false) = false
      ORDER BY created_at DESC
      LIMIT 1;
@@ -168,40 +175,70 @@ BEGIN
        AND COALESCE((meta->>'retry_count')::int, 0) >= 3
      RETURNING id, workspace_id, conversation_id, meta
   )
-  INSERT INTO public.events (type, level, workspace_id, conversation_id, payload)
-  SELECT 'batch_dead_letter',
-         'error',
-         dead.workspace_id,
-         dead.conversation_id,
-         jsonb_build_object(
-           'batch_id', dead.id,
-           'retry_count', COALESCE((dead.meta->>'retry_count')::int, 0),
-           'source', 'claim_next_batch',
-           'error', 'stale lease reclaimed too many times'
-         )
+  , logged AS (
+    INSERT INTO public.events (type, level, workspace_id, conversation_id, payload)
+    SELECT 'batch_dead_letter',
+           'error',
+           dead.workspace_id,
+           dead.conversation_id,
+           jsonb_build_object(
+             'batch_id', dead.id,
+             'retry_count', COALESCE((dead.meta->>'retry_count')::int, 0),
+             'source', 'claim_next_batch',
+             'error', 'stale lease reclaimed too many times'
+           )
+      FROM dead
+    RETURNING 1
+  )
+  -- The customer is left without a reply: a person takes the conversation
+  -- (same state change as applyTransition, without the contact ACK)…
+  , handed AS (
+    UPDATE public.conversations c
+       SET state = 'handoff_pending', ai_enabled = false, updated_at = NOW()
+      FROM dead
+     WHERE c.id = dead.conversation_id
+       AND c.workspace_id = dead.workspace_id
+       AND c.state = 'ai_active'
+    RETURNING c.id, c.workspace_id
+  )
+  , state_logged AS (
+    INSERT INTO public.events (type, level, workspace_id, conversation_id, payload)
+    SELECT 'state_change', 'info', handed.workspace_id, handed.id,
+           jsonb_build_object('from', 'ai_active', 'to', 'handoff_pending',
+                              'actor', 'system', 'trigger', 'batch_dead_letter')
+      FROM handed
+    RETURNING 1
+  )
+  -- …and the thread says why, as an internal note the contact never sees.
+  INSERT INTO public.messages (workspace_id, conversation_id, direction, type, body, status, meta)
+  SELECT dead.workspace_id, dead.conversation_id, 'out', 'system',
+         'La IA no pudo responder a este mensaje después de varios intentos. Atiéndelo tú.',
+         'sent',
+         jsonb_build_object('internal', true, 'batch_id', dead.id, 'reason', 'batch_dead_letter')
     FROM dead;
 
-  -- 2. The oldest ready (or stale) batch whose conversation has no other batch
-  --    in flight. The advisory lock (the same key upsert_batch_and_link_message
-  --    takes) keeps two concurrent claims off one conversation.
+  -- 2. Each conversation's OLDEST unfinished batch, if it is ready (or stale).
+  --    A conversation whose oldest unfinished batch is in flight, or waiting
+  --    out a retry backoff, has no candidate at all: its newer batches wait.
+  --    The advisory lock (the same key upsert_batch_and_link_message takes)
+  --    keeps two concurrent claims off one conversation.
   FOR v_candidate IN
-    SELECT b.id, b.conversation_id
-      FROM public.message_batches b
-     WHERE (b.status = 'buffering' AND b.flush_at < NOW())
-        OR (b.status = 'processing' AND b.updated_at < NOW() - INTERVAL '7 minutes')
-     ORDER BY b.flush_at ASC
+    WITH oldest AS (
+      SELECT DISTINCT ON (b.conversation_id)
+             b.id, b.conversation_id, b.status, b.flush_at, b.updated_at
+        FROM public.message_batches b
+       WHERE b.status IN ('buffering', 'processing')
+       ORDER BY b.conversation_id, b.created_at, b.id
+    )
+    SELECT o.id, o.conversation_id
+      FROM oldest o
+     WHERE (o.status = 'buffering' AND o.flush_at < NOW())
+        OR (o.status = 'processing' AND o.updated_at < NOW() - INTERVAL '7 minutes')
+     ORDER BY o.flush_at ASC
      LIMIT 50
   LOOP
     CONTINUE WHEN NOT pg_try_advisory_xact_lock(
       hashtextextended(v_candidate.conversation_id::text, 0)
-    );
-    CONTINUE WHEN EXISTS (
-      SELECT 1
-        FROM public.message_batches p
-       WHERE p.conversation_id = v_candidate.conversation_id
-         AND p.id <> v_candidate.id
-         AND p.status = 'processing'
-         AND p.updated_at >= NOW() - INTERVAL '7 minutes'
     );
 
     RETURN QUERY

@@ -8,7 +8,7 @@ BEGIN;
 CREATE EXTENSION IF NOT EXISTS pgtap WITH SCHEMA extensions;
 SET search_path = public, extensions;
 
-SELECT plan(84);
+SELECT plan(90);
 
 -- ── public.users: read-only for sessions ────────────────────────────────────
 SELECT ok(NOT has_table_privilege('authenticated', 'public.users', 'UPDATE'),
@@ -89,6 +89,7 @@ SELECT fk_ok('public', 'messages', ARRAY['workspace_id', 'conversation_id'], 'pu
 SELECT fk_ok('public', 'messages', ARRAY['workspace_id', 'batch_id'], 'public', 'message_batches', ARRAY['workspace_id', 'id']);
 SELECT fk_ok('public', 'messages', ARRAY['workspace_id', 'template_id'], 'public', 'templates', ARRAY['workspace_id', 'id']);
 SELECT fk_ok('public', 'events', ARRAY['workspace_id', 'conversation_id'], 'public', 'conversations', ARRAY['workspace_id', 'id']);
+SELECT fk_ok('public', 'message_errors', ARRAY['workspace_id', 'message_id'], 'public', 'messages', ARRAY['workspace_id', 'id']);
 SELECT fk_ok('public', 'conversations', ARRAY['workspace_id', 'contact_id'], 'public', 'contacts', ARRAY['workspace_id', 'id']);
 SELECT fk_ok('public', 'appointments', ARRAY['workspace_id', 'contact_id'], 'public', 'contacts', ARRAY['workspace_id', 'id']);
 SELECT fk_ok('public', 'appointments', ARRAY['workspace_id', 'conversation_id'], 'public', 'conversations', ARRAY['workspace_id', 'id']);
@@ -368,6 +369,15 @@ SELECT ok(EXISTS (
      WHERE type = 'batch_dead_letter'
        AND payload->>'batch_id' = 'b0000000-0000-4000-8000-0000000000b4'),
   'the dead-letter leaves an event');
+SELECT is(
+  (SELECT state::text FROM public.conversations WHERE id = 'b0000000-0000-4000-8000-0000000000d2'),
+  'handoff_pending', 'a dead-lettered batch hands its conversation to a person');
+SELECT ok(EXISTS (
+    SELECT 1 FROM public.messages
+     WHERE conversation_id = 'b0000000-0000-4000-8000-0000000000d2'
+       AND type = 'system' AND (meta->>'internal')::boolean
+       AND meta->>'batch_id' = 'b0000000-0000-4000-8000-0000000000b4'),
+  'and leaves an internal note in the thread saying why');
 
 INSERT INTO public.messages (id, workspace_id, conversation_id, direction, type, body, wamid) VALUES
   ('b0000000-0000-4000-8000-0000000000a1', 'b0000000-0000-4000-8000-000000000001',
@@ -389,6 +399,61 @@ SELECT isnt(
   (SELECT batch_id FROM public.messages WHERE id = 'b0000000-0000-4000-8000-0000000000a2'),
   (SELECT batch_id FROM public.messages WHERE id = 'b0000000-0000-4000-8000-0000000000a1'),
   'a new message never joins an isolated batch');
+
+-- ── the claim: oldest first, one per conversation, no stall ─────────────────
+INSERT INTO public.contacts (id, workspace_id, phone) VALUES
+  ('b0000000-0000-4000-8000-0000000000c3', 'b0000000-0000-4000-8000-000000000001', '+15550003333'),
+  ('b0000000-0000-4000-8000-0000000000c4', 'b0000000-0000-4000-8000-000000000001', '+15550004444'),
+  ('b0000000-0000-4000-8000-0000000000c5', 'b0000000-0000-4000-8000-000000000001', '+15550005555'),
+  ('b0000000-0000-4000-8000-0000000000c6', 'b0000000-0000-4000-8000-000000000001', '+15550006666');
+INSERT INTO public.conversations (id, workspace_id, contact_id) VALUES
+  ('b0000000-0000-4000-8000-0000000000d3', 'b0000000-0000-4000-8000-000000000001', 'b0000000-0000-4000-8000-0000000000c3'),
+  ('b0000000-0000-4000-8000-0000000000d4', 'b0000000-0000-4000-8000-000000000001', 'b0000000-0000-4000-8000-0000000000c4'),
+  ('b0000000-0000-4000-8000-0000000000d5', 'b0000000-0000-4000-8000-000000000001', 'b0000000-0000-4000-8000-0000000000c5'),
+  ('b0000000-0000-4000-8000-0000000000d6', 'b0000000-0000-4000-8000-000000000001', 'b0000000-0000-4000-8000-0000000000c6');
+
+-- d3: one batch in flight and 55 due ones behind it (the old claim looked at
+-- the 50 oldest due batches only, all blocked, and returned nothing to anyone).
+INSERT INTO public.message_batches (workspace_id, conversation_id, status, silence_ms, flush_at, message_count, meta, created_at, updated_at)
+VALUES ('b0000000-0000-4000-8000-000000000001', 'b0000000-0000-4000-8000-0000000000d3',
+        'processing', 0, '1990-01-01', 1, '{}', '2026-01-01', now());
+INSERT INTO public.message_batches (workspace_id, conversation_id, status, silence_ms, flush_at, message_count, meta, created_at)
+SELECT 'b0000000-0000-4000-8000-000000000001', 'b0000000-0000-4000-8000-0000000000d3',
+       'buffering', 0, '1990-01-02'::timestamptz + g * interval '1 second', 1, '{}',
+       '2026-01-02'::timestamptz + g * interval '1 second'
+  FROM generate_series(1, 55) AS g;
+INSERT INTO public.message_batches (id, workspace_id, conversation_id, status, silence_ms, flush_at, message_count, meta)
+VALUES ('b0000000-0000-4000-8000-0000000000b5', 'b0000000-0000-4000-8000-000000000001',
+        'b0000000-0000-4000-8000-0000000000d4', 'buffering', 0, '1995-01-01', 1, '{}');
+SELECT is(
+  (SELECT c.id FROM public.claim_next_batch() c),
+  'b0000000-0000-4000-8000-0000000000b5'::uuid,
+  'many blocked batches of one conversation do not stall everyone else');
+
+-- d5: a retry waiting out its backoff is older than a due batch.
+INSERT INTO public.message_batches (id, workspace_id, conversation_id, status, silence_ms, flush_at, message_count, meta, created_at) VALUES
+  ('b0000000-0000-4000-8000-0000000000b6', 'b0000000-0000-4000-8000-000000000001',
+   'b0000000-0000-4000-8000-0000000000d5', 'buffering', 0, now() + interval '1 hour', 1,
+   '{"isolated": true, "retry_count": 1, "pending_reply": "hola"}', '2026-01-01'),
+  ('b0000000-0000-4000-8000-0000000000b7', 'b0000000-0000-4000-8000-000000000001',
+   'b0000000-0000-4000-8000-0000000000d5', 'buffering', 0, '1996-01-01', 1, '{}', '2026-01-02');
+SELECT ok(NOT EXISTS (
+    SELECT 1 FROM public.claim_next_batch() c WHERE c.id = 'b0000000-0000-4000-8000-0000000000b7'),
+  'a newer batch never overtakes a retry of its conversation');
+
+-- d6: a due batch nobody has claimed yet keeps absorbing messages.
+INSERT INTO public.message_batches (id, workspace_id, conversation_id, status, silence_ms, flush_at, message_count, meta) VALUES
+  ('b0000000-0000-4000-8000-0000000000b8', 'b0000000-0000-4000-8000-000000000001',
+   'b0000000-0000-4000-8000-0000000000d6', 'buffering', 30000, now() - interval '1 minute', 1, '{}');
+INSERT INTO public.messages (id, workspace_id, conversation_id, direction, type, body, wamid) VALUES
+  ('b0000000-0000-4000-8000-0000000000a3', 'b0000000-0000-4000-8000-000000000001',
+   'b0000000-0000-4000-8000-0000000000d6', 'in', 'text', 'y otra cosa', 'wamid.sec.absorb');
+SELECT is(
+  public.upsert_batch_and_link_message(
+    'b0000000-0000-4000-8000-000000000001', 'b0000000-0000-4000-8000-0000000000d6',
+    'b0000000-0000-4000-8000-0000000000a3', 30000, false),
+  'b0000000-0000-4000-8000-0000000000b8'::uuid,
+  'a due, unclaimed batch absorbs a new message: one reply, not one each');
 
 SELECT * FROM finish();
 ROLLBACK;
