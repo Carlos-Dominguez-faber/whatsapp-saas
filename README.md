@@ -87,8 +87,7 @@ Business en un celular, Kapso reenvía esas respuestas humanas
 la conversación a `human_active` para que el agente no conteste encima de la
 persona.
 
-Para conectar un número, ver
-[`docs/runbook-conectar-numero-kapso.md`](docs/runbook-conectar-numero-kapso.md).
+Para conectar un número, ver el paso 11 de [`INSTALAR.md`](INSTALAR.md).
 
 > Las mejoras que no son del proveedor (inbox, KB, agente) se hacen en `main` y
 > se traen aquí con `git merge main`.
@@ -102,6 +101,12 @@ npm run dev                        # http://localhost:3000
 ```
 
 Otros comandos: `npm run build`, `npm run lint`, `npm run typecheck`.
+
+Pruebas:
+
+- `npm run test:unit` — pruebas unitarias con `node --test` (Node ≥ 22.18).
+- `supabase test db` — pruebas de seguridad de la base (pgTAP, en
+  `supabase/tests/`) contra un Supabase local (`supabase start`).
 
 ## El cron del buffer
 
@@ -123,7 +128,7 @@ supabase/
 └── cron/       # SQL post-deploy del buffer-flush
 scripts/
 ├── setup.mjs       # Orquestador de instalación (secrets, env, db, cron)
-└── seed-admin.mjs  # Super admin + workspace demo
+└── seed-admin.mjs  # Crea el super admin
 ```
 
 ## Variables de entorno
@@ -153,4 +158,12 @@ de un tenant a otro no descifra.
 
 ---
 
-_Material para miembros de Imperio Agentico._
+## Licencia
+
+[MIT](LICENSE). Puedes usar, modificar, forkear, redistribuir, vender y cobrar
+por este software, incluso con fines comerciales y sin pagar regalías. La única
+condición es conservar el aviso de copyright y el texto de la licencia en las
+copias o partes sustanciales que distribuyas. Se entrega **sin garantía**.
+
+_Nacido como material para miembros de Imperio Agentico — el código es MIT para
+cualquiera._

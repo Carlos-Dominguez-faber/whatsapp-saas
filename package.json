@@ -2,12 +2,14 @@
   "name": "forge-app",
   "version": "0.1.0",
   "private": true,
+  "license": "MIT",
   "scripts": {
     "dev": "next dev --turbopack",
     "build": "next build",
     "start": "next start",
     "lint": "eslint src/ middleware.ts",
     "typecheck": "tsc --noEmit",
+    "test:unit": "node --experimental-test-module-mocks --import ./scripts/register-alias-hook.mjs --import ./scripts/mock-module-compat.mjs --test \"src/**/*.test.ts\"",
     "test:e2e": "playwright test",
     "test:e2e:headed": "playwright test --headed"
   },
@@ -29,6 +31,7 @@
     "@radix-ui/react-tooltip": "^1.2.9",
     "@supabase/ssr": "^0.6.0",
     "@supabase/supabase-js": "^2.49.0",
+    "@typesafe-ai/sdk": "^0.6.0",
     "agentation": "^3.0.2",
     "ai": "^6.0.198",
     "class-variance-authority": "^0.7.1",

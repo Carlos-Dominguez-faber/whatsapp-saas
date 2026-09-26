@@ -25,18 +25,7 @@ export default async function InboxDetailPage({ params }: PageProps) {
 
   if (!user) redirect("/login");
 
-  // 2. Get active membership → workspace_id + role
-  const { data: membership } = await supabase
-    .from("memberships")
-    .select("workspace_id, role")
-    .eq("user_id", user.id)
-    .eq("is_active", true)
-    .limit(1)
-    .single();
-
-  const role = (membership?.role ?? "agent") as WorkspaceRole;
-
-  // 3. Fetch the conversation + contact
+  // 2. Fetch the conversation + contact (RLS: only visible to its members)
   const { data: convData } = await supabase
     .from("conversations")
     .select("*, contact:contacts(*)")
@@ -46,6 +35,20 @@ export default async function InboxDetailPage({ params }: PageProps) {
   if (!convData) notFound();
 
   const convWithContact = convData as ConversationRow & { contact: ContactRow };
+
+  // 3. Role in THIS conversation's workspace — not the user's first
+  // membership, which may belong to another workspace. With no membership
+  // here (e.g. a super admin browsing), the UI falls back to read-only; the
+  // server enforces the same rule on every send.
+  const { data: membership } = await supabase
+    .from("memberships")
+    .select("role")
+    .eq("user_id", user.id)
+    .eq("workspace_id", convWithContact.workspace_id)
+    .eq("is_active", true)
+    .maybeSingle();
+
+  const role = (membership?.role ?? "viewer") as WorkspaceRole;
 
   // 4. Fetch messages (ASC, limit 100)
   const { data: messagesData } = await supabase
@@ -57,14 +60,15 @@ export default async function InboxDetailPage({ params }: PageProps) {
 
   const messages = (messagesData ?? []) as MessageRow[];
 
-  // 5. Fetch sidebar conversations (same workspace, for InboxLayout)
+  // 5. Fetch sidebar conversations (the conversation's workspace, for InboxLayout)
+  const workspaceId = convWithContact.workspace_id;
   let sidebarConversations: ConversationWithContact[] = [];
 
-  if (membership) {
+  if (workspaceId) {
     const { data: conversations } = await supabase
       .from("conversations")
       .select("*, contact:contacts(*)")
-      .eq("workspace_id", membership.workspace_id)
+      .eq("workspace_id", workspaceId)
       .order("last_message_at", { ascending: false, nullsFirst: false })
       .limit(50);
 
@@ -119,7 +123,7 @@ export default async function InboxDetailPage({ params }: PageProps) {
   return (
     <InboxLayout
       conversations={sidebarConversations}
-      workspaceId={membership?.workspace_id ?? null}
+      workspaceId={workspaceId ?? null}
     >
       <ChatThread
         conversation={conversation}
