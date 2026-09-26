@@ -185,6 +185,9 @@ WABA y avisa si el ID configurado no pertenece a esa cuenta.
 
 Luego copia el **Webhook URL** que muestra la app (ya trae el `wsid` correcto) →
 pégalo en **Kapso → Webhooks** con el mismo signing secret y conecta el número.
+Suscribe los cinco eventos: `whatsapp.message.received` (trae los mensajes) y
+`sent`, `delivered`, `read` y `failed` (mueven el estado; en coexistence, `sent`
+es además por donde llega la respuesta del humano desde el celular).
 
 > ⚠️ **El buffering de webhooks de Kapso debe quedar APAGADO.** Si se activa,
 > Kapso agrupa los mensajes en un sobre `{batch:true, data:[…]}` que este webhook

@@ -87,8 +87,7 @@ Business en un celular, Kapso reenvía esas respuestas humanas
 la conversación a `human_active` para que el agente no conteste encima de la
 persona.
 
-Para conectar un número, ver
-[`docs/runbook-conectar-numero-kapso.md`](docs/runbook-conectar-numero-kapso.md).
+Para conectar un número, ver el paso 11 de [`INSTALAR.md`](INSTALAR.md).
 
 > Las mejoras que no son del proveedor (inbox, KB, agente) se hacen en `main` y
 > se traen aquí con `git merge main`.
