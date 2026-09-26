@@ -208,26 +208,13 @@ function cmdEnv() {
 // content lives on main as 20260927000000/1 (idempotent), so an install coming
 // from that branch just needs them marked as reverted in its history — or
 // `supabase db push` refuses ("Remote migration versions not found").
+// Marking a version that was never applied is a no-op, so this always runs:
+// no parsing of the CLI's table output.
 const RETIRED_KAPSO_BRANCH_MIGRATIONS = ["20260731000000", "20260731000001"];
 
 function repairRetiredMigrations() {
-  let listing = "";
-  try {
-    listing = execSync("supabase migration list", {
-      cwd: ROOT,
-      encoding: "utf8",
-      stdio: ["inherit", "pipe", "inherit"],
-    });
-  } catch {
-    return; // let `db push` report whatever is wrong
-  }
-  // A row whose Local column is empty and whose Remote column is the version.
-  const remoteOnly = RETIRED_KAPSO_BRANCH_MIGRATIONS.filter((v) =>
-    new RegExp(`^\\s*\\|\\s*${v}\\s*\\|`, "m").test(listing),
-  );
-  if (remoteOnly.length === 0) return;
-  warn(`Instalación que venía de la rama provider/kapso: marco ${remoteOnly.join(", ")} como ya incluidas en main.`);
-  run(`supabase migration repair --status reverted ${remoteOnly.join(" ")}`);
+  log("Historial de migraciones: marco como revertidas las de la antigua rama provider/kapso (no-op si nunca se aplicaron).");
+  run(`supabase migration repair --status reverted ${RETIRED_KAPSO_BRANCH_MIGRATIONS.join(" ")}`);
 }
 
 function cmdDbPush(args) {
