@@ -32,12 +32,22 @@ interface BatchInput {
   mergedText: string;
 }
 
+export interface JevBatchHooks {
+  /**
+   * Called with the verdict BEFORE its side effects (stage, handoff, event),
+   * so the caller can persist it: a worker that dies halfway leaves a verdict
+   * the retry reuses instead of judging — and paying — again.
+   */
+  onVerdict?: (effect: JevBatchEffect) => Promise<void>;
+}
+
 export async function applyJevToBatch(
   supabase: SupabaseClient,
   input: BatchInput,
+  hooks: JevBatchHooks = {},
 ): Promise<JevBatchEffect> {
   try {
-    return await runJevBatch(supabase, input);
+    return await runJevBatch(supabase, input, hooks);
   } catch (error: unknown) {
     console.error("[jev] apply failed:", jevFailureCode(error));
     return IDLE;
@@ -47,6 +57,7 @@ export async function applyJevToBatch(
 async function runJevBatch(
   supabase: SupabaseClient,
   input: BatchInput,
+  hooks: JevBatchHooks,
 ): Promise<JevBatchEffect> {
   if (!input.mergedText.trim()) return IDLE;
   const runtime = await loadRuntime(supabase, input.workspaceId);
@@ -55,18 +66,21 @@ async function runJevBatch(
     await recordFallback(supabase, input, "missing_api_key", 0);
     return IDLE;
   }
-  return judgeBatch(supabase, input, runtime.uses);
+  return judgeBatch(supabase, input, runtime.uses, hooks);
 }
 
 async function judgeBatch(
   supabase: SupabaseClient,
   input: BatchInput,
   uses: JevUses,
+  hooks: JevBatchHooks,
 ): Promise<JevBatchEffect> {
   const started = Date.now();
   try {
     const judged = await callJev(input.mergedText);
     const mapped = applyUses(judged, uses);
+    const effect = jevEffect(mapped, uses);
+    await hooks.onVerdict?.(effect);
     await persistJudgment(supabase, input, judged, mapped, uses);
     trackJudgment({
       model: judged.model,
@@ -76,7 +90,7 @@ async function judgeBatch(
       success: true,
       fallbackUsed: false,
     });
-    return jevEffect(mapped, uses);
+    return effect;
   } catch (error: unknown) {
     await recordFallback(supabase, input, jevFailureCode(error), Date.now() - started);
     return IDLE;

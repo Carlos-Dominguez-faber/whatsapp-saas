@@ -1,6 +1,7 @@
 // F7: Business info loader — loads structured + free_text data to inject into system prompts.
 
 import { createClient as createSbClient } from "@supabase/supabase-js";
+import { DEFAULT_TIMEZONE, resolveTimeZone } from "@/shared/lib/timezone";
 
 function svc() {
   return createSbClient(
@@ -92,31 +93,16 @@ export function buildUpcomingDaysTable(timeZone: string, now: Date): string {
   return lines.join("\n");
 }
 
-const DEFAULT_TIMEZONE = "America/Mexico_City";
-
-/**
- * True when `tz` is a timezone the runtime's Intl implementation can
- * resolve. `Intl.DateTimeFormat` throws RangeError synchronously for an
- * unrecognized IANA zone — this is the standard way to validate one.
- */
-function isValidTimeZone(tz: string): boolean {
-  try {
-    new Intl.DateTimeFormat(undefined, { timeZone: tz });
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 /**
  * A workspace admin can save an arbitrary string as the business timezone
  * (business_info.structured.timezone has no server-side IANA validation).
  * An invalid one used to throw uncaught here, dead-lettering every message
- * in the workspace after 3 retries — fall back to the default instead.
+ * in the workspace after 3 retries — fall back to the default instead. The
+ * same resolver picks check_availability's zone, so both agree.
  */
-export function buildNowContext(timeZone = DEFAULT_TIMEZONE): string {
-  const tz = isValidTimeZone(timeZone) ? timeZone : DEFAULT_TIMEZONE;
-  if (tz !== timeZone) {
+export function buildNowContext(timeZone?: string | null): string {
+  const tz = resolveTimeZone(timeZone);
+  if (timeZone && tz !== timeZone.trim()) {
     console.warn(
       `[business-info] buildNowContext: invalid timezone "${timeZone}", falling back to ${DEFAULT_TIMEZONE}`,
     );

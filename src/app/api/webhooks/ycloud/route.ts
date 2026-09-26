@@ -7,6 +7,7 @@ import {
 import { processInbound } from "@/features/inbox/services/normalizer";
 import { checkRateLimits } from "@/features/inbox/services/cost-tracker";
 import {
+  hasTimeToClaim,
   upsertBatch,
   processNextBatch,
 } from "@/features/inbox/services/buffer";
@@ -21,14 +22,17 @@ import {
 import { decryptCredentials } from "@/shared/lib/integration-secrets";
 import { applyMessageStatus } from "@/features/inbox/services/message-status";
 import { extractWebhookError } from "@/features/inbox/services/whatsapp-errors";
+import { samePhone } from "@/features/inbox/services/phone";
 
 // Keep the function alive long enough for the best-effort fast path below
 // (sleep through the buffer window + AI generation). The cron is the fallback.
 //
 // The budget is SHARED: the fast path first sleeps the whole silence window
-// (30 s by default) and only then runs the agent turn. With 60 a turn that
-// called a tool timed out and fell back to the cron, a minute or more later.
-export const maxDuration = 120;
+// (30 s by default, up to 120 s) and only then runs the agent turn, and it only
+// claims a batch with time left to finish it (hasTimeToClaim). 300 s is the
+// Hobby maximum with Fluid Compute, and stays below claim_next_batch()'s
+// 7-minute stale lease.
+export const maxDuration = 300;
 
 function svc() {
   return createSbClient(
@@ -38,6 +42,7 @@ function svc() {
 }
 
 export async function POST(request: NextRequest): Promise<NextResponse> {
+  const startedAt = Date.now();
   try {
     const rawBody = await request.text();
     const sigHeader = request.headers.get("YCloud-Signature");
@@ -107,10 +112,10 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
         .limit(10);
 
       ws =
-        (integrations ?? []).find(
-          (i: IntegrationRow) =>
-            (i.config as { phone_number?: string }).phone_number === toPhone,
-        ) ?? null;
+        (integrations ?? []).find((i: IntegrationRow) => {
+          const configured = (i.config as { phone_number?: string }).phone_number;
+          return Boolean(configured && toPhone && samePhone(configured, toPhone));
+        }) ?? null;
     }
 
     // No resolvable workspace → 401. A status update without a resolvable
@@ -164,6 +169,22 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
     const normalized = parseInbound(body);
     if (!normalized) {
       return NextResponse.json({ received: true });
+    }
+
+    // Routed by ?wsid, the signature only proves the event came from YCloud
+    // with this workspace's secret — not that it is for this workspace's
+    // number. A message for another number is ignored (and logged), never
+    // filed under this workspace. Without a configured number, it's accepted.
+    const configuredPhone = (ws.config as { phone_number?: string }).phone_number;
+    if (
+      wsidParam &&
+      configuredPhone &&
+      !samePhone(normalized.workspacePhone, configuredPhone)
+    ) {
+      console.warn(
+        "[webhook] inbound for another number on this workspace's webhook URL — ignored",
+      );
+      return NextResponse.json({ received: true, ignored: "destination_mismatch" });
     }
 
     const workspaceId = ws.workspace_id as string;
@@ -230,6 +251,12 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
         }
       : null;
 
+    // A reaction is recorded in the thread, but it isn't something to answer:
+    // it must not start a paid agent turn.
+    if (normalized.rawType === "reaction") {
+      return NextResponse.json({ received: true, reaction: true });
+    }
+
     // AI is toggled off — still fetch the media so the human agent sees it.
     if (!conversation.ai_enabled) {
       if (mediaJob) after(mediaJob);
@@ -276,6 +303,8 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
       await new Promise((resolve) =>
         setTimeout(resolve, effectiveSilenceMs + 500),
       );
+      // Without time to finish a turn, leave the batch to the cron.
+      if (!hasTimeToClaim(startedAt, maxDuration)) return;
       try {
         await processNextBatch();
       } catch (e) {

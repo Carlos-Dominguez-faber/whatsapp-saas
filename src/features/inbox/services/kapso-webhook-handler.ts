@@ -50,6 +50,8 @@ export interface NormalizedInbound {
   from: string;
   /** Message type as reported by Kapso */
   type: string;
+  /** The provider's own message type, before clamping (e.g. "reaction"). */
+  rawType: string;
   /** Text content, the media caption, or "[Multimedia]" when neither exists */
   text: string | null;
   /** WhatsApp message ID */
@@ -249,6 +251,7 @@ export function parseInbound(
       phoneNumberId,
       from,
       type: toMessageType(msgType),
+      rawType: msgType,
       text,
       wamid,
       customerName,

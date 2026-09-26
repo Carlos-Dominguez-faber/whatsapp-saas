@@ -54,7 +54,11 @@ export async function POST(
 
   try {
     const result = await syncTemplates(workspaceId);
-    return NextResponse.json({ synced: result.synced, errors: result.errors });
+    return NextResponse.json({
+      synced: result.synced,
+      errors: result.errors,
+      truncated: result.truncated,
+    });
   } catch (err) {
     const message = err instanceof Error ? err.message : "Error desconocido";
     console.error("[POST /api/workspace/[id]/templates/sync]:", err);

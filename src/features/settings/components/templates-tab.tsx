@@ -421,11 +421,12 @@ export function TemplatesTab({ workspaceId, initialTemplates }: Props) {
       const json = (await res.json()) as {
         synced?: number;
         errors?: number;
+        truncated?: boolean;
         error?: string;
       };
       if (!res.ok) throw new Error(json.error ?? "Error al sincronizar");
       toast.success(
-        `Sincronizadas ${json.synced ?? 0} plantillas${json.errors ? ` · ${json.errors} errores` : ""}`,
+        `Sincronizadas ${json.synced ?? 0} plantillas${json.errors ? ` · ${json.errors} errores` : ""}${json.truncated ? " · tu cuenta tiene más plantillas de las que se pudieron traer" : ""}`,
       );
       await fetchTemplates();
     } catch (err) {

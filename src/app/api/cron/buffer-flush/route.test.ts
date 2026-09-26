@@ -3,16 +3,20 @@ import { test, mock } from "node:test";
 
 const processCalls: number[] = [];
 let reconcileCalls = 0;
+// Results processNextBatch returns in order; empty → nothing left to claim.
+let queue: Array<{ processed: boolean; error?: string }> = [];
+let timeLeft = true;
 mock.module("@/features/inbox/services/buffer.ts", {
   exports: {
     processNextBatch: async () => {
       processCalls.push(1);
-      return { processed: false };
+      return queue.shift() ?? { processed: false };
     },
     reconcileOrphanedMessages: async () => {
       reconcileCalls++;
       return 2;
     },
+    hasTimeToClaim: () => timeLeft,
   },
 });
 
@@ -61,4 +65,24 @@ test("orphans are reconciled only for an authorized tick", async () => {
 
 test("declares maxDuration below claim_next_batch's 7-minute lease", () => {
   assert.equal(maxDuration, 300);
+});
+
+test("a failed batch doesn't stop the drain; nothing left does", async () => {
+  process.env.CRON_SECRET = "s3cret";
+  processCalls.length = 0;
+  timeLeft = true;
+  queue = [{ processed: true }, { processed: false, error: "boom" }, { processed: true }];
+  const res = await GET(req("Bearer s3cret"));
+  assert.equal(processCalls.length, 4, "3 results, then an empty claim ends it");
+  assert.equal((await res.json()).processed, 2);
+});
+
+test("no batch is claimed without time left to finish it", async () => {
+  process.env.CRON_SECRET = "s3cret";
+  processCalls.length = 0;
+  timeLeft = false;
+  queue = [{ processed: true }];
+  await GET(req("Bearer s3cret"));
+  assert.equal(processCalls.length, 0);
+  timeLeft = true;
 });

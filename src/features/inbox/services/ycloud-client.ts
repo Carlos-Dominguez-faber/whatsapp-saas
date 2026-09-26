@@ -5,6 +5,10 @@ const YCLOUD_MESSAGES_URL = `${YCLOUD_BASE_URL}/whatsapp/messages`;
 const YCLOUD_TEMPLATES_URL = `${YCLOUD_BASE_URL}/whatsapp/templates`;
 const YCLOUD_PHONE_NUMBERS_URL = `${YCLOUD_BASE_URL}/whatsapp/phoneNumbers`;
 
+// A send that hangs must not eat the function's time budget. Past this, the
+// message may or may not have left: dispatch treats it as a final failure.
+const SEND_TIMEOUT_MS = 20_000;
+
 export class YCloudError extends Error {
   readonly status: number;
   readonly body: unknown;
@@ -45,6 +49,7 @@ export async function sendText(
 
   const response = await fetch(YCLOUD_MESSAGES_URL, {
     method: "POST",
+    signal: AbortSignal.timeout(SEND_TIMEOUT_MS),
     headers: {
       "Content-Type": "application/json",
       "X-API-Key": apiKey,
@@ -127,6 +132,7 @@ export async function sendTemplate(
 
   const response = await fetch(YCLOUD_MESSAGES_URL, {
     method: "POST",
+    signal: AbortSignal.timeout(SEND_TIMEOUT_MS),
     headers: {
       "Content-Type": "application/json",
       "X-API-Key": apiKey,
@@ -171,36 +177,72 @@ export async function sendTemplate(
 // fetchYCloudTemplates
 // ──────────────────────────────────────────────────────────────────────────────
 
+/** YCloud pages the list (100 per page at most); more than this is cut. */
+const TEMPLATE_PAGE_SIZE = 100;
+const MAX_TEMPLATE_PAGES = 10;
+
+export interface YCloudTemplatePage {
+  items: unknown[];
+  /** True when the account has more templates than were read. */
+  truncated: boolean;
+}
+
 /**
- * Fetches all WhatsApp templates from the YCloud account.
- * Returns the raw records array for further processing.
+ * Fetches the WhatsApp templates of ONE WhatsApp Business Account. The API
+ * key reaches every WABA of the YCloud account, so without the filter another
+ * number's templates would be imported into this workspace. Reads every page,
+ * up to MAX_TEMPLATE_PAGES, and says when that cut the list.
  */
-export async function fetchYCloudTemplates(apiKey: string): Promise<unknown[]> {
-  const url = `${YCLOUD_BASE_URL}/whatsapp/templates?limit=100`;
+export async function fetchYCloudTemplates(
+  apiKey: string,
+  wabaId: string,
+): Promise<YCloudTemplatePage> {
+  const items: unknown[] = [];
+  let total: number | null = null;
 
-  const response = await fetch(url, {
-    method: "GET",
-    headers: {
-      "X-API-Key": apiKey,
-    },
-  });
+  for (let page = 1; page <= MAX_TEMPLATE_PAGES; page++) {
+    const params = new URLSearchParams({
+      page: String(page),
+      limit: String(TEMPLATE_PAGE_SIZE),
+      includeTotal: "true",
+      "filter.wabaId": wabaId,
+    });
+    const response = await fetch(`${YCLOUD_TEMPLATES_URL}?${params.toString()}`, {
+      method: "GET",
+      headers: { "X-API-Key": apiKey },
+      signal: AbortSignal.timeout(SEND_TIMEOUT_MS),
+    });
 
-  let responseBody: unknown;
-  try {
-    responseBody = await response.json();
-  } catch {
-    responseBody = null;
+    let responseBody: unknown;
+    try {
+      responseBody = await response.json();
+    } catch {
+      responseBody = null;
+    }
+
+    if (!response.ok) {
+      throw new YCloudError(
+        response.status,
+        responseBody,
+        `YCloud fetchTemplates error ${response.status}`,
+      );
+    }
+
+    const pageItems = templateListItems(responseBody);
+    const reported = (responseBody as { total?: unknown } | null)?.total;
+    if (typeof reported === "number") total = reported;
+    items.push(...pageItems);
+
+    const done =
+      pageItems.length < TEMPLATE_PAGE_SIZE ||
+      (total !== null && items.length >= total);
+    if (done) return { items, truncated: false };
   }
 
-  if (!response.ok) {
-    throw new YCloudError(
-      response.status,
-      responseBody,
-      `YCloud fetchTemplates error ${response.status}`,
-    );
-  }
-
-  return templateListItems(responseBody);
+  console.warn(
+    `[ycloud] template list cut at ${items.length}${total !== null ? ` of ${total}` : ""} templates`,
+  );
+  return { items, truncated: true };
 }
 
 /**

@@ -40,12 +40,31 @@ test("orders and locations become readable text", () => {
   );
   assert.equal(
     inboundContentText(
+      {
+        order: {
+          text: "para el sábado",
+          product_items: [
+            { product_retailer_id: "PASTEL-CHOCO", quantity: 2 },
+            { product_retailer_id: "VELAS", quantity: "1" },
+          ],
+        },
+      },
+      "order",
+    ),
+    "[Pedido del catálogo, 2 productos: PASTEL-CHOCO ×2, VELAS ×1]: para el sábado",
+  );
+  assert.equal(
+    inboundContentText(
       { location: { latitude: 1, longitude: 2, name: "Clínica Centro", address: "Av. 5" } },
       "location",
     ),
     "[Ubicación compartida: Clínica Centro, Av. 5]",
   );
   assert.equal(inboundContentText({ location: {} }, "location"), "[Ubicación compartida]");
+  assert.equal(
+    inboundContentText({ location: { latitude: 21.1619, longitude: -86.8515 } }, "location"),
+    "[Ubicación compartida: 21.16190, -86.85150]",
+  );
 });
 
 test("an unknown type is named, sanitised, instead of passing as media", () => {
@@ -62,4 +81,23 @@ test("an unknown type is named, sanitised, instead of passing as media", () => {
 test("a reaction names its emoji", () => {
   assert.equal(inboundContentText({ reaction: { emoji: "👍" } }, "reaction"), "[Reacción: 👍]");
   assert.equal(inboundContentText({ reaction: {} }, "reaction"), "[Reacción retirada]");
+});
+
+test("a Flow's answers are summarized, without its token", () => {
+  assert.equal(
+    inboundContentText(
+      {
+        interactive: {
+          type: "nfm_reply",
+          nfm_reply: {
+            name: "flow",
+            body: "Sent",
+            response_json: JSON.stringify({ flow_token: "tok", nombre: "Ana", fecha: "2026-09-30" }),
+          },
+        },
+      },
+      "interactive",
+    ),
+    "[Formulario enviado]: nombre: Ana; fecha: 2026-09-30",
+  );
 });

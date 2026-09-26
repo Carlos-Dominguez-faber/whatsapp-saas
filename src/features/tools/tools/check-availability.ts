@@ -121,11 +121,16 @@ async function run(args: Args, ctx: ToolContext): Promise<ToolResult> {
   );
 
   if (!res.ok) {
-    const err = await res.text();
+    // The raw body is HighLevel's own wording (English, internal ids): log
+    // it, but give the model a plain reason it can relay.
+    console.error(
+      `[check_availability] HighLevel ${res.status}:`,
+      (await res.text()).slice(0, 300),
+    );
     return {
       ok: false,
       output: null,
-      error: `HL API error: ${res.status} ${err.slice(0, 150)}`,
+      error: `El calendario de HighLevel respondió con un error (${res.status}); no se pudo consultar la disponibilidad. Dile al cliente que lo revisarás o pásalo a una persona.`,
     };
   }
 

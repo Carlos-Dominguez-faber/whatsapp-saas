@@ -62,6 +62,18 @@ interface Entry {
 export const GENERIC_SEND_ERROR =
   "No se pudo enviar el mensaje. Vuelve a intentar en unos minutos; si sigue fallando, avisa al equipo.";
 
+/**
+ * Un error de red, un timeout o un 5xx: el proveedor pudo haber enviado el
+ * mensaje antes de fallar. No se reintenta solo, y el operador debe revisar
+ * antes de reenviar para no duplicarlo.
+ */
+export const UNCONFIRMED_SEND_ERROR =
+  "No se pudo confirmar el envío: es posible que el mensaje sí haya llegado. Revisa con el contacto antes de reenviarlo.";
+
+/** El proveedor no respondió bien, en algo que no es un envío (una plantilla). */
+const PROVIDER_UNAVAILABLE =
+  "WhatsApp no está disponible en este momento. Vuelve a intentar en unos minutos.";
+
 /** Errores propios (no vienen de Meta) que también llegan al operador. */
 export const WINDOW_EXPIRED_MESSAGE =
   "Pasaron más de 24 horas desde el último mensaje del contacto. Envía una plantilla para retomar la conversación.";
@@ -218,10 +230,7 @@ const CATALOG: Record<number, Entry> = {
 function fromHttpStatus(status: number | null): Entry {
   if (status === null) return { text: GENERIC_SEND_ERROR, retry: false };
   if (status >= 500 || status === 408)
-    return {
-      text: "WhatsApp no está disponible en este momento. Vuelve a intentar en unos minutos.",
-      retry: true,
-    };
+    return { text: UNCONFIRMED_SEND_ERROR, retry: true };
   if (status === 429)
     return {
       text: "Se enviaron demasiados mensajes en poco tiempo. Espera unos minutos y vuelve a intentar.",
@@ -391,6 +400,11 @@ export function parseTemplateError(
 ): WhatsAppError {
   const parsed = parseWhatsAppError(payload, httpStatus);
   if (parsed.code !== null && parsed.code in CATALOG) return parsed;
+  // A failed template creation can't have "arrived" anywhere: the send-side
+  // text about checking with the contact doesn't apply.
+  if (httpStatus !== null && (httpStatus >= 500 || httpStatus === 408)) {
+    return { ...parsed, message: PROVIDER_UNAVAILABLE };
+  }
   // Estos textos hablan de la conexión o de la disponibilidad, no del envío:
   // sirven igual para una plantilla.
   if (

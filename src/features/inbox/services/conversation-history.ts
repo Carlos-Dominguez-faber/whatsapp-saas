@@ -42,7 +42,17 @@ export interface ConversationTurn {
 // ──────────────────────────────────────────────────────────────────────────────
 export async function getConversationHistory(
   conversationId: string,
-  opts: { limit: number; excludeBatchId?: string; workspaceId?: string },
+  opts: {
+    limit: number;
+    excludeBatchId?: string;
+    workspaceId?: string;
+    /**
+     * Only messages up to this instant: the current batch's last message.
+     * Messages that arrived after it belong to a later batch and get their
+     * own turn — here they would read as already said.
+     */
+    until?: string;
+  },
 ): Promise<ConversationTurn[]> {
   const supabase = svc();
 
@@ -54,6 +64,9 @@ export async function getConversationHistory(
 
   if (opts.workspaceId) {
     query = query.eq("workspace_id", opts.workspaceId);
+  }
+  if (opts.until) {
+    query = query.lte("created_at", opts.until);
   }
 
   if (opts.excludeBatchId) {

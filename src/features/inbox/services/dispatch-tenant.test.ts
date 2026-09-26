@@ -45,10 +45,15 @@ const tables: Record<string, Row[]> = {
   ],
 };
 
-let inserted: Array<{ table: string; row: Row }> = [];
 let upserted: Array<{ table: string; row: Row }> = [];
+tables.messages = [];
+tables.events = [];
+/** The messages table as dispatch left it. */
+const msgs = () => tables.messages;
 
-function query(table: string) {
+// A PostgREST-ish fake that honors eq() on reads, updates and deletes, so a
+// write scoped to the wrong row or workspace misses, as it would for real.
+function query(table: string, mode: "select" | "update" | "delete" = "select", patch?: Row) {
   const filters: Array<(r: Row) => boolean> = [];
   const rows = () => (tables[table] ?? []).filter((r) => filters.every((f) => f(r)));
   const builder: any = {
@@ -74,7 +79,16 @@ function query(table: string) {
         : { data: r[0] ?? null, error: null };
     },
     then(resolve: (v: unknown) => void) {
-      resolve({ data: rows(), error: null });
+      if (mode === "update") {
+        rows().forEach((r) => Object.assign(r, patch));
+        resolve({ error: null });
+      } else if (mode === "delete") {
+        const hit = new Set(rows());
+        tables[table] = tables[table].filter((r) => !hit.has(r));
+        resolve({ error: null });
+      } else {
+        resolve({ data: rows(), error: null });
+      }
     },
   };
   return builder;
@@ -85,23 +99,20 @@ const fakeClient = {
     return {
       select: () => query(table),
       insert(row: Row) {
-        inserted.push({ table, row });
-        const done = { error: null };
+        const stored = { id: `row_${(tables[table] ?? []).length + 1}`, ...row };
+        (tables[table] ??= []).push(stored);
+        const done = { data: stored, error: null };
         return {
-          select: () => ({
-            maybeSingle: async () => ({ data: { id: `row_${inserted.length}` }, error: null }),
-          }),
-          then: (resolve: (v: unknown) => void) => resolve(done),
+          select: () => ({ single: async () => done, maybeSingle: async () => done }),
+          then: (resolve: (v: unknown) => void) => resolve({ error: null }),
         };
       },
       upsert(row: Row) {
         upserted.push({ table, row });
         return Promise.resolve({ error: null });
       },
-      update: () => {
-        const chain: any = { eq: () => chain, then: (r: any) => r({ error: null }) };
-        return chain;
-      },
+      update: (patch: Row) => query(table, "update", patch),
+      delete: () => query(table, "delete"),
     };
   },
 };
@@ -117,6 +128,8 @@ mock.module("@/shared/lib/integration-secrets.ts", {
 let sends: Array<Record<string, unknown>> = [];
 // Set to make the next YCloud send fail the way the API does.
 let ycloudFailure: { status: number; body: unknown } | null = null;
+/** Runs inside the YCloud send, before it returns. */
+let sendHook: (() => void) | null = null;
 class FakeYCloudError extends Error {
   status: number;
   body: unknown;
@@ -131,6 +144,7 @@ mock.module("./ycloud-client.ts", {
     YCloudError: FakeYCloudError,
     sendText: async (p: Record<string, unknown>) => {
       sends.push({ provider: "ycloud", kind: "text", ...p });
+      sendHook?.();
       if (ycloudFailure) throw new FakeYCloudError(ycloudFailure.status, ycloudFailure.body);
       return { id: "yc_text", wamid: "wamid_text" };
     },
@@ -157,7 +171,8 @@ mock.module("./kapso-client.ts", {
 const { dispatchText, dispatchTemplate } = await import("./dispatch.ts");
 
 function reset() {
-  inserted = [];
+  tables.messages = [];
+  tables.events = [];
   upserted = [];
   sends = [];
   ycloudFailure = null;
@@ -173,7 +188,8 @@ test("a YCloud workspace sends through YCloud, from its E.164 number", async () 
   assert.equal(sends[0].from, "+15559999999");
   assert.equal(sends[0].apiKey, "yc-key-a");
   assert.equal(sends[0].to, "+15550000001");
-  assert.equal((inserted[0].row.meta as Row).ycloud_id, "yc_text");
+  assert.equal(msgs()[0].status, "sent");
+  assert.equal((msgs()[0].meta as Row).ycloud_id, "yc_text");
 });
 
 test("a Kapso workspace sends through Kapso with its phone_number_id, never its old YCloud row", async () => {
@@ -184,8 +200,8 @@ test("a Kapso workspace sends through Kapso with its phone_number_id, never its 
   assert.equal(sends[0].provider, "kapso");
   assert.equal(sends[0].phoneNumberId, "pn_b");
   assert.equal(sends[0].apiKey, "kp-key-b");
-  assert.equal(inserted[0].row.wamid, "wamid_k_text");
-  assert.equal((inserted[0].row.meta as Row).ycloud_id, undefined);
+  assert.equal(msgs()[0].wamid, "wamid_k_text");
+  assert.equal((msgs()[0].meta as Row).ycloud_id, undefined);
 });
 
 test("templates follow the workspace's provider too", async () => {
@@ -200,7 +216,7 @@ test("templates follow the workspace's provider too", async () => {
     ],
   );
   assert.deepEqual(
-    inserted.map((i) => i.row.workspace_id),
+    msgs().map((m) => m.workspace_id),
     ["ws_a", "ws_b"],
   );
 });
@@ -212,7 +228,7 @@ test("a conversation from another workspace is not sent nor persisted", async ()
   assert.equal(text.errorCode, "NOT_FOUND");
   assert.equal(tpl.errorCode, "NOT_FOUND");
   assert.equal(sends.length, 0);
-  assert.equal(inserted.length, 0);
+  assert.equal(msgs().length, 0);
 });
 
 test("an opted-out contact is not sent to", async () => {
@@ -223,7 +239,7 @@ test("an opted-out contact is not sent to", async () => {
   assert.equal(res.errorCode, "OPT_OUT");
   assert.match(res.error ?? "", /pidió no recibir/);
   assert.equal(sends.length, 0);
-  assert.equal(inserted.length, 0);
+  assert.equal(msgs().length, 0);
 });
 
 test("a workspace without an active WhatsApp provider fails loudly", async () => {
@@ -240,8 +256,8 @@ test("a workspace without an active WhatsApp provider fails loudly", async () =>
 test("a YCloud template keeps YCloud's id and is stored as sent", async () => {
   reset();
   await dispatchTemplate({ workspaceId: "ws_a", conversationId: "conv_a", templateName: "welcome" });
-  assert.equal(inserted[0].row.status, "sent");
-  assert.equal((inserted[0].row.meta as Row).ycloud_id, "yc_tpl");
+  assert.equal(msgs()[0].status, "sent");
+  assert.equal((msgs()[0].meta as Row).ycloud_id, "yc_tpl");
 });
 
 test("a failed send stores the reason in Spanish and the detail in message_errors only", async () => {
@@ -263,7 +279,7 @@ test("a failed send stores the reason in Spanish and the detail in message_error
   assert.equal(res.ok, false);
   assert.equal(res.errorCode, "SEND_FAILED");
   assert.equal(res.retryable, false);
-  const failed = inserted.find((i) => i.table === "messages")?.row as Row;
+  const failed = msgs()[0];
   assert.equal(failed.status, "failed");
   assert.match(String(failed.error_message), /no tenga WhatsApp/);
   // Nothing technical in the row the browser reads.
@@ -284,12 +300,13 @@ test("a send WhatsApp did not accept is retryable, and the buffer can skip the f
     recordRetryableFailure: false,
   });
   assert.equal(res.retryable, true);
-  assert.equal(inserted.length, 0, "no failed row while the caller will retry");
+  assert.equal(msgs().length, 0, "the queued row is removed while the caller will retry");
 
   reset();
   ycloudFailure = { status: 429, body: { error: { whatsappApiError: { code: 130429 } } } };
   await dispatchText({ workspaceId: "ws_a", conversationId: "conv_a", body: "hola" });
-  assert.equal(inserted.length, 1, "by default the failure is recorded");
+  assert.equal(msgs().length, 1, "by default the failure is recorded");
+  assert.equal(msgs()[0].status, "failed");
 });
 
 test("a network error may have delivered the message, so it is never retryable", async () => {
@@ -297,5 +314,65 @@ test("a network error may have delivered the message, so it is never retryable",
   ycloudFailure = { status: 503, body: null };
   const res = await dispatchText({ workspaceId: "ws_a", conversationId: "conv_a", body: "hola" });
   assert.equal(res.retryable, false);
-  assert.equal(inserted.length, 1);
+  assert.equal(msgs().length, 1);
+  assert.match(String(msgs()[0].error_message), /es posible que el mensaje sí haya llegado/);
+});
+
+test("the row is queued before the send, so a failure after it still has a row", async () => {
+  reset();
+  let rowsAtSend = -1;
+  const originalFailure = ycloudFailure;
+  ycloudFailure = null;
+  sendHook = () => {
+    rowsAtSend = msgs().length;
+  };
+  await dispatchText({ workspaceId: "ws_a", conversationId: "conv_a", body: "hola" });
+  sendHook = null;
+  ycloudFailure = originalFailure;
+  assert.equal(rowsAtSend, 1, "the queued row exists when the provider is called");
+  assert.equal(msgs()[0].status, "sent");
+});
+
+test("extra meta (the buffer's batch id) lands on the outbound row", async () => {
+  reset();
+  await dispatchText({
+    workspaceId: "ws_a",
+    conversationId: "conv_a",
+    body: "hola",
+    meta: { batch_id: "batch_9" },
+  });
+  assert.equal((msgs()[0].meta as Row).batch_id, "batch_9");
+});
+
+test("a blocked AI reply leaves an internal note with its text; a person's send doesn't", async () => {
+  reset();
+  (tables.contacts[0] as Row).opt_in = false;
+  await dispatchText({ workspaceId: "ws_a", conversationId: "conv_a", body: "tu cita", noteWhenBlocked: true });
+  assert.equal(sends.length, 0);
+  assert.equal(msgs().length, 1);
+  assert.equal(msgs()[0].type, "system");
+  assert.equal((msgs()[0].meta as Row).internal, true);
+  assert.match(String(msgs()[0].body), /tu cita/);
+
+  reset();
+  (tables.contacts[0] as Row).opt_in = false;
+  await dispatchText({ workspaceId: "ws_a", conversationId: "conv_a", body: "hola" });
+  assert.equal(msgs().length, 0);
+});
+
+test("a reply outside the 24h window is noted, never sent", async () => {
+  reset();
+  (tables.conversations[0] as Row).window_expires_at = "2020-01-01T00:00:00Z";
+  const res = await dispatchText({ workspaceId: "ws_a", conversationId: "conv_a", body: "hola", noteWhenBlocked: true });
+  (tables.conversations[0] as Row).window_expires_at = null;
+  assert.equal(res.errorCode, "WINDOW_EXPIRED");
+  assert.equal(sends.length, 0);
+  assert.equal((msgs()[0].meta as Row).reason, "send_blocked");
+});
+
+test("a conversation the send can't find is logged for the workspace", async () => {
+  reset();
+  await dispatchText({ workspaceId: "ws_a", conversationId: "conv_b", body: "hola", noteWhenBlocked: true });
+  assert.equal(msgs().length, 0);
+  assert.equal(tables.events[0]?.type, "outbound_not_sent");
 });

@@ -2,6 +2,7 @@ import { createClient as createSbClient } from "@supabase/supabase-js";
 import type {
   Tool,
   ToolContext,
+  ToolExecution,
   ToolResult,
   ToolRunOptions,
 } from "./core/tool";
@@ -128,6 +129,19 @@ class ToolRegistry {
     const start = Date.now();
     let result: ToolResult;
     let lastError: string | undefined;
+    const reportExecution = async (ok: boolean | null) => {
+      if (!opts?.onExecuted) return;
+      const execution: ToolExecution = {
+        name,
+        sensitivity: tool.sensitivity,
+        ok,
+      };
+      try {
+        await opts.onExecuted(execution);
+      } catch (hookErr) {
+        console.warn("[registry] onExecuted hook failed:", hookErr);
+      }
+    };
 
     for (let i = 0; i <= retries; i++) {
       try {
@@ -135,6 +149,7 @@ class ToolRegistry {
         const latencyMs = Date.now() - start;
         // Fire-and-forget logging
         void logToolCall(name, args, result, latencyMs, ctx);
+        await reportExecution(result.ok);
         return result;
       } catch (err) {
         lastError = err instanceof Error ? err.message : String(err);
@@ -153,6 +168,8 @@ class ToolRegistry {
       error: lastError ?? "Unknown tool error",
     };
     void logToolCall(name, args, errorResult, Date.now() - start, ctx);
+    // Threw or timed out: a write may have happened anyway.
+    await reportExecution(null);
     return errorResult;
   }
 
