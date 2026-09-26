@@ -270,13 +270,21 @@ su propia integración de WhatsApp (cada uno puede usar YCloud o Kapso).
   técnico queda en la tabla `message_errors`, que solo se lee desde el servidor
   (Supabase → Table Editor).
 - **La conversación pasó a "en espera de un asesor" sin que nadie lo pidiera:**
-  puede ser el juez Jev, el tope diario de IA con el traspaso activado, o una
-  respuesta vacía del modelo después de usar una tool (por ejemplo, agendó y no
-  confirmó): en ese caso una persona confirma, en vez de repetir la tool.
-- **Hay eventos `batch_dead_letter` y el agente no contestó:** el lote falló y agotó
-  sus 3 reintentos; el `error` del evento dice por qué. Si fue al revisar el presupuesto
-  (`reserve_llm_turn failed` / `sum_daily_llm_tokens failed`), la base no respondió
-  en ese momento: revisa el estado de tu proyecto de Supabase.
+  puede ser el juez Jev, el tope diario de IA con el traspaso activado, o que la IA
+  ya había ejecutado una acción (por ejemplo, agendó) y no pudo terminar su
+  respuesta: una persona confirma, en vez de repetir la acción. En los dos últimos
+  casos queda una nota interna en la conversación que lo explica.
+- **Hay eventos `batch_dead_letter`:** el lote falló y agotó sus 3 reintentos; el
+  `error` del evento dice por qué. La conversación pasa a una persona y queda una
+  nota interna en ella. Si fue al revisar el presupuesto (`reserve_llm_turn failed` /
+  `sum_daily_llm_tokens failed`), la base no respondió en ese momento: revisa el
+  estado de tu proyecto de Supabase.
+- **Una nota interna dice "No se envió esta respuesta":** la IA respondió, pero la
+  ventana de 24 horas ya había vencido o el contacto pidió no recibir mensajes. La
+  nota trae el texto por si quieres retomarlo con una plantilla.
+- **Un mensaje dice "No se pudo confirmar el envío":** hubo un error de red o del
+  proveedor después de mandarlo, y es posible que sí haya llegado. Revisa con el
+  contacto antes de reenviarlo.
 - **Al agregar una URL a la base de conocimiento:** solo se leen páginas públicas.
   Se siguen hasta 3 redirects y cada destino se revisa igual que la URL original.
   - **"URL no permitida":** la URL o un redirect apunta a una IP privada o interna.
@@ -345,28 +353,42 @@ las migraciones, así que las migraciones van **antes** de `vercel --prod`.
   revisión: WhatsApp solo las acepta desde su biblioteca oficial.
 - Los mensajes enviados por **YCloud** ahora avanzan a entregado y leído (antes
   se quedaban en "enviado").
-- Las respuestas con botones o listas, los pedidos del catálogo, las ubicaciones y
-  las reacciones le llegan al agente como texto, no como "[Multimedia]".
-- El buffer procesa **un lote por conversación a la vez**. La respuesta de la IA
-  se guarda antes de enviarse: si el envío falla y se reintenta, se reenvía el
-  mismo texto sin volver a llamar al modelo ni a sus tools. Solo se reintenta
-  cuando WhatsApp la rechazó por límite de envío; si pudo haber salido, queda como
-  fallida en vez de arriesgar un duplicado.
+- Las respuestas con botones o listas, los formularios (Flows), los pedidos del
+  catálogo y las ubicaciones le llegan al agente como texto, no como "[Multimedia]".
+  Las reacciones se guardan en la conversación, pero no gastan un turno de la IA.
+- El buffer procesa **un lote por conversación a la vez, el más viejo primero**, y
+  los mensajes que llegan mientras tanto se juntan en uno solo (una respuesta, no
+  una por mensaje). La respuesta de la IA se guarda antes de enviarse: si el envío
+  falla y se reintenta, se reenvía el mismo texto sin volver a llamar al modelo ni
+  a sus tools. Solo se reintenta cuando no salió (límite de envío de WhatsApp);
+  si pudo haber salido, queda como fallida en vez de arriesgar un duplicado.
+- Si la IA ya ejecutó una acción (agendar, escribir en el CRM) y no pudo terminar
+  su respuesta, la conversación pasa a una persona: nunca se repite la acción.
 - Si una persona toma la conversación mientras la IA está respondiendo, esa
   respuesta ya no se envía.
 - Un lote atorado (la función murió a medio turno) se retoma a los 7 minutos, con
-  un máximo de 3 intentos; después queda como `batch_dead_letter` en `events`.
-  Los mensajes que se quedaron sin lote se recuperan solos en el siguiente minuto.
+  un máximo de 3 intentos. Si se agotan, o si un lote falla 3 veces, la
+  conversación pasa a una persona con una nota interna, y queda un
+  `batch_dead_letter` en `events`.
+- Un mensaje que llegó pero no quedó en ningún lote (falló la base justo al
+  guardarlo) se recupera en la siguiente pasada del cron, siempre que tenga entre
+  2 y 15 minutos, la IA siga encendida en esa conversación y el contacto no haya
+  llegado a su tope por hora. Pasados 15 minutos ya no se contesta solo.
 - **Nuevo ajuste, apagado por defecto:** Configuración → Integraciones → WhatsApp →
   "Pasar a una persona si se acaba el presupuesto diario de IA".
 - Los horarios de HighLevel se consultan en la zona horaria del negocio
   (Configuración → Negocio) si el agente no pide otra.
 - La sincronización de plantillas de **YCloud** ahora sí trae tus plantillas (antes
-  traía cero). Después de actualizar, sincroniza en Configuración → Templates y revisa
-  que aparezcan.
-- Las rutas del buffer pueden durar hasta 300 segundos. Vercel lo permite en el
-  plan Hobby con **Fluid Compute**, que viene activo en proyectos nuevos; en uno
-  viejo, actívalo en Vercel → Settings → Functions.
+  traía cero), y solo las de la cuenta de WhatsApp (WABA) del número del workspace,
+  hasta 1,000. Después de actualizar, sincroniza en Configuración → Templates y
+  revisa que aparezcan.
+- Si la zona horaria del negocio no es válida (por ejemplo `-05:00` o `EST`), se usa
+  `America/Mexico_City`. Guárdala como zona IANA, por ejemplo `America/Bogota`.
+- El webhook de **YCloud** configurado con `?wsid=` ignora (y registra en el log) los
+  mensajes dirigidos a otro número que no sea el del workspace.
+- Las rutas del buffer y los webhooks pueden durar hasta 300 segundos. Vercel lo
+  permite en el plan Hobby con **Fluid Compute**, que viene activo en proyectos
+  nuevos; en uno viejo, actívalo en Vercel → Settings → Functions.
 
 **Si instalaste desde la antigua rama `provider/kapso`** (Kapso), cámbiate a `main`,
 donde ahora viven los dos proveedores. Cada workspace sigue con el proveedor que
