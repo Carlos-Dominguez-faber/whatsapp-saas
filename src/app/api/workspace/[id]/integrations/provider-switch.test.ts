@@ -201,3 +201,83 @@ test("other integrations (OpenRouter) never touch the WhatsApp provider", async 
   assert.equal(upserts.length, 1);
   assert.equal(upserts[0].provider, "openrouter");
 });
+
+// ── YCloud's number, normalized on save ──────────────────────────────────────
+
+/** YCloud's phoneNumbers endpoint for the next PUT; null = unreachable. */
+function ycloudLists(numbers: string[] | null): { keys: string[]; restore: () => void } {
+  const keys: string[] = [];
+  const original = globalThis.fetch;
+  globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+    keys.push(String((init?.headers as Record<string, string>)?.["X-API-Key"]));
+    if (!numbers) return new Response("{}", { status: 503 });
+    return new Response(
+      JSON.stringify({ items: numbers.map((phoneNumber) => ({ phoneNumber, wabaId: "waba_1" })) }),
+      { status: 200 },
+    );
+  }) as typeof fetch;
+  return { keys, restore: () => (globalThis.fetch = original) };
+}
+
+async function saveYCloudPhone(phone: string) {
+  const res = await put({ provider: "ycloud", config: { phone_number: phone } });
+  return { status: res.status, json: await res.json(), saved: rpcCalls[0]?.args.p_config as Record<string, unknown> };
+}
+
+test("a national YCloud number the account has is saved as YCloud lists it", async () => {
+  reset();
+  const { keys, restore } = ycloudLists(["+15550000001", "+5219981234567"]);
+  try {
+    for (const typed of ["998 123 4567", "(998) 123-4567"]) {
+      rpcCalls = [];
+      const { status, json, saved } = await saveYCloudPhone(typed);
+      assert.equal(status, 200);
+      assert.equal(saved.phone_number, "+5219981234567", typed);
+      assert.equal(json.phoneNumber, "+5219981234567");
+      assert.equal(json.warning, undefined);
+    }
+  } finally {
+    restore();
+  }
+  assert.equal(keys[0], "enc:yk", "the stored key, decrypted");
+});
+
+test("a US number typed without its 1 is matched to the account's line, not given +52", async () => {
+  reset();
+  const { restore } = ycloudLists(["+15551234567"]);
+  try {
+    const { saved } = await saveYCloudPhone("555-123-4567");
+    assert.equal(saved.phone_number, "+15551234567");
+  } finally {
+    restore();
+  }
+});
+
+test("a number with its country code is saved in E.164, with a warning if the account lacks it", async () => {
+  reset();
+  const { restore } = ycloudLists(["+15550000001"]);
+  try {
+    const { status, saved, json } = await saveYCloudPhone("0052 998 123 4567");
+    assert.equal(status, 200, "a warning, never a block");
+    assert.equal(saved.phone_number, "+529981234567");
+    assert.match(json.warning, /No encontramos \+529981234567/);
+  } finally {
+    restore();
+  }
+});
+
+test("a national number YCloud can't confirm is kept as typed, with how to fix it", async () => {
+  reset();
+  const { restore } = ycloudLists(null);
+  const original = console.warn;
+  console.warn = () => {};
+  try {
+    const { status, saved, json } = await saveYCloudPhone("998 123 4567");
+    assert.equal(status, 200);
+    assert.equal(saved.phone_number, "998 123 4567", "no guessed country code");
+    assert.match(json.warning, /lada internacional/);
+  } finally {
+    console.warn = original;
+    restore();
+  }
+});

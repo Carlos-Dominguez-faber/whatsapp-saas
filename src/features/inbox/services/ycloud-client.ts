@@ -1,5 +1,5 @@
 import type { MetaTemplateComponent } from "@/features/settings/lib/template-form";
-import { matchesOwnNumber } from "./phone";
+import { internationalDigits, matchesOwnNumber, normalizePhone } from "./phone";
 
 const YCLOUD_BASE_URL = "https://api.ycloud.com/v2";
 const YCLOUD_MESSAGES_URL = `${YCLOUD_BASE_URL}/whatsapp/messages`;
@@ -364,6 +364,51 @@ export async function listYCloudPhoneNumbers(
   }
 
   return numbers;
+}
+
+/**
+ * The workspace's YCloud number as it should be saved, from what the admin
+ * typed. It routes and checks every inbound webhook, so it is saved in E.164
+ * whenever that is certain: as YCloud lists it when the account has it (a
+ * national number is matched against the account's lines), else with the
+ * country code it was typed with. A national number YCloud can't confirm is
+ * saved as typed — completing it with a guessed code could reject every
+ * message — and `warning` tells the admin what to fix. Never throws: without
+ * the key, or with YCloud unreachable, it only skips the confirmation.
+ */
+export async function normalizeConfiguredPhone(
+  typed: string,
+  apiKey: string | null,
+): Promise<{ value: string; warning?: string }> {
+  const international = internationalDigits(typed);
+  let listed: YCloudPhoneNumber[] | null = null;
+  if (apiKey) {
+    try {
+      listed = await listYCloudPhoneNumbers(apiKey);
+    } catch (err) {
+      console.warn(
+        "[ycloud] could not list the account's numbers to confirm the configured one:",
+        err instanceof Error ? err.message : "unknown",
+      );
+    }
+  }
+  const own = listed?.find((n) => matchesOwnNumber(typed, n.phoneNumber));
+  if (own) return { value: normalizePhone(own.phoneNumber) };
+
+  if (international) {
+    const value = `+${international}`;
+    return listed
+      ? {
+          value,
+          warning: `No encontramos ${value} entre los números de tu cuenta de YCloud. Revisa que sea el número conectado: los mensajes que lleguen para otro número se ignoran.`,
+        }
+      : { value };
+  }
+  return {
+    value: typed.trim(),
+    warning:
+      "Escribe el número con su lada internacional (por ejemplo +52 998 123 4567): así podemos comprobar que cada mensaje que llega es para este número.",
+  };
 }
 
 /**

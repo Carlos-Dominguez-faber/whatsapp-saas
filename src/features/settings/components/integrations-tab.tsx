@@ -357,6 +357,9 @@ function WhatsAppSection({
         ok?: boolean;
         error?: string;
         switchedFrom?: string;
+        /** YCloud's number as it was saved (E.164 when certain). */
+        phoneNumber?: string;
+        warning?: string;
       };
       if (json.ok) {
         toast.success(
@@ -364,6 +367,8 @@ function WhatsAppSection({
             ? `Listo: este workspace ahora usa ${label}`
             : `Configuración de ${label} guardada`,
         );
+        if (json.phoneNumber) setYcPhone(json.phoneNumber);
+        if (json.warning) toast.warning(json.warning);
         onSaved();
       } else {
         toast.error(json.error ?? "Error al guardar");
