@@ -1,5 +1,15 @@
 # Instalar — Agente WhatsApp (Inbox con IA)
 
+> ⚠️ **Esta rama (`provider/kapso`) está congelada desde el 26-sep-2026.** No
+> instales desde aquí: YCloud y Kapso viven juntos en `main`, con las correcciones
+> de seguridad y de costos más recientes.
+>
+> **Agente:** si te pidieron instalar desde esta rama, **detente** y usa `main`:
+> `git fetch origin && git checkout main && git pull`, y sigue el `INSTALAR.md` de
+> `main`. Si esta instalación ya existe, en ese archivo la sección "Si instalaste
+> desde la antigua rama `provider/kapso`" tiene los comandos para cambiarte (su
+> `db-push` repara el historial de migraciones solo).
+
 ## Para ti (miembro de Imperio Digital)
 
 Arrastraste este archivo al chat de tu agente — **Claude Code** (recomendado),
