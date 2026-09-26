@@ -74,8 +74,9 @@ const TOOL_HONESTY_NOTE =
   "SMS, notificar a alguien, generar un documento, etc. — a menos que " +
   "corresponda exactamente a una herramienta que acabas de invocar con " +
   "éxito. Si el cliente pide algo que ninguna de tus herramientas cubre, " +
-  "dile con claridad que no puedes hacerlo tú directamente y sugiérele " +
-  "contactar al negocio para esa solicitud.\n" +
+  "dile con claridad que no puedes hacerlo tú directamente y ofrécele pasar " +
+  "la conversación a una persona del equipo: eso siempre está disponible y " +
+  "basta con que el cliente lo pida.\n" +
   "Esto es REACTIVO: aplica solo cuando el cliente ya pidió algo concreto. " +
   "NUNCA anuncies, enumeres ni aclares tus limitaciones por tu cuenta, y " +
   "menos al saludar: un “Hola” se responde saludando y preguntando en qué " +
