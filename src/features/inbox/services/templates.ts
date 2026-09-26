@@ -13,6 +13,7 @@ import {
   WHATSAPP_NOT_CONNECTED,
   type WhatsAppProvider,
 } from "./whatsapp-provider";
+import { extractRejectionReason, templateStatusPatch } from "./template-sync";
 
 function svc() {
   return createSbClient(
@@ -65,6 +66,10 @@ interface MetaTemplate {
   language?: string;
   category?: string;
   status?: string;
+  // Why Meta rejected it: Graph (Kapso) reports `rejected_reason`, YCloud
+  // `reason`; Meta sends "NONE" when there is none.
+  rejected_reason?: string;
+  reason?: string;
   components?: MetaTemplateComponent[];
   [key: string]: unknown;
 }
@@ -173,6 +178,13 @@ export async function syncTemplates(
     whatsapp.config,
   );
 
+  // What we already stored, by the template's identity (name + language):
+  // keeps a rejection reason Meta stops reporting, and `approved_at` on the
+  // first approval instead of every sync.
+  const previous = new Map(
+    (await listTemplates(workspaceId)).map((t) => [`${t.name}|${t.language}`, t]),
+  );
+
   let synced = 0;
   let errors = 0;
 
@@ -189,6 +201,7 @@ export async function syncTemplates(
       const components = Array.isArray(t.components) ? t.components : [];
       const bodyTemplate = extractBodyText(components);
       const variables = extractTemplateVariables(bodyTemplate);
+      const now = new Date().toISOString();
 
       const { error: upsertError } = await supabase.from("templates").upsert(
         {
@@ -201,8 +214,13 @@ export async function syncTemplates(
           components: t.components ?? {},
           variables,
           provider_template_id: templateOfficialId(t),
-          rejection_reason: null,
-          updated_at: new Date().toISOString(),
+          ...templateStatusPatch(
+            status,
+            extractRejectionReason(t.rejected_reason ?? t.reason),
+            previous.get(`${name}|${language}`),
+            now,
+          ),
+          updated_at: now,
         },
         {
           onConflict: "workspace_id,name,language",

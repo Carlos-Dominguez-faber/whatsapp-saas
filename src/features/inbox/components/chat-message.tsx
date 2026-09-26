@@ -116,7 +116,12 @@ export function ChatMessage({ message }: ChatMessageProps) {
           >
             {time}
           </span>
-          {isOutbound && <StatusIcon status={message.status} />}
+          {isOutbound && (
+            <StatusIcon
+              status={message.status}
+              errorMessage={message.error_message}
+            />
+          )}
         </div>
       </div>
     </div>

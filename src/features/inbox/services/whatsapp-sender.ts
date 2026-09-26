@@ -36,13 +36,24 @@ export interface WhatsAppSender {
 }
 
 /**
+ * A setting the workspace is missing, named in Spanish for the team. dispatch
+ * shows this message as is: unlike a provider error, it carries no remote text.
+ */
+export class WhatsAppConfigError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "WhatsAppConfigError";
+  }
+}
+
+/**
  * Without the id it sends from, the provider API answers with an opaque error
  * (Kapso even gets an empty path segment). Name the missing setting instead:
  * dispatch stores this message on the failed outbound, where the team sees it.
  */
 function requireSenderId(value: string, what: string, label: string): string {
   if (!value.trim()) {
-    throw new Error(
+    throw new WhatsAppConfigError(
       `Falta ${what} de ${label}: complétalo en Configuración → Integraciones → WhatsApp`,
     );
   }

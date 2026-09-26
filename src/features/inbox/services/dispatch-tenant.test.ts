@@ -46,6 +46,7 @@ const tables: Record<string, Row[]> = {
 };
 
 let inserted: Array<{ table: string; row: Row }> = [];
+let upserted: Array<{ table: string; row: Row }> = [];
 
 function query(table: string) {
   const filters: Array<(r: Row) => boolean> = [];
@@ -85,6 +86,16 @@ const fakeClient = {
       select: () => query(table),
       insert(row: Row) {
         inserted.push({ table, row });
+        const done = { error: null };
+        return {
+          select: () => ({
+            maybeSingle: async () => ({ data: { id: `row_${inserted.length}` }, error: null }),
+          }),
+          then: (resolve: (v: unknown) => void) => resolve(done),
+        };
+      },
+      upsert(row: Row) {
+        upserted.push({ table, row });
         return Promise.resolve({ error: null });
       },
       update: () => {
@@ -104,11 +115,23 @@ mock.module("@/shared/lib/integration-secrets.ts", {
 });
 
 let sends: Array<Record<string, unknown>> = [];
+// Set to make the next YCloud send fail the way the API does.
+let ycloudFailure: { status: number; body: unknown } | null = null;
+class FakeYCloudError extends Error {
+  status: number;
+  body: unknown;
+  constructor(status: number, body: unknown) {
+    super(`YCloud API error ${status}`);
+    this.status = status;
+    this.body = body;
+  }
+}
 mock.module("./ycloud-client.ts", {
   exports: {
-    YCloudError: class YCloudError extends Error {},
+    YCloudError: FakeYCloudError,
     sendText: async (p: Record<string, unknown>) => {
       sends.push({ provider: "ycloud", kind: "text", ...p });
+      if (ycloudFailure) throw new FakeYCloudError(ycloudFailure.status, ycloudFailure.body);
       return { id: "yc_text", wamid: "wamid_text" };
     },
     sendTemplate: async (p: Record<string, unknown>) => {
@@ -135,7 +158,9 @@ const { dispatchText, dispatchTemplate } = await import("./dispatch.ts");
 
 function reset() {
   inserted = [];
+  upserted = [];
   sends = [];
+  ycloudFailure = null;
   (tables.contacts[0] as Row).opt_in = true;
 }
 
@@ -184,8 +209,8 @@ test("a conversation from another workspace is not sent nor persisted", async ()
   reset();
   const text = await dispatchText({ workspaceId: "ws_a", conversationId: "conv_b", body: "hola" });
   const tpl = await dispatchTemplate({ workspaceId: "ws_a", conversationId: "conv_b", templateName: "welcome" });
-  assert.equal(text.error, "CONVERSATION_NOT_FOUND");
-  assert.equal(tpl.error, "CONVERSATION_NOT_FOUND");
+  assert.equal(text.errorCode, "NOT_FOUND");
+  assert.equal(tpl.errorCode, "NOT_FOUND");
   assert.equal(sends.length, 0);
   assert.equal(inserted.length, 0);
 });
@@ -195,7 +220,8 @@ test("an opted-out contact is not sent to", async () => {
   (tables.contacts[0] as Row).opt_in = false;
   const res = await dispatchText({ workspaceId: "ws_a", conversationId: "conv_a", body: "hola" });
   assert.equal(res.ok, false);
-  assert.match(res.error ?? "", /^OPT_OUT/);
+  assert.equal(res.errorCode, "OPT_OUT");
+  assert.match(res.error ?? "", /pidió no recibir/);
   assert.equal(sends.length, 0);
   assert.equal(inserted.length, 0);
 });
@@ -209,4 +235,67 @@ test("a workspace without an active WhatsApp provider fails loudly", async () =>
     /WhatsApp integration not found/,
   );
   assert.equal(sends.length, 0);
+});
+
+test("a YCloud template keeps YCloud's id and is stored as sent", async () => {
+  reset();
+  await dispatchTemplate({ workspaceId: "ws_a", conversationId: "conv_a", templateName: "welcome" });
+  assert.equal(inserted[0].row.status, "sent");
+  assert.equal((inserted[0].row.meta as Row).ycloud_id, "yc_tpl");
+});
+
+test("a failed send stores the reason in Spanish and the detail in message_errors only", async () => {
+  reset();
+  ycloudFailure = {
+    status: 400,
+    body: {
+      error: {
+        code: "WHATSAPP_ERROR",
+        whatsappApiError: {
+          code: 131026,
+          message: "Message undeliverable",
+          fbtrace_id: "trace_1",
+        },
+      },
+    },
+  };
+  const res = await dispatchText({ workspaceId: "ws_a", conversationId: "conv_a", body: "hola" });
+  assert.equal(res.ok, false);
+  assert.equal(res.errorCode, "SEND_FAILED");
+  assert.equal(res.retryable, false);
+  const failed = inserted.find((i) => i.table === "messages")?.row as Row;
+  assert.equal(failed.status, "failed");
+  assert.match(String(failed.error_message), /no tenga WhatsApp/);
+  // Nothing technical in the row the browser reads.
+  assert.ok(!JSON.stringify(failed).includes("trace_1"));
+  assert.ok(!JSON.stringify(failed).includes("undeliverable"));
+  const detail = upserted.find((u) => u.table === "message_errors")?.row as Row;
+  assert.equal(detail.code, 131026);
+  assert.equal(detail.fbtrace_id, "trace_1");
+});
+
+test("a send WhatsApp did not accept is retryable, and the buffer can skip the failed row", async () => {
+  reset();
+  ycloudFailure = { status: 429, body: { error: { whatsappApiError: { code: 130429 } } } };
+  const res = await dispatchText({
+    workspaceId: "ws_a",
+    conversationId: "conv_a",
+    body: "hola",
+    recordRetryableFailure: false,
+  });
+  assert.equal(res.retryable, true);
+  assert.equal(inserted.length, 0, "no failed row while the caller will retry");
+
+  reset();
+  ycloudFailure = { status: 429, body: { error: { whatsappApiError: { code: 130429 } } } };
+  await dispatchText({ workspaceId: "ws_a", conversationId: "conv_a", body: "hola" });
+  assert.equal(inserted.length, 1, "by default the failure is recorded");
+});
+
+test("a network error may have delivered the message, so it is never retryable", async () => {
+  reset();
+  ycloudFailure = { status: 503, body: null };
+  const res = await dispatchText({ workspaceId: "ws_a", conversationId: "conv_a", body: "hola" });
+  assert.equal(res.retryable, false);
+  assert.equal(inserted.length, 1);
 });
