@@ -300,22 +300,30 @@ las migraciones, así que las migraciones van **antes** de `vercel --prod`.
 - Generar una plantilla con IA pide rol **manager** o superior.
 - Por workspace y por hora: hasta **20** plantillas generadas con IA y **60**
   mensajes en la prueba de agentes. Sus tokens cuentan en el presupuesto diario.
-- Los modelos de agentes y de OpenRouter se eligen solo del catálogo. Un modelo
-  guardado antes que ya no esté en el catálogo sigue funcionando en las
-  conversaciones, pero la prueba de agentes pide cambiarlo.
+- Los modelos de agentes y de OpenRouter se eligen solo del catálogo.
+  - Si el workspace usa la clave de OpenRouter de la agencia (no tiene una
+    propia), un modelo fuera del catálogo — guardado antes o por otro camino — se
+    reemplaza en cada llamada por el modelo por defecto de la plataforma
+    (`OPENROUTER_DEFAULT_MODEL`), y queda un evento `model_outside_catalog` al día.
+  - Con clave propia, el workspace puede usar cualquier modelo: lo paga él.
+  - La prueba de agentes pide cambiar un modelo de agente que ya no está en el
+    catálogo.
 - El presupuesto diario sigue en **1,000,000 tokens** por workspace (se reinicia a
   las 00:00 UTC):
   - desde **800,000** el agente responde con un modelo más barato (con el prompt
     completo), y se pausan las plantillas con IA y la prueba de agentes; queda un
     evento `cost_alert` al día;
   - al llegar a **1,000,000** el agente deja de responder con IA hasta el día
-    siguiente; queda un evento `cost_cut` al día.
+    siguiente (el juez Jev, que corre fuera de este presupuesto, sigue pudiendo
+    pasar la conversación a una persona); queda un evento `cost_cut` al día.
 - Si al revisar el presupuesto la base no responde, el lote se reintenta (y tras 3
   reintentos queda como `batch_dead_letter` en `events`) en vez de perderse sin
   aviso. El reintento no gasta otro turno del tope por hora.
 - El tool **Webhook personalizado** sigue hasta 3 redirects, siempre por HTTPS y
   revisando cada destino. Así funcionan, por ejemplo, las web apps de Google Apps
-  Script, que responden a cada POST con un redirect después de ejecutarlo.
+  Script, que responden a cada POST con un redirect después de ejecutarlo. Si el
+  webhook respondió al POST con un redirect y un salto posterior falla, la llamada
+  cuenta como entregada: el webhook ya la recibió, y el agente no la repite.
 
 **Si instalaste desde la antigua rama `provider/kapso`** (Kapso), cámbiate a `main`,
 donde ahora viven los dos proveedores. Cada workspace sigue con el proveedor que
@@ -342,6 +350,20 @@ tiene (la lista está en `scripts/setup.mjs`); si no, `supabase db push` se nieg
 seguir. Eso solo destraba el historial: lo que esas migraciones crearon sigue en
 tu base. Lo que `main` adoptó de ellas vuelve con versiones nuevas que se pueden
 aplicar encima.
+
+**Si aplicaste ramas de otros PRs de la comunidad (#10–#17)**, traen versiones que
+ni `main` ni esa lista conocen, y `supabase db push` se va a negar a seguir. Es a
+propósito: nada se aplica a ciegas sobre una base con cambios desconocidos.
+
+1. Corre `supabase migration list` y anota las versiones que solo aparecen del lado
+   remoto (tu base).
+2. Revisa qué creó cada una (su archivo en la rama del PR).
+3. Si aceptas conservar esos cambios en tu base, márcalas:
+   `supabase migration repair --status reverted <versiones>`. Luego vuelve a correr
+   `setup.mjs db-push`.
+
+Si no estás seguro de qué hicieron, pide ayuda antes de repararlas: son cambios de
+esquema que `main` no conoce.
 
 **Una sola vez, si tu instalación es anterior al 26-sep-2026** (endurecimiento de
 seguridad entre workspaces):
