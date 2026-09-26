@@ -166,12 +166,7 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
     if (isStatusUpdate) {
       const statusData = parseStatusUpdate(body, eventName);
       if (statusData) {
-        await applyMessageStatus(
-          supabase,
-          ws.workspace_id,
-          statusData.wamid,
-          statusData.status,
-        );
+        await applyMessageStatus(supabase, ws.workspace_id, statusData);
       }
       return NextResponse.json({ received: true });
     }

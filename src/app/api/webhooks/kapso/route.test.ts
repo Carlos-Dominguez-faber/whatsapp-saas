@@ -12,7 +12,11 @@ process.env.SUPABASE_SERVICE_ROLE_KEY = "fake-service-key";
 const statusCalls: Array<{ workspaceId: string; wamid: string }> = [];
 mock.module("@/features/inbox/services/message-status.ts", {
   exports: {
-    applyMessageStatus: async (_db: unknown, workspaceId: string, wamid: string) => {
+    applyMessageStatus: async (
+      _db: unknown,
+      workspaceId: string,
+      { wamid }: { wamid: string },
+    ) => {
       statusCalls.push({ workspaceId, wamid });
     },
   },

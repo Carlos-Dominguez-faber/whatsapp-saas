@@ -20,6 +20,7 @@ import {
 } from "@/features/inbox/services/media-understanding";
 import { decryptCredentials } from "@/shared/lib/integration-secrets";
 import { applyMessageStatus } from "@/features/inbox/services/message-status";
+import { extractWebhookError } from "@/features/inbox/services/whatsapp-errors";
 
 // Keep the function alive long enough for the best-effort fast path below
 // (sleep through the buffer window + AI generation). The cron is the fallback.
@@ -138,15 +139,20 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
     // WH-02: monotonic status updates — only reached after signature verification.
     if (isStatusUpdate) {
       const statusData = (
-        body as { whatsappMessage?: { wamid?: string; status?: string } }
+        body as {
+          whatsappMessage?: { id?: string; wamid?: string; status?: string };
+        }
       ).whatsappMessage;
-      if (statusData?.wamid && statusData?.status) {
-        await applyMessageStatus(
-          supabase,
-          ws.workspace_id,
-          statusData.wamid,
-          statusData.status,
-        );
+      // YCloud assigns the wamid after the send, so its own message id is what
+      // our outbound row holds at first (meta.ycloud_id).
+      if (statusData?.status && (statusData.wamid || statusData.id)) {
+        await applyMessageStatus(supabase, ws.workspace_id, {
+          wamid: statusData.wamid ?? null,
+          providerMessageId: statusData.id ?? null,
+          status: statusData.status,
+          error:
+            statusData.status === "failed" ? extractWebhookError(body) : null,
+        });
       }
       return NextResponse.json({ received: true });
     }
