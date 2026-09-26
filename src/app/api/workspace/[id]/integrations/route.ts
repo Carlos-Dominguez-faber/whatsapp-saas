@@ -17,6 +17,11 @@ import {
   WORKSPACE_WHATSAPP_SETTINGS,
 } from "@/features/inbox/services/whatsapp-provider";
 
+import {
+  isCatalogModel,
+  MODEL_NOT_IN_CATALOG,
+} from "@/features/agents/lib/model-catalog";
+
 const IntegrationSchema = z.object({
   provider: z.enum(["ycloud", "kapso", "openrouter", "highlevel"]),
   enabled: z.boolean().optional(),
@@ -144,6 +149,20 @@ export async function PUT(
     .eq("workspace_id", workspaceId)
     .eq("provider", parsed.data.provider)
     .single();
+
+  // OpenRouter models: only catalog models, like the agents. The value already
+  // stored is accepted unchanged, so an older workspace can still save its
+  // other settings.
+  if (parsed.data.provider === "openrouter") {
+    const storedConfig = (existing?.config as Record<string, unknown> | null) ?? {};
+    for (const key of ["default_model", "fallback_model"] as const) {
+      const value = parsed.data.config?.[key];
+      if (value === undefined || value === null || value === "") continue;
+      if (typeof value !== "string" || (!isCatalogModel(value) && value !== storedConfig[key])) {
+        return NextResponse.json({ error: MODEL_NOT_IN_CATALOG }, { status: 400 });
+      }
+    }
+  }
 
   // Filter out masked placeholder values from credentials update
   const newCreds = Object.fromEntries(

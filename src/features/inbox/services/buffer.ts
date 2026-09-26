@@ -4,6 +4,7 @@ import { recordLlmUsage } from "./cost-tracker";
 import { dispatchText, dispatchTemplate } from "./dispatch";
 import { decide, applyTransition } from "./decision-engine";
 import { applyJevToBatch } from "@/features/jev-judge/apply";
+import { isCatalogModel } from "@/features/agents/lib/model-catalog";
 import type { ToolContext } from "@/features/tools/core/tool";
 import { resolveSystemPrompt } from "./prompt-resolver";
 import { buildSystemPrompt } from "./prompt-builder";
@@ -446,6 +447,7 @@ export async function processNextBatch(): Promise<ProcessBatchResult> {
     // costModel from SEC-06 takes priority when cost policy is degraded.
     const workspaceModel = await getWorkspaceModel(batch.workspace_id);
     const model = costModel ?? workspaceModel;
+    warnIfOutsideCatalog(model);
 
     const reply = await generateWithTools({
       systemPrompt: finalSystemPrompt,
@@ -574,6 +576,18 @@ export async function processNextBatch(): Promise<ProcessBatchResult> {
       error: errorMsg,
     };
   }
+}
+
+// Models saved before the catalog was enforced keep working; they are only
+// reported, once per model and server instance.
+const warnedModels = new Set<string>();
+function warnIfOutsideCatalog(model: string): void {
+  const envDefault = process.env.OPENROUTER_DEFAULT_MODEL ?? "openai/gpt-4o-mini";
+  if (model === envDefault || isCatalogModel(model) || warnedModels.has(model)) return;
+  warnedModels.add(model);
+  console.warn(
+    `[buffer] model ${model} is not in the catalog; turns keep using it, but it can no longer be chosen or tested`,
+  );
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

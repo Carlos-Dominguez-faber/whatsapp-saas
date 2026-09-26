@@ -24,7 +24,7 @@ import {
 } from "@/features/inbox/services/business-info";
 import { getEnabledTools } from "@/features/tools/services/tool-configs";
 import type { AgentConfig } from "@/features/agents/types";
-import { ALL_CATALOG_IDS } from "@/features/agents/lib/model-catalog";
+import { isCatalogModel } from "@/features/agents/lib/model-catalog";
 import { guardWorkspaceLlmCall } from "@/features/inbox/services/llm-call-guard";
 import { recordWorkspaceLlmCall } from "@/features/inbox/services/cost-tracker";
 
@@ -51,7 +51,7 @@ const Schema = z.object({
   // Only the curated catalog: the playground spends the workspace's key.
   modelOverride: z
     .string()
-    .refine((id) => ALL_CATALOG_IDS.includes(id), "Modelo no permitido")
+    .refine((id) => isCatalogModel(id), "Modelo no permitido")
     .optional(),
 });
 
@@ -122,11 +122,26 @@ export async function POST(
     );
   }
 
-  // Resolve model + system prompt.
+  // Resolve model + system prompt. The playground spends the workspace's key,
+  // so an agent model outside the catalog is refused here (production turns
+  // keep using it). The workspace default is validated when it is saved.
+  const agentModel = agent.model as string | null;
+  if (!parsed.data.modelOverride && agentModel && !isCatalogModel(agentModel)) {
+    return NextResponse.json(
+      {
+        error: `El modelo de este agente (${agentModel}) ya no está en el catálogo. Elige uno del catálogo para probarlo.`,
+      },
+      { status: 400 },
+    );
+  }
   const model =
     parsed.data.modelOverride ??
-    (agent.model as string | null) ??
+    agentModel ??
     (await getWorkspaceModel(workspaceId));
+
+  // Budget and hourly cap before anything that spends, KB embeddings included.
+  const guard = await guardWorkspaceLlmCall(workspaceId, "agent_test_chat");
+  if (!guard.ok) return guard.response;
 
   let promptBody = parsed.data.draftPromptBody;
   let guardrails: PromptGuardrails | null = null;
@@ -180,9 +195,6 @@ export async function POST(
       contactName: "",
     },
   });
-
-  const guard = await guardWorkspaceLlmCall(workspaceId, "agent_test_chat");
-  if (!guard.ok) return guard.response;
 
   try {
     // Enable the workspace's tools in the playground so the agent can actually
