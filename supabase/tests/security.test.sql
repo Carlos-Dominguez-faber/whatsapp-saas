@@ -8,7 +8,7 @@ BEGIN;
 CREATE EXTENSION IF NOT EXISTS pgtap WITH SCHEMA extensions;
 SET search_path = public, extensions;
 
-SELECT plan(36);
+SELECT plan(40);
 
 -- ── public.users: read-only for sessions ────────────────────────────────────
 SELECT ok(NOT has_table_privilege('authenticated', 'public.users', 'UPDATE'),
@@ -120,6 +120,34 @@ SELECT lives_ok(
     UPDATE public.prompts SET active_version_id = 'a0000000-0000-4000-8000-0000000000f2'
      WHERE id = 'a0000000-0000-4000-8000-0000000000f1'$$,
   'same-workspace prompt versions still work');
+
+-- ── one active WhatsApp provider per workspace ──────────────────────────────
+INSERT INTO public.integrations (workspace_id, provider, enabled, credentials, config) VALUES
+  ('a0000000-0000-4000-8000-000000000001', 'ycloud', true, '{}', '{}');
+SELECT throws_ok(
+  $$INSERT INTO public.integrations (workspace_id, provider, enabled, credentials, config)
+    VALUES ('a0000000-0000-4000-8000-000000000001', 'kapso', true, '{}', '{}')$$,
+  '23505', NULL,
+  'a workspace cannot have YCloud and Kapso enabled at the same time');
+SELECT lives_ok(
+  $$INSERT INTO public.integrations (workspace_id, provider, enabled, credentials, config)
+    VALUES ('a0000000-0000-4000-8000-000000000001', 'kapso', false, '{}', '{}')$$,
+  'a disabled second provider can be kept (switching back needs no re-entry)');
+
+-- ── 24h guard: records that are not sends pass with the window closed ───────
+UPDATE public.conversations SET window_expires_at = now() - interval '1 day'
+ WHERE id = 'b0000000-0000-4000-8000-0000000000d1';
+SELECT lives_ok(
+  $$INSERT INTO public.messages (workspace_id, conversation_id, direction, type, body, meta)
+    VALUES ('b0000000-0000-4000-8000-000000000001', 'b0000000-0000-4000-8000-0000000000d1',
+            'out', 'system', 'nota', '{"internal": true}')$$,
+  'an internal note is saved after the 24h window closed');
+SELECT throws_like(
+  $$INSERT INTO public.messages (workspace_id, conversation_id, direction, type, body)
+    VALUES ('b0000000-0000-4000-8000-000000000001', 'b0000000-0000-4000-8000-0000000000d1',
+            'out', 'text', 'hola')$$,
+  '%WINDOW_EXPIRED%',
+  'free text is still blocked after the 24h window closed');
 
 -- ── users are visible exactly to the people they work with ──────────────────
 INSERT INTO auth.users (id, email, instance_id, aud, role) VALUES
