@@ -225,7 +225,8 @@ export async function fetchKapsoTemplates(
 ): Promise<unknown[]> {
   // `rejected_reason` is NOT in Graph's default field set for this edge, so it
   // has to be asked for — and asking for fields means listing every field the
-  // sync reads (see syncTemplates).
+  // sync reads (see syncTemplates). VERIFICAR EN PROD: that Kapso forwards
+  // `fields` to Graph and still returns every template with it.
   const fields = "id,name,language,category,status,components,rejected_reason";
   const data = await kapsoFetch(
     `${KAPSO_WA_BASE}/${encodeURIComponent(wabaId)}/message_templates?limit=100&fields=${fields}`,

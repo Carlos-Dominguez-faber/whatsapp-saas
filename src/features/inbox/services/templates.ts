@@ -4,7 +4,11 @@
  */
 
 import { createClient as createSbClient } from "@supabase/supabase-js";
-import { fetchYCloudTemplates, templateOfficialId } from "./ycloud-client";
+import {
+  fetchYCloudTemplates,
+  resolveWabaId,
+  templateOfficialId,
+} from "./ycloud-client";
 import { fetchKapsoTemplates } from "./kapso-client";
 import {
   decryptWhatsAppCredentials,
@@ -138,7 +142,7 @@ async function fetchProviderTemplates(
   provider: WhatsAppProvider,
   apiKey: string,
   config: Record<string, unknown>,
-): Promise<unknown[]> {
+): Promise<{ items: unknown[]; truncated: boolean }> {
   if (provider === "kapso") {
     // Kapso's template endpoints are Meta's, scoped to a WABA id in the path.
     // It is configured per workspace — the API can't discover it without it.
@@ -148,14 +152,22 @@ async function fetchProviderTemplates(
         "[templates] falta waba_id en la configuración de Kapso del workspace",
       );
     }
-    return fetchKapsoTemplates(apiKey, wabaId);
+    return { items: await fetchKapsoTemplates(apiKey, wabaId), truncated: false };
   }
-  return fetchYCloudTemplates(apiKey);
+  // YCloud's key reaches every WABA of the account: only this number's.
+  const phoneNumber = (config.phone_number as string | undefined) ?? "";
+  if (!phoneNumber) {
+    throw new Error(
+      "[templates] falta el número de WhatsApp en la configuración de YCloud del workspace",
+    );
+  }
+  const wabaId = await resolveWabaId(apiKey, phoneNumber);
+  return fetchYCloudTemplates(apiKey, wabaId);
 }
 
 export async function syncTemplates(
   workspaceId: string,
-): Promise<{ synced: number; errors: number }> {
+): Promise<{ synced: number; errors: number; truncated: boolean }> {
   const supabase = svc();
 
   // 1. Load the workspace's WhatsApp integration
@@ -168,11 +180,11 @@ export async function syncTemplates(
   const apiKey = whatsappApiKey(whatsapp.provider, credentials);
 
   if (!apiKey || apiKey === "placeholder") {
-    return { synced: 0, errors: 0 };
+    return { synced: 0, errors: 0, truncated: false };
   }
 
   // 2. Fetch templates from the provider
-  const records = await fetchProviderTemplates(
+  const { items: records, truncated } = await fetchProviderTemplates(
     whatsapp.provider,
     apiKey,
     whatsapp.config,
@@ -242,7 +254,7 @@ export async function syncTemplates(
     }
   }
 
-  return { synced, errors };
+  return { synced, errors, truncated };
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
