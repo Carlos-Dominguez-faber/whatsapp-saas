@@ -30,6 +30,8 @@ interface ToolItem {
 
 interface Props {
   workspaceId: string;
+  /** The viewer's role in this workspace. */
+  role: string;
   initialTools: ToolItem[];
 }
 
@@ -63,7 +65,10 @@ const sensitivityConfig: Record<
   },
 };
 
-export function ToolsCatalog({ workspaceId, initialTools }: Props) {
+export function ToolsCatalog({ workspaceId, role, initialTools }: Props) {
+  // Toggling or configuring a tool needs manager (the tools API); agents and
+  // viewers see the catalog read-only instead of controls that would fail.
+  const canManage = role === "admin" || role === "manager";
   const [tools, setTools] = useState<ToolItem[]>(initialTools);
   const [pending, setPending] = useState<Set<string>>(new Set());
   const [expanded, setExpanded] = useState<string | null>(null);
@@ -134,6 +139,12 @@ export function ToolsCatalog({ workspaceId, initialTools }: Props) {
         <p className="mt-1 text-sm text-muted-foreground">
           Activa o desactiva las capacidades del agente para este workspace.
         </p>
+        {!canManage && (
+          <p className="mt-2 text-xs text-muted-foreground">
+            Solo managers y administradores del workspace pueden activar o
+            configurar tools.
+          </p>
+        )}
       </div>
 
       <ul className="space-y-2" role="list">
@@ -142,7 +153,7 @@ export function ToolsCatalog({ workspaceId, initialTools }: Props) {
           const config =
             sensitivityConfig[sensitivity] ?? sensitivityConfig.read;
           const isToggling = pending.has(tool.id);
-          const configurable = CONFIGURABLE_TOOLS.has(tool.key);
+          const configurable = canManage && CONFIGURABLE_TOOLS.has(tool.key);
           const isOpen = expanded === tool.id;
           const ToolIcon = TOOL_ICONS[tool.key] ?? Wrench;
           const BadgeIcon = config.Icon;
@@ -206,7 +217,7 @@ export function ToolsCatalog({ workspaceId, initialTools }: Props) {
                 <Switch
                   checked={tool.enabled}
                   onCheckedChange={() => handleToggle(tool)}
-                  disabled={isToggling}
+                  disabled={!canManage || isToggling}
                   aria-label={`${tool.enabled ? "Desactivar" : "Activar"} ${tool.name}`}
                 />
               </div>

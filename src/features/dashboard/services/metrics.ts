@@ -14,7 +14,8 @@ export interface WorkspaceMetrics {
   messagesToday: number;
   activeConversations: number;
   handoffPending: number;
-  llmCostWeekUsd: number;
+  /** null when the viewer may not see it (events are admin/manager only). */
+  llmCostWeekUsd: number | null;
   templatesSentWeek: number;
 }
 
@@ -32,6 +33,13 @@ const USD_PER_TOKEN = 0.000_002;
 
 export async function getWorkspaceMetrics(
   workspaceId: string,
+  opts: {
+    /**
+     * The LLM cost comes from events, which RLS shows to admins and managers
+     * only; these reads use the service role, so the caller decides.
+     */
+    includeLlmCost: boolean;
+  },
 ): Promise<WorkspaceMetrics> {
   const supabase = svc();
 
@@ -70,13 +78,15 @@ export async function getWorkspaceMetrics(
       .eq("workspace_id", workspaceId)
       .eq("state", "handoff_pending"),
 
-    // LLM usage events this week
-    supabase
-      .from("events")
-      .select("payload")
-      .eq("workspace_id", workspaceId)
-      .eq("type", "llm_usage")
-      .gte("created_at", weekStart.toISOString()),
+    // LLM usage events this week (admins and managers only)
+    opts.includeLlmCost
+      ? supabase
+          .from("events")
+          .select("payload")
+          .eq("workspace_id", workspaceId)
+          .eq("type", "llm_usage")
+          .gte("created_at", weekStart.toISOString())
+      : Promise.resolve({ data: null }),
 
     // Templates sent this week
     supabase
@@ -97,7 +107,7 @@ export async function getWorkspaceMetrics(
     messagesToday: messagesResult.count ?? 0,
     activeConversations: activeResult.count ?? 0,
     handoffPending: handoffResult.count ?? 0,
-    llmCostWeekUsd: totalTokensWeek * USD_PER_TOKEN,
+    llmCostWeekUsd: opts.includeLlmCost ? totalTokensWeek * USD_PER_TOKEN : null,
     templatesSentWeek: templatesResult.count ?? 0,
   };
 }
