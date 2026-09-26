@@ -152,6 +152,7 @@ mock.module("./decision-engine.ts", {
       return decideResult;
     },
     applyTransition: async (_conv: string, to: string, opts: Row = {}) => {
+      calls.push("transition");
       if (transitionError) throw transitionError;
       transitions.push({ to, trigger: opts.trigger });
     },
@@ -276,10 +277,12 @@ mock.module("./dispatch.ts", {
   },
 });
 
+let kbError: Error | null = null;
 mock.module("./kb-service.ts", {
   exports: {
     searchKb: async () => {
       calls.push("searchKb");
+      if (kbError) throw kbError;
       return [];
     },
     formatKbContext: () => "",
@@ -376,6 +379,7 @@ function reset(meta: Row = {}) {
   dispatchArgs.length = 0;
   generated = { text: "¡Hola!" };
   toolsRun.length = 0;
+  kbError = null;
   transitions.length = 0;
   transitionError = null;
   rpcCalls.length = 0;
@@ -505,6 +509,21 @@ test("the spent reservation is dropped from the saved checkpoint right after rec
   );
   assert.ok(recordedAt >= 0);
   assert.ok(firstWithoutReservation >= 0, "a checkpoint without the reservation is saved before the reply");
+});
+
+test("a KB search that fails (its embedding timed out) doesn't fail the turn", async () => {
+  reset();
+  kbError = new Error("The operation was aborted due to timeout");
+  const original = console.warn;
+  console.warn = () => {};
+  try {
+    const result = await processNextBatch();
+    assert.equal(result.processed, true);
+  } finally {
+    console.warn = original;
+  }
+  assert.ok(calls.includes("generate"));
+  assert.equal(dispatchArgs.length, 1);
 });
 
 test("the model goes through the catalog policy before the call", async () => {
@@ -922,6 +941,25 @@ test("transient failures back off 1, 5 and 15 minutes; deterministic ones 30 s p
   assert.equal(Math.round((flushAt - before) / 1000), 60, "WhatsApp not connected: 30 s × 2");
 });
 
+test("a batch's first transient failure is an event right away; later ones and deterministic ones aren't", async () => {
+  const retryEvents = () => tables.events.filter((e) => e.type === "batch_retry_transient");
+  reset();
+  decideResult = new Error("fetch failed");
+  await processNextBatch();
+  assert.equal(retryEvents().length, 1);
+  assert.equal((retryEvents()[0].payload as Row).batch_id, "batch_1");
+
+  reset({ retry_count: 1 });
+  decideResult = new Error("fetch failed");
+  await processNextBatch();
+  assert.equal(retryEvents().length, 0, "only the first");
+
+  reset();
+  whatsappSettings = null;
+  await processNextBatch();
+  assert.equal(retryEvents().length, 0, "not for a deterministic failure");
+});
+
 test("a batch reclaimed past its retries is dead-lettered without running the turn", async () => {
   reset({ retry_count: 4, last_error: "stale lease reclaimed by claim_next_batch" });
   const result = await processNextBatch();
@@ -995,6 +1033,10 @@ test("out of retries, a person takes over and the thread says why", async () => 
   assert.ok(rpcCalls.some((c) => c.fn === "cancel_batch"));
   assert.equal(batchRow().status, "cancelled");
   assert.deepEqual(transitions, [{ to: "handoff_pending", trigger: "batch_dead_letter" }]);
+  assert.ok(
+    calls.indexOf("transition") < calls.indexOf("rpc:cancel_batch"),
+    "handed off before the batch is cancelled",
+  );
   assert.equal((notes()[0]?.meta as Row).reason, "batch_dead_letter");
   assert.ok(tables.events.some((e) => e.type === "batch_dead_letter"));
 });

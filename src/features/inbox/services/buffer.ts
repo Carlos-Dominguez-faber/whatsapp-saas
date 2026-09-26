@@ -59,13 +59,14 @@ const CONVERSATION_NOT_FOUND = "Conversation not found";
 const TRANSIENT_BACKOFF_MS = [60_000, 5 * 60_000, 15 * 60_000];
 const DETERMINISTIC_BACKOFF_MS = 30_000;
 
+function isDeterministicError(errorMsg: string): boolean {
+  return [WHATSAPP_NOT_CONNECTED, EMPTY_REPLY_ERROR, CONVERSATION_NOT_FOUND].some(
+    (marker) => errorMsg.includes(marker),
+  );
+}
+
 function retryBackoffMs(retry: number, errorMsg: string): number {
-  const deterministic = [
-    WHATSAPP_NOT_CONNECTED,
-    EMPTY_REPLY_ERROR,
-    CONVERSATION_NOT_FOUND,
-  ].some((marker) => errorMsg.includes(marker));
-  if (deterministic) return DETERMINISTIC_BACKOFF_MS * retry;
+  if (isDeterministicError(errorMsg)) return DETERMINISTIC_BACKOFF_MS * retry;
   return TRANSIENT_BACKOFF_MS[
     Math.min(retry, TRANSIENT_BACKOFF_MS.length) - 1
   ];
@@ -779,7 +780,15 @@ export async function processNextBatch(): Promise<ProcessBatchResult> {
           activeAgent ? { mode: activeAgent.type } : {},
         ),
         getBusinessInfo(batch.workspace_id),
-        searchKb(batch.workspace_id, mergedText, 3),
+        // The KB is context, not the turn: a slow or failing search (its
+        // embedding times out at 15 s) answers without it.
+        searchKb(batch.workspace_id, mergedText, 3).catch((err: unknown) => {
+          console.warn("[buffer] KB search failed, answering without it:", {
+            batchId: batch.id,
+            error: err instanceof Error ? err.message : String(err),
+          });
+          return [];
+        }),
         listKbSourceLinks(batch.workspace_id),
       ]);
 
@@ -1040,6 +1049,27 @@ export async function processNextBatch(): Promise<ProcessBatchResult> {
     // The meta keeps every checkpoint; a batch that carries one is isolated,
     // so new messages open their own batch (the claim serves this one first).
     const backoffMs = retryBackoffMs(newRetryCount, errorMsg);
+    // A long outage stays quiet for ~20 minutes before the dead letter: the
+    // first transient failure of a batch is an event the team can see now.
+    if (newRetryCount === 1 && !isDeterministicError(errorMsg)) {
+      await supabase
+        .from("events")
+        .insert({
+          type: "batch_retry_transient",
+          level: "warn",
+          workspace_id: batch.workspace_id,
+          conversation_id: batch.conversation_id,
+          payload: {
+            batch_id: batch.id,
+            error: errorMsg,
+            next_attempt_at: new Date(Date.now() + backoffMs).toISOString(),
+          },
+        })
+        .then(
+          () => {},
+          () => {},
+        );
+    }
     await supabase
       .from("message_batches")
       .update({
@@ -1289,7 +1319,10 @@ async function handOffAfterWrite(
 
 /**
  * Out of retries. The customer has no reply, so besides the event a person
- * takes the conversation and the thread says why.
+ * takes the conversation and the thread says why. The batch is cancelled
+ * last: a worker that dies before that leaves it to be reclaimed and
+ * dead-lettered again (the handoff and the note don't repeat), never
+ * cancelled without anyone taking the conversation.
  */
 async function deadLetter(
   supabase: ReturnType<typeof svc>,
@@ -1297,7 +1330,13 @@ async function deadLetter(
   errorMsg: string,
   retryCount: number,
 ): Promise<void> {
-  await supabase.rpc("cancel_batch", { p_batch_id: batch.id });
+  await handOff(supabase, batch, "batch_dead_letter");
+  await addInternalNote(
+    supabase,
+    batch,
+    "La IA no pudo responder a este mensaje después de varios intentos. Atiéndelo tú.",
+    "batch_dead_letter",
+  );
 
   await supabase.from("events").insert({
     type: "batch_dead_letter",
@@ -1311,13 +1350,7 @@ async function deadLetter(
     },
   });
 
-  await handOff(supabase, batch, "batch_dead_letter");
-  await addInternalNote(
-    supabase,
-    batch,
-    "La IA no pudo responder a este mensaje después de varios intentos. Atiéndelo tú.",
-    "batch_dead_letter",
-  );
+  await supabase.rpc("cancel_batch", { p_batch_id: batch.id });
 }
 
 /**
