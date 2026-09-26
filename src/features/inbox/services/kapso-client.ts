@@ -362,6 +362,18 @@ export async function listAllPhoneNumbers(
   }));
 }
 
+/**
+ * Real, connected numbers first: a sandbox entry can't receive from the
+ * outside world, so it should never be the default pick.
+ */
+export function rankKapsoNumbers(
+  numbers: KapsoDiscoveredNumber[],
+): KapsoDiscoveredNumber[] {
+  const rank = (n: KapsoDiscoveredNumber) =>
+    n.kind === "production" && n.status === "CONNECTED" ? 0 : 1;
+  return [...numbers].sort((a, b) => rank(a) - rank(b));
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // getMediaUrl
 // ──────────────────────────────────────────────────────────────────────────────

@@ -1,7 +1,10 @@
 import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
 import { createClient } from "@/lib/supabase/server";
-import { listAllPhoneNumbers } from "@/features/inbox/services/kapso-client";
+import {
+  listAllPhoneNumbers,
+  rankKapsoNumbers,
+} from "@/features/inbox/services/kapso-client";
 
 // Workspace-agnostic Kapso key tester. Used during onboarding (before a
 // workspace exists) so the API key is never exposed to the browser and the
@@ -42,14 +45,7 @@ export async function POST(req: NextRequest) {
       });
     }
 
-    // Real numbers first — a sandbox entry can't receive from the outside world.
-    const sorted = [...numbers].sort((a, b) => {
-      const rank = (n: (typeof numbers)[number]) =>
-        n.kind === "production" && n.status === "CONNECTED" ? 0 : 1;
-      return rank(a) - rank(b);
-    });
-
-    return NextResponse.json({ ok: true, phoneNumbers: sorted });
+    return NextResponse.json({ ok: true, phoneNumbers: rankKapsoNumbers(numbers) });
   } catch (err) {
     console.error(
       "[integrations/kapso/test] Kapso fetch error:",
