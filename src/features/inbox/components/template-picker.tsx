@@ -19,7 +19,7 @@ import type { TemplateRow } from "../services/templates";
 // This component takes a conversationId and NOTHING that names a workspace.
 // That absence is the lock: the server actions resolve the workspace from the
 // conversation themselves. If a `workspaceId` prop ever comes back here, the
-// cross-tenant template hole (AVISO-SEGURIDAD-PLANTILLAS) comes back with it.
+// cross-tenant template hole closed in e6d9c64 comes back with it.
 interface TemplatePickerProps {
   conversationId: string;
   onSent?: () => void;

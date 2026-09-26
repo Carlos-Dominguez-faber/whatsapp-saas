@@ -107,7 +107,7 @@ supabase login
 SUPABASE_DB_PASSWORD='la-contraseña-del-paso-4' node scripts/setup.mjs db-push
 ```
 
-Esto corre `supabase link` + `supabase db push` (las 15 migraciones, incluido el
+Esto corre `supabase link` + `supabase db push` (todas las migraciones, incluido el
 habilitado de **pg_cron + pg_net** para el cron del buffer).
 
 **6. Despliega a Vercel.** En orden:
@@ -199,7 +199,7 @@ su propia integración de YCloud.
   vuelve a correr `cron-sql` + pégalo de nuevo.
 - **`vercel-env` dice "already exists":** esa var ya estaba; actualízala en el
   dashboard de Vercel → Settings → Environment Variables.
-- **El agente no responde al WhatsApp:** revisa `cron.job_run_details` (paso 11),
+- **El agente no responde al WhatsApp:** revisa `cron.job_run_details` (paso 12),
   que el webhook de YCloud apunte a tu URL, y que `OPENROUTER_API_KEY` tenga saldo.
 
 ## Actualizar a una versión nueva
@@ -207,19 +207,70 @@ su propia integración de YCloud.
 ```bash
 git pull                 # o reemplaza los archivos del proyecto
 npm install
-supabase db push         # aplica migraciones nuevas — SIEMPRE antes del deploy
+SUPABASE_DB_PASSWORD='tu-contraseña-de-la-base' node scripts/setup.mjs db-push   # SIEMPRE antes del deploy
 vercel --prod            # redeploy
 ```
 
 El orden importa: el código nuevo puede depender de funciones o permisos que traen
-las migraciones, así que `supabase db push` va **antes** de `vercel --prod`.
+las migraciones, así que las migraciones van **antes** de `vercel --prod`.
 
-Si tu instalación es anterior al cierre del registro público, córrelo una vez
-(con el `SUPABASE_ACCESS_TOKEN` del paso 7) o hazlo manual como indica ese paso:
+**Una sola vez, si tu instalación es anterior al 26-sep-2026** (endurecimiento de
+seguridad entre workspaces):
 
-```bash
-node scripts/setup.mjs site-url
-```
+1. Cierra el registro público de Supabase Auth (no toca tu Site URL ni tus Redirect
+   URLs). Con el token del paso 7, o sin él para que te diga el paso manual:
+
+   ```bash
+   SUPABASE_ACCESS_TOKEN='sbp_...' node scripts/setup.mjs close-signup
+   ```
+
+2. Audita lo que pudo pasar mientras los huecos estaban abiertos. En Supabase →
+   **SQL Editor**, corre esto y revisa cada resultado:
+
+   ```sql
+   -- a) Super admins: deben ser SOLO los que tú creaste.
+   SELECT id, email, created_at FROM public.users WHERE is_super_admin;
+
+   -- b) Cuentas que se registraron solas (sin perfil): bórralas en
+   --    Authentication → Users si no las reconoces.
+   SELECT a.id, a.email, a.created_at
+     FROM auth.users a LEFT JOIN public.users p ON p.id = a.id
+    WHERE p.id IS NULL ORDER BY a.created_at DESC;
+
+   -- c) Admins por workspace, los más recientes primero: busca a alguien que no
+   --    diste de alta tú.
+   SELECT w.name AS workspace, u.email, m.role, m.is_active, m.created_at
+     FROM public.memberships m
+     JOIN public.users u ON u.id = m.user_id
+     JOIN public.workspaces w ON w.id = m.workspace_id
+    WHERE m.role = 'admin' ORDER BY m.created_at DESC;
+
+   -- d) Perfiles cuyo email no coincide con su cuenta real.
+   SELECT p.id, p.email AS perfil, a.email AS cuenta
+     FROM public.users p JOIN auth.users a ON a.id = p.id
+    WHERE p.email <> a.email;
+   ```
+
+   Si `db-push` avisó `WARNING: ... existing rows point at another workspace`,
+   hay filas que apuntan a datos de otro workspace. Encuéntralas con:
+
+   ```sql
+   SELECT 'messages' AS tabla, m.id FROM public.messages m
+     JOIN public.conversations c ON c.id = m.conversation_id
+    WHERE c.workspace_id <> m.workspace_id
+   UNION ALL
+   SELECT 'message_batches', b.id FROM public.message_batches b
+     JOIN public.conversations c ON c.id = b.conversation_id
+    WHERE c.workspace_id <> b.workspace_id
+   UNION ALL
+   SELECT 'conversations', c.id FROM public.conversations c
+     JOIN public.contacts ct ON ct.id = c.contact_id
+    WHERE ct.workspace_id <> c.workspace_id;
+   ```
+
+   Quita el flag con `UPDATE public.users SET is_super_admin = false WHERE id = '...'`,
+   desactiva membresías que no reconozcas desde Settings → Equipo y borra las filas
+   cruzadas que aparezcan.
 
 **Nunca** rotes `ENCRYPTION_KEY`: es la llave con la que se cifran las
 credenciales de integraciones de cada workspace, y cambiarla las vuelve

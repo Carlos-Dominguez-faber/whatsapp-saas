@@ -122,7 +122,7 @@ supabase/
 └── cron/       # SQL post-deploy del buffer-flush
 scripts/
 ├── setup.mjs       # Orquestador de instalación (secrets, env, db, cron)
-└── seed-admin.mjs  # Super admin + workspace demo
+└── seed-admin.mjs  # Crea el super admin
 ```
 
 ## Variables de entorno
