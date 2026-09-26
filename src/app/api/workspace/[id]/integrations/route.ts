@@ -10,9 +10,14 @@ import {
   encryptCredentials,
   decryptCredentials,
 } from "@/shared/lib/integration-secrets";
+import {
+  isWhatsAppProvider,
+  WHATSAPP_PROVIDERS,
+  WORKSPACE_WHATSAPP_SETTINGS,
+} from "@/features/inbox/services/whatsapp-provider";
 
 const IntegrationSchema = z.object({
-  provider: z.enum(["ycloud", "openrouter", "highlevel"]),
+  provider: z.enum(["ycloud", "kapso", "openrouter", "highlevel"]),
   enabled: z.boolean().optional(),
   credentials: z.record(z.string(), z.string()).optional(),
   config: z.record(z.string(), z.unknown()).optional(),
@@ -156,8 +161,57 @@ export async function PUT(
   ) {
     mergedCreds.highlevel_webhook_secret = randomBytes(24).toString("hex");
   }
+  const provider = parsed.data.provider;
+  const enabled = parsed.data.enabled ?? true;
+
+  // Switching WhatsApp provider (YCloud ↔ Kapso): only one may be active per
+  // workspace (enforced by a unique index). The settings that belong to the
+  // workspace rather than the provider travel with the switch — precedence:
+  // what the UI sends > the currently active provider > this provider's own
+  // (possibly stale) row. The old row keeps its credentials, disabled, so
+  // switching back needs no re-entry.
+  let switchedFrom: { id: string; provider: string } | null = null;
+  const carried: Record<string, unknown> = {};
+  if (isWhatsAppProvider(provider) && enabled) {
+    const { data: active, error: activeError } = await svc
+      .from("integrations")
+      .select("id, provider, config")
+      .eq("workspace_id", workspaceId)
+      .in("provider", WHATSAPP_PROVIDERS as unknown as string[])
+      .neq("provider", provider)
+      .eq("enabled", true)
+      .maybeSingle();
+    if (activeError) {
+      console.error("[PUT /api/workspace/[id]/integrations] lookup error:", activeError.message);
+      return NextResponse.json(
+        { error: "No se pudo guardar la integración. Intenta de nuevo." },
+        { status: 500 },
+      );
+    }
+    if (active) {
+      const activeConfig = (active.config ?? {}) as Record<string, unknown>;
+      for (const key of WORKSPACE_WHATSAPP_SETTINGS) {
+        if (key in activeConfig) carried[key] = activeConfig[key];
+      }
+      const { error: offError } = await svc
+        .from("integrations")
+        .update({ enabled: false, updated_at: new Date().toISOString() })
+        .eq("id", active.id)
+        .eq("workspace_id", workspaceId);
+      if (offError) {
+        console.error("[PUT /api/workspace/[id]/integrations] switch error:", offError.message);
+        return NextResponse.json(
+          { error: "No se pudo cambiar de proveedor. Intenta de nuevo." },
+          { status: 500 },
+        );
+      }
+      switchedFrom = { id: active.id as string, provider: active.provider as string };
+    }
+  }
+
   const mergedConfig = {
     ...((existing?.config as object) ?? {}),
+    ...carried,
     ...(parsed.data.config ?? {}),
   };
 
@@ -173,8 +227,8 @@ export async function PUT(
   const { error } = await svc.from("integrations").upsert(
     {
       workspace_id: workspaceId,
-      provider: parsed.data.provider,
-      enabled: parsed.data.enabled ?? true,
+      provider,
+      enabled,
       credentials: encryptedCreds,
       config: mergedConfig,
       updated_at: new Date().toISOString(),
@@ -184,10 +238,21 @@ export async function PUT(
 
   if (error) {
     console.error("[PUT /api/workspace/[id]/integrations] upsert error:", error.message);
+    // Never leave the workspace without WhatsApp because the new row failed.
+    if (switchedFrom) {
+      await svc
+        .from("integrations")
+        .update({ enabled: true, updated_at: new Date().toISOString() })
+        .eq("id", switchedFrom.id)
+        .eq("workspace_id", workspaceId);
+    }
     return NextResponse.json(
       { error: "No se pudo guardar la integración. Intenta de nuevo." },
       { status: 500 },
     );
   }
-  return NextResponse.json({ ok: true });
+  return NextResponse.json({
+    ok: true,
+    ...(switchedFrom ? { switchedFrom: switchedFrom.provider } : {}),
+  });
 }
