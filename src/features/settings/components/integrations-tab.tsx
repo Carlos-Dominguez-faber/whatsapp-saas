@@ -194,6 +194,11 @@ function WhatsAppSection({
   const [handoffAckMessage, setHandoffAckMessage] = useState<string>(
     (settings.handoff_ack_message as string | undefined) ?? "",
   );
+  // Off by default: a handoff does not return to the AI by itself when the
+  // daily budget resets.
+  const [costCutHandoff, setCostCutHandoff] = useState<boolean>(
+    (settings.cost_cut_handoff as boolean | undefined) === true,
+  );
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
   const [copied, setCopied] = useState(false);
@@ -317,6 +322,7 @@ function WhatsAppSection({
       message_history_window: messagesInMemory,
       handoff_ack_enabled: handoffAckEnabled,
       handoff_ack_message: handoffAckMessage.trim(),
+      cost_cut_handoff: costCutHandoff,
     };
     const payload =
       selected === "kapso"
@@ -605,6 +611,26 @@ function WhatsAppSection({
             Se envía en cuanto la conversación queda en espera de un asesor, para
             que el contacto no se quede sin respuesta. Si lo dejas vacío se usa:
             “{DEFAULT_HANDOFF_ACK}”
+          </p>
+        </div>
+
+        <div className="space-y-2 border-t border-border/60 pt-4">
+          <div className="flex items-center justify-between gap-4">
+            <Label htmlFor="whatsapp-cost-cut-handoff">
+              Pasar a una persona si se acaba el presupuesto diario de IA
+            </Label>
+            <Switch
+              id="whatsapp-cost-cut-handoff"
+              checked={costCutHandoff}
+              onCheckedChange={setCostCutHandoff}
+            />
+          </div>
+          <p className="text-xs text-muted-foreground">
+            Cuando el workspace llega a su tope diario de IA, el agente deja de
+            responder hasta el día siguiente. Con esto activado, cada
+            conversación que escriba en ese lapso queda en espera de un asesor
+            (y recibe el aviso de arriba). Esas conversaciones no regresan solas
+            a la IA: devuélvelas desde el inbox.
           </p>
         </div>
 
