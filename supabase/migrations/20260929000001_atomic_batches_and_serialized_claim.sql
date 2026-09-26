@@ -21,17 +21,22 @@
 -- 3. claim_next_batch():
 --    - a stale lease is 7 minutes, strictly above the routes' maxDuration
 --      (300 s), so a live worker's batch is never handed to a second one;
---    - reclaiming a stale batch counts a retry, and after 3 it is
---      dead-lettered with an event, so a function killed mid-turn no longer
---      re-sends the same reply forever;
+--    - reclaiming a stale batch counts a retry. Past the 3 retries it is still
+--      reclaimed, once: buffer.ts then closes it without running the turn —
+--      a dead letter through applyTransition, so the contact's handoff
+--      acknowledgement and the team's notification fire (or just closes it
+--      if its reply went out). A function killed mid-turn no longer re-sends
+--      the same reply forever;
 --    - NEW: one batch per conversation at a time, oldest first. Only the
 --      conversation's oldest unfinished batch (buffering — including one
 --      waiting out a retry backoff — or processing) can be claimed, so a newer
 --      batch never overtakes a retry or runs in parallel with one in flight.
 --      One candidate per conversation, so a conversation with many blocked
 --      batches can't crowd everyone else out of the candidate list.
---    - NEW: a dead-lettered batch hands its conversation to a person and
---      leaves an internal note in the thread, so the missing reply is visible.
+--    - NEW: a backstop for a batch whose every reclaim died too (2 past the
+--      limit): closed as processed if its reply went out, otherwise
+--      dead-lettered here — the conversation goes to a person and an internal
+--      note says why (without the acknowledgement, which needs the app).
 -- ============================================================================
 
 -- ── 1. Atomic batch upsert ──────────────────────────────────────────────────
@@ -162,18 +167,44 @@ AS $$
 DECLARE
   v_candidate RECORD;
 BEGIN
-  -- 1. Dead-letter stale batches that already burned their retries (the same
-  --    limit as MAX_BATCH_RETRIES in buffer.ts — change both together).
-  WITH dead AS (
-    UPDATE public.message_batches
+  -- 1. Backstop. A stale batch past its retries (MAX_BATCH_RETRIES = 3 in
+  --    buffer.ts — change both together) is reclaimed below and buffer.ts
+  --    dead-letters it. Only one reclaimed twice more (retry_count 5) without
+  --    buffer.ts closing it ends here. A reply of its already sent (an
+  --    outbound row with its batch_id that is neither an internal note nor a
+  --    send WhatsApp didn't accept) closes it as processed.
+  WITH stale AS (
+    SELECT b.id,
+           EXISTS (
+             SELECT 1 FROM public.messages m
+              WHERE m.workspace_id = b.workspace_id
+                AND m.conversation_id = b.conversation_id
+                AND m.direction = 'out'
+                AND m.meta @> jsonb_build_object('batch_id', b.id)
+                AND NOT m.meta @> '{"internal": true}'
+                AND NOT m.meta @> '{"not_accepted": true}'
+           ) AS replied
+      FROM public.message_batches b
+     WHERE b.status = 'processing'
+       AND b.updated_at < NOW() - INTERVAL '7 minutes'
+       AND COALESCE((b.meta->>'retry_count')::int, 0) >= 5
+  )
+  , closed AS (
+    UPDATE public.message_batches b
+       SET status = 'processed', updated_at = NOW()
+      FROM stale
+     WHERE b.id = stale.id AND stale.replied
+    RETURNING b.id
+  )
+  , dead AS (
+    UPDATE public.message_batches b
        SET status = 'cancelled',
            updated_at = NOW(),
-           meta = COALESCE(meta, '{}'::jsonb)
+           meta = COALESCE(b.meta, '{}'::jsonb)
                   || jsonb_build_object('cancelled_reason', 'stale_lease_max_retries')
-     WHERE status = 'processing'
-       AND updated_at < NOW() - INTERVAL '7 minutes'
-       AND COALESCE((meta->>'retry_count')::int, 0) >= 3
-     RETURNING id, workspace_id, conversation_id, meta
+      FROM stale
+     WHERE b.id = stale.id AND NOT stale.replied
+    RETURNING b.id, b.workspace_id, b.conversation_id, b.meta
   )
   , logged AS (
     INSERT INTO public.events (type, level, workspace_id, conversation_id, payload)

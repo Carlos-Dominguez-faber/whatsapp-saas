@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { createClient as createSbClient } from "@supabase/supabase-js";
 import type {
   Tool,
@@ -126,12 +127,17 @@ class ToolRegistry {
     const attempt = () =>
       runWithTimeout(() => tool.run(parsed.data, ctx, opts), timeoutMs);
 
+    const callId = randomUUID();
+    // Before anything runs; a throw here means the tool never does.
+    await opts?.onStart?.({ callId, name, sensitivity: tool.sensitivity });
+
     const start = Date.now();
     let result: ToolResult;
     let lastError: string | undefined;
     const reportExecution = async (ok: boolean | null) => {
       if (!opts?.onExecuted) return;
       const execution: ToolExecution = {
+        callId,
         name,
         sensitivity: tool.sensitivity,
         ok,

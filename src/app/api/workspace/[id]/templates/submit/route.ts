@@ -13,8 +13,10 @@ import { createClient as createSbClient } from "@supabase/supabase-js";
 import {
   createYCloudTemplate,
   resolveWabaId,
+  WabaNotFoundError,
   YCloudError,
 } from "@/features/inbox/services/ycloud-client";
+import { phoneString } from "@/features/inbox/services/phone";
 import {
   createKapsoTemplate,
   KapsoError,
@@ -200,8 +202,7 @@ export async function POST(
       }
       result = await createKapsoTemplate(apiKey, wabaId, payload);
     } else {
-      const phoneNumber =
-        (whatsapp.config.phone_number as string | undefined) ?? "";
+      const phoneNumber = phoneString(whatsapp.config.phone_number) ?? "";
       if (!phoneNumber) {
         return NextResponse.json(
           { error: "Falta el número de WhatsApp en la configuración de YCloud" },
@@ -237,6 +238,9 @@ export async function POST(
 
     return NextResponse.json({ data: updated });
   } catch (err) {
+    if (err instanceof WabaNotFoundError) {
+      return NextResponse.json({ error: err.message }, { status: 422 });
+    }
     if (err instanceof YCloudError || err instanceof KapsoError) {
       // `err.message` carries Meta's raw text: server log only. The team gets
       // the catalog's Spanish reason.

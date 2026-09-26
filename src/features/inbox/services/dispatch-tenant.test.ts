@@ -298,9 +298,17 @@ test("a send WhatsApp did not accept is retryable, and the buffer can skip the f
     conversationId: "conv_a",
     body: "hola",
     recordRetryableFailure: false,
+    meta: { batch_id: "b_1" },
   });
   assert.equal(res.retryable, true);
-  assert.equal(msgs().length, 0, "the queued row is removed while the caller will retry");
+  // Never deleted (open inboxes don't hear deletes): marked for the retry to skip.
+  assert.equal(msgs().length, 1);
+  assert.equal(msgs()[0].status, "failed");
+  const meta = msgs()[0].meta as Row;
+  assert.equal(meta.not_accepted, true);
+  assert.equal(meta.batch_id, "b_1", "the row keeps its meta");
+  assert.match(String(msgs()[0].error_message), /vuelve a intentar/);
+  assert.equal(upserted.length, 0, "not a final failure: no message_errors row");
 
   reset();
   ycloudFailure = { status: 429, body: { error: { whatsappApiError: { code: 130429 } } } };
@@ -321,15 +329,18 @@ test("a network error may have delivered the message, so it is never retryable",
 test("the row is queued before the send, so a failure after it still has a row", async () => {
   reset();
   let rowsAtSend = -1;
+  let statusAtSend: unknown = null;
   const originalFailure = ycloudFailure;
   ycloudFailure = null;
   sendHook = () => {
     rowsAtSend = msgs().length;
+    statusAtSend = msgs()[0]?.status;
   };
   await dispatchText({ workspaceId: "ws_a", conversationId: "conv_a", body: "hola" });
   sendHook = null;
   ycloudFailure = originalFailure;
   assert.equal(rowsAtSend, 1, "the queued row exists when the provider is called");
+  assert.equal(statusAtSend, "queued", "and it is queued, not already 'sent'");
   assert.equal(msgs()[0].status, "sent");
 });
 

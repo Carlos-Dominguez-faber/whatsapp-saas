@@ -37,6 +37,7 @@ import {
   wasNotAccepted,
   GENERIC_SEND_ERROR,
   UNCONFIRMED_SEND_ERROR,
+  RETRY_PENDING_SEND_ERROR,
   WINDOW_EXPIRED_MESSAGE,
   OPT_OUT_MESSAGE,
   type WhatsAppError,
@@ -65,9 +66,10 @@ export interface DispatchTextParams {
   overrideAdmin?: boolean;
   /**
    * When false, a failure WhatsApp is known not to have accepted (rate limits)
-   * is returned as `retryable` without storing a failed message: the caller
-   * will send the same text again. The buffer passes false on every attempt
-   * but its last, so the inbox shows one failure, not one per attempt.
+   * is returned as `retryable`, and its row is marked failed with
+   * `meta.not_accepted` and a "will retry" reason instead of the final one:
+   * the caller will send the same text again, and its earlier-send check
+   * skips such rows. The buffer passes false on every attempt but its last.
    */
   recordRetryableFailure?: boolean;
   /**
@@ -294,7 +296,7 @@ async function sendQueuedRow(opts: {
   rowMeta: Record<string, unknown>;
   send: () => Promise<SendResult>;
   what: string;
-  /** False: a not-accepted failure removes the row; the caller re-sends. */
+  /** False: a not-accepted failure is marked as such; the caller re-sends. */
   recordRetryableFailure: boolean;
 }): Promise<DispatchResult> {
   const { supabase, sender, workspaceId, rowId, rowMeta } = opts;
@@ -312,13 +314,21 @@ async function sendQueuedRow(opts: {
     );
 
     if (retryable && !opts.recordRetryableFailure) {
-      // Nothing left; the caller sends the same text again. Remove the row so
-      // the retry doesn't mistake it for a message already sent.
-      await supabase
+      // Nothing left; the caller sends the same text again. The row stays (a
+      // deleted row would linger in open inboxes, which only hear inserts and
+      // updates), marked so the retry doesn't take it for a message sent.
+      const { error: markError } = await supabase
         .from("messages")
-        .delete()
+        .update({
+          status: "failed",
+          error_message: RETRY_PENDING_SEND_ERROR,
+          meta: { ...rowMeta, not_accepted: true },
+        })
         .eq("id", rowId)
         .eq("workspace_id", workspaceId);
+      if (markError) {
+        console.error("[dispatch] not-accepted update error:", markError.message);
+      }
     } else {
       const { error: failError } = await supabase
         .from("messages")

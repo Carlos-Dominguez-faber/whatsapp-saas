@@ -22,7 +22,12 @@ import {
 import { decryptCredentials } from "@/shared/lib/integration-secrets";
 import { applyMessageStatus } from "@/features/inbox/services/message-status";
 import { extractWebhookError } from "@/features/inbox/services/whatsapp-errors";
-import { samePhone } from "@/features/inbox/services/phone";
+import {
+  checkDestination,
+  phoneString,
+  samePhone,
+} from "@/features/inbox/services/phone";
+import { emitEventOncePerDay } from "@/features/inbox/services/daily-events";
 
 // Keep the function alive long enough for the best-effort fast path below
 // (sleep through the buffer window + AI generation). The cron is the fallback.
@@ -111,10 +116,11 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
         .eq("enabled", true)
         .limit(10);
 
+      const destination = phoneString(toPhone);
       ws =
         (integrations ?? []).find((i: IntegrationRow) => {
-          const configured = (i.config as { phone_number?: string }).phone_number;
-          return Boolean(configured && toPhone && samePhone(configured, toPhone));
+          const configured = phoneString(i.config?.phone_number);
+          return Boolean(configured && destination && samePhone(configured, destination));
         }) ?? null;
     }
 
@@ -173,18 +179,34 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
 
     // Routed by ?wsid, the signature only proves the event came from YCloud
     // with this workspace's secret — not that it is for this workspace's
-    // number. A message for another number is ignored (and logged), never
-    // filed under this workspace. Without a configured number, it's accepted.
-    const configuredPhone = (ws.config as { phone_number?: string }).phone_number;
-    if (
-      wsidParam &&
-      configuredPhone &&
-      !samePhone(normalized.workspacePhone, configuredPhone)
-    ) {
-      console.warn(
-        "[webhook] inbound for another number on this workspace's webhook URL — ignored",
-      );
-      return NextResponse.json({ received: true, ignored: "destination_mismatch" });
+    // number. A message for another number is ignored and left as an event
+    // for the workspace (once a day), never filed under it. The check needs
+    // the configured number with its country code: a national one is
+    // accepted, with an event saying so. Without a number, it's accepted.
+    if (wsidParam) {
+      const configuredPhone = ws.config?.phone_number;
+      const destination = checkDestination(configuredPhone, normalized.workspacePhone);
+      const workspaceId = ws.workspace_id;
+      if (destination === "mismatch") {
+        console.warn(
+          "[webhook] inbound for another number on this workspace's webhook URL — ignored",
+        );
+        after(() =>
+          emitEventOncePerDay(supabase, workspaceId, "inbound_destination_mismatch", "warn", {
+            configured_phone: phoneString(configuredPhone),
+            destination_phone: phoneString(normalized.workspacePhone),
+          }),
+        );
+        return NextResponse.json({ received: true, ignored: "destination_mismatch" });
+      }
+      if (destination === "unenforced") {
+        after(() =>
+          emitEventOncePerDay(supabase, workspaceId, "inbound_destination_unchecked", "warn", {
+            reason: "phone_number_without_country_code",
+            configured_phone: phoneString(configuredPhone),
+          }),
+        );
+      }
     }
 
     const workspaceId = ws.workspace_id as string;

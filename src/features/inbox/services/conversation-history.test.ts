@@ -12,9 +12,11 @@ let rows: Row[] = [];
 function orTest(expr: string): (r: Row) => boolean {
   const tests = expr.split(",").map((cond) => {
     const [col, op, ...rest] = cond.split(".");
-    const value = rest.join(".");
+    const value = rest.join(".").replace(/^"(.*)"$/, "$1");
     if (op === "is") return (r: Row) => r[col] == null;
+    if (op === "eq") return (r: Row) => r[col] != null && String(r[col]) === value;
     if (op === "neq") return (r: Row) => r[col] != null && String(r[col]) !== value;
+    if (op === "lte") return (r: Row) => r[col] != null && String(r[col]) <= value;
     throw new Error(`unsupported or() operator ${op}`);
   });
   return (r) => tests.some((t) => t(r));
@@ -83,5 +85,28 @@ test("the history leaves out failed sends, the current batch, later messages and
   assert.deepEqual(turns, [
     { role: "user", content: "hola" },
     { role: "assistant", content: "¡Hola! ¿En qué te ayudo?" },
+  ]);
+});
+
+test("a double text: the reply to the first batch is in the second batch's history", async () => {
+  // b1 is answered while b2 (sent right after it) waits its turn. The reply
+  // is newer than b2's last message, and still something the contact read.
+  rows = [
+    msg("m1", { direction: "in", body: "¿tienen citas mañana?", created_at: "2026-09-26T10:00:00Z", batch_id: "b1" }),
+    msg("m2", { direction: "in", body: "¿y cuánto cuesta?", created_at: "2026-09-26T10:00:20Z", batch_id: "b2" }),
+    msg("m3", { direction: "out", body: "Sí, mañana hay a las 10 y a las 12.", created_at: "2026-09-26T10:00:45Z", status: "sent" }),
+    msg("m4", { direction: "out", body: "Te confirmo en un momento", created_at: "2026-09-26T10:00:50Z", status: "sent" }),
+    msg("m5", { direction: "in", body: "otra cosa, de un lote posterior", created_at: "2026-09-26T10:01:30Z", batch_id: "b3" }),
+  ];
+  const turns = await getConversationHistory("conv_1", {
+    limit: 10,
+    excludeBatchId: "b2",
+    workspaceId: "ws_1",
+    until: "2026-09-26T10:00:20Z",
+  });
+  assert.deepEqual(turns, [
+    { role: "user", content: "¿tienen citas mañana?" },
+    { role: "assistant", content: "Sí, mañana hay a las 10 y a las 12." },
+    { role: "assistant", content: "Te confirmo en un momento" },
   ]);
 });

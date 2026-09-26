@@ -38,6 +38,7 @@ import type {
   Tool as ForgeTool,
   ToolContext,
   ToolExecution,
+  ToolStart,
 } from "@/features/tools/core/tool";
 
 // Upper bounds for one model call, so a hung provider can't eat the whole
@@ -291,6 +292,11 @@ export interface GenerateWithToolsParams {
   /** Prior conversation turns (oldest→newest), injected between system and the current batch. */
   history?: Array<{ role: "user" | "assistant"; content: string }>;
   /**
+   * Called right before each tool runs. If it throws, that tool doesn't run
+   * and the whole turn is aborted with its error.
+   */
+  onToolStart?: (start: ToolStart) => void | Promise<void>;
+  /**
    * Called once per tool that actually ran — also when the turn later fails,
    * which is when the caller most needs to know a write already happened.
    */
@@ -335,6 +341,13 @@ export async function generateWithTools(
   // Each entry uses inputSchema (zodSchema wrapper) + execute — the correct v6 shape.
   // execute returns Promise<unknown> to satisfy ToolSet's output constraint.
   const aiTools: ToolSet = {};
+  // A start hook that fails (the caller couldn't record a write) aborts the
+  // turn: the model must not carry on as if the tool had run.
+  const aborter = new AbortController();
+  let startFailure: unknown = null;
+  // Tools still running when the turn ends early (a timeout, a provider
+  // error): waited for, so the caller's hooks see how each one ended.
+  const inFlight = new Set<Promise<unknown>>();
 
   for (const forgeTool of params.availableTools ?? []) {
     const ctx = params.toolContext;
@@ -342,29 +355,52 @@ export async function generateWithTools(
       description: forgeTool.description,
       inputSchema: zodSchema(forgeTool.schema),
       execute: async (args: unknown): Promise<unknown> => {
-        return registry.run(forgeTool.name, args, ctx, {
+        const run = registry.run(forgeTool.name, args, ctx, {
+          onStart: async (start) => {
+            try {
+              await params.onToolStart?.(start);
+            } catch (err) {
+              startFailure ??= err;
+              aborter.abort(err);
+              throw err;
+            }
+          },
           onExecuted: params.onToolExecuted,
         });
+        inFlight.add(run);
+        try {
+          return await run;
+        } finally {
+          inFlight.delete(run);
+        }
       },
     });
   }
 
   const hasTools = Object.keys(aiTools).length > 0;
 
-  const result = await generateText({
-    model: openrouter.chat(modelId),
-    messages: [
-      { role: "system", content: params.systemPrompt },
-      ...(params.history ?? []),
-      { role: "user", content: params.userMessage },
-    ],
-    tools: hasTools ? aiTools : undefined,
-    stopWhen: hasTools ? stepCountIs(5) : undefined,
-    maxOutputTokens: 1024,
-    abortSignal: AbortSignal.timeout(
-      hasTools ? LLM_TOOL_TURN_TIMEOUT_MS : LLM_TIMEOUT_MS,
-    ),
-  });
+  let result: Awaited<ReturnType<typeof generateText>>;
+  try {
+    result = await generateText({
+      model: openrouter.chat(modelId),
+      messages: [
+        { role: "system", content: params.systemPrompt },
+        ...(params.history ?? []),
+        { role: "user", content: params.userMessage },
+      ],
+      tools: hasTools ? aiTools : undefined,
+      stopWhen: hasTools ? stepCountIs(5) : undefined,
+      maxOutputTokens: 1024,
+      abortSignal: AbortSignal.any([
+        aborter.signal,
+        AbortSignal.timeout(hasTools ? LLM_TOOL_TURN_TIMEOUT_MS : LLM_TIMEOUT_MS),
+      ]),
+    });
+  } catch (err) {
+    // Bounded by the registry's per-tool timeout.
+    await Promise.allSettled([...inFlight]);
+    throw startFailure ?? err;
+  }
 
   // totalUsage, not usage: a tool turn runs up to 5 steps, and usage only
   // reports the last one — the budget would see a fraction of the real spend.

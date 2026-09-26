@@ -21,6 +21,8 @@ import {
   isCatalogModel,
   MODEL_NOT_IN_CATALOG,
 } from "@/features/agents/lib/model-catalog";
+import { normalizeConfiguredPhone } from "@/features/inbox/services/ycloud-client";
+import { phoneString } from "@/features/inbox/services/phone";
 
 const IntegrationSchema = z.object({
   provider: z.enum(["ycloud", "kapso", "openrouter", "highlevel"]),
@@ -45,6 +47,24 @@ function maskRecord(
   return Object.fromEntries(
     Object.entries(obj).map(([k, v]) => [k, v ? "••••••" : ""]),
   );
+}
+
+/** The YCloud key this save will leave: the one typed now, else the stored one. */
+async function ycloudApiKey(
+  newCreds: Record<string, string>,
+  stored: Record<string, unknown> | null,
+  workspaceId: string,
+): Promise<string | null> {
+  if (newCreds.ycloud_api_key) return newCreds.ycloud_api_key;
+  if (!stored) return null;
+  try {
+    const plain = (await decryptCredentials(stored, workspaceId, "ycloud")) as {
+      ycloud_api_key?: unknown;
+    };
+    return typeof plain.ycloud_api_key === "string" ? plain.ycloud_api_key : null;
+  } catch {
+    return null;
+  }
 }
 
 // GET: return integrations with masked credentials
@@ -187,6 +207,20 @@ export async function PUT(
   const provider = parsed.data.provider;
   const enabled = parsed.data.enabled ?? true;
 
+  // YCloud's number: saved in E.164 when that is certain, confirmed against
+  // the account's own lines when the key allows it (a warning, never a block).
+  let config = parsed.data.config;
+  let phoneWarning: string | undefined;
+  const typedPhone = phoneString(config?.phone_number);
+  if (provider === "ycloud" && config && typedPhone) {
+    const normalized = await normalizeConfiguredPhone(
+      typedPhone,
+      await ycloudApiKey(newCreds, existing?.credentials ?? null, workspaceId),
+    );
+    config = { ...config, phone_number: normalized.value };
+    phoneWarning = normalized.warning;
+  }
+
   // A WhatsApp provider only becomes the active one when it can actually talk:
   // activating it disables the other, and without a key, secret or sender id
   // replies would be dropped silently. Checked against what is stored plus what
@@ -194,7 +228,7 @@ export async function PUT(
   if (isWhatsAppProvider(provider) && enabled) {
     const missing = missingWhatsAppFields(provider, mergedCreds, {
       ...((existing?.config as Record<string, unknown> | null) ?? {}),
-      ...(parsed.data.config ?? {}),
+      ...(config ?? {}),
     });
     if (missing.length > 0) {
       return NextResponse.json(
@@ -236,7 +270,7 @@ export async function PUT(
       p_provider: provider,
       p_enabled: enabled,
       p_credentials: encryptedCreds,
-      p_config: parsed.data.config ?? {},
+      p_config: config ?? {},
       p_workspace_keys: [...WORKSPACE_WHATSAPP_SETTINGS],
     });
     if (error) {
@@ -249,6 +283,9 @@ export async function PUT(
     return NextResponse.json({
       ok: true,
       ...(typeof switchedFrom === "string" && switchedFrom ? { switchedFrom } : {}),
+      ...(provider === "ycloud" && typedPhone
+        ? { phoneNumber: config?.phone_number, ...(phoneWarning ? { warning: phoneWarning } : {}) }
+        : {}),
     });
   }
 

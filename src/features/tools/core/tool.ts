@@ -17,19 +17,33 @@ export interface ToolResult {
 }
 
 /**
- * What happened when a tool actually ran (past schema validation and the
- * sensitive-tool gate). `ok` is the tool's own answer; `null` when the call
- * threw or timed out, so its side effect may or may not have happened.
+ * A tool about to run: past schema validation and the sensitive-tool gate.
+ * `callId` pairs it with its ToolExecution.
  */
-export interface ToolExecution {
+export interface ToolStart {
+  callId: string;
   name: string;
   sensitivity: ToolSensitivity;
+}
+
+/**
+ * What happened when a tool actually ran. `ok` is the tool's own answer;
+ * `null` when the call threw or timed out, so its side effect may or may not
+ * have happened.
+ */
+export interface ToolExecution extends ToolStart {
   ok: boolean | null;
 }
 
 export interface ToolRunOptions {
   timeoutMs?: number; // default 10_000
   retries?: number; // default 1
+  /**
+   * Called right before the tool runs. If it throws, the tool does NOT run and
+   * run() rejects with that error: a caller that must record a write before
+   * it happens can refuse to let it happen unrecorded.
+   */
+  onStart?: (start: ToolStart) => void | Promise<void>;
   /** Called once per tool that actually ran. Its errors are swallowed. */
   onExecuted?: (execution: ToolExecution) => void | Promise<void>;
 }

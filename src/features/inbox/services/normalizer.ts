@@ -14,6 +14,8 @@ export interface InboundMessage {
   text: string | null;
   wamid: string;
   customerName: string | null;
+  /** The provider's own type, before clamping (e.g. "reaction"). */
+  rawType?: string;
 }
 
 function svc() {
@@ -134,7 +136,12 @@ export async function processInbound(
         body: normalized.text,
         wamid: normalized.wamid,
         status: "delivered",
-        meta: { from_name: normalized.customerName },
+        meta: {
+          from_name: normalized.customerName,
+          // Kept in the thread, never answered: the webhook doesn't batch it,
+          // and this keeps the orphan reconciler from batching it either.
+          ...(normalized.rawType === "reaction" ? { no_reply: true } : {}),
+        },
       },
       {
         onConflict: "workspace_id,wamid",

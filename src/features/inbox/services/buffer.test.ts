@@ -42,7 +42,7 @@ function query(table: string, mode: "select" | "update" | "delete", patch?: Row)
       const hit = rows();
       hit.forEach((r) => Object.assign(r, structuredClone(patch)));
       updates.push({ table, patch: structuredClone(patch!), matched: hit.length });
-      return { data: null, error: null };
+      return { data: hit.map((r) => ({ id: r.id })), error: null };
     }
     if (mode === "delete") {
       const hit = new Set(rows());
@@ -52,6 +52,7 @@ function query(table: string, mode: "select" | "update" | "delete", patch?: Row)
     return { data: rows().slice(0, limit), error: null };
   };
   const b: any = {
+    select: () => b,
     eq: (c: string, v: unknown) => (filters.push((r) => get(r, c) === v), b),
     is: (c: string, v: unknown) => (filters.push((r) => (get(r, c) ?? null) === v), b),
     gt: (c: string, v: string) => (filters.push((r) => String(get(r, c)) > v), b),
@@ -140,6 +141,8 @@ let decideResult: Row | Error = {
 };
 const decideArgs: Row[] = [];
 const transitions: Array<{ to: string; trigger: unknown }> = [];
+/** Set to make applyTransition throw this error. */
+let transitionError: Error | null = null;
 mock.module("./decision-engine.ts", {
   exports: {
     decide: async (opts: Row) => {
@@ -149,6 +152,7 @@ mock.module("./decision-engine.ts", {
       return decideResult;
     },
     applyTransition: async (_conv: string, to: string, opts: Row = {}) => {
+      if (transitionError) throw transitionError;
       transitions.push({ to, trigger: opts.trigger });
     },
   },
@@ -217,19 +221,33 @@ mock.module("./model-policy.ts", {
   },
 });
 
-type Execution = { name: string; sensitivity: string; ok: boolean | null };
+/** ok "running": the tool started and was still running when the turn ended. */
+type Execution = { name: string; sensitivity: string; ok: boolean | null | "running" };
 const generateArgs: Row[] = [];
+/** Tools that actually ran (their start hook let them). */
+const toolsRun: string[] = [];
 /** The model's turn: the tools it runs, then its text — or a throw. */
 let generated: { text: string; tools?: Execution[]; throwAfterTools?: Error } = {
   text: "¡Hola!",
 };
+type Hooks = {
+  onToolStart?: (s: Row) => Promise<void>;
+  onToolExecuted?: (e: Row) => Promise<void>;
+};
 mock.module("./openrouter.ts", {
   exports: {
-    generateWithTools: async (opts: Row & { onToolExecuted?: (e: Execution) => Promise<void> }) => {
+    generateWithTools: async (opts: Row & Hooks) => {
       calls.push("generate");
       generateArgs.push(opts);
-      for (const execution of generated.tools ?? []) {
-        await opts.onToolExecuted?.(execution);
+      // Like the registry: start hook (a throw stops the tool and the turn),
+      // the tool, then its outcome.
+      let n = 0;
+      for (const tool of generated.tools ?? []) {
+        const callId = `call_${++n}`;
+        await opts.onToolStart?.({ callId, name: tool.name, sensitivity: tool.sensitivity });
+        toolsRun.push(tool.name);
+        if (tool.ok === "running") continue;
+        await opts.onToolExecuted?.({ callId, name: tool.name, sensitivity: tool.sensitivity, ok: tool.ok });
       }
       if (generated.throwAfterTools) throw generated.throwAfterTools;
       return {
@@ -357,7 +375,9 @@ function reset(meta: Row = {}) {
   dispatchResult = { ok: true };
   dispatchArgs.length = 0;
   generated = { text: "¡Hola!" };
+  toolsRun.length = 0;
   transitions.length = 0;
+  transitionError = null;
   rpcCalls.length = 0;
   rateAllowed = true;
   failUpdate = () => false;
@@ -580,6 +600,122 @@ test("a send an earlier attempt left 'queued' is marked unconfirmed, never re-se
   assert.match(String(row.error_message), /confirmar el envío/);
 });
 
+test("any retry checks for an earlier send first, even one whose reply checkpoint was lost", async () => {
+  reset({ retry_count: 1 });
+  tables.messages.push({
+    id: "out_1",
+    workspace_id: "ws_1",
+    conversation_id: "conv_1",
+    direction: "out",
+    status: "sent",
+    meta: { batch_id: "batch_1" },
+  });
+  const result = await processNextBatch();
+  assert.equal(result.processed, true);
+  for (const skipped of ["decide", "generate", "dispatch"]) {
+    assert.ok(!calls.includes(skipped), skipped);
+  }
+  assert.equal(batchRow().status, "processed");
+});
+
+test("a row WhatsApp didn't accept, or the batch's own note, is no earlier send", async () => {
+  reset({ retry_count: 1, pending_reply: "¡Hola!" });
+  tables.messages.push(
+    {
+      id: "out_1",
+      workspace_id: "ws_1",
+      conversation_id: "conv_1",
+      direction: "out",
+      status: "failed",
+      meta: { batch_id: "batch_1", not_accepted: true },
+    },
+    {
+      id: "note_1",
+      workspace_id: "ws_1",
+      conversation_id: "conv_1",
+      direction: "out",
+      type: "system",
+      status: "sent",
+      meta: { internal: true, batch_id: "batch_1", reason: "handoff_failed" },
+    },
+  );
+  await processNextBatch();
+  assert.equal(dispatchArgs.length, 1, "the reply is sent again");
+});
+
+test("a reply is never sent unless its checkpoint was saved", async () => {
+  reset();
+  failUpdate = (table, patch) =>
+    table === "message_batches" && !patch.status && Boolean((patch.meta as Row)?.pending_reply);
+  const original = console.error;
+  console.error = () => {};
+  try {
+    const result = await processNextBatch();
+    assert.equal(result.processed, false);
+  } finally {
+    console.error = original;
+  }
+  assert.ok(!calls.includes("dispatch"));
+});
+
+test("a reply sent on the last attempt whose batch can't be closed is not dead-lettered", async () => {
+  reset({ retry_count: 3 });
+  failUpdate = (table, patch) => table === "message_batches" && patch.status === "processed";
+  const original = console.error;
+  console.error = () => {};
+  try {
+    await processNextBatch();
+  } finally {
+    console.error = original;
+  }
+  assert.equal(dispatchArgs.length, 1);
+  assert.ok(!rpcCalls.some((c) => c.fn === "cancel_batch"), "no dead letter");
+  assert.deepEqual(transitions, []);
+  assert.deepEqual(notes(), [], "no 'the AI couldn't answer' note: it did");
+  const retry = batchUpdates().at(-1)!;
+  assert.equal(retry.status, "buffering");
+  assert.equal((retry.meta as Row).retry_count, 3, "closing isn't another failed attempt");
+
+  // The next attempt finds the send and only closes the batch.
+  failUpdate = () => false;
+  tables.messages.push({
+    id: "out_1",
+    workspace_id: "ws_1",
+    conversation_id: "conv_1",
+    direction: "out",
+    status: "sent",
+    meta: { batch_id: "batch_1" },
+  });
+  batchRow().status = "processing";
+  calls.length = 0;
+  await processNextBatch();
+  assert.ok(!calls.includes("dispatch"));
+  assert.equal(batchRow().status, "processed");
+});
+
+test("an earlier send found on the last attempt is closed, never dead-lettered, even if closing fails", async () => {
+  reset({ retry_count: 3, pending_reply: "¡Hola!" });
+  tables.messages.push({
+    id: "out_1",
+    workspace_id: "ws_1",
+    conversation_id: "conv_1",
+    direction: "out",
+    status: "sent",
+    meta: { batch_id: "batch_1" },
+  });
+  failUpdate = (table, patch) => table === "message_batches" && patch.status === "processed";
+  const original = console.error;
+  console.error = () => {};
+  try {
+    await processNextBatch();
+  } finally {
+    console.error = original;
+  }
+  assert.ok(!rpcCalls.some((c) => c.fn === "cancel_batch"));
+  assert.deepEqual(notes(), []);
+  assert.equal(batchUpdates().at(-1)!.status, "buffering");
+});
+
 test("a batch that can't be closed after its reply is re-queued with the reply, not re-generated", async () => {
   reset();
   failUpdate = (table, patch) => table === "message_batches" && patch.status === "processed";
@@ -658,15 +794,54 @@ test("a reclaimed batch whose write already ran hands off without running the tu
   assert.equal(transitions[0]?.trigger, "write_tool_unfinished");
 });
 
-test("each write is saved on the batch the moment it returns", async () => {
+test("each write is on record before it runs, then with its outcome", async () => {
   reset();
   generated = {
     text: "Listo",
     tools: [{ name: "schedule_highlevel", sensitivity: "write", ok: true }],
   };
   await processNextBatch();
-  const saved = batchUpdates().find((u) => Array.isArray((u.meta as Row | undefined)?.write_tools_ran));
-  assert.deepEqual((saved!.meta as Row).write_tools_ran, [{ name: "schedule_highlevel", ok: true }]);
+  const saved = batchUpdates()
+    .map((u) => (u.meta as Row | undefined)?.write_tools_ran)
+    .filter(Array.isArray);
+  assert.deepEqual(saved[0], [{ id: "call_1", name: "schedule_highlevel", ok: null }], "before it ran");
+  assert.deepEqual(saved[1], [{ id: "call_1", name: "schedule_highlevel", ok: true }], "after it returned");
+});
+
+test("a write whose record can't be saved never runs, and the turn is retried", async () => {
+  reset();
+  generated = {
+    text: "Listo",
+    tools: [{ name: "schedule_highlevel", sensitivity: "write", ok: true }],
+  };
+  failUpdate = (table, patch) =>
+    table === "message_batches" && !patch.status && Array.isArray((patch.meta as Row)?.write_tools_ran);
+  const original = console.error;
+  console.error = () => {};
+  try {
+    const result = await processNextBatch();
+    assert.equal(result.processed, false);
+  } finally {
+    console.error = original;
+  }
+  assert.deepEqual(toolsRun, []);
+  assert.deepEqual(transitions, [], "nothing was written: no handoff");
+  const retry = batchUpdates().at(-1)!;
+  assert.equal(retry.status, "buffering");
+  assert.equal((retry.meta as Row).write_tools_ran, undefined);
+});
+
+test("a write still running when the turn times out counts as done: a person takes over", async () => {
+  reset();
+  generated = {
+    text: "",
+    tools: [{ name: "schedule_highlevel", sensitivity: "write", ok: "running" }],
+    throwAfterTools: new Error("The operation was aborted due to timeout"),
+  };
+  const result = await processNextBatch();
+  assert.equal(result.processed, true);
+  assert.deepEqual(transitions, [{ to: "handoff_pending", trigger: "write_tool_unfinished" }]);
+  assert.equal(batchRow().status, "processed");
 });
 
 test("a write the tool reported as failed, or a read, is not counted", async () => {
@@ -701,6 +876,7 @@ test("an empty reply after a write went through hands off instead of running it 
   const result = await processNextBatch();
   assert.equal(result.processed, true);
   assert.deepEqual(transitions, [{ to: "handoff_pending", trigger: "empty_reply" }]);
+  assert.match(String(notes()[0]?.body), /schedule_highlevel/);
   assert.ok(!calls.includes("dispatch"));
   assert.equal(batchRow().status, "processed");
 });
@@ -710,7 +886,7 @@ test("an empty reply after a write that timed out hands off too (it may have hap
   generated = { text: "", tools: [{ name: "schedule_highlevel", sensitivity: "write", ok: null }] };
   const result = await processNextBatch();
   assert.equal(result.processed, true);
-  assert.equal(transitions[0]?.trigger, "write_tool_unfinished");
+  assert.equal(transitions[0]?.trigger, "empty_reply");
 });
 
 test("the budget cut hands off to a person only when the workspace opted in", async () => {
@@ -724,6 +900,85 @@ test("the budget cut hands off to a person only when the workspace opted in", as
   whatsappSettings = { provider: "ycloud", config: { cost_cut_handoff: true } };
   await processNextBatch();
   assert.deepEqual(transitions, [{ to: "handoff_pending", trigger: "cost_cut" }]);
+});
+
+test("transient failures back off 1, 5 and 15 minutes; deterministic ones 30 s per retry", async () => {
+  const waits: number[] = [];
+  for (const retry of [0, 1, 2]) {
+    reset({ retry_count: retry });
+    decideResult = new Error("fetch failed");
+    const before = Date.now();
+    await processNextBatch();
+    const flushAt = Date.parse(String(batchUpdates().at(-1)!.flush_at));
+    waits.push(Math.round((flushAt - before) / 60_000));
+  }
+  assert.deepEqual(waits, [1, 5, 15]);
+
+  reset({ retry_count: 1 });
+  whatsappSettings = null;
+  const before = Date.now();
+  await processNextBatch();
+  const flushAt = Date.parse(String(batchUpdates().at(-1)!.flush_at));
+  assert.equal(Math.round((flushAt - before) / 1000), 60, "WhatsApp not connected: 30 s × 2");
+});
+
+test("a batch reclaimed past its retries is dead-lettered without running the turn", async () => {
+  reset({ retry_count: 4, last_error: "stale lease reclaimed by claim_next_batch" });
+  const result = await processNextBatch();
+  assert.equal(result.processed, false);
+  for (const skipped of ["decide", "jev", "generate", "dispatch"]) {
+    assert.ok(!calls.includes(skipped), skipped);
+  }
+  assert.equal(batchRow().status, "cancelled");
+  // Through applyTransition, like a keyword handoff: acknowledgement and notification.
+  assert.deepEqual(transitions, [{ to: "handoff_pending", trigger: "batch_dead_letter" }]);
+  assert.equal((notes()[0]?.meta as Row).reason, "batch_dead_letter");
+});
+
+test("a handoff that fails is left visible: an error event and a note in the thread", async () => {
+  reset({ retry_count: 3 });
+  generated = { text: "" };
+  transitionError = new Error("conversations update timed out");
+  const original = console.error;
+  console.error = () => {};
+  try {
+    await processNextBatch();
+  } finally {
+    console.error = original;
+  }
+  assert.ok(tables.events.some((e) => e.type === "handoff_failed" && e.level === "error"));
+  assert.ok(notes().some((n) => (n.meta as Row).reason === "handoff_failed"));
+});
+
+test("a conversation a person already has is not a failed handoff", async () => {
+  reset({ retry_count: 3 });
+  generated = { text: "" };
+  transitionError = Object.assign(new Error("Invalid transition: human_active → handoff_pending"), {
+    name: "TransitionError",
+  });
+  const original = console.error;
+  console.error = () => {};
+  try {
+    await processNextBatch();
+  } finally {
+    console.error = original;
+  }
+  assert.ok(!tables.events.some((e) => e.type === "handoff_failed"));
+});
+
+test("an attempt that runs again doesn't repeat its note", async () => {
+  reset({ retry_count: 1, write_tools_ran: [{ name: "schedule_highlevel", ok: true }] });
+  tables.messages.push({
+    id: "note_1",
+    workspace_id: "ws_1",
+    conversation_id: "conv_1",
+    direction: "out",
+    type: "system",
+    status: "sent",
+    meta: { internal: true, batch_id: "batch_1", reason: "write_tool_unfinished" },
+  });
+  await processNextBatch();
+  assert.equal(notes().length, 1);
 });
 
 test("out of retries, a person takes over and the thread says why", async () => {
@@ -823,9 +1078,28 @@ test("an orphan gets an isolated batch flushed now; AI-off or rate-limited ones 
   assert.equal(await reconcileOrphanedMessages(), 0);
 });
 
-test("a batch is claimed only with 90 s of the function's time left", () => {
+test("a reaction is never revived as an orphan: it isn't for answering", async () => {
+  reset();
+  const fiveMinutesAgo = new Date(Date.now() - 5 * 60_000).toISOString();
+  tables.messages = [
+    {
+      id: "r1",
+      workspace_id: "ws_1",
+      conversation_id: "conv_1",
+      batch_id: null,
+      direction: "in",
+      meta: { no_reply: true },
+      created_at: fiveMinutesAgo,
+      conversations: { ai_enabled: true, contact_id: "c1" },
+    },
+  ];
+  assert.equal(await reconcileOrphanedMessages(), 0);
+  assert.ok(!rpcCalls.some((c) => c.fn === "upsert_batch_and_link_message"));
+});
+
+test("a batch is claimed only with 180 s of the function's time left (a whole worst-case turn)", () => {
   const start = 1_000_000;
-  assert.equal(hasTimeToClaim(start, 300, start + 200_000), true);
-  assert.equal(hasTimeToClaim(start, 300, start + 211_000), false);
-  assert.equal(hasTimeToClaim(start, 120, start + 31_000), false);
+  assert.equal(hasTimeToClaim(start, 300, start + 110_000), true);
+  assert.equal(hasTimeToClaim(start, 300, start + 121_000), false);
+  assert.equal(hasTimeToClaim(start, 120, start), false);
 });

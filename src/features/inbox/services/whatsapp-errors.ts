@@ -70,6 +70,13 @@ export const GENERIC_SEND_ERROR =
 export const UNCONFIRMED_SEND_ERROR =
   "No se pudo confirmar el envío: es posible que el mensaje sí haya llegado. Revisa con el contacto antes de reenviarlo.";
 
+/**
+ * WhatsApp no aceptó el envío (límite de mensajes) y la IA lo va a reintentar:
+ * nada llegó todavía. Lo ve el operador en el intento que no salió.
+ */
+export const RETRY_PENDING_SEND_ERROR =
+  "WhatsApp no aceptó este envío por ahora (límite de mensajes). La IA lo vuelve a intentar en unos minutos.";
+
 /** El proveedor no respondió bien, en algo que no es un envío (una plantilla). */
 const PROVIDER_UNAVAILABLE =
   "WhatsApp no está disponible en este momento. Vuelve a intentar en unos minutos.";

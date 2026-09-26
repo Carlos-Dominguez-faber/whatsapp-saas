@@ -1,4 +1,5 @@
 import type { MetaTemplateComponent } from "@/features/settings/lib/template-form";
+import { internationalDigits, matchesOwnNumber, normalizePhone } from "./phone";
 
 const YCLOUD_BASE_URL = "https://api.ycloud.com/v2";
 const YCLOUD_MESSAGES_URL = `${YCLOUD_BASE_URL}/whatsapp/messages`;
@@ -277,76 +278,157 @@ export function templateOfficialId(template: unknown): string | null {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// resolveWabaId
+// Phone numbers and resolveWabaId
 // ──────────────────────────────────────────────────────────────────────────────
 
-/** Strips everything but digits so "+52 998…" and "52998…" compare equal. */
-function digitsOnly(value: string): string {
-  return value.replace(/\D/g, "");
+const PHONE_NUMBER_PAGE_SIZE = 100;
+const MAX_PHONE_NUMBER_PAGES = 10;
+
+/** The configured number isn't on the YCloud account (message for the team). */
+export class WabaNotFoundError extends Error {
+  constructor() {
+    super(
+      "No encontramos el número de WhatsApp de este espacio entre los de tu cuenta de YCloud. Revisa el número en Integraciones.",
+    );
+    this.name = "WabaNotFoundError";
+  }
+}
+
+export interface YCloudPhoneNumber {
+  phoneNumber: string;
+  wabaId: string | null;
 }
 
 /**
- * Resolves the WhatsApp Business Account ID for a phone number. Template
- * creation (POST /v2/whatsapp/templates) requires `wabaId`, which we don't
- * store — so we look it up from the registered phone number at submit time.
- * Falls back to the first registered number's WABA when only one exists.
+ * Every WhatsApp number on the key's account (all pages, up to 1,000), as
+ * YCloud lists them. Throws YCloudError on a non-2xx.
+ */
+export async function listYCloudPhoneNumbers(
+  apiKey: string,
+): Promise<YCloudPhoneNumber[]> {
+  const numbers: YCloudPhoneNumber[] = [];
+  let total: number | null = null;
+
+  for (let page = 1; page <= MAX_PHONE_NUMBER_PAGES; page++) {
+    const params = new URLSearchParams({
+      page: String(page),
+      limit: String(PHONE_NUMBER_PAGE_SIZE),
+      includeTotal: "true",
+    });
+    const response = await fetch(`${YCLOUD_PHONE_NUMBERS_URL}?${params.toString()}`, {
+      method: "GET",
+      headers: { "X-API-Key": apiKey },
+      signal: AbortSignal.timeout(SEND_TIMEOUT_MS),
+    });
+
+    let responseBody: unknown;
+    try {
+      responseBody = await response.json();
+    } catch {
+      responseBody = null;
+    }
+
+    if (!response.ok) {
+      throw new YCloudError(
+        response.status,
+        responseBody,
+        `YCloud phoneNumbers error ${response.status}`,
+      );
+    }
+
+    const data = (responseBody ?? {}) as Record<string, unknown>;
+    // { items: [...] }; older shapes used `records`/`data`.
+    const items = (
+      Array.isArray(data.items)
+        ? data.items
+        : Array.isArray(data.records)
+          ? data.records
+          : Array.isArray(data.data)
+            ? data.data
+            : []
+    ) as Array<Record<string, unknown>>;
+    if (typeof data.total === "number") total = data.total;
+
+    for (const item of items) {
+      if (typeof item.phoneNumber !== "string") continue;
+      numbers.push({
+        phoneNumber: item.phoneNumber,
+        wabaId: typeof item.wabaId === "string" ? item.wabaId : null,
+      });
+    }
+
+    const done =
+      items.length < PHONE_NUMBER_PAGE_SIZE ||
+      (total !== null && page * PHONE_NUMBER_PAGE_SIZE >= total);
+    if (done) break;
+  }
+
+  return numbers;
+}
+
+/**
+ * The workspace's YCloud number as it should be saved, from what the admin
+ * typed. It routes and checks every inbound webhook, so it is saved in E.164
+ * whenever that is certain: as YCloud lists it when the account has it (a
+ * national number is matched against the account's lines), else with the
+ * country code it was typed with. A national number YCloud can't confirm is
+ * saved as typed — completing it with a guessed code could reject every
+ * message — and `warning` tells the admin what to fix. Never throws: without
+ * the key, or with YCloud unreachable, it only skips the confirmation.
+ */
+export async function normalizeConfiguredPhone(
+  typed: string,
+  apiKey: string | null,
+): Promise<{ value: string; warning?: string }> {
+  const international = internationalDigits(typed);
+  let listed: YCloudPhoneNumber[] | null = null;
+  if (apiKey) {
+    try {
+      listed = await listYCloudPhoneNumbers(apiKey);
+    } catch (err) {
+      console.warn(
+        "[ycloud] could not list the account's numbers to confirm the configured one:",
+        err instanceof Error ? err.message : "unknown",
+      );
+    }
+  }
+  const own = listed?.find((n) => matchesOwnNumber(typed, n.phoneNumber));
+  if (own) return { value: normalizePhone(own.phoneNumber) };
+
+  if (international) {
+    const value = `+${international}`;
+    return listed
+      ? {
+          value,
+          warning: `No encontramos ${value} entre los números de tu cuenta de YCloud. Revisa que sea el número conectado: los mensajes que lleguen para otro número se ignoran.`,
+        }
+      : { value };
+  }
+  return {
+    value: typed.trim(),
+    warning:
+      "Escribe el número con su lada internacional (por ejemplo +52 998 123 4567): así podemos comprobar que cada mensaje que llega es para este número.",
+  };
+}
+
+/**
+ * Resolves the WhatsApp Business Account ID for the workspace's number.
+ * Template creation (POST /v2/whatsapp/templates) requires `wabaId`, and the
+ * template list is filtered by it; we don't store it, so it is looked up from
+ * the configured number each time. Throws when no number on the account is
+ * that one: falling back to another number's WABA would read or create
+ * templates on a line that isn't the workspace's.
  */
 export async function resolveWabaId(
   apiKey: string,
-  phoneNumberE164: string,
+  configuredPhone: string,
 ): Promise<string> {
-  const response = await fetch(`${YCLOUD_PHONE_NUMBERS_URL}?limit=100`, {
-    method: "GET",
-    headers: { "X-API-Key": apiKey },
-  });
+  const numbers = await listYCloudPhoneNumbers(apiKey);
+  const match = numbers.find((n) => matchesOwnNumber(configuredPhone, n.phoneNumber));
 
-  let responseBody: unknown;
-  try {
-    responseBody = await response.json();
-  } catch {
-    responseBody = null;
-  }
+  if (!match?.wabaId) throw new WabaNotFoundError();
 
-  if (!response.ok) {
-    throw new YCloudError(
-      response.status,
-      responseBody,
-      `YCloud resolveWabaId error ${response.status}`,
-    );
-  }
-
-  const data = responseBody as Record<string, unknown>;
-  // The phoneNumbers endpoint returns { items: [...] }; older shapes used
-  // `records`/`data` — accept any of them defensively.
-  const items = (
-    Array.isArray(data.items)
-      ? data.items
-      : Array.isArray(data.records)
-        ? data.records
-        : Array.isArray(data.data)
-          ? data.data
-          : []
-  ) as Array<Record<string, unknown>>;
-
-  const target = digitsOnly(phoneNumberE164);
-  const match = items.find(
-    (p) =>
-      typeof p.phoneNumber === "string" && digitsOnly(p.phoneNumber) === target,
-  );
-
-  const wabaId =
-    (match?.wabaId as string | undefined) ??
-    (items[0]?.wabaId as string | undefined);
-
-  if (!wabaId) {
-    throw new YCloudError(
-      404,
-      responseBody,
-      "No se encontró el wabaId del número en YCloud",
-    );
-  }
-
-  return wabaId;
+  return match.wabaId;
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
