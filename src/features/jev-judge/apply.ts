@@ -15,6 +15,7 @@ import {
   readJevUses,
   type JevUses,
 } from "@/features/jev-judge/uses";
+import { WHATSAPP_PROVIDER } from "@/features/inbox/services/whatsapp-provider";
 
 const MODEL = "jev-latest";
 const IDLE = { suppressReply: false, ownsStage: false };
@@ -90,7 +91,7 @@ async function loadRuntime(
     .from("integrations")
     .select("config")
     .eq("workspace_id", workspaceId)
-    .eq("provider", "ycloud")
+    .eq("provider", WHATSAPP_PROVIDER)
     .eq("enabled", true)
     .maybeSingle();
   const config = data?.config ?? null;
