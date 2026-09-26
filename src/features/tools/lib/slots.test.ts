@@ -175,14 +175,14 @@ test("resolveTimeZone toma la primera candidata válida", () => {
   assert.equal(resolveTimeZone("America/Santiago", "UTC"), "America/Santiago");
 });
 
-test("resolveTimeZone cae a UTC cuando ninguna candidata sirve", () => {
-  assert.equal(resolveTimeZone("Chile", "GMT-3", "", undefined), "UTC");
-  assert.equal(resolveTimeZone(), "UTC");
+test("resolveTimeZone cae a la zona por defecto cuando ninguna candidata sirve", () => {
+  assert.equal(resolveTimeZone("Chile", "GMT-3", "", undefined), "America/Mexico_City");
+  assert.equal(resolveTimeZone(), "America/Mexico_City");
 });
 
 test("el output no afirma ausencia de cupos cuando hubo horarios ilegibles", () => {
   const out = buildAvailabilityOutput(
-    { days: {}, omittedDays: 0, unreadable: 4 },
+    { days: {}, omittedDays: 0, unreadable: 4, partialDay: null },
     "UTC",
   );
 
@@ -194,7 +194,7 @@ test("el output no afirma ausencia de cupos cuando hubo horarios ilegibles", () 
 
 test("el output declara ausencia solo cuando no hubo nada ilegible", () => {
   const out = buildAvailabilityOutput(
-    { days: {}, omittedDays: 0, unreadable: 0 },
+    { days: {}, omittedDays: 0, unreadable: 0, partialDay: null },
     "UTC",
   );
 
@@ -210,6 +210,7 @@ test("el output dice hasta qué día se sabe cuando hay recorte por maxDays", ()
       },
       omittedDays: 3,
       unreadable: 0,
+      partialDay: null,
     },
     "UTC",
   );
@@ -222,7 +223,7 @@ test("el output dice hasta qué día se sabe cuando hay recorte por maxDays", ()
 
 test("el output declara la zona realmente usada cuando la pedida no sirve", () => {
   const out = buildAvailabilityOutput(
-    { days: {}, omittedDays: 0, unreadable: 0 },
+    { days: {}, omittedDays: 0, unreadable: 0, partialDay: null },
     "America/Bogota",
     "America/Santiagoo",
   );
@@ -234,7 +235,7 @@ test("el output declara la zona realmente usada cuando la pedida no sirve", () =
 
 test("el output no menciona la zona pedida cuando sí se pudo usar", () => {
   const out = buildAvailabilityOutput(
-    { days: {}, omittedDays: 0, unreadable: 0 },
+    { days: {}, omittedDays: 0, unreadable: 0, partialDay: null },
     "America/Bogota",
     "America/Bogota",
   );
@@ -311,6 +312,7 @@ test("con horarios válidos e ilegibles el mensaje declara los ilegibles", () =>
       days: { "2026-06-12": ["2026-06-12T15:00:00Z"] },
       omittedDays: 0,
       unreadable: 2,
+      partialDay: null,
     },
     "UTC",
   );
@@ -375,7 +377,7 @@ test("zonedDayRange: un día normal en horario de verano empieza a las 03:00Z", 
   assert.equal(new Date(r!.startMs).toISOString(), "2026-09-15T03:00:00.000Z");
 });
 
-test("maxSlots recorta días enteros; el primero entra completo aunque lo exceda", () => {
+test("maxSlots recorta días enteros; un primer día más grande que el tope se muestra parcial", () => {
   const day = (d: string, n: number) =>
     Array.from({ length: n }, (_, i) =>
       `2026-06-${d}T${String(10 + Math.floor(i / 6)).padStart(2, "0")}:${String((i % 6) * 10).padStart(2, "0")}:00Z`,
@@ -387,5 +389,10 @@ test("maxSlots recorta días enteros; el primero entra completo aunque lo exceda
   assert.equal(omittedDays, 1);
 
   const big = groupByDay(day("12", 30), "UTC", 14, 20);
-  assert.equal(big.days["2026-06-12"].length, 30);
+  assert.equal(big.days["2026-06-12"].length, 20, "the earliest 20");
+  assert.equal(big.partialDay, "2026-06-12");
+  assert.match(
+    buildAvailabilityOutput(big, "UTC").message,
+    /El 2026-06-12 tiene más horarios de los que se muestran/,
+  );
 });

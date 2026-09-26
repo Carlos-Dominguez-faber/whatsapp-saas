@@ -14,6 +14,11 @@ export interface GroupedSlots {
   omittedDays: number;
   /** Valores que no se pudieron interpretar. NUNCA se descartan en silencio. */
   unreadable: number;
+  /**
+   * El único día que aparece incompleto: el primero, cuando él solo excede
+   * `maxSlots`. El output lo declara, para que el agente no niegue horarios.
+   */
+  partialDay: string | null;
 }
 
 /**
@@ -64,16 +69,26 @@ export function groupByDay(
   const days: Record<string, string[]> = {};
   let kept = 0;
   let total = 0;
+  let partialDay: string | null = null;
   for (const day of sortedDays.slice(0, maxDays)) {
     const size = byDay.get(day)!.size;
     if (kept > 0 && total + size > maxSlots) break;
-    days[day] = [...byDay.get(day)!.entries()]
+    const isos = [...byDay.get(day)!.entries()]
       .sort((a, b) => a[1] - b[1] || a[0].localeCompare(b[0]))
       .map(([iso]) => iso);
+    // A calendar so dense that its first day alone exceeds the cap: show the
+    // earliest slots of that day and say the rest exist.
+    if (size > maxSlots) {
+      days[day] = isos.slice(0, maxSlots);
+      partialDay = day;
+      kept++;
+      break;
+    }
+    days[day] = isos;
     kept++;
     total += size;
   }
-  return { days, omittedDays: sortedDays.length - kept, unreadable };
+  return { days, omittedDays: sortedDays.length - kept, unreadable, partialDay };
 }
 
 /**
@@ -100,28 +115,9 @@ function localDay(instant: number, tz: string): string {
   return local.split(" ")[0];
 }
 
-/**
- * Primera candidata que sea una zona IANA válida, o `"UTC"`.
- *
- * La zona la puede pedir el LLM como texto libre: `"America/Santiagoo"`,
- * `"Chile"` o `"GMT-3"` hacen lanzar a `Intl`. Antes se degradaba a UTC en
- * silencio y el output igual etiquetaba la zona pedida, así que el bot ofrecía
- * "12:00" que en Santiago eran las 09:00.
- */
-export function resolveTimeZone(
-  ...candidates: (string | undefined | null)[]
-): string {
-  for (const tz of candidates) {
-    if (!tz) continue;
-    try {
-      new Intl.DateTimeFormat("sv-SE", { timeZone: tz });
-      return tz;
-    } catch {
-      // siguiente candidata
-    }
-  }
-  return "UTC";
-}
+// One resolver for the whole app (the prompt's "now" uses it too), with the
+// workspace default — not UTC — as the last resort.
+export { resolveTimeZone } from "@/shared/lib/timezone";
 
 export interface AvailabilityOutput {
   days: Record<string, string[]>;
@@ -174,6 +170,12 @@ export function buildAvailabilityOutput(
     );
   } else if (count === 0 && grouped.unreadable > 0) {
     parts.push(`Se descartaron ${grouped.unreadable} valores ilegibles.`);
+  }
+
+  if (grouped.partialDay) {
+    parts.push(
+      `El ${grouped.partialDay} tiene más horarios de los que se muestran: si el cliente quiere otra hora de ese día, consulta un rango más corto o pregúntale qué hora le acomoda.`,
+    );
   }
 
   if (grouped.omittedDays > 0 && coveredUntil) {
