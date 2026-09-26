@@ -9,8 +9,14 @@ let convRow: ConvRow = { workspace_id: "ws_1" };
 // Role of the caller in the conversation's workspace; null = not an active member.
 let memberRole: string | null = "admin";
 
+// Records the filters of each membership lookup, so tests can pin WHICH
+// workspace the role was checked in.
+let membershipFilters: unknown[][] = [];
 const membershipChain: any = {
-  eq: () => membershipChain,
+  eq: (col: string, val: unknown) => {
+    membershipFilters.push([col, val]);
+    return membershipChain;
+  },
   maybeSingle: async () => ({
     data: memberRole ? { role: memberRole } : null,
     error: null,
@@ -113,11 +119,17 @@ for (const action of ["request", "cancel"] as const) {
 
 test("an agent can flag any thread for a human (request assigns nobody)", async () => {
   transitions.length = 0;
+  membershipFilters = [];
   memberRole = "agent";
   convRow = { workspace_id: "ws_1", assigned_to: null };
   const res = await POST(makeReq({ action: "request" }), params);
   assert.equal(res.status, 200);
   assert.equal(transitions.length, 1);
+  // The role is checked in the conversation's own workspace.
+  assert.ok(
+    membershipFilters.some(([c, v]) => c === "workspace_id" && v === "ws_1"),
+    "role must be checked in the conversation's workspace",
+  );
   memberRole = "admin";
 });
 

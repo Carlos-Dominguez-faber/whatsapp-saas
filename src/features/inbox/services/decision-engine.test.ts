@@ -110,9 +110,11 @@ test("scopes both the lookup and the update to workspaceId when it is given", as
     ["id", "conv_1"],
     ["workspace_id", "ws_1"],
   ]);
+  // The state_change event is logged under the conversation's workspace.
+  assert.equal((inserts[0].row as { workspace_id: string }).workspace_id, "ws_1");
 });
 
-test("a conversation from another workspace is not found and nothing is written", async () => {
+test("when the scoped lookup finds nothing, nothing is written", async () => {
   reset([{ data: null, error: { message: "0 rows" } }]);
   await assert.rejects(
     () => applyTransition("conv_other_ws", "human_active", { workspaceId: "ws_1" }),

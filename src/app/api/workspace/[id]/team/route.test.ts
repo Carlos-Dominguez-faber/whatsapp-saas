@@ -35,7 +35,7 @@ type Membership = {
   is_active: boolean;
 };
 let memberships: Membership[] = [];
-let writes: Array<{ kind: string; row: unknown }> = [];
+let writes: Array<{ kind: string; row: unknown; eqArgs?: unknown[][] }> = [];
 
 function membershipsTable() {
   const filters: Array<(m: Membership) => boolean> = [];
@@ -54,7 +54,11 @@ function membershipsTable() {
       filters.push((m) => (m as any)[col] !== val);
       return q;
     },
-    maybeSingle: async () => ({ data: rows()[0] ?? null, error: null }),
+    // Like PostgREST: more than one row is an error, not "the first one".
+    maybeSingle: async () =>
+      rows().length > 1
+        ? { data: null, error: { message: "multiple rows" } }
+        : { data: rows()[0] ?? null, error: null },
     then: (resolve: (v: unknown) => void) =>
       resolve(countMode ? { count: rows().length, error: null } : { data: rows(), error: null }),
   };
@@ -68,8 +72,15 @@ mock.module("@supabase/supabase-js", {
         select: (cols: string, opts?: { count?: string }) =>
           membershipsTable().select(cols, opts),
         update: (row: unknown) => {
-          writes.push({ kind: "update", row });
-          const chain: any = { eq: () => chain, then: (r: any) => r({ error: null }) };
+          const eqArgs: unknown[][] = [];
+          writes.push({ kind: "update", row, eqArgs });
+          const chain: any = {
+            eq: (col: string, val: unknown) => {
+              eqArgs.push([col, val]);
+              return chain;
+            },
+            then: (r: any) => r({ error: null }),
+          };
           return chain;
         },
         upsert: async (row: unknown) => {
@@ -138,11 +149,15 @@ test("manager cannot demote or deactivate an admin", async () => {
   assert.equal(writes.length, 0);
 });
 
-test("manager can still manage agents and viewers", async () => {
+test("manager can still manage agents and viewers, writing only this workspace", async () => {
   reset("manager");
   const res = await PATCH(req("PATCH", { userId: U_AGENT, role: "viewer" }), params);
   assert.equal(res.status, 200);
   assert.equal(writes.length, 1);
+  assert.deepEqual(writes[0].eqArgs, [
+    ["workspace_id", "ws_1"],
+    ["user_id", U_AGENT],
+  ]);
 });
 
 test("manager cannot invite an admin, nor re-invite an existing admin with a lower role", async () => {
