@@ -51,6 +51,9 @@ tables.events = [];
 /** The messages table as dispatch left it. */
 const msgs = () => tables.messages;
 
+/** The next N UPDATEs fail. */
+let failUpdates = 0;
+
 // A PostgREST-ish fake that honors eq() on reads, updates and deletes, so a
 // write scoped to the wrong row or workspace misses, as it would for real.
 function query(table: string, mode: "select" | "update" | "delete" = "select", patch?: Row) {
@@ -80,6 +83,11 @@ function query(table: string, mode: "select" | "update" | "delete" = "select", p
     },
     then(resolve: (v: unknown) => void) {
       if (mode === "update") {
+        if (failUpdates > 0) {
+          failUpdates--;
+          resolve({ error: { message: "update failed" } });
+          return;
+        }
         rows().forEach((r) => Object.assign(r, patch));
         resolve({ error: null });
       } else if (mode === "delete") {
@@ -315,6 +323,27 @@ test("a send WhatsApp did not accept is retryable, and the buffer can skip the f
   await dispatchText({ workspaceId: "ws_a", conversationId: "conv_a", body: "hola" });
   assert.equal(msgs().length, 1, "by default the failure is recorded");
   assert.equal(msgs()[0].status, "failed");
+});
+
+test("a not-accepted row that can't be marked is retried, then deleted — never left 'queued'", async () => {
+  const original = console.error;
+  console.error = () => {};
+  try {
+    reset();
+    failUpdates = 1;
+    ycloudFailure = { status: 429, body: { error: { whatsappApiError: { code: 130429 } } } };
+    await dispatchText({ workspaceId: "ws_a", conversationId: "conv_a", body: "hola", recordRetryableFailure: false });
+    assert.equal(msgs()[0]?.status, "failed", "the second attempt marks it");
+
+    reset();
+    failUpdates = 2;
+    ycloudFailure = { status: 429, body: { error: { whatsappApiError: { code: 130429 } } } };
+    await dispatchText({ workspaceId: "ws_a", conversationId: "conv_a", body: "hola", recordRetryableFailure: false });
+    assert.equal(msgs().length, 0, "a row still 'queued' would block the retry: deleted");
+  } finally {
+    console.error = original;
+    failUpdates = 0;
+  }
 });
 
 test("a network error may have delivered the message, so it is never retryable", async () => {

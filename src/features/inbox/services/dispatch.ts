@@ -316,18 +316,31 @@ async function sendQueuedRow(opts: {
     if (retryable && !opts.recordRetryableFailure) {
       // Nothing left; the caller sends the same text again. The row stays (a
       // deleted row would linger in open inboxes, which only hear inserts and
-      // updates), marked so the retry doesn't take it for a message sent.
-      const { error: markError } = await supabase
-        .from("messages")
-        .update({
-          status: "failed",
-          error_message: RETRY_PENDING_SEND_ERROR,
-          meta: { ...rowMeta, not_accepted: true },
-        })
-        .eq("id", rowId)
-        .eq("workspace_id", workspaceId);
-      if (markError) {
-        console.error("[dispatch] not-accepted update error:", markError.message);
+      // updates), marked so the retry doesn't take it for a message sent. A
+      // row left 'queued' would read as a possible send and block the retry:
+      // if it can't be marked, it is deleted — a ghost bubble is the lesser harm.
+      let marked = false;
+      for (let attempt = 0; attempt < 2 && !marked; attempt++) {
+        const { error: markError } = await supabase
+          .from("messages")
+          .update({
+            status: "failed",
+            error_message: RETRY_PENDING_SEND_ERROR,
+            meta: { ...rowMeta, not_accepted: true },
+          })
+          .eq("id", rowId)
+          .eq("workspace_id", workspaceId);
+        marked = !markError;
+        if (markError) {
+          console.error("[dispatch] not-accepted update error:", markError.message);
+        }
+      }
+      if (!marked) {
+        await supabase
+          .from("messages")
+          .delete()
+          .eq("id", rowId)
+          .eq("workspace_id", workspaceId);
       }
     } else {
       const { error: failError } = await supabase
