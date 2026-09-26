@@ -19,9 +19,16 @@ const LIMIT_MESSAGE: Record<WorkspaceLlmCallType, string> = {
 type GuardOk = { ok: true; reservationId?: string };
 type GuardFail = { ok: false; response: NextResponse };
 
+const BUDGET_MESSAGE = {
+  cut: "El workspace ya usó su presupuesto diario de IA. Intenta mañana.",
+  degrade:
+    "El workspace está por agotar su presupuesto diario de IA. Para que alcance para las conversaciones con clientes, generar plantillas y la prueba de agentes se pausan hasta mañana.",
+} as const;
+
 /**
  * Gate for a route that calls the model on the workspace's key outside an
- * agent turn: refuses when today's budget is spent, then reserves one of the
+ * agent turn: refuses once today's budget reaches the degrade threshold (what
+ * is left is kept for customer conversations), then reserves one of the
  * workspace's hourly calls of `type`. The caller records the real tokens with
  * recordWorkspaceLlmCall(reservationId) once the model answers.
  */
@@ -31,11 +38,11 @@ export async function guardWorkspaceLlmCall(
 ): Promise<GuardOk | GuardFail> {
   try {
     const budget = await enforceCostPolicy(workspaceId);
-    if (budget.policy === "cut") {
+    if (budget.policy !== "allow") {
       return {
         ok: false,
         response: NextResponse.json(
-          { error: "El workspace ya usó su presupuesto diario de IA. Intenta mañana." },
+          { error: BUDGET_MESSAGE[budget.policy] },
           { status: 429 },
         ),
       };
