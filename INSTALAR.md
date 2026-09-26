@@ -255,17 +255,21 @@ su propia integración de WhatsApp (cada uno puede usar YCloud o Kapso).
 
   Por eso conviene probar la conexión antes de guardar, y cambiar en un momento
   de poco tráfico.
-- **En los logs de Vercel sale `reserve_llm_turn is missing` o
-  `sum_daily_llm_tokens is missing`:** desplegaste antes de `db-push`. El agente
-  sigue respondiendo, pero sin el tope por hora ni el presupuesto diario hasta que
-  corras `setup.mjs db-push`.
+- **En los logs de Vercel sale `[db] reserve_llm_turn is missing`,
+  `[db] sum_daily_llm_tokens is missing` o `[db] reserve_workspace_llm_call is
+  missing`:** desplegaste antes de `db-push`. El agente sigue respondiendo y los
+  topes siguen aplicando con lecturas directas (menos exactas ante mensajes
+  simultáneos) hasta que corras `setup.mjs db-push`.
 - **Hay eventos `batch_dead_letter` y el agente no contestó:** el lote falló y agotó
   sus 3 reintentos; el `error` del evento dice por qué. Si fue al revisar el presupuesto
   (`reserve_llm_turn failed` / `sum_daily_llm_tokens failed`), la base no respondió
   en ese momento: revisa el estado de tu proyecto de Supabase.
-- **"URL no permitida" al agregar una URL a la base de conocimiento:** solo se leen
-  páginas públicas. Se rechazan las IPs privadas o internas (también detrás de un
-  redirect) y los sitios que solo tienen IPv6. Se siguen hasta 3 redirects.
+- **Al agregar una URL a la base de conocimiento:** solo se leen páginas públicas.
+  Se siguen hasta 3 redirects y cada destino se revisa igual que la URL original.
+  - **"URL no permitida":** la URL o un redirect apunta a una IP privada o interna.
+  - **"No se encontró el dominio de la URL (o solo tiene IPv6, que no se admite)":**
+    el dominio no existe, o solo tiene direcciones IPv6.
+  - **"La página redirige demasiadas veces":** más de 3 redirects.
 
 ## Actualizar a una versión nueva
 
@@ -285,16 +289,33 @@ las migraciones, así que las migraciones van **antes** de `vercel --prod`.
 
 **Cambios de permisos y límites (versión de finales de sep-2026):**
 
-- Solo un **admin** del workspace guarda cambios en **Integraciones**; un manager
-  las ve y puede probar la conexión.
+- En **Configuración → Integraciones** (WhatsApp, OpenRouter y HighLevel) solo un
+  **admin** del workspace guarda cambios; un manager las ve y puede probar la
+  conexión. Los ajustes del juez Jev (pestaña Agentes) y activar o configurar
+  tools siguen abiertos a managers.
+- Probar HighLevel y cargar sus pipelines pide rol **manager** o superior.
+- Agentes y viewers ya no ven la configuración de tools ni de integraciones, ni el
+  costo LLM del dashboard, ni el panel de observabilidad del inbox; el catálogo de
+  tools se les muestra en solo lectura.
 - Generar una plantilla con IA pide rol **manager** o superior.
 - Por workspace y por hora: hasta **20** plantillas generadas con IA y **60**
   mensajes en la prueba de agentes. Sus tokens cuentan en el presupuesto diario.
+- Los modelos de agentes y de OpenRouter se eligen solo del catálogo. Un modelo
+  guardado antes que ya no esté en el catálogo sigue funcionando en las
+  conversaciones, pero la prueba de agentes pide cambiarlo.
 - El presupuesto diario sigue en **1,000,000 tokens** por workspace (se reinicia a
-  las 00:00 UTC); desde 800,000 el agente responde con un modelo más barato.
-- El panel de observabilidad del inbox es solo para admins y managers.
+  las 00:00 UTC):
+  - desde **800,000** el agente responde con un modelo más barato (con el prompt
+    completo), y se pausan las plantillas con IA y la prueba de agentes; queda un
+    evento `cost_alert` al día;
+  - al llegar a **1,000,000** el agente deja de responder con IA hasta el día
+    siguiente; queda un evento `cost_cut` al día.
 - Si al revisar el presupuesto la base no responde, el lote se reintenta (y tras 3
-  reintentos queda como `batch_dead_letter` en `events`) en vez de perderse sin aviso.
+  reintentos queda como `batch_dead_letter` en `events`) en vez de perderse sin
+  aviso. El reintento no gasta otro turno del tope por hora.
+- El tool **Webhook personalizado** sigue hasta 3 redirects, siempre por HTTPS y
+  revisando cada destino. Así funcionan, por ejemplo, las web apps de Google Apps
+  Script, que responden a cada POST con un redirect después de ejecutarlo.
 
 **Si instalaste desde la antigua rama `provider/kapso`** (Kapso), cámbiate a `main`,
 donde ahora viven los dos proveedores. Cada workspace sigue con el proveedor que
@@ -314,6 +335,13 @@ vercel --prod
 
 `db-push` marca como revertidas las dos migraciones que solo existían en esa rama
 (`20260731000000/1`; su contenido ya viene en las de `main`) y aplica las nuevas.
+
+**Si además aplicaste ramas de los PRs #8 o #9 de la comunidad** (Francisco
+Velásquez), `db-push` también marca como revertidas sus versiones que `main` no
+tiene (la lista está en `scripts/setup.mjs`); si no, `supabase db push` se niega a
+seguir. Eso solo destraba el historial: lo que esas migraciones crearon sigue en
+tu base. Lo que `main` adoptó de ellas vuelve con versiones nuevas que se pueden
+aplicar encima.
 
 **Una sola vez, si tu instalación es anterior al 26-sep-2026** (endurecimiento de
 seguridad entre workspaces):
