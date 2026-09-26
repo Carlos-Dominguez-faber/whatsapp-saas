@@ -4,7 +4,7 @@
  */
 
 import { createClient as createSbClient } from "@supabase/supabase-js";
-import { fetchYCloudTemplates } from "./ycloud-client";
+import { fetchYCloudTemplates, templateOfficialId } from "./ycloud-client";
 import { fetchKapsoTemplates } from "./kapso-client";
 import {
   decryptWhatsAppCredentials,
@@ -200,7 +200,7 @@ export async function syncTemplates(
           body_template: bodyTemplate,
           components: t.components ?? {},
           variables,
-          provider_template_id: typeof t.id === "string" ? t.id : null,
+          provider_template_id: templateOfficialId(t),
           rejection_reason: null,
           updated_at: new Date().toISOString(),
         },

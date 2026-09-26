@@ -200,8 +200,38 @@ export async function fetchYCloudTemplates(apiKey: string): Promise<unknown[]> {
     );
   }
 
-  const data = responseBody as Record<string, unknown>;
-  return Array.isArray(data.records) ? data.records : [];
+  return templateListItems(responseBody);
+}
+
+/**
+ * The list endpoint returns its page as `items` (YCloud's paginated shape).
+ * `records` is accepted as a fallback; anything else is logged — keys only,
+ * never the payload — so a changed envelope doesn't sync 0 templates silently.
+ */
+export function templateListItems(body: unknown): unknown[] {
+  const data = (body ?? {}) as Record<string, unknown>;
+  if (Array.isArray(data.items)) return data.items;
+  if (Array.isArray(data.records)) {
+    console.warn("[ycloud] template list came back as `records`, not `items`");
+    return data.records;
+  }
+  console.warn(
+    "[ycloud] template list has neither `items` nor `records`; keys:",
+    Object.keys(data),
+  );
+  return [];
+}
+
+/**
+ * The template's id for Meta. YCloud reports it as `officialTemplateId`; `id`
+ * is only a fallback for shapes that carry Meta's id there.
+ */
+export function templateOfficialId(template: unknown): string | null {
+  const t = (template ?? {}) as Record<string, unknown>;
+  for (const value of [t.officialTemplateId, t.id]) {
+    if (typeof value === "string" && value) return value;
+  }
+  return null;
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -328,9 +358,9 @@ export async function createYCloudTemplate(
     );
   }
 
-  const data = responseBody as Record<string, unknown>;
+  const data = (responseBody ?? {}) as Record<string, unknown>;
   return {
-    id: typeof data.id === "string" ? data.id : "",
+    id: templateOfficialId(data) ?? "",
     status: typeof data.status === "string" ? data.status : "PENDING",
   };
 }
