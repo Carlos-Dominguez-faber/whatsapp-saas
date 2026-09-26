@@ -247,8 +247,9 @@ su propia integración de WhatsApp (cada uno puede usar YCloud o Kapso).
 - **Qué pasa con lo que estaba en curso al cambiar de proveedor:**
   - una respuesta que la IA estaba generando sale por el proveedor **nuevo**;
   - si ese envío falla (por ejemplo, una API Key equivocada), la respuesta queda en
-    el inbox como mensaje **fallido**, con el error; la conversación no se
-    reintenta sola, así que reenvíala desde el inbox;
+    el inbox como mensaje **fallido**, con el motivo; solo se reintenta sola cuando
+    WhatsApp la rechazó por límite de envío, así que en los demás casos reenvíala
+    desde el inbox;
   - los mensajes que ya había enviado el proveedor anterior se quedan en su último
     estado (por ejemplo "enviado"): sus avisos de entregado/leído llegan a un
     webhook que ya responde 401.
@@ -260,6 +261,18 @@ su propia integración de WhatsApp (cada uno puede usar YCloud o Kapso).
   missing`:** desplegaste antes de `db-push`. El agente sigue respondiendo y los
   topes siguen aplicando con lecturas directas (menos exactas ante mensajes
   simultáneos) hasta que corras `setup.mjs db-push`.
+- **En los logs de Vercel sale `[db] upsert_batch_and_link_message is missing`:**
+  desplegaste antes de `db-push`. Los mensajes se siguen agrupando con el método
+  anterior (dos escrituras, sin la garantía de no perder uno) hasta que corras
+  `setup.mjs db-push`.
+- **Un mensaje saliente quedó en rojo:** toca el ícono: dice por qué falló (número
+  sin WhatsApp, ventana de 24 horas vencida, plantilla pausada…). El detalle
+  técnico queda en la tabla `message_errors`, que solo se lee desde el servidor
+  (Supabase → Table Editor).
+- **La conversación pasó a "en espera de un asesor" sin que nadie lo pidiera:**
+  puede ser el juez Jev, el tope diario de IA con el traspaso activado, o una
+  respuesta vacía del modelo después de usar una tool (por ejemplo, agendó y no
+  confirmó): en ese caso una persona confirma, en vez de repetir la tool.
 - **Hay eventos `batch_dead_letter` y el agente no contestó:** el lote falló y agotó
   sus 3 reintentos; el `error` del evento dice por qué. Si fue al revisar el presupuesto
   (`reserve_llm_turn failed` / `sum_daily_llm_tokens failed`), la base no respondió
@@ -324,6 +337,36 @@ las migraciones, así que las migraciones van **antes** de `vercel --prod`.
   Script, que responden a cada POST con un redirect después de ejecutarlo. Si el
   webhook respondió al POST con un redirect y un salto posterior falla, la llamada
   cuenta como entregada: el webhook ya la recibió, y el agente no la repite.
+
+**Cambios en el buffer y los envíos (Fase 2, finales de sep-2026):**
+
+- Un mensaje fallido muestra el motivo en español al tocar su ícono rojo. Las
+  plantillas de autenticación (códigos de verificación) ya no se envían a
+  revisión: WhatsApp solo las acepta desde su biblioteca oficial.
+- Los mensajes enviados por **YCloud** ahora avanzan a entregado y leído (antes
+  se quedaban en "enviado").
+- Las respuestas con botones o listas, los pedidos del catálogo, las ubicaciones y
+  las reacciones le llegan al agente como texto, no como "[Multimedia]".
+- El buffer procesa **un lote por conversación a la vez**. La respuesta de la IA
+  se guarda antes de enviarse: si el envío falla y se reintenta, se reenvía el
+  mismo texto sin volver a llamar al modelo ni a sus tools. Solo se reintenta
+  cuando WhatsApp la rechazó por límite de envío; si pudo haber salido, queda como
+  fallida en vez de arriesgar un duplicado.
+- Si una persona toma la conversación mientras la IA está respondiendo, esa
+  respuesta ya no se envía.
+- Un lote atorado (la función murió a medio turno) se retoma a los 7 minutos, con
+  un máximo de 3 intentos; después queda como `batch_dead_letter` en `events`.
+  Los mensajes que se quedaron sin lote se recuperan solos en el siguiente minuto.
+- **Nuevo ajuste, apagado por defecto:** Configuración → Integraciones → WhatsApp →
+  "Pasar a una persona si se acaba el presupuesto diario de IA".
+- Los horarios de HighLevel se consultan en la zona horaria del negocio
+  (Configuración → Negocio) si el agente no pide otra.
+- La sincronización de plantillas de **YCloud** ahora sí trae tus plantillas (antes
+  traía cero). Después de actualizar, sincroniza en Configuración → Templates y revisa
+  que aparezcan.
+- Las rutas del buffer pueden durar hasta 300 segundos. Vercel lo permite en el
+  plan Hobby con **Fluid Compute**, que viene activo en proyectos nuevos; en uno
+  viejo, actívalo en Vercel → Settings → Functions.
 
 **Si instalaste desde la antigua rama `provider/kapso`** (Kapso), cámbiate a `main`,
 donde ahora viven los dos proveedores. Cada workspace sigue con el proveedor que
