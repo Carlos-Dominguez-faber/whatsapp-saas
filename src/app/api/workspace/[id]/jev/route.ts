@@ -6,6 +6,10 @@ import {
 } from "@/lib/auth/workspace-access";
 import { JevPatchSchema } from "@/features/jev-judge/schema";
 import { writeJevPatch } from "@/features/jev-judge/uses";
+import {
+  WHATSAPP_PROVIDER,
+  WHATSAPP_PROVIDER_LABEL,
+} from "@/features/inbox/services/whatsapp-provider";
 
 export async function PATCH(
   req: NextRequest,
@@ -30,12 +34,14 @@ export async function PATCH(
     .from("integrations")
     .select("id, config")
     .eq("workspace_id", workspaceId)
-    .eq("provider", "ycloud")
+    .eq("provider", WHATSAPP_PROVIDER)
     .maybeSingle();
 
   if (!existing) {
     return NextResponse.json(
-      { error: "Conecta YCloud en Integraciones antes de prender Jev." },
+      {
+        error: `Conecta ${WHATSAPP_PROVIDER_LABEL} en Integraciones antes de prender Jev.`,
+      },
       { status: 409 },
     );
   }

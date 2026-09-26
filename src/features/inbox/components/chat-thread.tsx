@@ -46,7 +46,7 @@ interface ChatThreadProps {
 export function ChatThread({
   conversation,
   initialMessages,
-  currentUserId: _currentUserId,
+  currentUserId,
   role = "agent",
 }: ChatThreadProps) {
   const messages = useRealtimeMessages(conversation.id, initialMessages);
@@ -60,6 +60,14 @@ export function ChatThread({
   const [note, setNote] = useState("");
   const [savingNote, setSavingNote] = useState(false);
   const router = useRouter();
+
+  // Mirrors the conversations UPDATE policy the server enforces for toggling
+  // the AI and handing a thread back to it: admins, managers, or the member
+  // the thread is assigned to.
+  const canUpdateConversation =
+    role === "admin" ||
+    role === "manager" ||
+    conversation.assigned_to === currentUserId;
 
   const isWindowExpired =
     conversation.window_expires_at != null &&
@@ -243,8 +251,8 @@ export function ChatThread({
               </RoleGate>
             )}
 
-            {/* Return to AI — gated by role (human_active only) */}
-            {conversation.state === "human_active" && (
+            {/* Return to AI — human_active only, for whoever may update it */}
+            {conversation.state === "human_active" && canUpdateConversation && (
               <RoleGate role={role} check={canTakeConversation}>
                 <Button
                   type="button"
@@ -295,10 +303,12 @@ export function ChatThread({
             >
               <User className="h-4 w-4" aria-hidden="true" />
             </Button>
-            <AiToggleButton
-              conversationId={conversation.id}
-              initialEnabled={conversation.ai_enabled}
-            />
+            {canUpdateConversation && (
+              <AiToggleButton
+                conversationId={conversation.id}
+                initialEnabled={conversation.ai_enabled}
+              />
+            )}
           </div>
         </header>
 
@@ -334,15 +344,14 @@ export function ChatThread({
             noteMode && "bg-warning/5 border-warning/20",
           )}
         >
-          {isWindowExpired ? (
-            <TemplatePicker
-              conversationId={conversation.id}
-              workspaceId={conversation.workspace_id}
-            />
-          ) : !canSendMessages(role) ? (
+          {/* Permissions first: with the 24h window closed, a viewer must still
+              see "read only", not a template picker offering to send. */}
+          {!canSendMessages(role) ? (
             <p className="py-2 text-center text-xs text-muted-foreground/60 select-none">
               Solo lectura — sin permisos para enviar mensajes
             </p>
+          ) : isWindowExpired ? (
+            <TemplatePicker conversationId={conversation.id} />
           ) : noteMode ? (
             /* ── Note mode composer ───────────────────────────── */
             <div className="space-y-2">

@@ -266,17 +266,77 @@ async function cmdSiteUrl() {
   const ref = deriveRef(env.NEXT_PUBLIC_SUPABASE_URL);
   if (!ref) fail("No pude derivar el project-ref de NEXT_PUBLIC_SUPABASE_URL.");
   if (!mgmtToken()) {
-    warn("Sin SUPABASE_ACCESS_TOKEN — hazlo manual en Supabase → Authentication → URL Configuration:");
-    log(`   Site URL     = ${appUrl}`);
-    log(`   Redirect URL = ${appUrl}/**`);
+    warn("Sin SUPABASE_ACCESS_TOKEN — hazlo manual en Supabase → Authentication:");
+    log(`   URL Configuration → Site URL     = ${appUrl}`);
+    log(`   URL Configuration → Redirect URL = ${appUrl}/**`);
+    log(`   Sign In / Providers → desactiva "Allow new users to sign up"`);
     return;
   }
+  // disable_signup: the app's /signup is invite-only, but Supabase Auth's own
+  // /auth/v1/signup accepts the public anon key. Users are created through the
+  // Admin API (seed-admin, agency panel, team invites), which keeps working.
   const res = await mgmtCall("PATCH", `/v1/projects/${ref}/config/auth`, {
     site_url: appUrl,
     uri_allow_list: `${appUrl}/**`,
+    disable_signup: true,
   });
   if (!res.ok) fail(`Management API (config/auth) falló ${res.status}: ${JSON.stringify(res.data)}`);
-  ok(`Site URL = ${appUrl} · Redirect = ${appUrl}/** (vía Management API)`);
+  ok(`Site URL = ${appUrl} · Redirect = ${appUrl}/** · registro público cerrado (vía Management API)`);
+}
+
+// Is Supabase Auth's own /auth/v1/signup closed? Public endpoint, no token.
+async function signupIsClosed(env) {
+  const url = (env.NEXT_PUBLIC_SUPABASE_URL || "").replace(/\/+$/, "");
+  const anon = env.NEXT_PUBLIC_SUPABASE_ANON_KEY || "";
+  if (!url || isPlaceholder(anon)) return null;
+  try {
+    const res = await fetch(`${url}/auth/v1/settings`, { headers: { apikey: anon } });
+    if (!res.ok) return null;
+    const settings = await res.json();
+    return settings?.disable_signup === true;
+  } catch {
+    return null;
+  }
+}
+
+// Closes public signup ONLY — unlike site-url it leaves Site URL and Redirect
+// URLs alone, so it is safe on an install that customized them. Exits non-zero
+// unless it could confirm signup is closed.
+async function cmdCloseSignup() {
+  const env = readEnvFile(ENV_PATH);
+  let patched = false;
+  if (mgmtToken()) {
+    const ref = deriveRef(env.NEXT_PUBLIC_SUPABASE_URL);
+    if (!ref) fail("No pude derivar el project-ref de NEXT_PUBLIC_SUPABASE_URL.");
+    const res = await mgmtCall("PATCH", `/v1/projects/${ref}/config/auth`, {
+      disable_signup: true,
+    });
+    if (!res.ok) fail(`Management API (config/auth) falló ${res.status}: ${JSON.stringify(res.data)}`);
+    patched = true;
+  } else {
+    warn('Sin SUPABASE_ACCESS_TOKEN — hazlo manual: Supabase → Authentication → Sign In / Providers → desactiva "Allow new users to sign up" → Save.');
+  }
+
+  // Auth may take a few seconds to pick up the new config after the PATCH.
+  let closed = await signupIsClosed(env);
+  for (let i = 0; patched && closed === false && i < 10; i++) {
+    await new Promise((r) => setTimeout(r, 3000));
+    closed = await signupIsClosed(env);
+  }
+
+  if (closed === true) {
+    ok("Registro público de Supabase Auth: cerrado.");
+  } else if (closed === false) {
+    fail(
+      patched
+        ? "El registro público de Supabase Auth sigue ABIERTO tras el cambio; revisa el toggle a mano."
+        : "El registro público de Supabase Auth sigue ABIERTO. Desactívalo y vuelve a correr close-signup.",
+    );
+  } else {
+    fail(
+      "No pude verificar /auth/v1/settings (¿faltan NEXT_PUBLIC_SUPABASE_URL o NEXT_PUBLIC_SUPABASE_ANON_KEY en .env.local?). Revisa el toggle a mano.",
+    );
+  }
 }
 
 function cmdVercelEnv() {
@@ -341,7 +401,8 @@ Uso: node scripts/setup.mjs <comando>
   set-app-url U  Setea NEXT_PUBLIC_APP_URL a la URL de prod (post-deploy)
   cron-sql       Imprime el SQL del cron para pegar en el SQL Editor (manual)
   cron-apply     Agenda el cron vía Management API (necesita SUPABASE_ACCESS_TOKEN)
-  site-url       Setea Site URL + Redirect en Supabase vía Management API (idem)
+  site-url       Setea Site URL + Redirect y cierra el registro público (idem)
+  close-signup   Solo cierra el registro público de Supabase Auth y lo verifica
   vercel-env     Empuja las vars de .env.local a Vercel production
   doctor         Revisa prerequisitos y qué keys faltan
   help           Muestra esta ayuda
@@ -373,6 +434,9 @@ switch (cmd) {
     break;
   case "site-url":
     await cmdSiteUrl();
+    break;
+  case "close-signup":
+    await cmdCloseSignup();
     break;
   case "vercel-env":
     cmdVercelEnv();

@@ -102,6 +102,12 @@ npm run dev                        # http://localhost:3000
 
 Otros comandos: `npm run build`, `npm run lint`, `npm run typecheck`.
 
+Pruebas:
+
+- `npm run test:unit` — pruebas unitarias con `node --test` (Node ≥ 22.18).
+- `supabase test db` — pruebas de seguridad de la base (pgTAP, en
+  `supabase/tests/`) contra un Supabase local (`supabase start`).
+
 ## El cron del buffer
 
 El inbox agrupa los mensajes entrantes en _batches_ que un worker debe drenar
@@ -122,7 +128,7 @@ supabase/
 └── cron/       # SQL post-deploy del buffer-flush
 scripts/
 ├── setup.mjs       # Orquestador de instalación (secrets, env, db, cron)
-└── seed-admin.mjs  # Super admin + workspace demo
+└── seed-admin.mjs  # Crea el super admin
 ```
 
 ## Variables de entorno

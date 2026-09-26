@@ -10,6 +10,7 @@ import { trackJudgment } from "@/features/jev-judge/observe";
 import { previewWithoutJev } from "@/features/jev-judge/preview";
 import { checkBenchRateLimit } from "@/features/jev-judge/rate-limit";
 import { BenchTextSchema, JudgeViewSchema } from "@/features/jev-judge/schema";
+import { WHATSAPP_PROVIDER } from "@/features/inbox/services/whatsapp-provider";
 
 const MODEL = "jev-latest";
 
@@ -104,7 +105,7 @@ async function savedUses(workspaceId: string): Promise<JevUses> {
     .from("integrations")
     .select("config")
     .eq("workspace_id", workspaceId)
-    .eq("provider", "ycloud")
+    .eq("provider", WHATSAPP_PROVIDER)
     .maybeSingle();
   return readJevUses(data?.config);
 }

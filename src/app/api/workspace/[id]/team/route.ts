@@ -41,6 +41,75 @@ function svc() {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
+// Role ceiling
+//
+// memberships' RLS reserves writes to admins, but these handlers write with the
+// service role and let managers in, so the ceiling lives here: a manager runs
+// day-to-day staffing (agents, viewers) but can neither grant manager/admin nor
+// touch a manager's or admin's membership — otherwise a manager could promote
+// themselves or deactivate the admins. An admin can do anything except leave
+// the workspace without an active admin.
+// ──────────────────────────────────────────────────────────────────────────────
+
+type Role = z.infer<typeof RoleEnum>;
+
+const RANK: Record<Role, number> = { viewer: 0, agent: 1, manager: 2, admin: 3 };
+
+function withinCeiling(actor: Role, role: Role): boolean {
+  return actor === "admin" || RANK[role] < RANK[actor];
+}
+
+const FORBIDDEN_ROLE = () =>
+  NextResponse.json(
+    { error: "No tienes permiso para asignar o modificar ese rol" },
+    { status: 403 },
+  );
+
+const LAST_ADMIN = () =>
+  NextResponse.json(
+    { error: "El espacio de trabajo debe conservar al menos un admin activo" },
+    { status: 409 },
+  );
+
+async function loadMembership(
+  db: ReturnType<typeof svc>,
+  workspaceId: string,
+  userId: string,
+): Promise<{ role: Role; is_active: boolean } | null> {
+  const { data, error } = await db
+    .from("memberships")
+    .select("role, is_active")
+    .eq("workspace_id", workspaceId)
+    .eq("user_id", userId)
+    .maybeSingle();
+  if (error) throw new Error(`membership lookup failed: ${error.message}`);
+  return (data as { role: Role; is_active: boolean } | null) ?? null;
+}
+
+/** True when `userId` is the only active admin and the change removes that. */
+async function removesLastAdmin(
+  db: ReturnType<typeof svc>,
+  workspaceId: string,
+  userId: string,
+  current: { role: Role; is_active: boolean },
+  next: { role: Role; is_active: boolean },
+): Promise<boolean> {
+  const wasAdmin = current.role === "admin" && current.is_active;
+  const staysAdmin = next.role === "admin" && next.is_active;
+  if (!wasAdmin || staysAdmin) return false;
+
+  const { count, error } = await db
+    .from("memberships")
+    .select("user_id", { count: "exact", head: true })
+    .eq("workspace_id", workspaceId)
+    .eq("role", "admin")
+    .eq("is_active", true)
+    .neq("user_id", userId);
+  if (error) throw new Error(`admin count failed: ${error.message}`);
+  return (count ?? 0) === 0;
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
 // GET /api/workspace/[id]/team
 // Returns all memberships with user email, role, is_active, created_at
 // ──────────────────────────────────────────────────────────────────────────────
@@ -72,7 +141,11 @@ export async function GET(
     .order("created_at", { ascending: true });
 
   if (error) {
-    return NextResponse.json({ error: error.message }, { status: 500 });
+    console.error("[GET /api/workspace/[id]/team] list error:", error.message);
+    return NextResponse.json(
+      { error: "No se pudo cargar el equipo. Intenta de nuevo." },
+      { status: 500 },
+    );
   }
 
   // Flatten nested users join into a flat member shape
@@ -126,6 +199,7 @@ export async function POST(
   }
 
   const { email, role, password } = parsed.data;
+  if (!withinCeiling(auth.role, role)) return FORBIDDEN_ROLE();
   const db = svc();
 
   // Provision the account directly — no invite email / SMTP. The agency shares
@@ -142,6 +216,28 @@ export async function POST(
           err instanceof Error ? err.message : "No se pudo crear el usuario",
       },
       { status: 400 },
+    );
+  }
+
+  // Re-inviting an existing member rewrites their role: same ceiling as PATCH.
+  try {
+    const existing = await loadMembership(db, workspaceId, provisioned.userId);
+    if (existing) {
+      if (!withinCeiling(auth.role, existing.role)) return FORBIDDEN_ROLE();
+      if (
+        await removesLastAdmin(db, workspaceId, provisioned.userId, existing, {
+          role,
+          is_active: true,
+        })
+      ) {
+        return LAST_ADMIN();
+      }
+    }
+  } catch (err) {
+    console.error("[POST /api/workspace/[id]/team] ceiling check:", err);
+    return NextResponse.json(
+      { error: "No se pudo verificar el miembro. Intenta de nuevo." },
+      { status: 500 },
     );
   }
 
@@ -199,6 +295,30 @@ export async function PATCH(
   const { userId, role, is_active } = parsed.data;
   const db = svc();
 
+  try {
+    const current = await loadMembership(db, workspaceId, userId);
+    if (!current) {
+      return NextResponse.json({ error: "Miembro no encontrado" }, { status: 404 });
+    }
+    if (!withinCeiling(auth.role, current.role)) return FORBIDDEN_ROLE();
+    if (role !== undefined && !withinCeiling(auth.role, role)) {
+      return FORBIDDEN_ROLE();
+    }
+    const next = {
+      role: role ?? current.role,
+      is_active: is_active ?? current.is_active,
+    };
+    if (await removesLastAdmin(db, workspaceId, userId, current, next)) {
+      return LAST_ADMIN();
+    }
+  } catch (err) {
+    console.error("[PATCH /api/workspace/[id]/team] ceiling check:", err);
+    return NextResponse.json(
+      { error: "No se pudo verificar el miembro. Intenta de nuevo." },
+      { status: 500 },
+    );
+  }
+
   const updates: Record<string, unknown> = {
     updated_at: new Date().toISOString(),
   };
@@ -211,8 +331,13 @@ export async function PATCH(
     .eq("workspace_id", workspaceId)
     .eq("user_id", userId);
 
-  if (error)
-    return NextResponse.json({ error: error.message }, { status: 500 });
+  if (error) {
+    console.error("[PATCH /api/workspace/[id]/team] update error:", error.message);
+    return NextResponse.json(
+      { error: "No se pudo actualizar el miembro. Intenta de nuevo." },
+      { status: 500 },
+    );
+  }
 
   return NextResponse.json({ ok: true });
 }
@@ -247,14 +372,41 @@ export async function DELETE(
   const { userId } = parsed.data;
   const db = svc();
 
+  try {
+    const current = await loadMembership(db, workspaceId, userId);
+    if (!current) {
+      return NextResponse.json({ error: "Miembro no encontrado" }, { status: 404 });
+    }
+    if (!withinCeiling(auth.role, current.role)) return FORBIDDEN_ROLE();
+    if (
+      await removesLastAdmin(db, workspaceId, userId, current, {
+        role: current.role,
+        is_active: false,
+      })
+    ) {
+      return LAST_ADMIN();
+    }
+  } catch (err) {
+    console.error("[DELETE /api/workspace/[id]/team] ceiling check:", err);
+    return NextResponse.json(
+      { error: "No se pudo verificar el miembro. Intenta de nuevo." },
+      { status: 500 },
+    );
+  }
+
   const { error } = await db
     .from("memberships")
     .update({ is_active: false, updated_at: new Date().toISOString() })
     .eq("workspace_id", workspaceId)
     .eq("user_id", userId);
 
-  if (error)
-    return NextResponse.json({ error: error.message }, { status: 500 });
+  if (error) {
+    console.error("[DELETE /api/workspace/[id]/team] remove error:", error.message);
+    return NextResponse.json(
+      { error: "No se pudo quitar al miembro. Intenta de nuevo." },
+      { status: 500 },
+    );
+  }
 
   return NextResponse.json({ ok: true });
 }
