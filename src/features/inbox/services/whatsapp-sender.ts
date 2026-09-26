@@ -35,6 +35,20 @@ export interface WhatsAppSender {
   }): Promise<SendResult>;
 }
 
+/**
+ * Without the id it sends from, the provider API answers with an opaque error
+ * (Kapso even gets an empty path segment). Name the missing setting instead:
+ * dispatch stores this message on the failed outbound, where the team sees it.
+ */
+function requireSenderId(value: string, what: string, label: string): string {
+  if (!value.trim()) {
+    throw new Error(
+      `Falta ${what} de ${label}: complétalo en Configuración → Integraciones → WhatsApp`,
+    );
+  }
+  return value;
+}
+
 export function whatsappSender(
   provider: WhatsAppProvider,
   credentials: Record<string, unknown>,
@@ -45,19 +59,26 @@ export function whatsappSender(
   const label = WHATSAPP_PROVIDER_LABELS[provider];
 
   if (provider === "kapso") {
-    const phoneNumberId = (config.phone_number_id as string | undefined) ?? "";
+    const configured = (config.phone_number_id as string | undefined) ?? "";
+    const phoneNumberId = () =>
+      requireSenderId(configured, "el Phone Number ID", label);
     return {
       provider,
       label,
       live,
       async sendText(to, body) {
-        const sent = await kapso.sendText({ apiKey, phoneNumberId, to, body });
+        const sent = await kapso.sendText({
+          apiKey,
+          phoneNumberId: phoneNumberId(),
+          to,
+          body,
+        });
         return { wamid: sent.wamid || undefined };
       },
       async sendTemplate({ to, templateName, language, components }) {
         const sent = await kapso.sendTemplate({
           apiKey,
-          phoneNumberId,
+          phoneNumberId: phoneNumberId(),
           to,
           templateName,
           language,
@@ -68,13 +89,14 @@ export function whatsappSender(
     };
   }
 
-  const from = (config.phone_number as string | undefined) ?? "";
+  const configured = (config.phone_number as string | undefined) ?? "";
+  const from = () => requireSenderId(configured, "el número de WhatsApp", label);
   return {
     provider,
     label,
     live,
     async sendText(to, body) {
-      const sent = await ycloud.sendText({ apiKey, from, to, body });
+      const sent = await ycloud.sendText({ apiKey, from: from(), to, body });
       return {
         wamid: sent.wamid || undefined,
         providerMessageId: sent.id || undefined,
@@ -83,7 +105,7 @@ export function whatsappSender(
     async sendTemplate({ to, templateName, language, components }) {
       const sent = await ycloud.sendTemplate({
         apiKey,
-        from,
+        from: from(),
         to,
         templateName,
         language,
