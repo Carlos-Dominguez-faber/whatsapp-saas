@@ -47,6 +47,39 @@ export const WORKSPACE_WHATSAPP_SETTINGS = [
   "jev_opt_out",
 ] as const;
 
+/** Where each provider keeps the id it sends from. */
+const SENDER_ID_KEY: Record<WhatsAppProvider, string> = {
+  ycloud: "phone_number", // the E.164 number
+  kapso: "phone_number_id", // Meta's phone number id
+};
+
+function present(value: unknown): boolean {
+  return typeof value === "string" && value.trim() !== "";
+}
+
+/**
+ * What a provider still lacks before it can be a workspace's active one: the
+ * API key, the webhook signing secret and the id it sends from. Without any of
+ * them nothing goes out (or nothing comes in), so activating it would leave
+ * the workspace silent. Returns user-facing labels; empty means ready.
+ * `credentials` may be encrypted — only presence is checked.
+ */
+export function missingWhatsAppFields(
+  provider: WhatsAppProvider,
+  credentials: Record<string, unknown>,
+  config: Record<string, unknown>,
+): string[] {
+  const missing: string[] = [];
+  if (!present(whatsappApiKey(provider, credentials))) missing.push("la API Key");
+  if (!present(credentials.webhook_signing_secret)) {
+    missing.push("el Webhook Signing Secret");
+  }
+  if (!present(config[SENDER_ID_KEY[provider]])) {
+    missing.push(provider === "kapso" ? "el Phone Number ID" : "el número de WhatsApp");
+  }
+  return missing;
+}
+
 export interface WhatsAppIntegrationRow {
   id: string;
   provider: WhatsAppProvider;
