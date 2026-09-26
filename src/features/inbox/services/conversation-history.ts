@@ -47,9 +47,12 @@ export async function getConversationHistory(
     excludeBatchId?: string;
     workspaceId?: string;
     /**
-     * Only messages up to this instant: the current batch's last message.
-     * Messages that arrived after it belong to a later batch and get their
-     * own turn — here they would read as already said.
+     * Inbound messages only up to this instant: the current batch's last
+     * message. Later inbound messages belong to a later batch and get their
+     * own turn — here they would read as already said. Outbound rows are
+     * never cut: a reply (the AI's or a person's) sent after this batch's
+     * last message — typically to the batch before it, while this one
+     * waited — is part of what the contact has already been told.
      */
     until?: string;
   },
@@ -66,7 +69,7 @@ export async function getConversationHistory(
     query = query.eq("workspace_id", opts.workspaceId);
   }
   if (opts.until) {
-    query = query.lte("created_at", opts.until);
+    query = query.or(`direction.eq.out,created_at.lte."${opts.until}"`);
   }
 
   if (opts.excludeBatchId) {
