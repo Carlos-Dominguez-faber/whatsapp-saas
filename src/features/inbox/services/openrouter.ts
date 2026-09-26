@@ -173,9 +173,10 @@ export async function generateReply(
     maxOutputTokens: 1024,
   });
 
-  // AI SDK v6 exposes inputTokens / outputTokens; map to stable naming
-  const promptTokens = result.usage?.inputTokens ?? 0;
-  const completionTokens = result.usage?.outputTokens ?? 0;
+  // AI SDK v6 exposes inputTokens / outputTokens; map to stable naming.
+  // totalUsage sums every step (usage is the last step only).
+  const promptTokens = result.totalUsage?.inputTokens ?? 0;
+  const completionTokens = result.totalUsage?.outputTokens ?? 0;
 
   return {
     text: result.text,
@@ -247,10 +248,12 @@ export async function generateChatReply(params: {
     }),
   );
 
+  // totalUsage, not usage: with tools the model runs up to 5 steps, and usage
+  // only reports the last one.
   return {
     text: result.text,
-    promptTokens: result.usage?.inputTokens ?? 0,
-    completionTokens: result.usage?.outputTokens ?? 0,
+    promptTokens: result.totalUsage?.inputTokens ?? 0,
+    completionTokens: result.totalUsage?.outputTokens ?? 0,
   };
 }
 
@@ -333,10 +336,12 @@ export async function generateWithTools(
     maxOutputTokens: 1024,
   });
 
+  // totalUsage, not usage: a tool turn runs up to 5 steps, and usage only
+  // reports the last one — the budget would see a fraction of the real spend.
   return {
     text: result.text,
-    inputTokens: result.usage?.inputTokens ?? 0,
-    outputTokens: result.usage?.outputTokens ?? 0,
+    inputTokens: result.totalUsage?.inputTokens ?? 0,
+    outputTokens: result.totalUsage?.outputTokens ?? 0,
     toolCallsExecuted: result.steps?.length ?? 0,
   };
 }
