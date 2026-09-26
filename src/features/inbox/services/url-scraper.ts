@@ -92,7 +92,8 @@ export async function fetchUrlText(rawUrl: string): Promise<string> {
       headers: {
         "User-Agent": "Mozilla/5.0 (compatible; AgenteWA-KB/1.0)",
         Accept: "text/html,application/xhtml+xml,text/plain",
-        "Accept-Encoding": "gzip, deflate, br",
+        // deflate is left out: servers disagree on its framing (zlib or raw).
+        "Accept-Encoding": "gzip, br",
       },
       timeoutMs: FETCH_TIMEOUT_MS,
       maxResponseBytes: MAX_HTML_BYTES,
@@ -138,7 +139,10 @@ function scrapeErrorMessage(err: unknown): string {
     return "URL no permitida";
   }
   if (message === "Tool timeout") return "La página tardó demasiado en responder";
-  if (message.startsWith("Unsupported content-encoding")) {
+  if (
+    message.startsWith("Unsupported content-encoding") ||
+    message.startsWith("Unreadable compressed body")
+  ) {
     return "La página respondió en un formato comprimido que no se puede leer";
   }
   return "No se pudo descargar la URL";

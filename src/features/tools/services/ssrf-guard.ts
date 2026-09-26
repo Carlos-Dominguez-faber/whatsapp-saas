@@ -3,7 +3,7 @@ import type { IncomingHttpHeaders, IncomingMessage } from "node:http";
 import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { isIPv4 } from "node:net";
-import type { Readable } from "node:stream";
+import { pipeline, type Readable } from "node:stream";
 import {
   createBrotliDecompress,
   createGunzip,
@@ -212,8 +212,10 @@ export function fetchPinned(
         const status = res.statusCode ?? 0;
         const resHeaders = res.headers ?? {};
         if (status >= 300 && status < 400) {
-          res.resume();
+          // Drop the connection instead of draining it: a redirect body that
+          // trickles in must not outlive the deadline.
           settled = true;
+          req.destroy();
           resolve({ status, headers: resHeaders, bodyText: "", truncated: false });
           return;
         }
@@ -222,15 +224,23 @@ export function fetchPinned(
         if (opts.decompress) {
           const decoder = decoderFor(res);
           if (decoder === "unsupported") {
-            res.resume();
             settled = true;
+            req.destroy();
             reject(
               new Error(`Unsupported content-encoding: ${res.headers["content-encoding"]}`),
             );
             return;
           }
           if (decoder) {
-            body = res.pipe(decoder);
+            // pipeline() propagates errors both ways: a compressed body that
+            // closes early, or bytes that are not what the header claims,
+            // fail right away instead of waiting for the deadline.
+            body = pipeline(res, decoder, (err) => {
+              if (!err || settled) return;
+              settled = true;
+              req.destroy();
+              reject(new Error(`Unreadable compressed body: ${err.message}`));
+            });
             // Only an abort (cap reached, deadline) tears the decoder down: on
             // a normal finish the request closes before the decoder has
             // flushed, and destroying it then would swallow its "end".
@@ -324,6 +334,16 @@ export class RedirectRefusedError extends Error {
   }
 }
 
+/**
+ * The status of the first response, attached to any error thrown after it
+ * arrived: the target already received the request even though a later hop
+ * failed (see custom_webhook).
+ */
+export function firstStatusOf(err: unknown): number | undefined {
+  const status = (err as { firstStatus?: unknown } | null)?.firstStatus;
+  return typeof status === "number" ? status : undefined;
+}
+
 export interface FollowRedirectOptions extends PinnedRequestOptions {
   /** Also accept http:// for the URL and every redirect target. */
   allowHttp?: boolean;
@@ -333,15 +353,33 @@ export interface FollowRedirectOptions extends PinnedRequestOptions {
   resolvedIp?: string;
 }
 
+const FOLLOWED_REDIRECTS = new Set([301, 302, 303, 307, 308]);
+
+// Headers that may cross to another origin (the CORS-safelisted ones plus the
+// agent and encoding). Anything else — Authorization, Proxy-Authorization,
+// Cookie, custom tokens — is dropped, as fetch() does.
+const CROSS_ORIGIN_HEADERS = new Set([
+  "accept",
+  "accept-encoding",
+  "accept-language",
+  "content-language",
+  "content-type",
+  "user-agent",
+]);
+
 /**
- * fetchPinned() that follows redirects safely: every target is validated like
- * a brand-new URL (scheme, private ranges) and fetched over a connection
- * pinned to the address that was checked. 301/302/303 continue as a GET
- * without body (what browsers and fetch() do); 307/308 keep the method and
- * body. One absolute deadline covers every hop.
+ * fetchPinned() that follows redirects the way fetch() does, safely: every
+ * target is validated like a brand-new URL (scheme, private ranges) and
+ * fetched over a connection pinned to the address that was checked.
+ *
+ * - 301/302 turn a POST into a GET without body; 303 turns anything but HEAD
+ *   into a GET; 307/308 keep method and body. 300 and 305 are not followed.
+ * - Only safelisted headers follow to another origin.
+ * - One absolute deadline covers every hop, DNS lookups included.
  *
  * Throws RedirectRefusedError when a hop fails validation, the location is
- * invalid, or there are more than `maxRedirects` redirects.
+ * invalid, or there are more than `maxRedirects` redirects. An error thrown
+ * after the first response carries its status (firstStatusOf).
  */
 export async function fetchPinnedFollowingRedirects(
   url: string,
@@ -350,65 +388,76 @@ export async function fetchPinnedFollowingRedirects(
   const deadline = Date.now() + opts.timeoutMs;
   const maxRedirects = opts.maxRedirects ?? 3;
   let current = url;
-  let method = opts.method;
+  let method = opts.method.toUpperCase();
   let body = opts.body;
   let headers = { ...opts.headers };
   let knownIp = opts.resolvedIp;
+  let firstStatus: number | undefined;
 
-  for (let hop = 0; ; hop++) {
-    const remaining = deadline - Date.now();
-    if (remaining <= 0) throw new Error("Tool timeout");
+  try {
+    for (let hop = 0; ; hop++) {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) throw new Error("Tool timeout");
 
-    let ip = knownIp;
-    if (!ip) {
-      const check = await validateWebhookUrl(current, {
-        allowHttp: opts.allowHttp,
-        dnsTimeoutMs: remaining,
-      });
-      if (check.error === "DNS lookup timed out") throw new Error("Tool timeout");
-      if (check.error || !check.resolvedIp) {
-        throw new RedirectRefusedError(check.error ?? "Cannot resolve hostname");
+      let ip = knownIp;
+      if (!ip) {
+        const check = await validateWebhookUrl(current, {
+          allowHttp: opts.allowHttp,
+          dnsTimeoutMs: Math.min(DEFAULT_DNS_TIMEOUT_MS, remaining),
+        });
+        if (check.error === "DNS lookup timed out") throw new Error("Tool timeout");
+        if (check.error || !check.resolvedIp) {
+          throw new RedirectRefusedError(check.error ?? "Cannot resolve hostname");
+        }
+        ip = check.resolvedIp;
       }
-      ip = check.resolvedIp;
-    }
-    knownIp = undefined;
+      knownIp = undefined;
 
-    const res = await fetchPinned(current, ip, {
-      method,
-      headers,
-      body,
-      timeoutMs: Math.max(1, deadline - Date.now()),
-      maxResponseBytes: opts.maxResponseBytes,
-      decompress: opts.decompress,
-    });
+      const res = await fetchPinned(current, ip, {
+        method,
+        headers,
+        body,
+        timeoutMs: Math.max(1, deadline - Date.now()),
+        maxResponseBytes: opts.maxResponseBytes,
+        decompress: opts.decompress,
+      });
+      firstStatus ??= res.status;
 
-    const location = res.headers.location;
-    if (res.status < 300 || res.status >= 400 || res.status === 304 || !location) {
-      return { ...res, url: current };
-    }
-    if (hop >= maxRedirects) {
-      throw new RedirectRefusedError(`Too many redirects (more than ${maxRedirects})`);
-    }
+      const location = res.headers.location;
+      if (!FOLLOWED_REDIRECTS.has(res.status) || !location) {
+        return { ...res, url: current };
+      }
+      if (hop >= maxRedirects) {
+        throw new RedirectRefusedError(`Too many redirects (more than ${maxRedirects})`);
+      }
 
-    let next: URL;
-    try {
-      next = new URL(location, current);
-    } catch {
-      throw new RedirectRefusedError("Invalid redirect location");
+      let next: URL;
+      try {
+        next = new URL(location, current);
+      } catch {
+        throw new RedirectRefusedError("Invalid redirect location");
+      }
+      if (new URL(current).origin !== next.origin) {
+        headers = Object.fromEntries(
+          Object.entries(headers).filter(([k]) => CROSS_ORIGIN_HEADERS.has(k.toLowerCase())),
+        );
+      }
+      const toGet =
+        ((res.status === 301 || res.status === 302) && method === "POST") ||
+        (res.status === 303 && method !== "GET" && method !== "HEAD");
+      if (toGet) {
+        method = "GET";
+        body = undefined;
+        headers = Object.fromEntries(
+          Object.entries(headers).filter(([k]) => !/^content-(type|length)$/i.test(k)),
+        );
+      }
+      current = next.toString();
     }
-    if (new URL(current).origin !== next.origin) {
-      // Like fetch(): credentials meant for one host never follow to another.
-      headers = Object.fromEntries(
-        Object.entries(headers).filter(([k]) => !/^(authorization|cookie)$/i.test(k)),
-      );
+  } catch (err) {
+    if (firstStatus !== undefined && err instanceof Error) {
+      Object.assign(err, { firstStatus });
     }
-    if (res.status === 301 || res.status === 302 || res.status === 303) {
-      if (method !== "GET" && method !== "HEAD") method = "GET";
-      body = undefined;
-      headers = Object.fromEntries(
-        Object.entries(headers).filter(([k]) => !/^content-(type|length)$/i.test(k)),
-      );
-    }
-    current = next.toString();
+    throw err;
   }
 }

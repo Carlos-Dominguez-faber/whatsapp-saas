@@ -53,10 +53,12 @@ let resolvedIp: string | undefined = "8.8.8.8";
 const pinnedIps: string[] = [];
 class RedirectRefusedError extends Error {}
 let redirectRefusal: string | null = null;
+let refusalFirstStatus: number | undefined;
 mock.module("../services/ssrf-guard.ts", {
   exports: {
     validateWebhookUrl: async () => ({ error: sslCheckError, resolvedIp }),
     RedirectRefusedError,
+    firstStatusOf: (err: unknown) => (err as { firstStatus?: number }).firstStatus,
     // Delegates to globalThis.fetch so each test can stub the network, while
     // recording which IP the first hop was pinned to.
     fetchPinnedFollowingRedirects: async (
@@ -64,7 +66,9 @@ mock.module("../services/ssrf-guard.ts", {
       opts: { resolvedIp?: string; method: string; headers: Record<string, string>; body?: string },
     ) => {
       pinnedIps.push(opts.resolvedIp ?? "");
-      if (redirectRefusal) throw new RedirectRefusedError(redirectRefusal);
+      if (redirectRefusal) {
+        throw Object.assign(new RedirectRefusedError(redirectRefusal), { firstStatus: refusalFirstStatus });
+      }
       const res = await globalThis.fetch(url, {
         method: opts.method,
         headers: opts.headers,
@@ -82,6 +86,7 @@ const ctx: ToolContext = { workspaceId: "ws_1", conversationId: "conv_1", contac
 function reset() {
   responseQueue = [];
   redirectRefusal = null;
+  refusalFirstStatus = undefined;
   sslCheckError = null;
   resolvedIp = "8.8.8.8";
   pinnedIps.length = 0;
@@ -238,6 +243,23 @@ test("a redirect to a blocked target is reported as a failed call, not a crash",
     output: null,
     error: "Blocked: 10.0.0.5 is a private/internal IP address (SEC-08 anti-SSRF)",
   });
+});
+
+test("when the POST was answered with a redirect, a failed later hop still counts as delivered", async () => {
+  reset();
+  redirectRefusal = "Blocked: 10.0.0.5 is a private/internal IP address (SEC-08 anti-SSRF)";
+  refusalFirstStatus = 302;
+  responseQueue = [
+    { data: { id: "tool_1" }, error: null },
+    { data: { config: { webhook_url: "https://hooks.example/wh" } }, error: null },
+    { data: null, error: null },
+    { data: null, error: null },
+    { data: null, error: null },
+  ];
+  const result = await customWebhookTool.run({}, ctx);
+  assert.equal(result.ok, true);
+  assert.equal((result.output as { status: number }).status, 302);
+  assert.equal((result.output as { redirect_followed: boolean }).redirect_followed, false);
 });
 
 test("resolves a configured payload field's {{token}} against the loaded variable values", async () => {

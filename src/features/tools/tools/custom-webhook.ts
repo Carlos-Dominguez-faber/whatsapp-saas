@@ -3,6 +3,7 @@ import { z } from "zod";
 import type { Tool, ToolContext, ToolResult } from "../core/tool";
 import {
   fetchPinnedFollowingRedirects,
+  firstStatusOf,
   RedirectRefusedError,
   validateWebhookUrl,
 } from "../services/ssrf-guard";
@@ -151,6 +152,20 @@ async function run(args: Args, ctx: ToolContext): Promise<ToolResult> {
       maxResponseBytes: 0,
     });
   } catch (err) {
+    // The POST itself was answered with a redirect: the webhook already got
+    // the call, only a later hop failed. Reporting it as failed would invite
+    // the agent to send it again.
+    const firstStatus = firstStatusOf(err);
+    if (firstStatus !== undefined && firstStatus >= 300 && firstStatus < 400) {
+      return {
+        ok: true,
+        output: {
+          status: firstStatus,
+          redirect_followed: false,
+          note: "El webhook recibió la llamada; su redirect no se pudo seguir. No la repitas.",
+        },
+      };
+    }
     if (err instanceof RedirectRefusedError) {
       return { ok: false, output: null, error: err.message };
     }

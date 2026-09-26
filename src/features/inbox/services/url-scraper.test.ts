@@ -67,6 +67,7 @@ test("each refusal and failure has its own message", async () => {
     [new RedirectRefusedError("Invalid redirect location"), /redirige a una URL inválida/],
     [new Error("Tool timeout"), /tardó demasiado en responder/],
     [new Error("Unsupported content-encoding: zstd"), /formato comprimido/],
+    [new Error("Unreadable compressed body: incorrect header check"), /formato comprimido/],
     [new Error("ECONNRESET"), /No se pudo descargar la URL/],
   ];
   for (const [err, expected] of cases) {

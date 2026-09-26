@@ -12,8 +12,25 @@ import { gzipSync } from "node:zlib";
 import { fetchPinned } from "./ssrf-guard.ts";
 
 let lastHost = "";
+let trickleClosed = false;
 const server = createServer((req: IncomingMessage, res: ServerResponse) => {
   lastHost = req.headers.host ?? "";
+  if (req.url === "/gzip-cut") {
+    // Half of a gzip body, then the connection drops.
+    const full = gzipSync(Buffer.from("b".repeat(200_000)));
+    res.writeHead(200, { "content-type": "text/plain", "content-encoding": "gzip" });
+    res.write(full.subarray(0, Math.floor(full.length / 2)), () => res.socket?.destroy());
+    return;
+  }
+  if (req.url === "/redirect-trickle") {
+    res.writeHead(302, { location: "/hello" });
+    const timer = setInterval(() => res.write("."), 20);
+    req.on("close", () => {
+      trickleClosed = true;
+      clearInterval(timer);
+    });
+    return;
+  }
   if (req.url === "/hello") {
     res.writeHead(200, { "content-type": "text/plain" });
     res.end("hola");
@@ -103,4 +120,34 @@ test("with decompress, an unknown content-encoding is rejected, not read as text
       }),
     /Unsupported content-encoding: zstd/,
   );
+});
+
+test("a gzip body that closes halfway fails at once instead of waiting out the deadline", async () => {
+  const started = Date.now();
+  await assert.rejects(
+    () =>
+      fetchPinned(`${base}/gzip-cut`, "127.0.0.1", {
+        method: "GET",
+        headers: {},
+        timeoutMs: 5000,
+        decompress: true,
+      }),
+    (err: unknown) => err instanceof Error && err.message !== "Tool timeout",
+  );
+  assert.ok(Date.now() - started < 2000);
+});
+
+test("a redirect whose body trickles is answered at once and its connection dropped", async () => {
+  trickleClosed = false;
+  const started = Date.now();
+  const res = await fetchPinned(`${base}/redirect-trickle`, "127.0.0.1", {
+    method: "GET",
+    headers: {},
+    timeoutMs: 5000,
+  });
+  assert.equal(res.status, 302);
+  assert.equal(res.headers.location, "/hello");
+  assert.ok(Date.now() - started < 1000);
+  await new Promise((r) => setTimeout(r, 100));
+  assert.equal(trickleClosed, true);
 });

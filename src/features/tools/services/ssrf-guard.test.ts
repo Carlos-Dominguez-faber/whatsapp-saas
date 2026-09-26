@@ -91,6 +91,7 @@ const {
   fetchPinned,
   fetchPinnedFollowingRedirects,
   RedirectRefusedError,
+  firstStatusOf,
 } = await import("./ssrf-guard.ts");
 
 function reset() {
@@ -491,7 +492,7 @@ test("more than maxRedirects redirects are refused", async () => {
   assert.equal(requests.length, 4);
 });
 
-test("credentials do not follow a redirect to another host", async () => {
+test("only safelisted headers follow a redirect to another host", async () => {
   reset();
   resolve4Impl = async () => ["8.8.8.8"];
   responseQueue = [
@@ -500,12 +501,115 @@ test("credentials do not follow a redirect to another host", async () => {
   ];
   await fetchPinnedFollowingRedirects("https://hooks.example.com/hook", {
     method: "POST",
-    headers: { Authorization: "Bearer s3cret", "Content-Type": "application/json" },
+    headers: {
+      Authorization: "Bearer s3cret",
+      "Proxy-Authorization": "Basic abc",
+      "X-Api-Token": "t0k3n",
+      "Content-Type": "application/json",
+      "User-Agent": "AgenteWA",
+    },
     body: "{}",
     timeoutMs: 5000,
   });
   assert.equal(requests[0].options.headers.Authorization, "Bearer s3cret");
-  assert.equal(requests[1].options.headers.Authorization, undefined);
-  assert.equal(requests[1].options.headers["Content-Type"], "application/json");
+  const next = requests[1].options.headers;
+  assert.equal(next.Authorization, undefined);
+  assert.equal(next["Proxy-Authorization"], undefined);
+  assert.equal(next["X-Api-Token"], undefined);
+  assert.equal(next["Content-Type"], "application/json");
+  assert.equal(next["User-Agent"], "AgenteWA");
+});
+
+test("a same-origin redirect keeps every header", async () => {
+  reset();
+  resolve4Impl = async () => ["8.8.8.8"];
+  responseQueue = [
+    { status: 307, headers: { location: "/v2" } },
+    { status: 200, headers: {} },
+  ];
+  await fetchPinnedFollowingRedirects("https://hooks.example.com/v1", {
+    method: "GET",
+    headers: { "X-Api-Token": "t0k3n" },
+    timeoutMs: 5000,
+  });
+  assert.equal(requests[1].options.headers["X-Api-Token"], "t0k3n");
+});
+
+test("like fetch(): 301/302 only turn a POST into a GET, 303 turns anything but HEAD into a GET", async () => {
+  const cases: Array<[number, string, string, boolean]> = [
+    // [status, method in, method out, body kept]
+    [301, "PUT", "PUT", true],
+    [302, "PATCH", "PATCH", true],
+    [302, "POST", "GET", false],
+    [303, "PUT", "GET", false],
+    [303, "HEAD", "HEAD", false],
+  ];
+  for (const [status, methodIn, methodOut, bodyKept] of cases) {
+    reset();
+    resolve4Impl = async () => ["8.8.8.8"];
+    responseQueue = [
+      { status, headers: { location: "/next" } },
+      { status: 200, headers: {} },
+    ];
+    await fetchPinnedFollowingRedirects("https://hooks.example.com/hook", {
+      method: methodIn,
+      headers: {},
+      body: methodIn === "HEAD" ? undefined : "{}",
+      timeoutMs: 5000,
+    });
+    const label = `${status} ${methodIn}`;
+    assert.equal(requests[1].options.method, methodOut, label);
+    assert.equal(requests[1].req.body === "{}", bodyKept, label);
+  }
+});
+
+test("300 and 305 are returned as they are, not followed", async () => {
+  for (const status of [300, 305]) {
+    reset();
+    resolve4Impl = async () => ["8.8.8.8"];
+    responseQueue = [{ status, headers: { location: "https://elsewhere.example.com/" } }];
+    const result = await fetchPinnedFollowingRedirects("https://hooks.example.com/hook", {
+      method: "GET",
+      headers: {},
+      timeoutMs: 5000,
+    });
+    assert.equal(result.status, status);
+    assert.equal(requests.length, 1);
+  }
+});
+
+test("an error after the first response carries that response's status", async () => {
+  reset();
+  resolve4Impl = async (host) => (host === "internal.example.com" ? ["10.0.0.5"] : ["8.8.8.8"]);
+  responseQueue = [{ status: 302, headers: { location: "https://internal.example.com/" } }];
+  try {
+    await fetchPinnedFollowingRedirects("https://hooks.example.com/hook", {
+      method: "POST",
+      headers: {},
+      body: "{}",
+      timeoutMs: 5000,
+    });
+    assert.fail("expected a refusal");
+  } catch (err) {
+    assert.ok(err instanceof RedirectRefusedError);
+    assert.equal(firstStatusOf(err), 302);
+  }
+});
+
+test("a DNS lookup on a later hop is bounded by what is left of the deadline", async () => {
+  reset();
+  resolve4Impl = async (host) => (host === "slow.example.com" ? new Promise<string[]>(() => {}) : ["8.8.8.8"]);
+  responseQueue = [{ status: 302, headers: { location: "https://slow.example.com/" } }];
+  const started = Date.now();
+  await assert.rejects(
+    () =>
+      fetchPinnedFollowingRedirects("https://hooks.example.com/hook", {
+        method: "GET",
+        headers: {},
+        timeoutMs: 150,
+      }),
+    /Tool timeout/,
+  );
+  assert.ok(Date.now() - started < 1000);
 });
 
