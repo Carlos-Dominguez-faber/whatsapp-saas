@@ -109,3 +109,12 @@ test("PUT accepts a catalog model, and an older stored model sent back unchanged
   const changed = await putOpenRouter({ default_model: "legacy/model-y" });
   assert.equal(changed.status, 400);
 });
+
+test("PUT also checks the legacy `model` key the workspace default can come from", async () => {
+  memberResult = { ok: true, userId: "user_1", role: "admin" };
+  existingRow = { credentials: {}, config: {}, oauth_tokens: {} };
+  upserts.length = 0;
+  const res = await putOpenRouter({ model: "some/unlisted-model" });
+  assert.equal(res.status, 400);
+  assert.equal(upserts.length, 0);
+});

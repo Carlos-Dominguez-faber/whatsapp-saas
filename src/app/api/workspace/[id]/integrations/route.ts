@@ -155,7 +155,8 @@ export async function PUT(
   // other settings.
   if (parsed.data.provider === "openrouter") {
     const storedConfig = (existing?.config as Record<string, unknown> | null) ?? {};
-    for (const key of ["default_model", "fallback_model"] as const) {
+    // `model` is the key older configs used; getWorkspaceModel still reads it.
+    for (const key of ["default_model", "fallback_model", "model"] as const) {
       const value = parsed.data.config?.[key];
       if (value === undefined || value === null || value === "") continue;
       if (typeof value !== "string" || (!isCatalogModel(value) && value !== storedConfig[key])) {

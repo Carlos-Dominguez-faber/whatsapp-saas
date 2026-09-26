@@ -27,6 +27,7 @@ import type { AgentConfig } from "@/features/agents/types";
 import { isCatalogModel } from "@/features/agents/lib/model-catalog";
 import { guardWorkspaceLlmCall } from "@/features/inbox/services/llm-call-guard";
 import { recordWorkspaceLlmCall } from "@/features/inbox/services/cost-tracker";
+import { enforceModelPolicy } from "@/features/inbox/services/model-policy";
 
 // POST /api/workspace/[id]/agents/[agentId]/test-chat
 // In-UI playground: replies with the agent's model + (draft or published) prompt
@@ -134,10 +135,17 @@ export async function POST(
       { status: 400 },
     );
   }
-  const model =
+  // The resolved model also goes through the runtime policy: on the platform
+  // key a workspace default outside the catalog (a legacy config.model, or a
+  // direct write) is swapped for the platform default.
+  const model = await enforceModelPolicy(
+    db,
+    workspaceId,
     parsed.data.modelOverride ??
-    agentModel ??
-    (await getWorkspaceModel(workspaceId));
+      agentModel ??
+      (await getWorkspaceModel(workspaceId)),
+    "agent_test_chat",
+  );
 
   // Budget and hourly cap before anything that spends, KB embeddings included.
   const guard = await guardWorkspaceLlmCall(workspaceId, "agent_test_chat");

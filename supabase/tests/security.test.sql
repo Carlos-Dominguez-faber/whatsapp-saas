@@ -8,7 +8,7 @@ BEGIN;
 CREATE EXTENSION IF NOT EXISTS pgtap WITH SCHEMA extensions;
 SET search_path = public, extensions;
 
-SELECT plan(73);
+SELECT plan(75);
 
 -- ── public.users: read-only for sessions ────────────────────────────────────
 SELECT ok(NOT has_table_privilege('authenticated', 'public.users', 'UPDATE'),
@@ -309,6 +309,14 @@ SELECT throws_ok(
   $$INSERT INTO public.events (workspace_id, type, payload)
     VALUES ('b0000000-0000-4000-8000-000000000001', 'cost_cut', '{}')$$,
   '42501', NULL, 'a session cannot pre-empt the daily cost_cut event');
+SELECT throws_ok(
+  $$INSERT INTO public.events (workspace_id, type, payload)
+    VALUES ('b0000000-0000-4000-8000-000000000001', 'cost_alert', '{}')$$,
+  '42501', NULL, 'a session cannot pre-empt the daily cost_alert event');
+SELECT throws_ok(
+  $$INSERT INTO public.events (workspace_id, type, payload)
+    VALUES ('b0000000-0000-4000-8000-000000000001', 'model_outside_catalog', '{}')$$,
+  '42501', NULL, 'a session cannot pre-empt the daily model_outside_catalog event');
 SELECT lives_ok(
   $$INSERT INTO public.events (workspace_id, type, payload)
     VALUES ('b0000000-0000-4000-8000-000000000001', 'note_viewed', '{}')$$,

@@ -92,7 +92,16 @@ export async function getOpenRouterApiKey(
 ): Promise<string> {
   const envKey = process.env.OPENROUTER_API_KEY ?? "";
   if (!workspaceId) return envKey;
+  return (await readWorkspaceOpenRouterKey(workspaceId)) ?? envKey;
+}
 
+/**
+ * The workspace's own OpenRouter key, or null when its calls run on the
+ * platform (agency) key from OPENROUTER_API_KEY.
+ */
+export async function readWorkspaceOpenRouterKey(
+  workspaceId: string,
+): Promise<string | null> {
   try {
     const db = svcClient(
       process.env.NEXT_PUBLIC_SUPABASE_URL!,
@@ -113,9 +122,9 @@ export async function getOpenRouterApiKey(
     const key = creds.openrouter_api_key;
     if (typeof key === "string" && key.length > 0) return key;
   } catch {
-    // Non-fatal — fall through to env key
+    // Non-fatal — the caller falls back to the platform key
   }
-  return envKey;
+  return null;
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
