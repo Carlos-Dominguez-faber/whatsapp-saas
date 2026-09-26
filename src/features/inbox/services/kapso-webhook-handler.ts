@@ -1,5 +1,6 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 import { extractWebhookError, type WhatsAppError } from "./whatsapp-errors";
+import { inboundContentText } from "./inbound-content";
 
 /**
  * Verifies a Kapso webhook signature.
@@ -234,7 +235,8 @@ export function parseInbound(
 
       if (text === null) text = "[Multimedia]";
     } else {
-      text = "[Multimedia]";
+      // Button taps, list/interactive replies, orders, locations…
+      text = inboundContentText(message, msgType);
     }
 
     // Kapso transcribes voice notes for us; media-understanding can skip the
