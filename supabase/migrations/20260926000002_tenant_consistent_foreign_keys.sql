@@ -19,6 +19,14 @@
 -- action per relationship. The composite keys also freeze workspace_id on
 -- referenced rows that are in use (ON UPDATE NO ACTION).
 --
+-- Exception: agents.prompt_id, prompts.active_version_id and
+-- prompt_versions.prompt_id keep their single-column FKs, because the app
+-- embeds them through PostgREST column hints (prompts!prompt_id,
+-- prompt_versions!active_version_id), which only resolve against a
+-- single-column FK — swapping them would break every prompt lookup, including
+-- the code that still runs between `db push` and the redeploy. Those three are
+-- guarded by a trigger instead (section 4).
+--
 -- Constraints are added NOT VALID (enforced for every new write immediately)
 -- and then validated; if an existing install already holds cross-workspace
 -- rows, validation is skipped with a WARNING instead of failing the upgrade.
@@ -31,7 +39,7 @@ DECLARE
 BEGIN
   FOREACH t IN ARRAY ARRAY[
     'conversations', 'contacts', 'message_batches', 'templates', 'schedules',
-    'prompts', 'prompt_versions', 'kb_documents'
+    'kb_documents'
   ] LOOP
     IF to_regclass('public.' || t) IS NOT NULL AND NOT EXISTS (
       SELECT 1 FROM pg_constraint
@@ -62,14 +70,15 @@ DECLARE
     ['appointments',    'appointments_contact_id_fkey',         'contact_id',      'contacts',        'SET NULL'],
     ['appointments',    'appointments_conversation_id_fkey',    'conversation_id', 'conversations',   'SET NULL'],
     ['appointments',    'appointments_schedule_id_fkey',        'schedule_id',     'schedules',       'SET NULL'],
-    ['agents',          'agents_prompt_id_fkey',                'prompt_id',       'prompts',         'SET NULL'],
-    ['prompt_versions', 'prompt_versions_prompt_id_fkey',       'prompt_id',       'prompts',         'CASCADE'],
-    ['prompts',         'fk_prompts_active_version',            'active_version_id', 'prompt_versions', 'SET NULL'],
     ['kb_chunks',       'kb_chunks_document_id_fkey',           'document_id',     'kb_documents',    'CASCADE']
   ];
   new_name text;
   on_delete text;
 BEGIN
+  IF current_setting('server_version_num')::int < 150000 THEN
+    RAISE EXCEPTION 'This migration needs Postgres 15+ (ON DELETE SET NULL (column)). Upgrade it in Supabase → Settings → Infrastructure, then run db push again.';
+  END IF;
+
   FOREACH fk SLICE 1 IN ARRAY fks LOOP
     CONTINUE WHEN to_regclass('public.' || fk[1]) IS NULL
                OR to_regclass('public.' || fk[4]) IS NULL;
@@ -115,7 +124,83 @@ BEGIN
 END
 $$;
 
--- 4. message_batches is written only by the service-role buffer pipeline;
+-- 4. The prompt family keeps its single-column FKs (see header); a trigger
+--    enforces the same rule, and workspace_id is frozen on those rows so a
+--    referenced prompt or version cannot be moved out from under its users.
+CREATE OR REPLACE FUNCTION public.enforce_same_workspace_ref()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = ''
+AS $$
+DECLARE
+  ref_table text := TG_ARGV[0];
+  ref_col   text := TG_ARGV[1];
+  ref_id    uuid := (to_jsonb(NEW) ->> ref_col)::uuid;
+  found     boolean;
+BEGIN
+  IF TG_OP = 'UPDATE' AND NEW.workspace_id IS DISTINCT FROM OLD.workspace_id THEN
+    RAISE EXCEPTION '%.workspace_id cannot change', TG_TABLE_NAME
+      USING ERRCODE = '23503';
+  END IF;
+  IF ref_id IS NULL THEN
+    RETURN NEW;
+  END IF;
+  EXECUTE format(
+    'SELECT EXISTS (SELECT 1 FROM public.%I WHERE id = $1 AND workspace_id = $2)',
+    ref_table
+  ) INTO found USING ref_id, NEW.workspace_id;
+  IF NOT found THEN
+    RAISE EXCEPTION '%.% must reference a % row of workspace %',
+      TG_TABLE_NAME, ref_col, ref_table, NEW.workspace_id
+      USING ERRCODE = '23503';
+  END IF;
+  RETURN NEW;
+END
+$$;
+
+REVOKE ALL ON FUNCTION public.enforce_same_workspace_ref() FROM PUBLIC, anon, authenticated;
+
+DROP TRIGGER IF EXISTS trg_agents_prompt_same_workspace ON public.agents;
+CREATE TRIGGER trg_agents_prompt_same_workspace
+  BEFORE INSERT OR UPDATE ON public.agents
+  FOR EACH ROW EXECUTE FUNCTION public.enforce_same_workspace_ref('prompts', 'prompt_id');
+
+DROP TRIGGER IF EXISTS trg_prompts_active_version_same_workspace ON public.prompts;
+CREATE TRIGGER trg_prompts_active_version_same_workspace
+  BEFORE INSERT OR UPDATE ON public.prompts
+  FOR EACH ROW EXECUTE FUNCTION public.enforce_same_workspace_ref('prompt_versions', 'active_version_id');
+
+DROP TRIGGER IF EXISTS trg_prompt_versions_prompt_same_workspace ON public.prompt_versions;
+CREATE TRIGGER trg_prompt_versions_prompt_same_workspace
+  BEFORE INSERT OR UPDATE ON public.prompt_versions
+  FOR EACH ROW EXECUTE FUNCTION public.enforce_same_workspace_ref('prompts', 'prompt_id');
+
+-- Triggers only guard new writes: flag legacy cross-workspace rows.
+DO $$
+DECLARE
+  bad int;
+BEGIN
+  SELECT
+    (SELECT count(*) FROM public.agents a
+       JOIN public.prompts p ON p.id = a.prompt_id
+      WHERE p.workspace_id <> a.workspace_id)
+  + (SELECT count(*) FROM public.prompts p
+       JOIN public.prompt_versions v ON v.id = p.active_version_id
+      WHERE v.workspace_id <> p.workspace_id)
+  + (SELECT count(*) FROM public.prompt_versions v
+       JOIN public.prompts p ON p.id = v.prompt_id
+      WHERE p.workspace_id <> v.workspace_id)
+  INTO bad;
+  IF bad > 0 THEN
+    RAISE WARNING
+      '% agents/prompts/prompt_versions rows point at another workspace. See the audit queries in INSTALAR.md (Actualizar).',
+      bad;
+  END IF;
+END
+$$;
+
+-- 5. message_batches is written only by the service-role buffer pipeline;
 --    users have no business writing it directly.
 REVOKE INSERT, UPDATE, DELETE ON public.message_batches FROM anon, authenticated;
 
