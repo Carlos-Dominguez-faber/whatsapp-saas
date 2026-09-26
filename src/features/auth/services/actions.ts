@@ -13,6 +13,8 @@ function localizeAuthError(msg: string): string {
     "Invalid login credentials": "Correo o contraseña incorrectos",
     "Email not confirmed": "Email no confirmado",
     "User already registered": "Este correo ya está registrado",
+    "Signups not allowed for this instance":
+      "El registro está cerrado. Pide al administrador que te invite.",
   };
   return map[msg] ?? msg;
 }

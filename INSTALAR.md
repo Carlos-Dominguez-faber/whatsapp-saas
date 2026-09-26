@@ -131,10 +131,17 @@ export SUPABASE_ACCESS_TOKEN='sbp_...'
 node scripts/setup.mjs site-url
 ```
 
-Esto setea **Site URL** + **Redirect URLs** a tu dominio de Vercel. Si el usuario
-prefiere no usar token, hazlo manual: Supabase → **Authentication → URL
-Configuration** → Site URL = tu URL, Redirect = `<url>/**`.
-(Sin esto, el login y el reset de contraseña redirigen mal.)
+Esto setea **Site URL** + **Redirect URLs** a tu dominio de Vercel y **cierra el
+registro público** de Supabase Auth. Si el usuario prefiere no usar token, hazlo
+manual en Supabase → **Authentication**:
+
+- **URL Configuration** → Site URL = tu URL, Redirect = `<url>/**`.
+  (Sin esto, el login y el reset de contraseña redirigen mal.)
+- **Sign In / Providers** → desactiva **"Allow new users to sign up"** → Save.
+  El formulario `/signup` de la app ya es invite-only, pero la API de Supabase Auth
+  (`/auth/v1/signup`) acepta registros con la anon key pública, que viaja en el
+  frontend. El super admin (paso 8) y los usuarios que se crean desde el panel
+  siguen funcionando, porque usan la Admin API con `service_role`.
 
 **8. Crea tu super admin.** Pídele un email y una contraseña (mínimo 8 caracteres)
 para entrar a la plataforma:
@@ -200,8 +207,18 @@ su propia integración de YCloud.
 ```bash
 git pull                 # o reemplaza los archivos del proyecto
 npm install
-supabase db push         # aplica migraciones nuevas
+supabase db push         # aplica migraciones nuevas — SIEMPRE antes del deploy
 vercel --prod            # redeploy
+```
+
+El orden importa: el código nuevo puede depender de funciones o permisos que traen
+las migraciones, así que `supabase db push` va **antes** de `vercel --prod`.
+
+Si tu instalación es anterior al cierre del registro público, córrelo una vez
+(con el `SUPABASE_ACCESS_TOKEN` del paso 7) o hazlo manual como indica ese paso:
+
+```bash
+node scripts/setup.mjs site-url
 ```
 
 **Nunca** rotes `ENCRYPTION_KEY`: es la llave con la que se cifran las

@@ -266,17 +266,22 @@ async function cmdSiteUrl() {
   const ref = deriveRef(env.NEXT_PUBLIC_SUPABASE_URL);
   if (!ref) fail("No pude derivar el project-ref de NEXT_PUBLIC_SUPABASE_URL.");
   if (!mgmtToken()) {
-    warn("Sin SUPABASE_ACCESS_TOKEN — hazlo manual en Supabase → Authentication → URL Configuration:");
-    log(`   Site URL     = ${appUrl}`);
-    log(`   Redirect URL = ${appUrl}/**`);
+    warn("Sin SUPABASE_ACCESS_TOKEN — hazlo manual en Supabase → Authentication:");
+    log(`   URL Configuration → Site URL     = ${appUrl}`);
+    log(`   URL Configuration → Redirect URL = ${appUrl}/**`);
+    log(`   Sign In / Providers → desactiva "Allow new users to sign up"`);
     return;
   }
+  // disable_signup: the app's /signup is invite-only, but Supabase Auth's own
+  // /auth/v1/signup accepts the public anon key. Users are created through the
+  // Admin API (seed-admin, agency panel, team invites), which keeps working.
   const res = await mgmtCall("PATCH", `/v1/projects/${ref}/config/auth`, {
     site_url: appUrl,
     uri_allow_list: `${appUrl}/**`,
+    disable_signup: true,
   });
   if (!res.ok) fail(`Management API (config/auth) falló ${res.status}: ${JSON.stringify(res.data)}`);
-  ok(`Site URL = ${appUrl} · Redirect = ${appUrl}/** (vía Management API)`);
+  ok(`Site URL = ${appUrl} · Redirect = ${appUrl}/** · registro público cerrado (vía Management API)`);
 }
 
 function cmdVercelEnv() {
