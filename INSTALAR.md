@@ -175,8 +175,9 @@ o **Kapso** si está en Estados Unidos (YCloud no opera ahí).
 - **YCloud:** pega la **API Key**, el número (E.164) y el **Webhook Signing Secret**
   (cada cliente tiene los suyos).
 - **Kapso:** pega la **API Key** y el **Webhook Signing Secret**, y pulsa **Probar
-  conexión**: rellena el `phone_number_id` y el `waba_id` de Meta. Guía detallada:
-  `docs/runbook-conectar-numero-kapso.md`.
+  conexión**: rellena el `phone_number_id` y el `waba_id` de Meta. El
+  `phone_number_id` **no es el número de teléfono**: si los confundes, todos los
+  envíos fallan con 400.
 
 **Probar conexión** usa lo que está en pantalla, aunque no lo hayas guardado. La app
 no activa un proveedor sin API Key, Webhook Signing Secret y número (YCloud) o Phone
@@ -184,6 +185,18 @@ Number ID (Kapso): el botón de guardar te dice qué falta.
 
 Guarda, copia el **Webhook URL** que muestra la app (ya trae el `wsid` y la ruta del
 proveedor elegido) → pégalo en los webhooks del proveedor y conecta el número.
+
+En **Kapso**, al crear el webhook con el mismo signing secret, suscribe los cinco
+eventos: `whatsapp.message.received` (trae los mensajes) y `sent`, `delivered`,
+`read` y `failed` (mueven el estado; con coexistence, `sent` es además por donde
+llega la respuesta del humano desde el celular).
+
+> ⚠️ **El buffering de webhooks de Kapso debe quedar APAGADO** (`buffer_enabled:
+> false`). Si se activa, Kapso agrupa los mensajes en un sobre `{batch:true,
+> data:[…]}` que este webhook no procesa, y el agente se queda callado sin dar
+> error. La app ya tiene su propio buffer (`buffer_silence_seconds`); dos sobran.
+> Si queda encendido lo verás en los logs de Vercel como
+> `[kapso] webhook batching is ON`.
 
 **12. Verificación final.** Desde un teléfono, manda un WhatsApp al número conectado.
 En ~1 minuto (cuando dispare el cron) el agente debe responder. Si no, revisa las
@@ -215,6 +228,22 @@ su propia integración de WhatsApp (cada uno puede usar YCloud o Kapso).
   que el webhook del proveedor (YCloud o Kapso) apunte a tu URL con la ruta del
   proveedor activo, y que `OPENROUTER_API_KEY` tenga saldo. Si cambiaste de
   proveedor, el webhook del anterior ya no se acepta (responde 401).
+- **Kapso: no llegan los mensajes.** Lo primero es ver qué intentó entregar Kapso
+  (el endpoint lleva guion bajo; con guion medio da 404):
+
+  ```bash
+  curl -sS "https://api.kapso.ai/platform/v1/webhook_deliveries?per_page=10" \
+    -H "X-API-Key: $KAPSO_API_KEY"
+  ```
+
+  - **sin entregas:** el webhook no existe o no está `active` en Kapso;
+  - **`401`:** el signing secret de Kapso no es el de la app, o el
+    `phone_number_id` del evento no es el del workspace (el `?wsid=` de la URL
+    apunta a otro workspace);
+  - **`200` pero nada en el inbox:** el evento llegó y se descartó; revisa los logs
+    de Vercel (por ejemplo, el buffering de Kapso encendido). Un 200 no prueba que
+    el mensaje se guardó;
+  - **`5xx`:** error de la app; revisa los logs de Vercel.
 - **Qué pasa con lo que estaba en curso al cambiar de proveedor:**
   - una respuesta que la IA estaba generando sale por el proveedor **nuevo**;
   - si ese envío falla (por ejemplo, una API Key equivocada), la respuesta queda en

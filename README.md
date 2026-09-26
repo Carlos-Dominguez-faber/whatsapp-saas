@@ -77,7 +77,7 @@ Con Kapso, `phone_number_id` y `waba_id` se autocompletan al pulsar «Probar
 conexión». Con **coexistence**, si el mismo número se usa también desde la app
 de WhatsApp Business en un celular, esas respuestas humanas se guardan y la
 conversación pasa a `human_active` para que el agente no conteste encima de la
-persona. Guía paso a paso: [`docs/runbook-conectar-numero-kapso.md`](docs/runbook-conectar-numero-kapso.md).
+persona. Guía paso a paso: el paso 11 de [`INSTALAR.md`](INSTALAR.md).
 
 > La antigua rama `provider/kapso` quedó congelada: todo vive en `main`. Si
 > instalaste desde esa rama, cambia a `main` como indica INSTALAR.md →
