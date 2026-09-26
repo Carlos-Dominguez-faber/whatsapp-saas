@@ -16,19 +16,19 @@ mock.module("@/shared/lib/integration-secrets.ts", {
   exports: { encryptCredentials: async (c: unknown) => c },
 });
 
-// Service-role client: answers the gate's two reads from the fixtures below
-// and records every write, returning a fresh id for insert(...).select().single().
-let isSuperAdmin = false;
-let membershipCount = 0;
+// Service-role client: answers the gate's profile read from the fixtures below
+// (recording its filters) and records every write.
+let profile: { is_super_admin: boolean } | null = null;
+let profileError: { message: string } | null = null;
+let profileFilters: unknown[][] = [];
 let inserts: string[] = [];
 
-function chain(result: unknown): any {
+function writeChain(): any {
   const c: any = {
     select: () => c,
     eq: () => c,
-    maybeSingle: async () => result,
     single: async () => ({ data: { id: "new_id" }, error: null }),
-    then: (resolve: (v: unknown) => void) => resolve(result),
+    then: (resolve: (v: unknown) => void) => resolve({ error: null }),
   };
   return c;
 }
@@ -37,16 +37,22 @@ mock.module("@supabase/supabase-js", {
   exports: {
     createClient: () => ({
       from: (table: string) => ({
-        select: (_cols: string, opts?: { head?: boolean }) =>
-          table === "memberships" && opts?.head
-            ? chain({ count: membershipCount, error: null })
-            : chain({ data: { is_super_admin: isSuperAdmin }, error: null }),
+        select: () => {
+          const c: any = {
+            eq: (col: string, val: unknown) => {
+              if (table === "users") profileFilters.push([col, val]);
+              return c;
+            },
+            maybeSingle: async () => ({ data: profile, error: profileError }),
+          };
+          return c;
+        },
         insert: () => {
           inserts.push(table);
-          return chain({ error: null });
+          return writeChain();
         },
-        update: () => chain({ error: null }),
-        delete: () => chain({ error: null }),
+        update: () => writeChain(),
+        delete: () => writeChain(),
       }),
     }),
   },
@@ -56,29 +62,41 @@ const { completeOnboarding } = await import("./onboarding-actions.ts");
 
 const input = { useCase: "general", businessName: "Acme" };
 
-test("an account invited to any workspace cannot mint itself a new admin workspace", async () => {
-  isSuperAdmin = false;
-  membershipCount = 1; // e.g. a viewer, or a deactivated ex-member
+function reset(p: typeof profile, err: typeof profileError = null) {
+  profile = p;
+  profileError = err;
+  profileFilters = [];
   inserts = [];
+}
+
+test("a non-super-admin cannot mint a workspace, whatever their memberships", async () => {
+  // Covers the viewer, the deactivated ex-member and the client whose
+  // workspace was deleted (zero memberships left).
+  reset({ is_super_admin: false });
   const result = await completeOnboarding(input);
   assert.ok("error" in result && result.error);
   assert.equal(inserts.length, 0, "nothing may be created");
 });
 
-test("a super admin can onboard even with existing memberships", async () => {
-  isSuperAdmin = true;
-  membershipCount = 3;
-  inserts = [];
+test("an account without a profile row is refused", async () => {
+  reset(null);
   const result = await completeOnboarding(input);
-  assert.equal(result.error, undefined);
-  assert.equal(inserts[0], "workspaces");
+  assert.ok("error" in result && result.error);
+  assert.equal(inserts.length, 0);
 });
 
-test("an account that never belonged to a workspace can onboard", async () => {
-  isSuperAdmin = false;
-  membershipCount = 0;
-  inserts = [];
+test("a failed profile read is a denial, not a pass", async () => {
+  reset({ is_super_admin: true }, { message: "db down" });
+  const result = await completeOnboarding(input);
+  assert.ok("error" in result && result.error);
+  assert.equal(inserts.length, 0);
+});
+
+test("a super admin onboards, checked against their own profile row", async () => {
+  reset({ is_super_admin: true });
   const result = await completeOnboarding(input);
   assert.equal(result.error, undefined);
+  assert.deepEqual(profileFilters, [["id", "user_1"]]);
+  assert.equal(inserts[0], "workspaces");
   assert.ok(inserts.includes("memberships"));
 });

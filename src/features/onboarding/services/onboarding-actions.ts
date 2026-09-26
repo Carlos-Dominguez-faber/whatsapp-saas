@@ -74,30 +74,22 @@ export async function completeOnboarding(
     process.env.SUPABASE_SERVICE_ROLE_KEY!,
   );
 
-  // 3b. This action is an HTTP endpoint; the /onboarding page's redirect is
-  //     not a lock. Onboarding is for a super admin, or for an account that has
-  //     never belonged to any workspace. Anyone invited somewhere (a viewer, a
-  //     deactivated ex-member) must not mint themselves an admin workspace
-  //     running on the agency's keys.
-  const [{ data: profile }, { count: membershipCount, error: countError }] =
-    await Promise.all([
-      serviceClient
-        .from("users")
-        .select("is_super_admin")
-        .eq("id", user.id)
-        .maybeSingle(),
-      serviceClient
-        .from("memberships")
-        .select("id", { count: "exact", head: true })
-        .eq("user_id", user.id),
-    ]);
+  // 3b. This action is an HTTP endpoint; the /onboarding page is not a lock.
+  //     Workspaces are created by the agency, so only a super admin may
+  //     onboard. Anyone else — a viewer, a deactivated ex-member, a client
+  //     whose workspace was deleted — must not mint an admin workspace running
+  //     on the agency's keys. A failed read is a denial, never a pass.
+  const { data: profile, error: profileError } = await serviceClient
+    .from("users")
+    .select("is_super_admin")
+    .eq("id", user.id)
+    .maybeSingle();
 
-  if (countError) {
-    console.error("[completeOnboarding] membership check error:", countError);
+  if (profileError) {
+    console.error("[completeOnboarding] profile check error:", profileError);
     return { error: "No se pudo verificar tu cuenta. Intenta de nuevo." };
   }
-  const isSuperAdmin = profile?.is_super_admin === true;
-  if (!isSuperAdmin && (membershipCount ?? 0) > 0) {
+  if (profile?.is_super_admin !== true) {
     return { error: "No tienes permiso para crear un espacio de trabajo" };
   }
 
