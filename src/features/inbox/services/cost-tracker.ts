@@ -170,3 +170,88 @@ export async function reserveLlmTurn(
 
   return { allowed: true, reservationId: row.reservation_id ?? undefined };
 }
+
+/** Manager-facing LLM tools that spend the workspace's key outside a turn. */
+export type WorkspaceLlmCallType = "template_generate" | "agent_test_chat";
+
+/**
+ * Atomically claims one of the workspace's hourly calls of `type`, or denies
+ * once `hourlyLimit` calls of that type already happened in the last hour.
+ * Same contract as reserveLlmTurn: a database error throws, and a missing
+ * function (code deployed before `db-push`) allows unreserved with a warning.
+ */
+export async function reserveWorkspaceLlmCall(
+  workspaceId: string,
+  type: WorkspaceLlmCallType,
+  hourlyLimit: number,
+): Promise<ReserveLlmTurnResult> {
+  const supabase = svc();
+
+  const { data, error } = await supabase.rpc("reserve_workspace_llm_call", {
+    p_workspace_id: workspaceId,
+    p_type: type,
+    p_hourly_limit: hourlyLimit,
+  });
+
+  if (error) {
+    if (isMissingFunctionError(error)) {
+      console.warn(
+        "[cost-tracker] reserve_workspace_llm_call is missing — run `setup.mjs db-push`; the hourly limit is not enforced until then",
+      );
+      return { allowed: true };
+    }
+    throw new Error(`reserve_workspace_llm_call failed: ${error.message}`);
+  }
+
+  const row = (
+    data as { allowed: boolean; reservation_id: string | null }[] | null
+  )?.[0];
+
+  if (!row?.allowed) {
+    return { allowed: false, reason: "rate_limit_workspace_hour" };
+  }
+
+  return { allowed: true, reservationId: row.reservation_id ?? undefined };
+}
+
+/**
+ * Records the tokens of a reserveWorkspaceLlmCall() call: fills in the
+ * reservation row, or inserts one when there was no reservation. The row's
+ * total_tokens is what sum_daily_llm_tokens() adds to the daily budget.
+ * Never throws — the call already happened.
+ */
+export async function recordWorkspaceLlmCall(opts: {
+  reservationId?: string;
+  workspaceId: string;
+  type: WorkspaceLlmCallType;
+  model: string;
+  promptTokens: number;
+  completionTokens: number;
+  extra?: Record<string, unknown>;
+}): Promise<void> {
+  const supabase = svc();
+  const payload = {
+    ...opts.extra,
+    model: opts.model,
+    input_tokens: opts.promptTokens,
+    output_tokens: opts.completionTokens,
+    total_tokens: opts.promptTokens + opts.completionTokens,
+  };
+
+  const { error } = opts.reservationId
+    ? await supabase
+        .from("events")
+        .update({ payload })
+        .eq("id", opts.reservationId)
+        .eq("workspace_id", opts.workspaceId)
+    : await supabase.from("events").insert({
+        type: opts.type,
+        level: "info",
+        workspace_id: opts.workspaceId,
+        payload,
+      });
+
+  if (error) {
+    console.error(`[cost-tracker] failed to record ${opts.type} usage:`, error);
+  }
+}

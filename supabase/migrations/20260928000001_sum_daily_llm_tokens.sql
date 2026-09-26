@@ -37,7 +37,9 @@ AS $$
     END
   ), 0)
   FROM public.events
-  WHERE type = 'llm_usage'
+  -- The agent's turns plus the manager tools that also spend the workspace's
+  -- OpenRouter key: template drafts and the agent playground.
+  WHERE type IN ('llm_usage', 'template_generate', 'agent_test_chat')
     AND workspace_id = p_workspace_id
     AND created_at >= p_day_start;
 $$;
