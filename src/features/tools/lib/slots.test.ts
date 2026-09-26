@@ -374,3 +374,18 @@ test("zonedDayRange: un día normal en horario de verano empieza a las 03:00Z", 
   assert.ok(r);
   assert.equal(new Date(r!.startMs).toISOString(), "2026-09-15T03:00:00.000Z");
 });
+
+test("maxSlots recorta días enteros; el primero entra completo aunque lo exceda", () => {
+  const day = (d: string, n: number) =>
+    Array.from({ length: n }, (_, i) =>
+      `2026-06-${d}T${String(10 + Math.floor(i / 6)).padStart(2, "0")}:${String((i % 6) * 10).padStart(2, "0")}:00Z`,
+    );
+  const slots = [...day("12", 8), ...day("13", 8), ...day("14", 8)];
+  const { days, omittedDays } = groupByDay(slots, "UTC", 14, 20);
+  assert.deepEqual(Object.keys(days), ["2026-06-12", "2026-06-13"]);
+  assert.equal(days["2026-06-13"].length, 8, "a kept day is complete");
+  assert.equal(omittedDays, 1);
+
+  const big = groupByDay(day("12", 30), "UTC", 14, 20);
+  assert.equal(big.days["2026-06-12"].length, 30);
+});

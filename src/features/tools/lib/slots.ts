@@ -10,7 +10,7 @@ const HAS_OFFSET = /(?:Z|[+-]\d{2}:?\d{2})$/i;
 export interface GroupedSlots {
   /** `{ "YYYY-MM-DD": ["<ISO original del proveedor>", ...] }` */
   days: Record<string, string[]>;
-  /** Días completos del rango que quedaron fuera por `maxDays`. */
+  /** Días completos del rango que quedaron fuera por `maxDays` o `maxSlots`. */
   omittedDays: number;
   /** Valores que no se pudieron interpretar. NUNCA se descartan en silencio. */
   unreadable: number;
@@ -39,6 +39,10 @@ export function groupByDay(
   slots: readonly unknown[],
   tz: string,
   maxDays = 14,
+  // Tope total de horarios: el output entra entero al contexto del modelo.
+  // Se respeta el mismo invariante que con maxDays: se cortan DÍAS ENTEROS
+  // (el primero siempre entra completo), nunca horarios sueltos de un día.
+  maxSlots = 60,
 ): GroupedSlots {
   // day -> (ISO original -> instante), para ordenar por instante y deduplicar.
   const byDay = new Map<string, Map<string, number>>();
@@ -57,14 +61,19 @@ export function groupByDay(
   }
 
   const sortedDays = [...byDay.keys()].sort();
-  const keptDays = sortedDays.slice(0, maxDays);
   const days: Record<string, string[]> = {};
-  for (const day of keptDays) {
+  let kept = 0;
+  let total = 0;
+  for (const day of sortedDays.slice(0, maxDays)) {
+    const size = byDay.get(day)!.size;
+    if (kept > 0 && total + size > maxSlots) break;
     days[day] = [...byDay.get(day)!.entries()]
       .sort((a, b) => a[1] - b[1] || a[0].localeCompare(b[0]))
       .map(([iso]) => iso);
+    kept++;
+    total += size;
   }
-  return { days, omittedDays: sortedDays.length - keptDays.length, unreadable };
+  return { days, omittedDays: sortedDays.length - kept, unreadable };
 }
 
 /**

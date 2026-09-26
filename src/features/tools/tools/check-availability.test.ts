@@ -22,6 +22,7 @@ function jsonResponse(status: number, body: unknown): Response {
 function mockFetch(opts: {
   connected?: boolean;
   timezone?: string;
+  businessTimezone?: string;
   hlStatus?: number;
   hlBody?: unknown;
 }) {
@@ -47,6 +48,15 @@ function mockFetch(opts: {
                 enabled: true,
               },
             ],
+      );
+    }
+
+    if (url.includes("/rest/v1/business_info")) {
+      return jsonResponse(
+        200,
+        opts.businessTimezone
+          ? [{ structured: { timezone: opts.businessTimezone }, free_text: null }]
+          : [],
       );
     }
 
@@ -283,4 +293,35 @@ test("un día con más de 20 horarios los devuelve todos", async () => {
     (out.days as Record<string, string[]>)["2026-09-17"].length,
     48,
   );
+});
+
+test("sin zona del LLM usa la del negocio antes que la de HighLevel (que vale UTC por defecto)", async () => {
+  const { fn, calls } = mockFetch({
+    timezone: "UTC",
+    businessTimezone: "America/Mexico_City",
+    hlBody: { "2026-06-12": { slots: ["2026-06-12T15:00:00-06:00"] } },
+  });
+
+  const result = await withFetch(fn as typeof fetch, () =>
+    checkAvailabilityTool.run({ date_from: "2026-06-12", date_to: "2026-06-12" }, ctx),
+  );
+
+  assert.equal(result.ok, true);
+  assert.equal((result.output as Record<string, unknown>).timezone, "America/Mexico_City");
+  const hl = calls.find((u) => u.includes("/free-slots"))!;
+  assert.equal(new URL(hl).searchParams.get("timezone"), "America/Mexico_City");
+});
+
+test("la zona del LLM, si es válida, gana sobre la del negocio", async () => {
+  const { fn } = mockFetch({
+    businessTimezone: "America/Mexico_City",
+    hlBody: { "2026-06-12": { slots: [] } },
+  });
+  const result = await withFetch(fn as typeof fetch, () =>
+    checkAvailabilityTool.run(
+      { date_from: "2026-06-12", date_to: "2026-06-12", timezone: "America/Bogota" },
+      ctx,
+    ),
+  );
+  assert.equal((result.output as Record<string, unknown>).timezone, "America/Bogota");
 });
