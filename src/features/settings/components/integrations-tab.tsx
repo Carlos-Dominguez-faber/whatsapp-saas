@@ -17,6 +17,15 @@ import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
 import { DEFAULT_HANDOFF_ACK } from "@/features/inbox/types/handoff";
 import { ModelPicker } from "@/features/agents/components/model-picker";
+import {
+  describeKapsoNumber,
+  e164FromDisplay,
+  KapsoNumberSelect,
+  WhatsAppProviderPicker,
+  WHATSAPP_LABEL,
+  type KapsoNumberOption,
+  type WhatsAppProviderId,
+} from "./whatsapp-provider-picker";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -103,13 +112,6 @@ function Section({
 
 // ─── WhatsApp section (provider per workspace: YCloud or Kapso) ───────────────
 
-type WhatsAppProviderId = "ycloud" | "kapso";
-
-const WHATSAPP_LABEL: Record<WhatsAppProviderId, string> = {
-  ycloud: "YCloud",
-  kapso: "Kapso",
-};
-
 function WhatsAppSection({
   workspaceId,
   ycloud,
@@ -180,6 +182,8 @@ function WhatsAppSection({
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
   const [copied, setCopied] = useState(false);
+  // Kapso numbers to choose from, when a test with a typed key found several.
+  const [kapsoChoices, setKapsoChoices] = useState<KapsoNumberOption[]>([]);
 
   const label = WHATSAPP_LABEL[selected];
   const webhookPath = `/api/webhooks/${selected}?wsid=${workspaceId}`;
@@ -188,6 +192,37 @@ function WhatsAppSection({
       ? `${window.location.origin}${webhookPath}`
       : webhookPath;
   const switching = active !== null && active !== selected;
+
+  // Same rule as the server (422): without key, secret and sender id the
+  // provider cannot talk. "••••••" means stored, which counts.
+  const missing = (
+    selected === "kapso"
+      ? [
+          [kpApiKey, "la API Key"],
+          [kpSecret, "el Webhook Signing Secret"],
+          [kpPhoneNumberId, "el Phone Number ID"],
+        ]
+      : [
+          [ycApiKey, "la API Key"],
+          [ycSecret, "el Webhook Signing Secret"],
+          [ycPhone, "el número de WhatsApp"],
+        ]
+  )
+    .filter(([value]) => !value.trim())
+    .map(([, what]) => what);
+
+  function pickKapsoNumber(n: KapsoNumberOption, how: "filled" | "picked") {
+    setKpPhoneNumberId(n.phone_number_id ?? "");
+    setKpWabaId(n.waba_id ?? "");
+    const e164 = e164FromDisplay(n.display_phone_number);
+    if (e164) setKpPhone(e164);
+    setKapsoChoices([]);
+    toast.info(
+      how === "filled"
+        ? `Rellené los datos con ${describeKapsoNumber(n)} — revisa y guarda`
+        : `Elegiste ${describeKapsoNumber(n)} — prueba la conexión y guarda`,
+    );
+  }
 
   function handleCopy() {
     navigator.clipboard.writeText(webhookUrl).then(() => {
@@ -199,24 +234,33 @@ function WhatsAppSection({
   async function handleTest() {
     setTesting(true);
     try {
+      // What is on screen, saved or not: the server falls back to the stored
+      // value for anything masked ("••••••") or left out.
       const res = await fetch(
         `/api/workspace/${workspaceId}/integrations/test`,
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ provider: selected }),
+          body: JSON.stringify(
+            selected === "kapso"
+              ? {
+                  provider: "kapso",
+                  apiKey: kpApiKey,
+                  config: {
+                    phone_number_id: kpPhoneNumberId.trim(),
+                    waba_id: kpWabaId.trim(),
+                  },
+                }
+              : { provider: "ycloud", apiKey: ycApiKey },
+          ),
         },
       );
       const json = (await res.json()) as {
         ok: boolean;
         error?: string;
-        warning?: string;
+        warnings?: string[];
         balance?: { balance?: unknown; currency?: unknown };
-        phoneNumbers?: Array<{
-          phone_number_id?: string;
-          waba_id?: string;
-          display_phone_number?: string | null;
-        }>;
+        phoneNumbers?: KapsoNumberOption[];
       };
       if (json.ok) {
         const detail =
@@ -224,19 +268,23 @@ function WhatsAppSection({
             ? json.balance
               ? ` — Saldo: ${json.balance.balance ?? "?"} ${json.balance.currency ?? ""}`
               : ""
-            : json.phoneNumbers?.[0]?.display_phone_number
-              ? ` — ${json.phoneNumbers[0].display_phone_number}`
+            : json.phoneNumbers?.[0]
+              ? ` — ${describeKapsoNumber(json.phoneNumbers[0])}`
               : "";
+        setKapsoChoices([]);
         toast.success(`${label} conectado${detail}`);
-        if (json.warning) toast.warning(json.warning);
+        for (const warning of json.warnings ?? []) toast.warning(warning);
       } else {
-        // Kapso: a failed test still lists the project's numbers — offer to
-        // fill in the right IDs instead of making them be hunted down.
-        const first = json.phoneNumbers?.[0];
-        if (selected === "kapso" && first?.phone_number_id && !kpPhoneNumberId) {
-          setKpPhoneNumberId(first.phone_number_id);
-          if (first.waba_id && !kpWabaId) setKpWabaId(first.waba_id);
-          toast.info("Rellené los IDs con el número del proyecto — revisa y guarda");
+        // Kapso with a typed key: a failed test lists the project's numbers
+        // (connected production first). One and nothing filled in → fill it;
+        // otherwise let them choose — never assume which client's number it is.
+        const numbers = json.phoneNumbers ?? [];
+        if (selected === "kapso" && numbers.length > 0) {
+          if (numbers.length === 1 && !kpPhoneNumberId.trim()) {
+            pickKapsoNumber(numbers[0], "filled");
+          } else {
+            setKapsoChoices(numbers);
+          }
         }
         toast.error(json.error ?? "Error al probar la conexión");
       }
@@ -315,39 +363,20 @@ function WhatsAppSection({
       <div className="grid gap-4">
         <div className="space-y-2">
           <Label id="whatsapp-provider-label">Proveedor</Label>
-          <div
-            role="radiogroup"
-            aria-labelledby="whatsapp-provider-label"
-            className="inline-flex w-fit rounded-md border border-input p-0.5"
-          >
-            {(["ycloud", "kapso"] as const).map((p) => (
-              <button
-                key={p}
-                type="button"
-                role="radio"
-                aria-checked={selected === p}
-                onClick={() => setSelected(p)}
-                className={
-                  "rounded px-3 py-1.5 text-sm transition-colors " +
-                  (selected === p
-                    ? "bg-primary text-primary-foreground"
-                    : "text-muted-foreground hover:text-foreground")
-                }
-              >
-                {WHATSAPP_LABEL[p]}
-                {active === p && (
-                  <span className="ml-1.5 text-[10px] uppercase tracking-wide opacity-80">
-                    activo
-                  </span>
-                )}
-              </button>
-            ))}
-          </div>
+          <WhatsAppProviderPicker
+            value={selected}
+            onChange={setSelected}
+            active={active}
+            labelledBy="whatsapp-provider-label"
+          />
           {switching && (
             <p className="text-xs text-amber-500">
               Al guardar, este workspace deja de usar {WHATSAPP_LABEL[active]} y
               pasa a {label}. La configuración de {WHATSAPP_LABEL[active]} queda
-              guardada por si vuelves, y sus webhooks dejan de aceptarse.
+              guardada por si vuelves, y sus webhooks dejan de aceptarse: los
+              mensajes que ya envió dejan de actualizar su estado (entregado,
+              leído), y una respuesta que la IA esté preparando en ese momento
+              sale por {label}. Prueba la conexión antes de guardar.
             </p>
           )}
         </div>
@@ -396,7 +425,10 @@ function WhatsAppSection({
                 type="password"
                 placeholder="kapso_..."
                 value={kpApiKey}
-                onChange={(e) => setKpApiKey(e.target.value)}
+                onChange={(e) => {
+                  setKpApiKey(e.target.value);
+                  setKapsoChoices([]);
+                }}
                 autoComplete="off"
               />
             </div>
@@ -422,9 +454,17 @@ function WhatsAppSection({
               <p className="text-xs text-muted-foreground">
                 El ID numérico del número en Meta, no el número en sí. Sin esto
                 no se puede enviar ningún mensaje. Lo encuentras en el dashboard
-                de Kapso (o se autocompleta al probar la conexión).
+                de Kapso, o escribe la API Key y prueba la conexión para elegirlo.
               </p>
             </div>
+            {kapsoChoices.length > 0 && (
+              <KapsoNumberSelect
+                id="kapso-number-choice"
+                numbers={kapsoChoices}
+                value={kpPhoneNumberId}
+                onPick={(n) => pickKapsoNumber(n, "picked")}
+              />
+            )}
             <div className="space-y-2">
               <Label htmlFor="kapso-waba-id">WABA ID</Label>
               <Input
@@ -572,8 +612,9 @@ function WhatsAppSection({
             type="button"
             size="sm"
             onClick={handleSave}
-            disabled={saving}
+            disabled={saving || missing.length > 0}
             aria-busy={saving}
+            aria-describedby={missing.length > 0 ? "whatsapp-missing" : undefined}
           >
             {saving && (
               <Loader2 className="h-4 w-4 mr-2 animate-spin" aria-hidden />
@@ -581,6 +622,11 @@ function WhatsAppSection({
             {switching ? `Guardar y cambiar a ${label}` : "Guardar"}
           </Button>
         </div>
+        {missing.length > 0 && (
+          <p id="whatsapp-missing" className="text-xs text-muted-foreground">
+            Para guardar {label} falta {missing.join(", ")}.
+          </p>
+        )}
       </div>
     </Section>
   );

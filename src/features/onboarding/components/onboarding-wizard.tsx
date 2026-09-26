@@ -18,6 +18,15 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
+import {
+  describeKapsoNumber,
+  e164FromDisplay,
+  KapsoNumberSelect,
+  WhatsAppProviderPicker,
+  WHATSAPP_LABEL,
+  type KapsoNumberOption,
+  type WhatsAppProviderId,
+} from "@/features/settings/components/whatsapp-provider-picker";
 import { completeOnboarding } from "../services/onboarding-actions";
 import type { OnboardingInput } from "../services/onboarding-actions";
 
@@ -39,13 +48,6 @@ interface WizardState {
   /** Kapso only: WhatsApp Business Account id (templates) */
   kapsoWabaId: string;
 }
-
-type WhatsAppProviderId = "ycloud" | "kapso";
-
-const WHATSAPP_LABEL: Record<WhatsAppProviderId, string> = {
-  ycloud: "YCloud",
-  kapso: "Kapso",
-};
 
 // ─── Use case cards data ──────────────────────────────────────────────────────
 
@@ -239,11 +241,15 @@ function Step3({
   onChange,
   isTesting,
   onTest,
+  kapsoChoices,
+  onPickKapsoNumber,
 }: {
   state: WizardState;
   onChange: (patch: Partial<WizardState>) => void;
   isTesting: boolean;
   onTest: () => void;
+  kapsoChoices: KapsoNumberOption[];
+  onPickKapsoNumber: (n: KapsoNumberOption) => void;
 }) {
   const [copied, setCopied] = useState(false);
   const provider = state.whatsappProvider;
@@ -273,29 +279,22 @@ function Step3({
       <div className="space-y-4">
         <div className="space-y-2">
           <Label id="onboarding-provider-label">Proveedor</Label>
-          <div
-            role="radiogroup"
-            aria-labelledby="onboarding-provider-label"
-            className="inline-flex w-fit rounded-md border border-input p-0.5"
-          >
-            {(["ycloud", "kapso"] as const).map((p) => (
-              <button
-                key={p}
-                type="button"
-                role="radio"
-                aria-checked={provider === p}
-                onClick={() => onChange({ whatsappProvider: p })}
-                className={
-                  "rounded px-3 py-1.5 text-sm transition-colors " +
-                  (provider === p
-                    ? "bg-primary text-primary-foreground"
-                    : "text-muted-foreground hover:text-foreground")
-                }
-              >
-                {WHATSAPP_LABEL[p]}
-              </button>
-            ))}
-          </div>
+          <WhatsAppProviderPicker
+            value={provider}
+            onChange={(p) => {
+              if (p === provider) return;
+              // Keys, secrets and Meta ids belong to one provider: never send
+              // YCloud's key to Kapso's test (or the other way around).
+              onChange({
+                whatsappProvider: p,
+                whatsappApiKey: "",
+                whatsappSigningSecret: "",
+                kapsoPhoneNumberId: "",
+                kapsoWabaId: "",
+              });
+            }}
+            labelledBy="onboarding-provider-label"
+          />
           <p className="text-xs text-muted-foreground">
             Si tu número o tus clientes están en Estados Unidos, usa Kapso
             (YCloud no opera ahí).
@@ -340,6 +339,14 @@ function Step3({
                 Se autocompleta al probar la conexión.
               </p>
             </div>
+            {kapsoChoices.length > 0 && (
+              <KapsoNumberSelect
+                id="onboarding-kapso-number"
+                numbers={kapsoChoices}
+                value={state.kapsoPhoneNumberId}
+                onPick={onPickKapsoNumber}
+              />
+            )}
             <div className="space-y-2">
               <Label htmlFor="kapso-waba-id">WABA ID</Label>
               <Input
@@ -500,6 +507,8 @@ export function OnboardingWizard() {
   const [step, setStep] = useState(0);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [isTesting, setIsTesting] = useState(false);
+  // Kapso numbers to choose from when the project has more than one.
+  const [kapsoChoices, setKapsoChoices] = useState<KapsoNumberOption[]>([]);
   const [completedWorkspaceId, setCompletedWorkspaceId] = useState<
     string | null
   >(null);
@@ -519,6 +528,10 @@ export function OnboardingWizard() {
 
   function patch(update: Partial<WizardState>) {
     setState((prev) => ({ ...prev, ...update }));
+    // Numbers listed for one key (or provider) mean nothing for another.
+    if ("whatsappApiKey" in update || "whatsappProvider" in update) {
+      setKapsoChoices([]);
+    }
   }
 
   function canAdvance(): boolean {
@@ -589,11 +602,7 @@ export function OnboardingWizard() {
       const json = (await res.json()) as {
         ok?: boolean;
         balance?: { balance?: number; currency?: string };
-        phoneNumbers?: Array<{
-          phone_number_id?: string;
-          waba_id?: string;
-          display_phone_number?: string | null;
-        }>;
+        phoneNumbers?: KapsoNumberOption[];
         error?: string;
       };
       if (!json.ok) {
@@ -601,16 +610,26 @@ export function OnboardingWizard() {
         return;
       }
       if (provider === "kapso") {
-        // Kapso lists the project's numbers (real ones first): fill in the
-        // Meta ids the user would otherwise have to copy by hand.
-        const first = json.phoneNumbers?.[0];
+        // Kapso lists the project's numbers (connected production first).
+        // With one, fill in the Meta ids the user would otherwise copy by
+        // hand; with several, let them choose — it may be another client's.
+        const numbers = json.phoneNumbers ?? [];
+        if (numbers.length > 1 && !state.kapsoPhoneNumberId) {
+          setKapsoChoices(numbers);
+          toast.success(
+            `${label} conectado — hay ${numbers.length} números en el proyecto: elige el de este negocio`,
+          );
+          return;
+        }
+        const first = numbers[0];
         patch({
           kapsoPhoneNumberId: state.kapsoPhoneNumberId || first?.phone_number_id || "",
           kapsoWabaId: state.kapsoWabaId || first?.waba_id || "",
-          whatsappPhone: state.whatsappPhone || first?.display_phone_number || "",
+          whatsappPhone:
+            state.whatsappPhone || e164FromDisplay(first?.display_phone_number),
         });
         toast.success(
-          `${label} conectado${first?.display_phone_number ? ` — ${first.display_phone_number}` : ""}`,
+          `${label} conectado${first ? ` — ${describeKapsoNumber(first)}` : ""}`,
         );
       } else {
         const balance =
@@ -645,6 +664,16 @@ export function OnboardingWizard() {
           onChange={patch}
           isTesting={isTesting}
           onTest={handleTestConnection}
+          kapsoChoices={state.whatsappProvider === "kapso" ? kapsoChoices : []}
+          onPickKapsoNumber={(n) => {
+            patch({
+              kapsoPhoneNumberId: n.phone_number_id ?? "",
+              kapsoWabaId: n.waba_id ?? "",
+              whatsappPhone: e164FromDisplay(n.display_phone_number) || state.whatsappPhone,
+            });
+            setKapsoChoices([]);
+            toast.info(`Elegiste ${describeKapsoNumber(n)}`);
+          }}
         />
       )}
       {step === 3 && completedWorkspaceId && (
