@@ -37,7 +37,14 @@ import { createClient as svcClient } from "@supabase/supabase-js";
 import type {
   Tool as ForgeTool,
   ToolContext,
+  ToolExecution,
 } from "@/features/tools/core/tool";
+
+// Upper bounds for one model call, so a hung provider can't eat the whole
+// function (the buffer needs time left to send and to close the batch). A
+// tool turn runs up to 5 steps, each with its own tool calls.
+const LLM_TIMEOUT_MS = 60_000;
+const LLM_TOOL_TURN_TIMEOUT_MS = 120_000;
 import { registry } from "@/features/tools/index";
 import { getActiveAgent } from "@/features/agents/services/active-agent";
 import { decryptCredentials } from "@/shared/lib/integration-secrets";
@@ -180,6 +187,7 @@ export async function generateReply(
       { role: "user", content: userMessage },
     ],
     maxOutputTokens: 1024,
+    abortSignal: AbortSignal.timeout(LLM_TIMEOUT_MS),
   });
 
   // AI SDK v6 exposes inputTokens / outputTokens; map to stable naming.
@@ -254,6 +262,9 @@ export async function generateChatReply(params: {
       tools: hasTools ? aiTools : undefined,
       stopWhen: hasTools ? stepCountIs(5) : undefined,
       maxOutputTokens: params.maxOutputTokens ?? 512,
+      abortSignal: AbortSignal.timeout(
+        hasTools ? LLM_TOOL_TURN_TIMEOUT_MS : LLM_TIMEOUT_MS,
+      ),
     }),
   );
 
@@ -279,6 +290,11 @@ export interface GenerateWithToolsParams {
   toolContext: ToolContext;
   /** Prior conversation turns (oldest→newest), injected between system and the current batch. */
   history?: Array<{ role: "user" | "assistant"; content: string }>;
+  /**
+   * Called once per tool that actually ran — also when the turn later fails,
+   * which is when the caller most needs to know a write already happened.
+   */
+  onToolExecuted?: (execution: ToolExecution) => void | Promise<void>;
 }
 
 export interface GenerateWithToolsResult {
@@ -326,7 +342,9 @@ export async function generateWithTools(
       description: forgeTool.description,
       inputSchema: zodSchema(forgeTool.schema),
       execute: async (args: unknown): Promise<unknown> => {
-        return registry.run(forgeTool.name, args, ctx);
+        return registry.run(forgeTool.name, args, ctx, {
+          onExecuted: params.onToolExecuted,
+        });
       },
     });
   }
@@ -343,6 +361,9 @@ export async function generateWithTools(
     tools: hasTools ? aiTools : undefined,
     stopWhen: hasTools ? stepCountIs(5) : undefined,
     maxOutputTokens: 1024,
+    abortSignal: AbortSignal.timeout(
+      hasTools ? LLM_TOOL_TURN_TIMEOUT_MS : LLM_TIMEOUT_MS,
+    ),
   });
 
   // totalUsage, not usage: a tool turn runs up to 5 steps, and usage only

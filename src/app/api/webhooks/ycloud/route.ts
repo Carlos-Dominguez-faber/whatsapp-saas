@@ -7,6 +7,7 @@ import {
 import { processInbound } from "@/features/inbox/services/normalizer";
 import { checkRateLimits } from "@/features/inbox/services/cost-tracker";
 import {
+  hasTimeToClaim,
   upsertBatch,
   processNextBatch,
 } from "@/features/inbox/services/buffer";
@@ -26,9 +27,11 @@ import { extractWebhookError } from "@/features/inbox/services/whatsapp-errors";
 // (sleep through the buffer window + AI generation). The cron is the fallback.
 //
 // The budget is SHARED: the fast path first sleeps the whole silence window
-// (30 s by default) and only then runs the agent turn. With 60 a turn that
-// called a tool timed out and fell back to the cron, a minute or more later.
-export const maxDuration = 120;
+// (30 s by default, up to 120 s) and only then runs the agent turn, and it only
+// claims a batch with time left to finish it (hasTimeToClaim). 300 s is the
+// Hobby maximum with Fluid Compute, and stays below claim_next_batch()'s
+// 7-minute stale lease.
+export const maxDuration = 300;
 
 function svc() {
   return createSbClient(
@@ -38,6 +41,7 @@ function svc() {
 }
 
 export async function POST(request: NextRequest): Promise<NextResponse> {
+  const startedAt = Date.now();
   try {
     const rawBody = await request.text();
     const sigHeader = request.headers.get("YCloud-Signature");
@@ -276,6 +280,8 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
       await new Promise((resolve) =>
         setTimeout(resolve, effectiveSilenceMs + 500),
       );
+      // Without time to finish a turn, leave the batch to the cron.
+      if (!hasTimeToClaim(startedAt, maxDuration)) return;
       try {
         await processNextBatch();
       } catch (e) {

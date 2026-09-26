@@ -32,7 +32,7 @@ mock.module("@/features/inbox/services/normalizer.ts", {
 });
 mock.module("@/features/inbox/services/cost-tracker.ts", { exports: { checkRateLimits: unused } });
 mock.module("@/features/inbox/services/buffer.ts", {
-  exports: { upsertBatch: unused, processNextBatch: unused },
+  exports: { upsertBatch: unused, processNextBatch: unused, hasTimeToClaim: () => true },
 });
 mock.module("@/features/inbox/services/media-handler.ts", {
   exports: { downloadAndStoreMedia: unused, patchMessageMedia: unused },

@@ -14,6 +14,7 @@ import {
 } from "@/features/inbox/services/normalizer";
 import { checkRateLimits } from "@/features/inbox/services/cost-tracker";
 import {
+  hasTimeToClaim,
   upsertBatch,
   processNextBatch,
 } from "@/features/inbox/services/buffer";
@@ -32,11 +33,11 @@ import { applyMessageStatus } from "@/features/inbox/services/message-status";
 // (sleep through the buffer window + AI generation). The cron is the fallback.
 //
 // The budget is SHARED: the fast path first sleeps the whole silence window
-// (30s by default, up to 120s) and only then runs the agent turn. With 60 the
-// generation had under 30s left, so every turn that called a tool timed out and
-// fell back to the reconciler — the user got the reply ~8 minutes later. A turn
-// that only checks availability already takes ~33s on its own.
-export const maxDuration = 120;
+// (30 s by default, up to 120 s) and only then runs the agent turn, and it only
+// claims a batch with time left to finish it (hasTimeToClaim). 300 s is the
+// Hobby maximum with Fluid Compute, and stays below claim_next_batch()'s
+// 7-minute stale lease.
+export const maxDuration = 300;
 
 function svc() {
   return createSbClient(
@@ -46,6 +47,7 @@ function svc() {
 }
 
 export async function POST(request: NextRequest): Promise<NextResponse> {
+  const startedAt = Date.now();
   try {
     const rawBody = await request.text();
     // Kapso signs the RAW body with HMAC-SHA256 (hex), no timestamp.
@@ -307,6 +309,8 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
       await new Promise((resolve) =>
         setTimeout(resolve, effectiveSilenceMs + 500),
       );
+      // Without time to finish a turn, leave the batch to the cron.
+      if (!hasTimeToClaim(startedAt, maxDuration)) return;
       try {
         await processNextBatch();
       } catch (e) {

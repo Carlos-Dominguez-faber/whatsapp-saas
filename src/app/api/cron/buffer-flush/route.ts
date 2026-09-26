@@ -1,6 +1,7 @@
 import { timingSafeEqual } from "node:crypto";
 import { NextResponse } from "next/server";
 import {
+  hasTimeToClaim,
   processNextBatch,
   reconcileOrphanedMessages,
 } from "@/features/inbox/services/buffer";
@@ -33,6 +34,7 @@ function isAuthorized(header: string | null): boolean {
 }
 
 export async function GET(request: Request): Promise<NextResponse> {
+  const startedAt = Date.now();
   if (!isAuthorized(request.headers.get("Authorization"))) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
@@ -43,12 +45,19 @@ export async function GET(request: Request): Promise<NextResponse> {
 
   const results: Array<{ processed: boolean; error?: string }> = [];
 
-  for (let i = 0; i < MAX_BATCHES_PER_RUN; i++) {
+  // Never claim a batch without time to finish it: a function killed mid-turn
+  // leaves the batch stuck for the 7-minute lease.
+  for (
+    let i = 0;
+    i < MAX_BATCHES_PER_RUN && hasTimeToClaim(startedAt, maxDuration);
+    i++
+  ) {
     const result = await processNextBatch();
     results.push(result);
 
-    // No more ready batches — stop early
-    if (!result.processed) break;
+    // No more ready batches — stop early. A batch that failed is re-queued
+    // or dead-lettered by processNextBatch; keep draining the others.
+    if (!result.processed && !result.error) break;
   }
 
   const processedCount = results.filter((r) => r.processed).length;

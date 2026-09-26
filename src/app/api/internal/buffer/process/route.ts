@@ -137,7 +137,10 @@ export async function POST(request: Request): Promise<NextResponse> {
     }
   }
 
-  // ── 3b. Process next ready batch (or the one we just primed above) ────────
+  // ── 3b. Process the next ready batch ──────────────────────────────────────
+  // claim_next_batch() serves each conversation's oldest unfinished batch
+  // first, so the primed batch may wait behind an older one — or another
+  // conversation's may come first. The response says which one ran.
   const result = await processNextBatch();
 
   if (result.error) {
@@ -147,7 +150,8 @@ export async function POST(request: Request): Promise<NextResponse> {
   return NextResponse.json({
     ok: true,
     processed: result.processed,
-    batchId: batchId ?? undefined,
+    requestedBatchId: batchId ?? undefined,
+    processedBatchId: result.batchId,
     ...(result.error ? { error: "No se pudo procesar el lote" } : {}),
   });
 }

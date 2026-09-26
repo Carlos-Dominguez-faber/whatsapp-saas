@@ -14,7 +14,9 @@ const updateFilters: Array<[string, unknown]> = [];
 // Rows the re-arm UPDATE reports as affected; [] = someone else claimed it first.
 let updatedRows: unknown[] = [{ id: "batch_1" }];
 let updateError: unknown = null;
-let processResult: { processed: boolean; error?: string } = { processed: true };
+let processResult: { processed: boolean; batchId?: string; error?: string } = {
+  processed: true,
+};
 
 const fakeSvc = {
   from: () => ({
@@ -171,4 +173,14 @@ test("a targeted batchId only revives batches still in 'buffering', never one in
 
 test("declares maxDuration below claim_next_batch's 7-minute lease", () => {
   assert.equal(maxDuration, 300);
+});
+
+test("the response names the batch requested and the batch actually processed", async () => {
+  reset();
+  lookupRow = { id: "batch_1", workspace_id: "ws_1", status: "buffering" };
+  processResult = { processed: true, batchId: "batch_other" };
+  const res = await POST(signed(JSON.stringify({ batchId: "batch_1" })));
+  const body = await res.json();
+  assert.equal(body.requestedBatchId, "batch_1");
+  assert.equal(body.processedBatchId, "batch_other");
 });
