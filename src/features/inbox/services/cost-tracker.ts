@@ -1,6 +1,9 @@
 import { createClient as createSbClient } from "@supabase/supabase-js";
 import { performance } from "node:perf_hooks";
-import { isMissingFunctionError } from "@/shared/lib/db-errors";
+import {
+  isMissingFunctionError,
+  reportMissingFunctionOnce,
+} from "@/shared/lib/db-errors";
 
 const LLM_TURNS_PER_CONTACT_PER_HOUR = 20;
 
@@ -117,6 +120,32 @@ export async function checkRateLimits(
   return { allowed: true };
 }
 
+/**
+ * Counts this workspace's events of `type` in the last hour (optionally for one
+ * contact). The fallback when a reservation function is missing; throws on a
+ * database error like the functions it stands in for.
+ */
+async function countRecentEvents(
+  supabase: ReturnType<typeof svc>,
+  opts: { workspaceId: string; type: string; contactId?: string },
+): Promise<number> {
+  const nowMs = performance.timeOrigin + performance.now();
+  let query = supabase
+    .from("events")
+    .select("id", { count: "exact", head: true })
+    .eq("type", opts.type)
+    .eq("workspace_id", opts.workspaceId)
+    .gte("created_at", new Date(nowMs - 3_600_000).toISOString());
+  if (opts.contactId) {
+    query = query.filter("payload->>contact_id", "eq", opts.contactId);
+  }
+  const { count, error } = await query;
+  if (error) {
+    throw new Error(`hourly count fallback failed: ${error.message}`);
+  }
+  return count ?? 0;
+}
+
 export interface ReserveLlmTurnResult {
   allowed: boolean;
   reason?: string;
@@ -147,13 +176,21 @@ export async function reserveLlmTurn(
   });
 
   if (error) {
-    if (isMissingFunctionError(error)) {
-      // Code deployed before `db-push`: keep the agent answering, unreserved,
-      // rather than silencing every workspace until the migration runs.
-      console.warn(
-        "[cost-tracker] reserve_llm_turn is missing — run `setup.mjs db-push`; the hourly limit is not enforced until then",
+    if (isMissingFunctionError(error, "reserve_llm_turn")) {
+      // Code deployed before `db-push`: keep the agent answering and apply the
+      // hourly limit with a plain count (not atomic) until the migration runs.
+      reportMissingFunctionOnce(
+        "reserve_llm_turn",
+        "the hourly turn limit is checked with a non-atomic count",
       );
-      return { allowed: true };
+      const count = await countRecentEvents(supabase, {
+        workspaceId,
+        type: "llm_usage",
+        contactId,
+      });
+      return count >= LLM_TURNS_PER_CONTACT_PER_HOUR
+        ? { allowed: false, reason: "rate_limit_contact_hour" }
+        : { allowed: true };
     }
     // A real database error: throw so processNextBatch() retries the batch
     // with backoff and dead-letters it visibly, instead of dropping the turn.
@@ -194,11 +231,15 @@ export async function reserveWorkspaceLlmCall(
   });
 
   if (error) {
-    if (isMissingFunctionError(error)) {
-      console.warn(
-        "[cost-tracker] reserve_workspace_llm_call is missing — run `setup.mjs db-push`; the hourly limit is not enforced until then",
+    if (isMissingFunctionError(error, "reserve_workspace_llm_call")) {
+      reportMissingFunctionOnce(
+        "reserve_workspace_llm_call",
+        "the hourly limit of template drafts and playground calls is checked with a non-atomic count",
       );
-      return { allowed: true };
+      const count = await countRecentEvents(supabase, { workspaceId, type });
+      return count >= hourlyLimit
+        ? { allowed: false, reason: "rate_limit_workspace_hour" }
+        : { allowed: true };
     }
     throw new Error(`reserve_workspace_llm_call failed: ${error.message}`);
   }

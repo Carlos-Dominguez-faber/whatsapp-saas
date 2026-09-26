@@ -14,6 +14,7 @@ mock.module("node:perf_hooks", {
 interface QueueEntry {
   data?: unknown;
   error?: unknown;
+  count?: number | null;
 }
 
 let responseQueue: QueueEntry[] = [];
@@ -22,7 +23,7 @@ const insertedRows: unknown[] = [];
 let insertErrorToReturn: unknown = null;
 let rpcResponse: QueueEntry = { data: null, error: null };
 let rpcCalls: Array<{ fn: string; args: unknown }> = [];
-const updateCalls: Array<{ row: unknown; eqArgs: unknown[] }> = [];
+const updateCalls: Array<{ row: unknown; eqArgs: unknown[][] }> = [];
 
 function nextResponse(): QueueEntry {
   return responseQueue.shift() ?? { data: null, error: null };
@@ -52,8 +53,8 @@ function makeChain() {
 const fakeClient = {
   from() {
     return {
-      select(columns: string) {
-        calls.push({ op: "select", args: [columns] });
+      select(columns: string, opts?: unknown) {
+        calls.push({ op: "select", args: [columns, opts] });
         return makeChain();
       },
       insert(row: unknown) {
@@ -61,12 +62,19 @@ const fakeClient = {
         return Promise.resolve({ error: insertErrorToReturn });
       },
       update(row: unknown) {
-        return {
+        // Chainable like PostgREST's builder: .eq().eq() then await.
+        const entry = { row, eqArgs: [] as unknown[][] };
+        updateCalls.push(entry);
+        const chain: any = {
           eq(column: string, value: unknown) {
-            updateCalls.push({ row, eqArgs: [column, value] });
-            return Promise.resolve({ error: insertErrorToReturn });
+            entry.eqArgs.push([column, value]);
+            return chain;
+          },
+          then(resolve: (v: { error: unknown }) => void) {
+            resolve({ error: insertErrorToReturn });
           },
         };
+        return chain;
       },
     };
   },
@@ -80,7 +88,19 @@ mock.module("@supabase/supabase-js", {
   exports: { createClient: () => fakeClient },
 });
 
-const { recordLlmUsage, checkRateLimits, reserveLlmTurn } = await import("./cost-tracker.ts");
+const {
+  recordLlmUsage,
+  checkRateLimits,
+  reserveLlmTurn,
+  reserveWorkspaceLlmCall,
+  recordWorkspaceLlmCall,
+} = await import("./cost-tracker.ts");
+
+const MISSING = {
+  code: "PGRST202",
+  message: "Could not find the function",
+  hint: "Perhaps you meant to call the function public.sum_daily_llm_tokens",
+};
 
 test("recordLlmUsage inserts an llm_usage event with summed total_tokens", async () => {
   insertedRows.length = 0;
@@ -221,12 +241,115 @@ test("reserveLlmTurn throws when the RPC errors, so the batch is retried and dea
   await assert.rejects(() => reserveLlmTurn("ws_1", "contact_1"), /reserve_llm_turn failed: boom/);
 });
 
-test("reserveLlmTurn allows without a reservation when the function does not exist yet (deployed before db-push)", async () => {
-  for (const code of ["PGRST202", "42883"]) {
-    rpcResponse = { data: null, error: { code, message: "function not found" } };
-    const result = await reserveLlmTurn("ws_1", "contact_1");
-    assert.deepEqual(result, { allowed: true });
-  }
+test("before db-push reserveLlmTurn still applies the hourly limit with a plain count", async () => {
+  rpcResponse = { data: null, error: MISSING };
+  calls = [];
+  responseQueue = [{ count: 3, error: null }];
+  assert.deepEqual(await reserveLlmTurn("ws_1", "contact_1"), { allowed: true });
+  assert.ok(
+    calls.some((c) => c.op === "filter" && c.args[0] === "payload->>contact_id" && c.args[2] === "contact_1"),
+  );
+
+  responseQueue = [{ count: 20, error: null }];
+  assert.deepEqual(await reserveLlmTurn("ws_1", "contact_1"), {
+    allowed: false,
+    reason: "rate_limit_contact_hour",
+  });
+});
+
+test("reserveLlmTurn called with the wrong parameters throws instead of falling back", async () => {
+  rpcResponse = {
+    data: null,
+    error: {
+      code: "PGRST202",
+      message: "Could not find the function",
+      hint: "Perhaps you meant to call the function public.reserve_llm_turn(p_contact_id, p_hourly_limit, p_workspace_id)",
+    },
+  };
+  await assert.rejects(() => reserveLlmTurn("ws_1", "contact_1"), /reserve_llm_turn failed/);
+});
+
+// ── reserveWorkspaceLlmCall / recordWorkspaceLlmCall ─────────────────────────
+
+test("reserveWorkspaceLlmCall reserves one of the workspace's hourly calls of a type", async () => {
+  rpcCalls = [];
+  rpcResponse = { data: [{ allowed: true, reservation_id: "res_w1" }], error: null };
+  const result = await reserveWorkspaceLlmCall("ws_1", "template_generate", 20);
+  assert.deepEqual(result, { allowed: true, reservationId: "res_w1" });
+  assert.deepEqual(rpcCalls[0], {
+    fn: "reserve_workspace_llm_call",
+    args: { p_workspace_id: "ws_1", p_type: "template_generate", p_hourly_limit: 20 },
+  });
+});
+
+test("reserveWorkspaceLlmCall denies at the limit and throws on a database error", async () => {
+  rpcResponse = { data: [{ allowed: false, reservation_id: null }], error: null };
+  assert.deepEqual(await reserveWorkspaceLlmCall("ws_1", "agent_test_chat", 60), {
+    allowed: false,
+    reason: "rate_limit_workspace_hour",
+  });
+  rpcResponse = { data: null, error: { message: "boom" } };
+  await assert.rejects(
+    () => reserveWorkspaceLlmCall("ws_1", "agent_test_chat", 60),
+    /reserve_workspace_llm_call failed: boom/,
+  );
+});
+
+test("before db-push reserveWorkspaceLlmCall counts the type's calls in the last hour", async () => {
+  rpcResponse = { data: null, error: MISSING };
+  calls = [];
+  responseQueue = [{ count: 20, error: null }];
+  assert.deepEqual(await reserveWorkspaceLlmCall("ws_1", "template_generate", 20), {
+    allowed: false,
+    reason: "rate_limit_workspace_hour",
+  });
+  assert.ok(calls.some((c) => c.op === "eq" && c.args[0] === "type" && c.args[1] === "template_generate"));
+});
+
+test("recordWorkspaceLlmCall fills the reserved row, scoped to its workspace", async () => {
+  insertedRows.length = 0;
+  updateCalls.length = 0;
+  insertErrorToReturn = null;
+  await recordWorkspaceLlmCall({
+    reservationId: "res_w1",
+    workspaceId: "ws_1",
+    type: "agent_test_chat",
+    model: "openai/gpt-4.1",
+    promptTokens: 300,
+    completionTokens: 40,
+    extra: { agent_id: "agent_1" },
+  });
+  assert.equal(insertedRows.length, 0);
+  assert.deepEqual(updateCalls[0].eqArgs, [
+    ["id", "res_w1"],
+    ["workspace_id", "ws_1"],
+  ]);
+  assert.deepEqual((updateCalls[0].row as { payload: unknown }).payload, {
+    agent_id: "agent_1",
+    model: "openai/gpt-4.1",
+    input_tokens: 300,
+    output_tokens: 40,
+    total_tokens: 340,
+  });
+});
+
+test("recordWorkspaceLlmCall inserts a row when there was no reservation", async () => {
+  insertedRows.length = 0;
+  updateCalls.length = 0;
+  await recordWorkspaceLlmCall({
+    workspaceId: "ws_1",
+    type: "template_generate",
+    model: "openai/gpt-4o-mini",
+    promptTokens: 10,
+    completionTokens: 5,
+  });
+  assert.equal(updateCalls.length, 0);
+  assert.deepEqual(insertedRows[0], {
+    type: "template_generate",
+    level: "info",
+    workspace_id: "ws_1",
+    payload: { model: "openai/gpt-4o-mini", input_tokens: 10, output_tokens: 5, total_tokens: 15 },
+  });
 });
 
 test("recordLlmUsage updates the reservation row in place when a reservationId is given, instead of inserting a new one", async () => {
@@ -244,7 +367,7 @@ test("recordLlmUsage updates the reservation row in place when a reservationId i
   });
   assert.equal(insertedRows.length, 0);
   assert.equal(updateCalls.length, 1);
-  assert.deepEqual(updateCalls[0].eqArgs, ["id", "res_1"]);
+  assert.deepEqual(updateCalls[0].eqArgs, [["id", "res_1"]]);
   const row = updateCalls[0].row as { conversation_id: string; payload: Record<string, unknown> };
   assert.equal(row.conversation_id, "conv_1");
   assert.deepEqual(row.payload, {
