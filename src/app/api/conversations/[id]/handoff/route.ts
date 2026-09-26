@@ -77,7 +77,7 @@ export async function POST(
 
   try {
     // 4. Determine target state
-    // 'request' → handoff_pending (from ai_active or human_active)
+    // 'request' → handoff_pending (from ai_active)
     // 'cancel'  → ai_active (from handoff_pending)
     const to = action === "request" ? "handoff_pending" : "ai_active";
 

@@ -61,6 +61,14 @@ export function ChatThread({
   const [savingNote, setSavingNote] = useState(false);
   const router = useRouter();
 
+  // Mirrors the conversations UPDATE policy the server enforces for toggling
+  // the AI and handing a thread back to it: admins, managers, or the member
+  // the thread is assigned to.
+  const canUpdateConversation =
+    role === "admin" ||
+    role === "manager" ||
+    conversation.assigned_to === currentUserId;
+
   const isWindowExpired =
     conversation.window_expires_at != null &&
     new Date(conversation.window_expires_at) < new Date();
@@ -243,12 +251,8 @@ export function ChatThread({
               </RoleGate>
             )}
 
-            {/* Return to AI — human_active only; the server lets admins,
-                managers and the assigned member do it, so hide it otherwise */}
-            {conversation.state === "human_active" &&
-              (role === "admin" ||
-                role === "manager" ||
-                conversation.assigned_to === currentUserId) && (
+            {/* Return to AI — human_active only, for whoever may update it */}
+            {conversation.state === "human_active" && canUpdateConversation && (
               <RoleGate role={role} check={canTakeConversation}>
                 <Button
                   type="button"
@@ -299,10 +303,12 @@ export function ChatThread({
             >
               <User className="h-4 w-4" aria-hidden="true" />
             </Button>
-            <AiToggleButton
-              conversationId={conversation.id}
-              initialEnabled={conversation.ai_enabled}
-            />
+            {canUpdateConversation && (
+              <AiToggleButton
+                conversationId={conversation.id}
+                initialEnabled={conversation.ai_enabled}
+              />
+            )}
           </div>
         </header>
 
