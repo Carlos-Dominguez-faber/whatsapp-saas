@@ -4,6 +4,8 @@ import { createClient as createSbClient } from "@supabase/supabase-js";
 import { getActiveWorkspace } from "@/features/workspace/services/active-workspace";
 import { listAgents } from "@/features/agents/services/agent-queries";
 import { SettingsShell } from "@/features/settings/components/settings-shell";
+import { countJudgmentsToday } from "@/features/jev-judge/usage";
+import { readJevUses } from "@/features/jev-judge/uses";
 
 export default async function SettingsPage() {
   const supabase = await createClient();
@@ -63,6 +65,11 @@ export default async function SettingsPage() {
   ]);
 
   const initialAgents = await listAgents(svc, workspaceId);
+  const ycloud = (integrationsData ?? []).find(
+    (row) => row.provider === "ycloud",
+  );
+  const ycloudConfig = (ycloud?.config as Record<string, unknown> | null) ?? {};
+  const judgmentsToday = await countJudgmentsToday(svc, workspaceId);
 
   // Mask credentials server-side before passing to client components
   function maskRecord(
@@ -120,6 +127,12 @@ export default async function SettingsPage() {
       initialTools={toolsWithEnabled}
       initialIntegrations={maskedIntegrations}
       initialAgents={initialAgents}
+      jev={{
+        enabled: ycloudConfig.jev_enabled === true,
+        uses: readJevUses(ycloudConfig),
+        keyReady: Boolean(process.env.TYPESAFE_API_KEY),
+        judgmentsToday,
+      }}
     />
   );
 }

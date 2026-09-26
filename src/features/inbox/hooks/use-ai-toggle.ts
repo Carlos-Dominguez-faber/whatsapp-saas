@@ -1,6 +1,7 @@
 "use client";
 
 import { useTransition, useState } from "react";
+import { toast } from "sonner";
 
 interface UseAiToggleReturn {
   aiEnabled: boolean;
@@ -34,10 +35,13 @@ export function useAiToggle(
         if (!res.ok) {
           // Revert on failure
           setAiEnabled(!next);
+          const data = (await res.json().catch(() => ({}))) as { error?: string };
+          toast.error(data.error ?? "No se pudo cambiar la IA");
         }
       } catch {
         // Revert on network error
         setAiEnabled(!next);
+        toast.error("Error de conexión");
       }
     });
   };
