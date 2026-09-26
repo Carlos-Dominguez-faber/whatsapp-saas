@@ -7,6 +7,7 @@ import {
   isMissingFunctionError,
   reportMissingFunctionOnce,
 } from "@/shared/lib/db-errors";
+import { emitEventOncePerDay } from "./daily-events";
 
 function svc() {
   return createSbClient(
@@ -70,7 +71,7 @@ export async function enforceCostPolicy(
     console.warn(
       `[cost-enforcer] workspace=${workspaceId} hit hard limit: ${totalTokensToday} tokens`,
     );
-    await emitOncePerDay(supabase, workspaceId, dayStart, "cost_cut", "error", {
+    await emitEventOncePerDay(supabase, workspaceId, "cost_cut", "error", {
       total_tokens_today: totalTokensToday,
       hard_limit: DAILY_TOKEN_HARD_LIMIT,
     });
@@ -81,7 +82,7 @@ export async function enforceCostPolicy(
     console.warn(
       `[cost-enforcer] workspace=${workspaceId} warn threshold crossed: ${totalTokensToday} tokens`,
     );
-    await emitOncePerDay(supabase, workspaceId, dayStart, "cost_alert", "warn", {
+    await emitEventOncePerDay(supabase, workspaceId, "cost_alert", "warn", {
       total_tokens_today: totalTokensToday,
       threshold: DAILY_TOKEN_WARN_THRESHOLD,
       hard_limit: DAILY_TOKEN_HARD_LIMIT,
@@ -128,8 +129,12 @@ async function readDailyTokens(
   throw new Error(`sum_daily_llm_tokens failed: ${error.message}`);
 }
 
+// Rows asked for per page. PostgREST may return fewer (its max-rows), so the
+// loop advances by what actually came back and stops on an empty page.
 const PAGE_SIZE = 1000;
-const MAX_PAGES = 100;
+// Past this many rows the fallback gives up and throws (the batch retries)
+// rather than returning a sum it could not finish.
+const MAX_ROWS = 100_000;
 
 async function sumDailyTokensDirect(
   supabase: Svc,
@@ -137,8 +142,13 @@ async function sumDailyTokensDirect(
   dayStart: Date,
 ): Promise<number> {
   let total = 0;
-  for (let page = 0; page < MAX_PAGES; page++) {
-    const from = page * PAGE_SIZE;
+  let from = 0;
+  for (;;) {
+    if (from >= MAX_ROWS) {
+      throw new Error(
+        `daily budget fallback stopped after ${MAX_ROWS} rows; run db-push`,
+      );
+    }
     const { data, error } = await supabase
       .from("events")
       .select("payload")
@@ -146,51 +156,18 @@ async function sumDailyTokensDirect(
       .in("type", [...BUDGET_EVENT_TYPES])
       .gte("created_at", dayStart.toISOString())
       .order("created_at", { ascending: true })
+      .order("id", { ascending: true })
       .range(from, from + PAGE_SIZE - 1);
     if (error) {
       throw new Error(`daily budget fallback read failed: ${error.message}`);
     }
-    for (const row of data ?? []) {
+    const rows = data ?? [];
+    if (rows.length === 0) return total;
+    for (const row of rows) {
       const t = (row.payload as Record<string, unknown> | null)?.total_tokens;
       if (typeof t === "number" && Number.isFinite(t) && t >= 0) total += t;
     }
-    if ((data?.length ?? 0) < PAGE_SIZE) break;
-  }
-  return total;
-}
-
-/**
- * Inserts an alert event unless this workspace already has one of `type`
- * today. Best-effort: a failure is logged and never blocks the turn.
- */
-async function emitOncePerDay(
-  supabase: Svc,
-  workspaceId: string,
-  dayStart: Date,
-  type: "cost_alert" | "cost_cut",
-  level: "warn" | "error",
-  payload: Record<string, unknown>,
-): Promise<void> {
-  try {
-    const { data: existing, error } = await supabase
-      .from("events")
-      .select("id")
-      .eq("workspace_id", workspaceId)
-      .eq("type", type)
-      .gte("created_at", dayStart.toISOString())
-      .limit(1);
-    if (error) throw error;
-    if ((existing?.length ?? 0) > 0) return;
-
-    const { error: insertError } = await supabase.from("events").insert({
-      type,
-      level,
-      workspace_id: workspaceId,
-      payload,
-    });
-    if (insertError) throw insertError;
-  } catch (err) {
-    console.error(`[cost-enforcer] failed to record ${type}:`, err);
+    from += rows.length;
   }
 }
 

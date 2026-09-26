@@ -133,6 +133,7 @@ test("before db-push the cap still holds: a missing sum function falls back to s
       ],
       error: null,
     },
+    { data: [], error: null }, // end of the events
     { data: [], error: null }, // the cost_cut lookup
   ];
   const result = await enforceCostPolicy("ws_1");
@@ -140,6 +141,37 @@ test("before db-push the cap still holds: a missing sum function falls back to s
   const sumOps = selectOps[0];
   assert.ok(sumOps.some(([op, col]) => op === "in" && col === "type"));
   assert.ok(sumOps.some(([op, col, val]) => op === "eq" && col === "workspace_id" && val === "ws_1"));
+  // A stable order, so no row is skipped or read twice between pages.
+  assert.deepEqual(
+    sumOps.filter(([op]) => op === "order").map(([, col]) => col),
+    ["created_at", "id"],
+  );
+});
+
+test("the fallback keeps paging by what came back, even when pages are smaller than asked", async () => {
+  reset();
+  rpcResponse = { data: null, error: { code: "PGRST202", hint: null } };
+  const row = { payload: { total_tokens: 300_000 } };
+  selectQueue = [
+    { data: [row, row], error: null },
+    { data: [row, row], error: null },
+    { data: [], error: null },
+    { data: [], error: null }, // cost_cut lookup
+  ];
+  const result = await enforceCostPolicy("ws_1");
+  assert.deepEqual(result, { policy: "cut", reason: "daily_hard_limit" });
+  assert.deepEqual(
+    selectOps[1].find(([op]) => op === "range"),
+    ["range", 2, 1001],
+  );
+});
+
+test("the fallback throws rather than return a sum it could not finish", async () => {
+  reset();
+  rpcResponse = { data: null, error: { code: "PGRST202", hint: null } };
+  const page = { data: Array.from({ length: 1000 }, () => ({ payload: { total_tokens: 0 } })), error: null };
+  selectQueue = Array.from({ length: 101 }, () => page);
+  await assert.rejects(() => enforceCostPolicy("ws_1"), /stopped after 100000 rows/);
 });
 
 test("the sum function called with the wrong parameters is a bug: it throws instead of falling back", async () => {
