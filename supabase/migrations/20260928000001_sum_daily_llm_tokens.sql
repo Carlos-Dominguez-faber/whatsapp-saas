@@ -31,7 +31,9 @@ SET search_path = ''
 AS $$
   SELECT COALESCE(SUM(
     CASE
-      WHEN payload->>'total_tokens' ~ '^[0-9]+$'
+      -- At most 12 digits: a longer number would overflow bigint and turn
+      -- the whole sum into an error, which fails every turn of the workspace.
+      WHEN payload->>'total_tokens' ~ '^[0-9]{1,12}$'
       THEN (payload->>'total_tokens')::bigint
       ELSE 0
     END

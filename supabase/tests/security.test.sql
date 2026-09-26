@@ -8,7 +8,7 @@ BEGIN;
 CREATE EXTENSION IF NOT EXISTS pgtap WITH SCHEMA extensions;
 SET search_path = public, extensions;
 
-SELECT plan(67);
+SELECT plan(73);
 
 -- ── public.users: read-only for sessions ────────────────────────────────────
 SELECT ok(NOT has_table_privilege('authenticated', 'public.users', 'UPDATE'),
@@ -126,6 +126,11 @@ INSERT INTO public.events (workspace_id, type, payload) VALUES
   ('a0000000-0000-4000-8000-000000000001', 'llm_usage', '{"total_tokens": 5000}');
 SELECT is(public.sum_daily_llm_tokens('b0000000-0000-4000-8000-000000000001', now() - interval '1 day'),
   123::bigint, 'sum_daily_llm_tokens adds agent turns, template drafts and playground calls of one workspace');
+INSERT INTO public.events (workspace_id, type, payload) VALUES
+  ('b0000000-0000-4000-8000-000000000001', 'llm_usage', '{"total_tokens": "99999999999999999999999"}'),
+  ('b0000000-0000-4000-8000-000000000001', 'llm_usage', '{"total_tokens": "-5"}');
+SELECT is(public.sum_daily_llm_tokens('b0000000-0000-4000-8000-000000000001', now() - interval '1 day'),
+  123::bigint, 'sum_daily_llm_tokens ignores a total_tokens that would overflow bigint instead of failing');
 
 -- ── cross-workspace references are rejected ─────────────────────────────────
 SELECT throws_ok(
@@ -280,6 +285,34 @@ SELECT isnt_empty(
 SELECT is_empty(
   $$SELECT 1 FROM public.users WHERE email = 'sec-b@test.local'$$,
   'a user cannot read the users of a workspace they do not belong to');
+RESET ROLE;
+
+-- ── sessions cannot write the events the budget reads ───────────────────────
+-- Even an admin of the workspace: the type check does not depend on the role,
+-- so what an admin cannot insert, an agent cannot either.
+SET LOCAL ROLE authenticated;
+SELECT set_config('request.jwt.claims',
+  '{"sub":"b0000000-0000-4000-8000-0000000000e1","role":"authenticated"}', true);
+SELECT throws_ok(
+  $$INSERT INTO public.events (workspace_id, type, payload)
+    VALUES ('b0000000-0000-4000-8000-000000000001', 'llm_usage', '{"total_tokens": 999999}')$$,
+  '42501', NULL, 'a session cannot insert llm_usage (fake spend that cuts the agent off)');
+SELECT throws_ok(
+  $$INSERT INTO public.events (workspace_id, type, payload)
+    VALUES ('b0000000-0000-4000-8000-000000000001', 'template_generate', '{}')$$,
+  '42501', NULL, 'a session cannot insert template_generate');
+SELECT throws_ok(
+  $$INSERT INTO public.events (workspace_id, type, payload)
+    VALUES ('b0000000-0000-4000-8000-000000000001', 'agent_test_chat', '{}')$$,
+  '42501', NULL, 'a session cannot insert agent_test_chat');
+SELECT throws_ok(
+  $$INSERT INTO public.events (workspace_id, type, payload)
+    VALUES ('b0000000-0000-4000-8000-000000000001', 'cost_cut', '{}')$$,
+  '42501', NULL, 'a session cannot pre-empt the daily cost_cut event');
+SELECT lives_ok(
+  $$INSERT INTO public.events (workspace_id, type, payload)
+    VALUES ('b0000000-0000-4000-8000-000000000001', 'note_viewed', '{}')$$,
+  'a session still inserts other event types in its workspace');
 RESET ROLE;
 
 SELECT * FROM finish();
