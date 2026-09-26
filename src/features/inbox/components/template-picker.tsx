@@ -16,9 +16,12 @@ import {
 } from "../services/template-actions";
 import type { TemplateRow } from "../services/templates";
 
+// This component takes a conversationId and NOTHING that names a workspace.
+// That absence is the lock: the server actions resolve the workspace from the
+// conversation themselves. If a `workspaceId` prop ever comes back here, the
+// cross-tenant template hole (AVISO-SEGURIDAD-PLANTILLAS) comes back with it.
 interface TemplatePickerProps {
   conversationId: string;
-  workspaceId: string;
   onSent?: () => void;
 }
 
@@ -45,7 +48,6 @@ function fillPreview(body: string, variables: string[]): string {
 
 export function TemplatePicker({
   conversationId,
-  workspaceId,
   onSent,
 }: TemplatePickerProps) {
   const [templates, setTemplates] = useState<TemplateRow[]>([]);
@@ -60,7 +62,7 @@ export function TemplatePicker({
   useEffect(() => {
     // `isLoading` is initialized to true; the fetch clears it in finally.
     let cancelled = false;
-    getApprovedTemplates(workspaceId)
+    getApprovedTemplates(conversationId)
       .then((rows) => {
         if (!cancelled) setTemplates(rows);
       })
@@ -73,7 +75,7 @@ export function TemplatePicker({
     return () => {
       cancelled = true;
     };
-  }, [workspaceId]);
+  }, [conversationId]);
 
   function handleSelectTemplate(template: TemplateRow) {
     const count = extractVariableCount(template.body_template);
@@ -99,7 +101,6 @@ export function TemplatePicker({
     setIsPending(true);
     try {
       const result = await sendTemplateAction(
-        workspaceId,
         conversationId,
         selectedTemplate.name,
         selectedTemplate.language,

@@ -334,15 +334,14 @@ export function ChatThread({
             noteMode && "bg-warning/5 border-warning/20",
           )}
         >
-          {isWindowExpired ? (
-            <TemplatePicker
-              conversationId={conversation.id}
-              workspaceId={conversation.workspace_id}
-            />
-          ) : !canSendMessages(role) ? (
+          {/* Permissions first: with the 24h window closed, a viewer must still
+              see "read only", not a template picker offering to send. */}
+          {!canSendMessages(role) ? (
             <p className="py-2 text-center text-xs text-muted-foreground/60 select-none">
               Solo lectura — sin permisos para enviar mensajes
             </p>
+          ) : isWindowExpired ? (
+            <TemplatePicker conversationId={conversation.id} />
           ) : noteMode ? (
             /* ── Note mode composer ───────────────────────────── */
             <div className="space-y-2">
