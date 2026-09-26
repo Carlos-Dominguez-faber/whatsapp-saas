@@ -14,57 +14,105 @@ type Row = {
   error_message?: string | null;
 };
 
+/**
+ * PostgREST's `or=(…)` for the forms the app uses: `col.is.null`,
+ * `col.eq.v`, `col.neq.v`, `col.in.(a,b)`. Honoring it is the point: a wrong
+ * guard in the code has to make the fake miss, as the real database would.
+ */
+function orFilter(expr: string): (r: Record<string, unknown>) => boolean {
+  const conds: string[] = [];
+  let depth = 0;
+  let current = "";
+  for (const ch of expr) {
+    if (ch === "(") depth++;
+    if (ch === ")") depth--;
+    if (ch === "," && depth === 0) {
+      conds.push(current);
+      current = "";
+    } else {
+      current += ch;
+    }
+  }
+  conds.push(current);
+  const tests = conds.map((cond) => {
+    const [col, op, ...rest] = cond.split(".");
+    const value = rest.join(".");
+    switch (op) {
+      case "is":
+        assert.equal(value, "null", `unsupported is.${value}`);
+        return (r: Record<string, unknown>) => r[col] == null;
+      case "eq":
+        return (r: Record<string, unknown>) => String(r[col]) === value;
+      case "neq":
+        return (r: Record<string, unknown>) => r[col] != null && String(r[col]) !== value;
+      case "in": {
+        const set = value.replace(/^\(|\)$/g, "").split(",");
+        return (r: Record<string, unknown>) => r[col] != null && set.includes(String(r[col]));
+      }
+      default:
+        throw new Error(`unsupported or() operator: ${op}`);
+    }
+  });
+  return (r) => tests.some((t) => t(r));
+}
+
 function field(row: Row, col: string): unknown {
-  if (col.startsWith("meta->>")) return row.meta?.[col.slice("meta->>".length)];
   return (row as Record<string, unknown>)[col];
 }
 
-// In-memory messages table honouring every filter, like PostgREST, including
-// the terminal-status guard in the UPDATE's WHERE.
-function fakeDb(rows: Row[], opts: { lookupError?: string } = {}) {
+// In-memory messages table honouring every filter, like PostgREST.
+function fakeDb(
+  rows: Row[],
+  opts: { lookupError?: string; afterSelect?: () => void } = {},
+) {
   const updates: Array<{ id: unknown; patch: Record<string, unknown> }> = [];
   const errorRows: unknown[] = [];
   const client = {
     from: (table: string) => ({
       select: () => {
-        const filters: Array<[string, unknown]> = [];
+        const filters: Array<(r: Row) => boolean> = [];
+        let limit = Infinity;
         const q: any = {
-          eq: (col: string, val: unknown) => {
-            filters.push([col, val]);
-            return q;
-          },
-          filter: (col: string, _op: string, val: unknown) => {
-            filters.push([col, val]);
-            return q;
-          },
-          maybeSingle: async () => {
-            if (opts.lookupError) return { data: null, error: { message: opts.lookupError } };
-            const hits = rows.filter((r) => filters.every(([c, v]) => field(r, c) === v));
-            return hits.length > 1
-              ? { data: null, error: { message: "multiple rows" } }
-              : { data: hits[0] ?? null, error: null };
+          eq: (col: string, val: unknown) => (filters.push((r) => field(r, col) === val), q),
+          contains: (col: string, val: Record<string, unknown>) => (
+            filters.push((r) =>
+              Object.entries(val).every(
+                ([k, v]) => ((field(r, col) ?? {}) as Record<string, unknown>)[k] === v,
+              ),
+            ),
+            q
+          ),
+          limit: (n: number) => ((limit = n), q),
+          then: (resolve: (v: unknown) => void) => {
+            // Rows come back as copies: what the caller read, not live rows.
+            const result = opts.lookupError
+              ? { data: null, error: { message: opts.lookupError } }
+              : {
+                  data: rows
+                    .filter((r) => filters.every((f) => f(r)))
+                    .slice(0, limit)
+                    .map((r) => structuredClone(r)),
+                  error: null,
+                };
+            opts.afterSelect?.();
+            resolve(result);
           },
         };
         return q;
       },
       update: (patch: Record<string, unknown>) => {
-        const filters: Array<[string, unknown]> = [];
+        const filters: Array<(r: Row) => boolean> = [];
         const q: any = {
-          eq: (col: string, val: unknown) => {
-            filters.push([col, val]);
-            return q;
-          },
-          or: async () => {
-            const hit = rows.find(
-              (r) =>
-                filters.every(([c, v]) => field(r, c) === v) &&
-                r.status !== "failed",
-            );
+          eq: (col: string, val: unknown) => (filters.push((r) => field(r, col) === val), q),
+          is: (col: string, val: null) => (filters.push((r) => field(r, col) == val), q),
+          or: (expr: string) => (filters.push(orFilter(expr) as (r: Row) => boolean), q),
+          then: (resolve: (v: unknown) => void) => {
+            const hit = rows.find((r) => filters.every((f) => f(r)));
             if (hit) {
               updates.push({ id: hit.id, patch });
               Object.assign(hit, patch);
             }
-            return { error: null };
+            resolve({ error: null });
           },
         };
         return q;
@@ -101,6 +149,19 @@ test("statuses never go backwards", async () => {
   ]);
   await applyMessageStatus(client, "ws_a", { wamid: "wamid.1", status: "delivered" });
   assert.deepEqual(updates, []);
+});
+
+test("racing webhooks can't move 'read' back to 'delivered' (the guard is in the WHERE)", async () => {
+  const row: Row = { id: "msg_a", workspace_id: "ws_a", wamid: "wamid.1", status: "sent" };
+  // 'delivered' reads the row as 'sent'; before its UPDATE, 'read' commits.
+  const { client, updates } = fakeDb([row], {
+    afterSelect: () => {
+      row.status = "read";
+    },
+  });
+  await applyMessageStatus(client, "ws_a", { wamid: "wamid.1", status: "delivered" });
+  assert.equal(row.status, "read");
+  assert.deepEqual(updates, [], "the guarded UPDATE matched nothing");
 });
 
 test("'failed' is terminal: a late 'sent' does not resurrect it", async () => {
@@ -141,7 +202,8 @@ test("a YCloud row with no wamid yet is found by YCloud's id and gets its wamid"
     status: "delivered",
   });
   assert.deepEqual(updates, [
-    { id: "msg_yc", patch: { wamid: "wamid.new", status: "delivered" } },
+    { id: "msg_yc", patch: { wamid: "wamid.new" } },
+    { id: "msg_yc", patch: { status: "delivered" } },
   ]);
 
   // The next event matches by the backfilled wamid.
@@ -150,6 +212,16 @@ test("a YCloud row with no wamid yet is found by YCloud's id and gets its wamid"
     providerMessageId: "yc_123",
     status: "read",
   });
+  assert.equal(rows[0].status, "read");
+});
+
+test("a status that doesn't move still backfills the wamid", async () => {
+  const rows: Row[] = [
+    { id: "msg_yc", workspace_id: "ws_a", direction: "out", wamid: null, status: "read", meta: { ycloud_id: "yc_1" } },
+  ];
+  const { client } = fakeDb(rows);
+  await applyMessageStatus(client, "ws_a", { wamid: "wamid.x", providerMessageId: "yc_1", status: "sent" });
+  assert.equal(rows[0].wamid, "wamid.x");
   assert.equal(rows[0].status, "read");
 });
 

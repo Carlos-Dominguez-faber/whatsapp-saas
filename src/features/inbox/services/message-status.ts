@@ -54,21 +54,23 @@ async function findMessage(
       .select("id, status, wamid")
       .eq("workspace_id", workspaceId)
       .eq("wamid", event.wamid)
-      .maybeSingle();
+      .limit(1);
     if (error) throw new Error(`[message-status] lookup failed: ${error.message}`);
-    if (data) return data as MessageMatch;
+    if (data?.[0]) return data[0] as MessageMatch;
   }
 
   if (event.providerMessageId) {
+    // A containment filter, so the GIN (jsonb_path_ops) index on
+    // messages.meta serves it; `meta->>ycloud_id` would scan the workspace.
     const { data, error } = await supabase
       .from("messages")
       .select("id, status, wamid")
       .eq("workspace_id", workspaceId)
       .eq("direction", "out")
-      .filter("meta->>ycloud_id", "eq", event.providerMessageId)
-      .maybeSingle();
+      .contains("meta", { ycloud_id: event.providerMessageId })
+      .limit(1);
     if (error) throw new Error(`[message-status] lookup failed: ${error.message}`);
-    if (data) return data as MessageMatch;
+    if (data?.[0]) return data[0] as MessageMatch;
   }
 
   return null;
@@ -86,36 +88,50 @@ export async function applyMessageStatus(
 
   const current = msg.status;
   const newStatus = event.status;
-  const patch: Record<string, unknown> = {};
 
-  // Backfill the wamid YCloud assigns after the send.
-  if (event.wamid && !msg.wamid) patch.wamid = event.wamid;
-
-  // 'failed' is terminal: a late 'sent'/'delivered' must not resurrect it.
-  if (current !== "failed") {
-    if (newStatus === "failed") {
-      patch.status = "failed";
-      if (event.error) patch.error_message = event.error.message;
-    } else {
-      // For ordered statuses: only advance, never go back
-      const currentIdx = current
-        ? STATUS_ORDER.indexOf(current as OrderedStatus)
-        : -1;
-      const newIdx = STATUS_ORDER.indexOf(newStatus as OrderedStatus);
-      if (newIdx > currentIdx) patch.status = newStatus;
-    }
+  // Backfill the wamid YCloud assigns after the send — on its own, so a
+  // status that doesn't move still leaves the row findable by wamid.
+  if (event.wamid && !msg.wamid) {
+    const { error } = await supabase
+      .from("messages")
+      .update({ wamid: event.wamid })
+      .eq("id", msg.id)
+      .eq("workspace_id", workspaceId)
+      .is("wamid", null);
+    if (error) throw new Error(`[message-status] wamid backfill failed: ${error.message}`);
   }
 
-  if (Object.keys(patch).length === 0) return;
+  // 'failed' is terminal: a late 'sent'/'delivered' must not resurrect it.
+  if (current === "failed") return;
 
-  // The terminal guard also rides in the WHERE: a concurrent 'failed' wins
-  // over a 'delivered' read a moment earlier.
+  let patch: Record<string, unknown>;
+  let allowedFrom: string;
+  if (newStatus === "failed") {
+    patch = { status: "failed" };
+    if (event.error) patch.error_message = event.error.message;
+    allowedFrom = "status.is.null,status.neq.failed";
+  } else {
+    // For ordered statuses: only advance, never go back
+    const currentIdx = current
+      ? STATUS_ORDER.indexOf(current as OrderedStatus)
+      : -1;
+    const newIdx = STATUS_ORDER.indexOf(newStatus as OrderedStatus);
+    if (newIdx <= currentIdx) return;
+    patch = { status: newStatus };
+    // The monotonic rule rides in the WHERE too: two webhooks racing (read
+    // and delivered arrive together) can't move 'read' back to 'delivered'.
+    const lower = STATUS_ORDER.slice(0, newIdx);
+    allowedFrom = lower.length
+      ? `status.is.null,status.in.(${lower.join(",")})`
+      : "status.is.null";
+  }
+
   const { error } = await supabase
     .from("messages")
     .update(patch)
     .eq("id", msg.id)
     .eq("workspace_id", workspaceId)
-    .or("status.is.null,status.neq.failed");
+    .or(allowedFrom);
   if (error) throw new Error(`[message-status] update failed: ${error.message}`);
 
   if (patch.status === "failed" && event.error) {

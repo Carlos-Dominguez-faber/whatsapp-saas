@@ -22,6 +22,7 @@ import {
 import { decryptCredentials } from "@/shared/lib/integration-secrets";
 import { applyMessageStatus } from "@/features/inbox/services/message-status";
 import { extractWebhookError } from "@/features/inbox/services/whatsapp-errors";
+import { samePhone } from "@/features/inbox/services/phone";
 
 // Keep the function alive long enough for the best-effort fast path below
 // (sleep through the buffer window + AI generation). The cron is the fallback.
@@ -111,10 +112,10 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
         .limit(10);
 
       ws =
-        (integrations ?? []).find(
-          (i: IntegrationRow) =>
-            (i.config as { phone_number?: string }).phone_number === toPhone,
-        ) ?? null;
+        (integrations ?? []).find((i: IntegrationRow) => {
+          const configured = (i.config as { phone_number?: string }).phone_number;
+          return Boolean(configured && toPhone && samePhone(configured, toPhone));
+        }) ?? null;
     }
 
     // No resolvable workspace → 401. A status update without a resolvable
@@ -168,6 +169,22 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
     const normalized = parseInbound(body);
     if (!normalized) {
       return NextResponse.json({ received: true });
+    }
+
+    // Routed by ?wsid, the signature only proves the event came from YCloud
+    // with this workspace's secret — not that it is for this workspace's
+    // number. A message for another number is ignored (and logged), never
+    // filed under this workspace. Without a configured number, it's accepted.
+    const configuredPhone = (ws.config as { phone_number?: string }).phone_number;
+    if (
+      wsidParam &&
+      configuredPhone &&
+      !samePhone(normalized.workspacePhone, configuredPhone)
+    ) {
+      console.warn(
+        "[webhook] inbound for another number on this workspace's webhook URL — ignored",
+      );
+      return NextResponse.json({ received: true, ignored: "destination_mismatch" });
     }
 
     const workspaceId = ws.workspace_id as string;
@@ -233,6 +250,12 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
           }
         }
       : null;
+
+    // A reaction is recorded in the thread, but it isn't something to answer:
+    // it must not start a paid agent turn.
+    if (normalized.rawType === "reaction") {
+      return NextResponse.json({ received: true, reaction: true });
+    }
 
     // AI is toggled off — still fetch the media so the human agent sees it.
     if (!conversation.ai_enabled) {

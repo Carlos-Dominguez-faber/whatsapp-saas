@@ -24,10 +24,32 @@ mock.module("@/shared/lib/integration-secrets.ts", {
 const unused = async () => {
   throw new Error("not expected in this test");
 };
-mock.module("@/features/inbox/services/normalizer.ts", { exports: { processInbound: unused } });
-mock.module("@/features/inbox/services/cost-tracker.ts", { exports: { checkRateLimits: unused } });
+let inboundCalls = 0;
+mock.module("@/features/inbox/services/normalizer.ts", {
+  exports: {
+    processInbound: async () => {
+      inboundCalls++;
+      return {
+        contact: { id: "ct_1" },
+        conversation: { id: "conv_1", ai_enabled: true },
+        message: { id: "msg_1" },
+      };
+    },
+  },
+});
+let batchCalls = 0;
+mock.module("@/features/inbox/services/cost-tracker.ts", {
+  exports: { checkRateLimits: async () => ({ allowed: true }) },
+});
 mock.module("@/features/inbox/services/buffer.ts", {
-  exports: { upsertBatch: unused, processNextBatch: unused, hasTimeToClaim: () => true },
+  exports: {
+    upsertBatch: async () => {
+      batchCalls++;
+      return "batch_1";
+    },
+    processNextBatch: unused,
+    hasTimeToClaim: () => true,
+  },
 });
 mock.module("@/features/inbox/services/media-handler.ts", {
   exports: { downloadAndStoreMedia: unused, patchMessageMedia: unused },
@@ -55,6 +77,26 @@ const fakeSvc = {
 mock.module("@supabase/supabase-js", { exports: { createClient: () => fakeSvc } });
 
 const { POST } = await import("./route.ts");
+
+function signedPost(payload: Record<string, unknown>) {
+  const body = JSON.stringify(payload);
+  const t = Math.floor(Date.now() / 1000);
+  const s = createHmac("sha256", "yc-secret").update(`${t}.${body}`).digest("hex");
+  return POST(
+    new NextRequest("http://localhost/api/webhooks/ycloud?wsid=ws_1", {
+      method: "POST",
+      body,
+      headers: { "content-type": "application/json", "YCloud-Signature": `t=${t},s=${s}` },
+    }),
+  );
+}
+
+function inbound(to: string, message: Record<string, unknown>) {
+  return signedPost({
+    type: "whatsapp.inbound_message.received",
+    whatsappInboundMessage: { wamid: "wamid.in.1", from: "+5215512345678", to, ...message },
+  });
+}
 
 function updated(whatsappMessage: Record<string, unknown>) {
   const body = JSON.stringify({ type: "whatsapp.message.updated", whatsappMessage });
@@ -90,4 +132,22 @@ test("a failed YCloud status carries the reason, translated", async () => {
   const error = statusCalls[0].event.error as { code: number; message: string };
   assert.equal(error.code, 131026);
   assert.match(error.message, /no tenga WhatsApp/);
+});
+
+test("a message for another number on this workspace's URL is ignored, not filed here", async () => {
+  inboundCalls = 0;
+  const res = await inbound("+15559999999", { type: "text", text: { body: "hola" } });
+  assert.equal(res.status, 200);
+  assert.equal((await res.json()).ignored, "destination_mismatch");
+  assert.equal(inboundCalls, 0);
+});
+
+test("the workspace's own number matches even written another way", async () => {
+  inboundCalls = 0;
+  batchCalls = 0;
+  // Configured "+15550000000"; YCloud sends it with separators.
+  const res = await inbound("+1 555 000 0000", { type: "reaction", reaction: { emoji: "👍" } });
+  assert.equal(inboundCalls, 1);
+  assert.equal((await res.json()).reaction, true);
+  assert.equal(batchCalls, 0, "a reaction is stored but starts no paid turn");
 });

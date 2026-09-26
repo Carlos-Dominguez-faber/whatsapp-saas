@@ -263,6 +263,12 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
         }
       : null;
 
+    // A reaction is recorded in the thread, but it isn't something to answer:
+    // it must not start a paid agent turn.
+    if (normalized.rawType === "reaction") {
+      return NextResponse.json({ received: true, reaction: true });
+    }
+
     // AI is toggled off — still fetch the media so the human agent sees it.
     if (!conversation.ai_enabled) {
       if (mediaJob) after(mediaJob);
