@@ -96,11 +96,23 @@ mock.module("./whatsapp-provider.ts", {
   },
 });
 
+let jevVerdict = { suppressReply: false, ownsStage: false };
 mock.module("@/features/jev-judge/apply.ts", {
   exports: {
     applyJevToBatch: async () => {
       calls.push("jev");
-      return { suppressReply: false, ownsStage: false };
+      return jevVerdict;
+    },
+  },
+});
+
+let modelPolicy = (model: string) => model;
+const modelPolicyArgs: unknown[][] = [];
+mock.module("./model-policy.ts", {
+  exports: {
+    enforceModelPolicy: async (_sb: unknown, ws: string, model: string, source: string) => {
+      modelPolicyArgs.push([ws, model, source]);
+      return modelPolicy(model);
     },
   },
 });
@@ -117,10 +129,12 @@ mock.module("./openrouter.ts", {
   },
 });
 
+let dispatchError: Error | null = null;
 mock.module("./dispatch.ts", {
   exports: {
     dispatchText: async () => {
       calls.push("dispatch");
+      if (dispatchError) throw dispatchError;
       return { ok: true };
     },
     dispatchTemplate: async () => ({ ok: true }),
@@ -174,6 +188,10 @@ function reset(meta: Row = {}) {
   decideResult = { decision: "respond", reason: "normal", availableTools: [], reservationId: "res_1" };
   costPolicy = { policy: "allow", reason: "within_budget" };
   whatsappSettings = { provider: "ycloud", config: {} };
+  jevVerdict = { suppressReply: false, ownsStage: false };
+  modelPolicy = (model: string) => model;
+  modelPolicyArgs.length = 0;
+  dispatchError = null;
 }
 
 test("the turn's reservation reaches recordLlmUsage, so the turn counts once", async () => {
@@ -186,26 +204,45 @@ test("the turn's reservation reaches recordLlmUsage, so the turn counts once", a
   assert.equal(batchUpdates.at(-1)?.status, "processed");
 });
 
-test("the budget is checked right after decide, before Jev and the KB search", async () => {
+test("order: decide → Jev → WhatsApp provider → budget → KB search → model", async () => {
   reset();
   await processNextBatch();
-  const order = ["decide", "enforceCostPolicy", "loadWhatsAppSettings", "jev", "searchKb", "generate"];
+  const order = ["decide", "jev", "loadWhatsAppSettings", "enforceCostPolicy", "searchKb", "generate"];
   const positions = order.map((c) => calls.indexOf(c));
+  assert.ok(positions.every((p) => p >= 0), calls.join(" → "));
   assert.deepEqual([...positions].sort((a, b) => a - b), positions, calls.join(" → "));
 });
 
-test("a cut workspace is marked processed without paying for Jev, the KB or the model", async () => {
+test("on a cut day Jev still runs (it can hand off to a person), but not the KB or the model", async () => {
   reset();
   costPolicy = { policy: "cut", reason: "daily_hard_limit" };
   const result = await processNextBatch();
   assert.equal(result.processed, true);
-  for (const skipped of ["jev", "searchKb", "generate", "dispatch"]) {
+  assert.ok(calls.includes("jev"));
+  for (const skipped of ["searchKb", "generate", "dispatch"]) {
     assert.ok(!calls.includes(skipped), `${skipped} must not run on cut`);
   }
   assert.equal(batchUpdates.at(-1)?.status, "processed");
 });
 
-test("a budget read error retries the batch — it is not marked processed — and keeps the reservation", async () => {
+test("a reply Jev suppresses is processed even without a WhatsApp provider", async () => {
+  reset();
+  jevVerdict = { suppressReply: true, ownsStage: false };
+  whatsappSettings = null;
+  const result = await processNextBatch();
+  assert.equal(result.processed, true);
+  assert.equal(batchUpdates.at(-1)?.status, "processed");
+  assert.ok(!calls.includes("enforceCostPolicy"));
+});
+
+test("a retry reuses the Jev verdict of its first attempt instead of judging again", async () => {
+  reset({ retry_count: 1, jev_verdict: { suppressReply: false, ownsStage: true } });
+  await processNextBatch();
+  assert.ok(!calls.includes("jev"));
+  assert.ok(calls.includes("generate"));
+});
+
+test("a budget read error retries the batch — it is not marked processed — keeping the reservation and the Jev verdict", async () => {
   reset();
   costPolicy = new Error("sum_daily_llm_tokens failed: timeout");
   const result = await processNextBatch();
@@ -217,6 +254,27 @@ test("a budget read error retries the batch — it is not marked processed — a
   const meta = retry.meta as Row;
   assert.equal(meta.retry_count, 1);
   assert.equal(meta.llm_reservation_id, "res_1");
+  assert.deepEqual(meta.jev_verdict, { suppressReply: false, ownsStage: false });
+});
+
+test("once the turn's tokens are recorded, a later failure retries with a fresh reservation", async () => {
+  reset();
+  dispatchError = new Error("provider down");
+  const result = await processNextBatch();
+  assert.equal(result.processed, false);
+  assert.equal(usageRecords[0].reservationId, "res_1");
+  const meta = batchUpdates.at(-1)!.meta as Row;
+  // Reusing res_1 would overwrite the tokens this attempt already spent.
+  assert.equal("llm_reservation_id" in meta, false);
+});
+
+test("the model goes through the catalog policy before the call", async () => {
+  reset();
+  modelPolicy = () => "openai/gpt-4o-mini";
+  await processNextBatch();
+  assert.deepEqual(modelPolicyArgs[0], ["ws_1", "openai/gpt-4.1", "agent_turn"]);
+  assert.equal(generateArgs[0].model, "openai/gpt-4o-mini");
+  assert.equal(usageRecords[0].model, "openai/gpt-4o-mini");
 });
 
 test("a retry hands its earlier reservation to decide instead of taking a new slot", async () => {
@@ -227,13 +285,14 @@ test("a retry hands its earlier reservation to decide instead of taking a new sl
   assert.equal(usageRecords[0].reservationId, "res_prev");
 });
 
-test("without a WhatsApp provider the batch retries before Jev or the model spend anything", async () => {
+test("without a WhatsApp provider the batch retries before the budget, the KB or the model", async () => {
   reset();
   whatsappSettings = null;
   const result = await processNextBatch();
   assert.equal(result.processed, false);
-  assert.ok(!calls.includes("jev"));
-  assert.ok(!calls.includes("generate"));
+  for (const skipped of ["enforceCostPolicy", "searchKb", "generate"]) {
+    assert.ok(!calls.includes(skipped), skipped);
+  }
 });
 
 test("a degraded budget keeps the full prompt and only switches the model", async () => {
