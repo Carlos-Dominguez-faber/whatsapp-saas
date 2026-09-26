@@ -103,3 +103,30 @@ test("a HighLevel number takes the workspace's code only when it fits that count
   assert.equal(phoneWithCountryCode("998 123 4567", "49"), null, "no known format");
   assert.equal(phoneWithCountryCode("ext. 12", "52"), null);
 });
+
+test("HighLevel numbers of 11-12 digits written the national way are read as national, not junk", () => {
+  // Argentina: area + 15 + number, the mobile 9, the trunk 0.
+  assert.equal(phoneWithCountryCode("11 15 2345 6789", "54"), "+541123456789");
+  assert.equal(phoneWithCountryCode("011 15 2345 6789", "54"), "+541123456789");
+  assert.equal(phoneWithCountryCode("221 15 234 5678", "54"), "+542212345678");
+  assert.equal(phoneWithCountryCode("9 11 2345 6789", "54"), "+541123456789");
+  // Mexico: the mobile 1, the old 044/045 prefixes, 01.
+  assert.equal(phoneWithCountryCode("1 998 123 4567", "52"), "+529981234567");
+  assert.equal(phoneWithCountryCode("044 998 123 4567", "52"), "+529981234567");
+  assert.equal(phoneWithCountryCode("045 998 123 4567", "52"), "+529981234567");
+  assert.equal(phoneWithCountryCode("01 998 123 4567", "52"), "+529981234567");
+  // Brazil: an 11-digit mobile.
+  assert.equal(phoneWithCountryCode("11 91234 5678", "55"), "+5511912345678");
+  // The US: the trunk 1.
+  assert.equal(phoneWithCountryCode("1 555 123 4567", "1"), "+15551234567");
+});
+
+test("bare digits count as international only with the workspace's own country code", () => {
+  assert.equal(phoneWithCountryCode("5219981234567", "52"), "+5219981234567");
+  assert.equal(phoneWithCountryCode("529981234567", "52"), "+529981234567");
+  assert.equal(phoneWithCountryCode("5491123456789", "54"), "+5491123456789");
+  // Another country's digits, or a number plus extension digits: unmatched.
+  assert.equal(phoneWithCountryCode("447911123456", "52"), null);
+  assert.equal(phoneWithCountryCode("998 123 4567 ext 12", "52"), null);
+  assert.equal(phoneWithCountryCode("998 123 4567 x 123", "52"), null);
+});

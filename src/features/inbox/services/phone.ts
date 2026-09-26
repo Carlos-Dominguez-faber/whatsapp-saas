@@ -169,19 +169,60 @@ const NATIONAL_NUMBER_LENGTHS: Record<string, number[]> = {
 };
 
 /**
+ * The national number inside `digits` (written without a country code), or
+ * null when no reading fits the country's lengths. Besides the number as
+ * written, it tries it without what people put in front: the trunk `0`; in
+ * Mexico the old mobile prefixes `044`/`045` and the `1` (as in `+52 1`); in
+ * Argentina the mobile `9` (as in `+54 9`) and the `15` written after the
+ * area code; in the US and Canada the `1`.
+ */
+function nationalNumber(digits: string, countryCode: string): string | null {
+  const lengths = NATIONAL_NUMBER_LENGTHS[countryCode];
+  if (!lengths) return null;
+  const noTrunk = digits.replace(/^0/, "");
+  const readings = [digits, noTrunk];
+  if (countryCode === "52") {
+    readings.push(digits.replace(/^04[45]/, ""), noTrunk.replace(/^1/, ""));
+  }
+  if (countryCode === "54") {
+    readings.push(noTrunk.replace(/^9/, ""));
+    // Area code (2 to 4 digits) + 15 + number: 12 digits.
+    for (let at = 2; at <= 4; at++) {
+      if (noTrunk.length === 12 && noTrunk.slice(at, at + 2) === "15") {
+        readings.push(noTrunk.slice(0, at) + noTrunk.slice(at + 2));
+      }
+    }
+  }
+  if (countryCode === "1") readings.push(digits.replace(/^1/, ""));
+  return readings.find((n) => lengths.includes(n.length)) ?? null;
+}
+
+/**
  * A number from another system (HighLevel) in E.164, or null when it can't be
- * placed with certainty. One written with its country code keeps it. One
- * written without it takes the workspace's code only when its length (after
- * a trunk `0`) fits that country's national numbers; anything else stays
- * unmatched rather than becoming a junk number.
+ * placed with certainty. One written with `+` or `00` keeps its code. One
+ * written without is read as a national number of the workspace's country
+ * first (its length must fit, once the usual prefixes are dropped); failing
+ * that, bare digits count as international only if they start with the
+ * workspace's own country code. Anything else stays unmatched rather than
+ * becoming a junk number.
  */
 export function phoneWithCountryCode(
   phone: string,
   defaultCountryCode: string,
 ): string | null {
-  const international = internationalDigits(phone);
-  if (international) return `+${international}`;
-  const national = phone.replace(/\D/g, "").replace(/^0/, "");
-  const lengths = NATIONAL_NUMBER_LENGTHS[defaultCountryCode];
-  return lengths?.includes(national.length) ? `+${defaultCountryCode}${national}` : null;
+  const trimmed = phone.trim();
+  const digits = trimmed.replace(/\D/g, "");
+  if (trimmed.startsWith("+") || digits.startsWith("00")) {
+    const international = internationalDigits(trimmed);
+    return international ? `+${international}` : null;
+  }
+  const national = nationalNumber(digits, defaultCountryCode);
+  if (national) return `+${defaultCountryCode}${national}`;
+  if (
+    digits.startsWith(defaultCountryCode) &&
+    nationalNumber(digits.slice(defaultCountryCode.length), defaultCountryCode)
+  ) {
+    return `+${digits}`;
+  }
+  return null;
 }

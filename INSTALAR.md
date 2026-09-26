@@ -408,9 +408,11 @@ las migraciones, así que las migraciones van **antes** de `vercel --prod`.
   quieres esa sincronización, quita el webhook de contactos en HighLevel.
   - Enlaza el contacto de HighLevel con el de WhatsApp que tenga el mismo
     teléfono, aunque esté escrito distinto (`+52 1…` y `+52…` cuentan como el
-    mismo número). Un número de HighLevel sin código de país usa el del negocio
-    solo si tiene el largo de un número de ese país (10 dígitos en México); si
-    no, ese contacto no se enlaza por teléfono. Si no existe, lo crea.
+    mismo número). Un número de HighLevel sin `+` usa el código de país del
+    negocio solo si tiene el largo de un número de ese país (10 dígitos en
+    México), contando los prefijos de siempre (`044`/`045` o `1` en México, `9` o
+    `15` en Argentina, el `0`); o si ya empieza con ese código. Si no, ese
+    contacto no se enlaza por teléfono. Si no existe, lo crea.
   - No sobrescribe nada tuyo: **suma** sus etiquetas a las locales y solo llena
     el nombre y el correo si estaban vacíos.
   - Al revés, al guardar un contacto aquí sus etiquetas se **agregan** en

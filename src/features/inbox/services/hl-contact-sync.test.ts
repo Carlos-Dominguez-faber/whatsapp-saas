@@ -169,7 +169,7 @@ test("a local-format HighLevel number takes the workspace's country code", async
 
 test("an unknown HighLevel contact is created with a normalized phone", async () => {
   const contacts: Row[] = [];
-  await withFetch(fakeBackend({ contacts, hlContact: { id: "hl_7", phone: "1 555 000 2222", tags: ["x"] } }).fn, () =>
+  await withFetch(fakeBackend({ contacts, hlContact: { id: "hl_7", phone: "+1 (555) 000-2222", tags: ["x"] } }).fn, () =>
     syncContactFromHL("ws_1", "hl_7"),
   );
   assert.equal(contacts.length, 1);
