@@ -1,5 +1,6 @@
 import { createClient as createSbClient } from "@supabase/supabase-js";
 import { performance } from "node:perf_hooks";
+import { isMissingFunctionError } from "@/shared/lib/db-errors";
 
 const LLM_TURNS_PER_CONTACT_PER_HOUR = 20;
 
@@ -101,10 +102,12 @@ export async function checkRateLimits(
     .gte("created_at", hourAgo);
 
   if (error) {
+    // This is only the webhook's cheap peek. The authoritative, atomic check
+    // is reserveLlmTurn() in decide(), which runs again before any model call.
+    // Failing closed here would drop the message from the buffer with no
+    // retry, so an unreadable count lets it through to that check instead.
     console.error("[cost-tracker] hourly check error:", error);
-    // Fail closed — an unverifiable budget is not an allowed one (same
-    // policy as enforceCostPolicy in cost-enforcer.ts).
-    return { allowed: false, reason: "rate_limit_check_failed" };
+    return { allowed: true };
   }
 
   if ((hourlyEvents?.length ?? 0) >= LLM_TURNS_PER_CONTACT_PER_HOUR) {
@@ -144,8 +147,17 @@ export async function reserveLlmTurn(
   });
 
   if (error) {
-    console.error("[cost-tracker] reserve_llm_turn RPC error:", error);
-    return { allowed: false, reason: "rate_limit_check_failed" };
+    if (isMissingFunctionError(error)) {
+      // Code deployed before `db-push`: keep the agent answering, unreserved,
+      // rather than silencing every workspace until the migration runs.
+      console.warn(
+        "[cost-tracker] reserve_llm_turn is missing — run `setup.mjs db-push`; the hourly limit is not enforced until then",
+      );
+      return { allowed: true };
+    }
+    // A real database error: throw so processNextBatch() retries the batch
+    // with backoff and dead-letters it visibly, instead of dropping the turn.
+    throw new Error(`reserve_llm_turn failed: ${error.message}`);
   }
 
   const row = (

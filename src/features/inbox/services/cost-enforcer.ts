@@ -3,6 +3,7 @@
 // This module ACTS on budget state: degrade or cut AI when thresholds are crossed.
 
 import { createClient as createSbClient } from "@supabase/supabase-js";
+import { isMissingFunctionError } from "@/shared/lib/db-errors";
 
 function svc() {
   return createSbClient(
@@ -11,11 +12,12 @@ function svc() {
   );
 }
 
-// Hard cut: AI is completely halted above this daily token count
-const DAILY_TOKEN_HARD_LIMIT = 1_500_000;
+// Hard cut: AI is completely halted above this daily token count. Kept at the
+// 1,000,000 tokens the old per-turn check in cost-tracker enforced.
+const DAILY_TOKEN_HARD_LIMIT = 1_000_000;
 
 // Warn threshold: degrade to a cheaper model above this count
-const DAILY_TOKEN_WARN_THRESHOLD = 1_000_000;
+const DAILY_TOKEN_WARN_THRESHOLD = 800_000;
 
 export type CostPolicy = "allow" | "degrade" | "cut";
 
@@ -33,7 +35,9 @@ export interface CostPolicyResult {
  *   - >= DAILY_TOKEN_WARN_THRESHOLD → policy=degrade + inserts cost_alert event
  *   - otherwise                  → policy=allow
  *
- * Fails open on DB errors to avoid blocking legitimate traffic.
+ * A database error throws, so the caller's batch is retried and eventually
+ * dead-lettered instead of spending without a verified budget. A missing
+ * sum_daily_llm_tokens (code deployed before `db-push`) allows with a warning.
  */
 export async function enforceCostPolicy(
   workspaceId: string,
@@ -49,12 +53,17 @@ export async function enforceCostPolicy(
   });
 
   if (error) {
-    console.error("[cost-enforcer] failed to read daily events:", error);
-    // Fail closed — an unverifiable budget is treated as exceeded, not
-    // allowed. A transient Supabase blip now blocks AI
-    // for this workspace instead of permitting unbounded spend; that
-    // tradeoff is intentional for a money guard.
-    return { policy: "cut", reason: "db_error_fail_closed" };
+    if (isMissingFunctionError(error)) {
+      console.warn(
+        "[cost-enforcer] sum_daily_llm_tokens is missing — run `setup.mjs db-push`; the daily budget is not enforced until then",
+      );
+      return { policy: "allow", reason: "budget_function_missing" };
+    }
+    // Fail closed without dropping the turn: an unverifiable budget is not an
+    // allowed one, so throw and let processNextBatch() retry with backoff and
+    // dead-letter the batch visibly if the database stays down.
+    console.error("[cost-enforcer] failed to read the daily budget:", error);
+    throw new Error(`sum_daily_llm_tokens failed: ${error.message}`);
   }
 
   // sum_daily_llm_tokens sums in SQL — no PostgREST

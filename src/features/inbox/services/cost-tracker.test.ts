@@ -126,11 +126,11 @@ test("checkRateLimits denies once the contact hits the hourly turn ceiling (boun
   assert.deepEqual(result, { allowed: false, reason: "rate_limit_contact_hour" });
 });
 
-test("checkRateLimits fails closed when the hourly query errors — an unverifiable budget is not an allowed one", async () => {
+test("checkRateLimits lets the message through when the hourly peek errors — reserveLlmTurn in decide() is the real check", async () => {
   calls = [];
   responseQueue = [{ data: null, error: { message: "boom" } }];
   const result = await checkRateLimits("ws_1", "contact_1");
-  assert.deepEqual(result, { allowed: false, reason: "rate_limit_check_failed" });
+  assert.deepEqual(result, { allowed: true });
 });
 
 test("checkRateLimits scopes the hourly query by type, workspace, and contact_id", async () => {
@@ -216,10 +216,17 @@ test("reserveLlmTurn denies without a reservation id once the hourly ceiling is 
   assert.deepEqual(result, { allowed: false, reason: "rate_limit_contact_hour" });
 });
 
-test("reserveLlmTurn fails closed when the RPC errors", async () => {
+test("reserveLlmTurn throws when the RPC errors, so the batch is retried and dead-lettered", async () => {
   rpcResponse = { data: null, error: { message: "boom" } };
-  const result = await reserveLlmTurn("ws_1", "contact_1");
-  assert.deepEqual(result, { allowed: false, reason: "rate_limit_check_failed" });
+  await assert.rejects(() => reserveLlmTurn("ws_1", "contact_1"), /reserve_llm_turn failed: boom/);
+});
+
+test("reserveLlmTurn allows without a reservation when the function does not exist yet (deployed before db-push)", async () => {
+  for (const code of ["PGRST202", "42883"]) {
+    rpcResponse = { data: null, error: { code, message: "function not found" } };
+    const result = await reserveLlmTurn("ws_1", "contact_1");
+    assert.deepEqual(result, { allowed: true });
+  }
 });
 
 test("recordLlmUsage updates the reservation row in place when a reservationId is given, instead of inserting a new one", async () => {

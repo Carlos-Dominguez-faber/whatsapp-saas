@@ -42,9 +42,9 @@ test("enforceCostPolicy allows when today's usage is under the warn threshold", 
   assert.deepEqual(result, { policy: "allow", reason: "within_budget" });
 });
 
-test("enforceCostPolicy degrades and logs a cost_alert at the warn threshold boundary (exactly 1,000,000)", async () => {
+test("enforceCostPolicy degrades and logs a cost_alert at the warn threshold boundary (exactly 800,000)", async () => {
   insertedRows.length = 0;
-  rpcResponse = { data: 1_000_000, error: null };
+  rpcResponse = { data: 800_000, error: null };
   const result = await enforceCostPolicy("ws_1");
   assert.deepEqual(result, {
     policy: "degrade",
@@ -55,18 +55,25 @@ test("enforceCostPolicy degrades and logs a cost_alert at the warn threshold bou
   assert.equal((insertedRows[0] as { type: string }).type, "cost_alert");
 });
 
-test("enforceCostPolicy cuts at the hard limit boundary (exactly 1,500,000) without inserting an alert", async () => {
+test("enforceCostPolicy cuts at the hard limit boundary (exactly 1,000,000) without inserting an alert", async () => {
   insertedRows.length = 0;
-  rpcResponse = { data: 1_500_000, error: null };
+  rpcResponse = { data: 1_000_000, error: null };
   const result = await enforceCostPolicy("ws_1");
   assert.deepEqual(result, { policy: "cut", reason: "daily_hard_limit" });
   assert.equal(insertedRows.length, 0);
 });
 
-test("enforceCostPolicy fails closed (cut) when the daily sum RPC errors — an unverifiable budget must not allow spend", async () => {
+test("enforceCostPolicy throws when the daily sum RPC errors, so the batch is retried instead of spending unverified", async () => {
   rpcResponse = { data: null, error: { message: "boom" } };
-  const result = await enforceCostPolicy("ws_1");
-  assert.deepEqual(result, { policy: "cut", reason: "db_error_fail_closed" });
+  await assert.rejects(() => enforceCostPolicy("ws_1"), /sum_daily_llm_tokens failed: boom/);
+});
+
+test("enforceCostPolicy allows when sum_daily_llm_tokens does not exist yet (deployed before db-push)", async () => {
+  for (const code of ["PGRST202", "42883"]) {
+    rpcResponse = { data: null, error: { code, message: "function not found" } };
+    const result = await enforceCostPolicy("ws_1");
+    assert.deepEqual(result, { policy: "allow", reason: "budget_function_missing" });
+  }
 });
 
 test("enforceCostPolicy trusts a sum past what a single 1000-row PostgREST page could hold", async () => {

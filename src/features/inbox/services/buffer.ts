@@ -245,7 +245,7 @@ async function consolidateBatch(
 //   2. No batch available → return { processed: false }
 //   3. consolidateBatch → mergedText
 //   4. Load conversation (ai_enabled, workspace_id, contact info)
-//   5. checkRateLimits
+//   5. decide(): state, handoff keyword, atomic hourly reservation
 //   6. generateReply with consolidated text
 //   7. recordLlmUsage
 //   8. sendText via the workspace's WhatsApp provider (or insert dev_mode outbound)
@@ -441,6 +441,9 @@ export async function processNextBatch(): Promise<ProcessBatchResult> {
 
     // ── 8. Record LLM usage ──────────────────────────────────────────────────
     await recordLlmUsage({
+      // Fill in the slot decide() reserved instead of inserting a second row:
+      // both would count toward the contact's hourly limit.
+      reservationId: decisionResult.reservationId,
       workspaceId: batch.workspace_id,
       conversationId: batch.conversation_id,
       contactId: conversation.contact_id as string,
