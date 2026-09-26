@@ -300,23 +300,43 @@ async function signupIsClosed(env) {
 }
 
 // Closes public signup ONLY — unlike site-url it leaves Site URL and Redirect
-// URLs alone, so it is safe on an install that customized them.
+// URLs alone, so it is safe on an install that customized them. Exits non-zero
+// unless it could confirm signup is closed.
 async function cmdCloseSignup() {
   const env = readEnvFile(ENV_PATH);
-  const ref = deriveRef(env.NEXT_PUBLIC_SUPABASE_URL);
-  if (!ref) fail("No pude derivar el project-ref de NEXT_PUBLIC_SUPABASE_URL.");
+  let patched = false;
   if (mgmtToken()) {
+    const ref = deriveRef(env.NEXT_PUBLIC_SUPABASE_URL);
+    if (!ref) fail("No pude derivar el project-ref de NEXT_PUBLIC_SUPABASE_URL.");
     const res = await mgmtCall("PATCH", `/v1/projects/${ref}/config/auth`, {
       disable_signup: true,
     });
     if (!res.ok) fail(`Management API (config/auth) falló ${res.status}: ${JSON.stringify(res.data)}`);
+    patched = true;
   } else {
     warn('Sin SUPABASE_ACCESS_TOKEN — hazlo manual: Supabase → Authentication → Sign In / Providers → desactiva "Allow new users to sign up" → Save.');
   }
-  const closed = await signupIsClosed(env);
-  if (closed === true) ok("Registro público de Supabase Auth: cerrado.");
-  else if (closed === false) fail("El registro público de Supabase Auth sigue ABIERTO.");
-  else warn("No pude verificar /auth/v1/settings; revisa el toggle a mano.");
+
+  // Auth may take a few seconds to pick up the new config after the PATCH.
+  let closed = await signupIsClosed(env);
+  for (let i = 0; patched && closed === false && i < 10; i++) {
+    await new Promise((r) => setTimeout(r, 3000));
+    closed = await signupIsClosed(env);
+  }
+
+  if (closed === true) {
+    ok("Registro público de Supabase Auth: cerrado.");
+  } else if (closed === false) {
+    fail(
+      patched
+        ? "El registro público de Supabase Auth sigue ABIERTO tras el cambio; revisa el toggle a mano."
+        : "El registro público de Supabase Auth sigue ABIERTO. Desactívalo y vuelve a correr close-signup.",
+    );
+  } else {
+    fail(
+      "No pude verificar /auth/v1/settings (¿faltan NEXT_PUBLIC_SUPABASE_URL o NEXT_PUBLIC_SUPABASE_ANON_KEY en .env.local?). Revisa el toggle a mano.",
+    );
+  }
 }
 
 function cmdVercelEnv() {
