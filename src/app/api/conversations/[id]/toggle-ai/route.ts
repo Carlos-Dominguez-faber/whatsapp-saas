@@ -51,7 +51,7 @@ export async function PATCH(
     const { id } = await params;
     const { data: conv, error: convError } = await supabase
       .from("conversations")
-      .select("state, workspace_id, assigned_to")
+      .select("state, ai_enabled, workspace_id, assigned_to")
       .eq("id", id)
       .single();
 
@@ -74,6 +74,20 @@ export async function PATCH(
 
     // 4. Idempotent: nothing to do if the AI is already where the caller wants it.
     if (currentState === target) {
+      // Rows written by the old toggle (which only set ai_enabled) can sit in
+      // ai_active with ai_enabled=false: "on" in the UI but silenced by the
+      // webhook. Re-align the flag so turning the AI on really turns it on.
+      // Same UPDATE policy as checked above, so the RLS client suffices.
+      if (conv.ai_enabled !== ai_enabled) {
+        const { error: repairError } = await supabase
+          .from("conversations")
+          .update({ ai_enabled })
+          .eq("id", id)
+          .eq("workspace_id", conv.workspace_id as string);
+        if (repairError) {
+          throw new Error(`ai_enabled repair failed: ${repairError.message}`);
+        }
+      }
       return NextResponse.json({ ok: true, ai_enabled, state: currentState });
     }
 

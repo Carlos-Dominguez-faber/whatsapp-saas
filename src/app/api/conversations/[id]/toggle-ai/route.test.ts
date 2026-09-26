@@ -5,6 +5,7 @@ import { NextRequest } from "next/server";
 let currentUser: { id: string } | null = { id: "user_1" };
 let convRow: {
   state: string;
+  ai_enabled?: boolean;
   workspace_id: string;
   assigned_to?: string | null;
 } | null = {
@@ -39,7 +40,11 @@ const fakeSupabase = {
     }),
     update: (row: unknown) => {
       directUpdates.push(row);
-      return { eq: () => ({ select: () => ({ single: async () => ({ data: row, error: null }) }) }) };
+      const chain: any = {
+        eq: () => chain,
+        then: (resolve: (v: unknown) => void) => resolve({ error: null }),
+      };
+      return chain;
     },
   },
 };
@@ -92,10 +97,22 @@ test("turning the AI off from ai_active transitions to human_active", async () =
 
 test("is idempotent: already in the target state → 200 without a transition", async () => {
   transitions.length = 0;
-  convRow = { state: "ai_active", workspace_id: "ws_1" };
+  directUpdates.length = 0;
+  convRow = { state: "ai_active", ai_enabled: true, workspace_id: "ws_1" };
   const res = await PATCH(makeReq({ ai_enabled: true }), params);
   assert.equal(res.status, 200);
   assert.equal(transitions.length, 0);
+  assert.equal(directUpdates.length, 0);
+});
+
+test("legacy row (ai_active with ai_enabled=false) gets its flag repaired when turned on", async () => {
+  transitions.length = 0;
+  directUpdates.length = 0;
+  convRow = { state: "ai_active", ai_enabled: false, workspace_id: "ws_1" };
+  const res = await PATCH(makeReq({ ai_enabled: true }), params);
+  assert.equal(res.status, 200);
+  assert.equal(transitions.length, 0);
+  assert.deepEqual(directUpdates, [{ ai_enabled: true }]);
 });
 
 test("422 on a closed conversation", async () => {
