@@ -26,7 +26,7 @@
 -- though no tokens were billed.
 -- ============================================================
 
-CREATE OR REPLACE FUNCTION reserve_llm_turn(
+CREATE OR REPLACE FUNCTION public.reserve_llm_turn(
   p_workspace_id UUID,
   p_contact_id TEXT,
   p_hourly_limit INT
@@ -75,9 +75,11 @@ END;
 $$;
 
 -- Server-side only (called from decide() via service_role) — never by an
--- end-user client. Matches the REVOKE pattern in
--- 20260608000008_sec02_function_hardening.sql for the sibling worker RPCs.
-REVOKE EXECUTE ON FUNCTION public.reserve_llm_turn(uuid, text, int) FROM anon, authenticated;
+-- end-user client. Postgres grants EXECUTE to PUBLIC on every new function and
+-- Supabase's default privileges add anon/authenticated, so all three are
+-- revoked (same pattern as 20260926000001_revoke_public_batch_rpcs.sql).
+REVOKE ALL ON FUNCTION public.reserve_llm_turn(uuid, text, int) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.reserve_llm_turn(uuid, text, int) TO service_role;
 
 -- ============================================================
 -- End of migration: 20260928000000_llm_turn_reservation

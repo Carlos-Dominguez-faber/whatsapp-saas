@@ -42,7 +42,9 @@ AS $$
     AND created_at >= p_day_start;
 $$;
 
-REVOKE ALL ON FUNCTION public.sum_daily_llm_tokens(uuid, timestamptz) FROM PUBLIC;
+-- PUBLIC alone is not enough: Supabase's default privileges grant EXECUTE on
+-- new functions to anon and authenticated directly.
+REVOKE ALL ON FUNCTION public.sum_daily_llm_tokens(uuid, timestamptz) FROM PUBLIC, anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.sum_daily_llm_tokens(uuid, timestamptz) TO service_role;
 
 -- ============================================================
