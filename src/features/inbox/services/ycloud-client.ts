@@ -6,13 +6,18 @@ const YCLOUD_TEMPLATES_URL = `${YCLOUD_BASE_URL}/whatsapp/templates`;
 const YCLOUD_PHONE_NUMBERS_URL = `${YCLOUD_BASE_URL}/whatsapp/phoneNumbers`;
 
 export class YCloudError extends Error {
+  readonly status: number;
+  readonly body: unknown;
+
   constructor(
-    public readonly status: number,
-    public readonly body: unknown,
+    status: number,
+    body: unknown,
     message: string,
   ) {
     super(message);
     this.name = "YCloudError";
+    this.status = status;
+    this.body = body;
   }
 }
 

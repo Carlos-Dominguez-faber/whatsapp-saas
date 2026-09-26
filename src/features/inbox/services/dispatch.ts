@@ -59,6 +59,7 @@ interface IntegrationRow {
 
 interface ContactPhoneRow {
   phone: string;
+  opt_in: boolean | null;
 }
 
 interface ConversationWindowRow {
@@ -96,37 +97,62 @@ async function loadIntegration(
   };
 }
 
+/**
+ * Loads the conversation window and the contact's phone/opt-in, scoped to
+ * `workspaceId`. This runs with the service role (no RLS), so the tenant
+ * filter must live here: without it a conversationId from another workspace
+ * would load and its contact would receive the message with this workspace's
+ * credentials. Returns null when the conversation or contact is not in the
+ * workspace; throws only on a database error.
+ */
 async function loadConversationAndPhone(
   conversationId: string,
+  workspaceId: string,
   supabase: ReturnType<typeof svc>,
-): Promise<{ window_expires_at: string | null; toPhone: string }> {
+): Promise<{
+  window_expires_at: string | null;
+  toPhone: string;
+  optIn: boolean;
+} | null> {
   const { data: conv, error: convError } = await supabase
     .from("conversations")
     .select("window_expires_at, contact_id")
     .eq("id", conversationId)
-    .single();
+    .eq("workspace_id", workspaceId)
+    .maybeSingle();
 
-  if (convError || !conv) {
-    throw new Error(`[dispatch] conversation not found: ${convError?.message}`);
+  if (convError) {
+    throw new Error(`[dispatch] conversation lookup failed: ${convError.message}`);
   }
+  if (!conv) return null;
 
   const convRow = conv as ConversationWindowRow;
 
   const { data: contact, error: contactError } = await supabase
     .from("contacts")
-    .select("phone")
+    .select("phone, opt_in")
     .eq("id", convRow.contact_id)
-    .single();
+    .eq("workspace_id", workspaceId)
+    .maybeSingle();
 
-  if (contactError || !contact) {
-    throw new Error(`[dispatch] contact not found: ${contactError?.message}`);
+  if (contactError) {
+    throw new Error(`[dispatch] contact lookup failed: ${contactError.message}`);
   }
+  if (!contact) return null;
 
+  const contactRow = contact as ContactPhoneRow;
   return {
     window_expires_at: convRow.window_expires_at,
-    toPhone: (contact as ContactPhoneRow).phone,
+    toPhone: contactRow.phone,
+    optIn: contactRow.opt_in !== false,
   };
 }
+
+const NOT_FOUND: DispatchResult = { ok: false, error: "CONVERSATION_NOT_FOUND" };
+const OPT_OUT: DispatchResult = {
+  ok: false,
+  error: "OPT_OUT: contact has opted out of WhatsApp messages",
+};
 
 // ──────────────────────────────────────────────────────────────────────────────
 // dispatchText — sends a free-text outbound message
@@ -148,36 +174,17 @@ export async function dispatchText(
 
   const supabase = svc();
 
-  // 1. Load conversation window + contact phone
-  const { window_expires_at, toPhone } = await loadConversationAndPhone(
+  // 1. Load conversation window + contact phone (scoped to the workspace)
+  const loaded = await loadConversationAndPhone(
     conversationId,
+    workspaceId,
     supabase,
   );
+  if (!loaded) return NOT_FOUND;
+  const { window_expires_at, toPhone } = loaded;
 
   // SEC-10: Block outbound to opted-out contacts
-  const { data: convRow } = await supabase
-    .from("conversations")
-    .select("contact_id")
-    .eq("id", conversationId)
-    .single();
-
-  if (convRow) {
-    const { data: contactOptData } = await supabase
-      .from("contacts")
-      .select("opt_in")
-      .eq("id", (convRow as { contact_id: string }).contact_id)
-      .single();
-
-    if (
-      contactOptData &&
-      (contactOptData as { opt_in: boolean }).opt_in === false
-    ) {
-      return {
-        ok: false,
-        error: "OPT_OUT: contact has opted out of WhatsApp messages",
-      };
-    }
-  }
+  if (!loaded.optIn) return OPT_OUT;
 
   // 2. App-level 24h window guard (DB trigger is the final enforcer)
   if (
@@ -283,29 +290,16 @@ export async function dispatchTemplate(
   const supabase = svc();
 
   // 1. Load contact phone (templates bypass the window guard entirely)
-  const { toPhone } = await loadConversationAndPhone(conversationId, supabase);
+  const loaded = await loadConversationAndPhone(
+    conversationId,
+    workspaceId,
+    supabase,
+  );
+  if (!loaded) return NOT_FOUND;
+  const { toPhone } = loaded;
 
   // SEC-10: Block outbound to opted-out contacts
-  const { data: tplConvRow } = await supabase
-    .from("conversations")
-    .select("contact_id")
-    .eq("id", conversationId)
-    .single();
-
-  if (tplConvRow) {
-    const { data: tplOptData } = await supabase
-      .from("contacts")
-      .select("opt_in")
-      .eq("id", (tplConvRow as { contact_id: string }).contact_id)
-      .single();
-
-    if (tplOptData && (tplOptData as { opt_in: boolean }).opt_in === false) {
-      return {
-        ok: false,
-        error: "OPT_OUT: contact has opted out of WhatsApp messages",
-      };
-    }
-  }
+  if (!loaded.optIn) return OPT_OUT;
 
   // 2. Load YCloud credentials
   const { apiKey, fromPhone } = await loadIntegration(workspaceId, supabase);
