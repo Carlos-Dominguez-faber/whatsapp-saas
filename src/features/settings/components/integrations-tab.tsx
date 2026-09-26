@@ -110,17 +110,32 @@ function Section({
   );
 }
 
+// Integrations are written by admins only (integrations_write_admins); managers
+// can read and test them.
+const ADMIN_ONLY_NOTE =
+  "Solo un administrador del workspace puede guardar cambios en las integraciones.";
+
+function AdminOnlyNote({ id }: { id: string }) {
+  return (
+    <p id={id} className="text-xs text-muted-foreground">
+      {ADMIN_ONLY_NOTE}
+    </p>
+  );
+}
+
 // ─── WhatsApp section (provider per workspace: YCloud or Kapso) ───────────────
 
 function WhatsAppSection({
   workspaceId,
   ycloud,
   kapso,
+  canEdit,
   onSaved,
 }: {
   workspaceId: string;
   ycloud: IntegrationData | undefined;
   kapso: IntegrationData | undefined;
+  canEdit: boolean;
   onSaved: () => void;
 }) {
   // The provider this workspace talks through today (at most one is enabled).
@@ -612,9 +627,15 @@ function WhatsAppSection({
             type="button"
             size="sm"
             onClick={handleSave}
-            disabled={saving || missing.length > 0}
+            disabled={!canEdit || saving || missing.length > 0}
             aria-busy={saving}
-            aria-describedby={missing.length > 0 ? "whatsapp-missing" : undefined}
+            aria-describedby={
+              !canEdit
+                ? "whatsapp-admin-only"
+                : missing.length > 0
+                  ? "whatsapp-missing"
+                  : undefined
+            }
           >
             {saving && (
               <Loader2 className="h-4 w-4 mr-2 animate-spin" aria-hidden />
@@ -622,10 +643,14 @@ function WhatsAppSection({
             {switching ? `Guardar y cambiar a ${label}` : "Guardar"}
           </Button>
         </div>
-        {missing.length > 0 && (
-          <p id="whatsapp-missing" className="text-xs text-muted-foreground">
-            Para guardar {label} falta {missing.join(", ")}.
-          </p>
+        {!canEdit ? (
+          <AdminOnlyNote id="whatsapp-admin-only" />
+        ) : (
+          missing.length > 0 && (
+            <p id="whatsapp-missing" className="text-xs text-muted-foreground">
+              Para guardar {label} falta {missing.join(", ")}.
+            </p>
+          )
         )}
       </div>
     </Section>
@@ -637,10 +662,12 @@ function WhatsAppSection({
 function OpenRouterSection({
   workspaceId,
   initial,
+  canEdit,
   onSaved,
 }: {
   workspaceId: string;
   initial: IntegrationData | undefined;
+  canEdit: boolean;
   onSaved: () => void;
 }) {
   const [apiKey, setApiKey] = useState(
@@ -739,19 +766,21 @@ function OpenRouterSection({
           </p>
         </div>
 
-        <div className="pt-2">
+        <div className="space-y-2 pt-2">
           <Button
             type="button"
             size="sm"
             onClick={handleSave}
-            disabled={saving}
+            disabled={!canEdit || saving}
             aria-busy={saving}
+            aria-describedby={!canEdit ? "openrouter-admin-only" : undefined}
           >
             {saving && (
               <Loader2 className="h-4 w-4 mr-2 animate-spin" aria-hidden />
             )}
             Guardar
           </Button>
+          {!canEdit && <AdminOnlyNote id="openrouter-admin-only" />}
         </div>
       </div>
     </Section>
@@ -763,10 +792,12 @@ function OpenRouterSection({
 function HighLevelSection({
   workspaceId,
   initial,
+  canEdit,
   onSaved,
 }: {
   workspaceId: string;
   initial: IntegrationData | undefined;
+  canEdit: boolean;
   onSaved: () => void;
 }) {
   const [pit, setPit] = useState(initial?.credentials?.highlevel_pit ?? "");
@@ -1046,8 +1077,9 @@ function HighLevelSection({
             type="button"
             size="sm"
             onClick={handleSave}
-            disabled={saving}
+            disabled={!canEdit || saving}
             aria-busy={saving}
+            aria-describedby={!canEdit ? "highlevel-admin-only" : undefined}
           >
             {saving && (
               <Loader2 className="h-4 w-4 mr-2 animate-spin" aria-hidden />
@@ -1055,6 +1087,7 @@ function HighLevelSection({
             Guardar
           </Button>
         </div>
+        {!canEdit && <AdminOnlyNote id="highlevel-admin-only" />}
       </div>
     </Section>
   );
@@ -1064,13 +1097,18 @@ function HighLevelSection({
 
 interface Props {
   workspaceId: string;
+  /** The viewer's role in this workspace. */
+  role: string;
   initialIntegrations: unknown[];
 }
 
-export function IntegrationsTab({ workspaceId, initialIntegrations }: Props) {
+export function IntegrationsTab({ workspaceId, role, initialIntegrations }: Props) {
   const [integrations, setIntegrations] = useState<IntegrationData[]>(
     initialIntegrations as IntegrationData[],
   );
+  // Same split as the RLS policies: admins and managers read, admins write.
+  const canRead = role === "admin" || role === "manager";
+  const canEdit = role === "admin";
 
   const refresh = useCallback(async () => {
     try {
@@ -1087,6 +1125,15 @@ export function IntegrationsTab({ workspaceId, initialIntegrations }: Props) {
   const openrouter = findIntegration(integrations, "openrouter");
   const highlevel = findIntegration(integrations, "highlevel");
 
+  if (!canRead) {
+    return (
+      <p className="text-sm text-muted-foreground">
+        Solo los administradores y managers del workspace pueden ver las
+        integraciones.
+      </p>
+    );
+  }
+
   return (
     <div className="space-y-6">
       <WhatsAppSection
@@ -1095,18 +1142,21 @@ export function IntegrationsTab({ workspaceId, initialIntegrations }: Props) {
         workspaceId={workspaceId}
         ycloud={ycloud}
         kapso={kapso}
+        canEdit={canEdit}
         onSaved={refresh}
       />
       <Separator />
       <OpenRouterSection
         workspaceId={workspaceId}
         initial={openrouter}
+        canEdit={canEdit}
         onSaved={refresh}
       />
       <Separator />
       <HighLevelSection
         workspaceId={workspaceId}
         initial={highlevel}
+        canEdit={canEdit}
         onSaved={refresh}
       />
     </div>

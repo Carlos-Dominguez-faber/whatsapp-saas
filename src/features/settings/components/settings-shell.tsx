@@ -85,6 +85,7 @@ export function SettingsShell({
           <div className="p-6 space-y-6 rounded-lg border border-border/60 bg-card">
             <IntegrationsTab
               workspaceId={workspaceId}
+              role={role}
               initialIntegrations={initialIntegrations}
             />
           </div>

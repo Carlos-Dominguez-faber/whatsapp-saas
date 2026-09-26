@@ -118,8 +118,10 @@ export async function PUT(
 ) {
   const { id: workspaceId } = await params;
 
+  // Admins only, the same rule as the integrations_write_admins policy: the
+  // write below uses the service role, so this check is the policy.
   const auth = await requireWorkspaceMember(workspaceId, {
-    minRole: "manager",
+    minRole: "admin",
   });
   if (!auth.ok) return auth.response;
 

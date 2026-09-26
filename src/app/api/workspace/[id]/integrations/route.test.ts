@@ -28,7 +28,7 @@ mock.module("@supabase/supabase-js", {
   exports: { createClient: () => fakeSvc },
 });
 
-const { GET } = await import("./route.ts");
+const { GET, PUT } = await import("./route.ts");
 const params = { params: Promise.resolve({ id: "ws_1" }) };
 const req = new NextRequest("http://localhost/api/workspace/ws_1/integrations");
 
@@ -47,4 +47,20 @@ test("GET returns the 403 from the membership helper for a viewer", async () => 
   };
   const res = await GET(req, params);
   assert.equal(res.status, 403);
+});
+
+test("PUT asks the membership helper for the admin role (integrations_write_admins)", async () => {
+  memberCalls.length = 0;
+  memberResult = {
+    ok: false,
+    response: NextResponse.json({ error: "Permisos insuficientes" }, { status: 403 }),
+  };
+  const putReq = new NextRequest("http://localhost/api/workspace/ws_1/integrations", {
+    method: "PUT",
+    body: JSON.stringify({ provider: "ycloud", credentials: { api_key: "k" } }),
+  });
+  const res = await PUT(putReq, params);
+  // A manager gets the helper's 403 and nothing is written.
+  assert.equal(res.status, 403);
+  assert.deepEqual(memberCalls[0], ["ws_1", { minRole: "admin" }]);
 });
