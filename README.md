@@ -1,5 +1,15 @@
 # Agente WhatsApp — Inbox Conversacional con IA
 
+> ⚠️ **Esta rama (`provider/kapso`) está congelada desde el 26-sep-2026 y ya no
+> recibe cambios.** YCloud y Kapso viven ahora juntos en `main`, y cada workspace
+> elige su proveedor en Configuración → Integraciones → WhatsApp.
+>
+> - **Instalación nueva:** clona `main` (sin `-b provider/kapso`).
+> - **Ya instalaste desde esta rama:** cámbiate a `main` siguiendo
+>   [INSTALAR.md de `main` → "Si instalaste desde la antigua rama `provider/kapso`"](https://github.com/Carlos-Dominguez-faber/whatsapp-saas/blob/main/INSTALAR.md).
+>   Tus workspaces con Kapso siguen en Kapso.
+> - **PRs:** ábrelos contra `main`.
+
 Plataforma **multi-tenant** de inbox de WhatsApp con un agente de IA operable por
 humano: inbox tipo WhatsApp Web, CRM, motor de agente con handoff, agendamiento y
 cumplimiento de la ventana de 24h de Meta. Cada workspace es un cliente.
@@ -89,8 +99,8 @@ persona.
 
 Para conectar un número, ver el paso 11 de [`INSTALAR.md`](INSTALAR.md).
 
-> Las mejoras que no son del proveedor (inbox, KB, agente) se hacen en `main` y
-> se traen aquí con `git merge main`.
+> Esta rama ya no recibe `git merge main`: todo lo nuevo, de los dos proveedores,
+> está en `main`.
 
 ## Desarrollo local
 
