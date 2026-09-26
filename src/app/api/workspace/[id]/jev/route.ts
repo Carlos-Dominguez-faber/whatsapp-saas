@@ -6,7 +6,7 @@ import {
 } from "@/lib/auth/workspace-access";
 import { JevPatchSchema } from "@/features/jev-judge/schema";
 import { writeJevPatch } from "@/features/jev-judge/uses";
-import { loadWhatsAppIntegration } from "@/features/inbox/services/whatsapp-provider";
+import { loadWhatsAppSettings } from "@/features/inbox/services/whatsapp-provider";
 
 export async function PATCH(
   req: NextRequest,
@@ -28,7 +28,7 @@ export async function PATCH(
     process.env.SUPABASE_SERVICE_ROLE_KEY!,
   );
   // Jev's settings live in the workspace's active WhatsApp integration.
-  const existing = await loadWhatsAppIntegration(svc, workspaceId);
+  const existing = await loadWhatsAppSettings(svc, workspaceId);
 
   if (!existing) {
     return NextResponse.json(

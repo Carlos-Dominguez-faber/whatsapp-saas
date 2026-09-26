@@ -25,11 +25,6 @@ export function isWhatsAppProvider(value: unknown): value is WhatsAppProvider {
   return (WHATSAPP_PROVIDERS as readonly unknown[]).includes(value);
 }
 
-/** Path of the provider's webhook; the workspace goes in `?wsid=`. */
-export function whatsappWebhookPath(provider: WhatsAppProvider): string {
-  return `/api/webhooks/${provider}`;
-}
-
 /**
  * Keys of the WhatsApp integration `config` that belong to the WORKSPACE, not
  * to the provider: they survive a provider switch (carried over to the new
@@ -80,34 +75,62 @@ export function missingWhatsAppFields(
   return missing;
 }
 
-export interface WhatsAppIntegrationRow {
+export interface WhatsAppSettingsRow {
   id: string;
   provider: WhatsAppProvider;
   enabled: boolean;
   config: Record<string, unknown>;
+}
+
+export interface WhatsAppIntegrationRow extends WhatsAppSettingsRow {
   credentials: Record<string, unknown> | null;
+}
+
+async function loadActiveRow(
+  supabase: SupabaseClient,
+  workspaceId: string,
+  columns: string,
+): Promise<Record<string, unknown> | null> {
+  const lookup = (providers: readonly string[]) =>
+    supabase
+      .from("integrations")
+      .select(columns)
+      .eq("workspace_id", workspaceId)
+      .in("provider", providers as string[])
+      .eq("enabled", true)
+      .maybeSingle();
+
+  let { data, error } = await lookup(WHATSAPP_PROVIDERS);
+  // 22P02: the database does not know 'kapso' yet — this code was deployed
+  // before `db push` ran 20260927000000. Keep YCloud workspaces sending
+  // instead of failing every lookup until the migration lands.
+  if (error?.code === "22P02") {
+    console.error(
+      "[whatsapp] 'kapso' is not in integration_provider yet — run `setup.mjs db-push`",
+    );
+    ({ data, error } = await lookup(["ycloud"]));
+  }
+  if (error) {
+    throw new Error(`[whatsapp] integration lookup failed: ${error.message}`);
+  }
+  return (data as Record<string, unknown> | null) ?? null;
 }
 
 /**
  * The workspace's ACTIVE WhatsApp integration (enabled, YCloud or Kapso), or
  * null when it has none. `credentials` come back still encrypted — call
  * `decryptWhatsAppCredentials` only where the secret is actually needed.
+ * Callers that only read settings use `loadWhatsAppSettings`.
  */
 export async function loadWhatsAppIntegration(
   supabase: SupabaseClient,
   workspaceId: string,
 ): Promise<WhatsAppIntegrationRow | null> {
-  const { data, error } = await supabase
-    .from("integrations")
-    .select("id, provider, enabled, config, credentials")
-    .eq("workspace_id", workspaceId)
-    .in("provider", WHATSAPP_PROVIDERS as unknown as string[])
-    .eq("enabled", true)
-    .maybeSingle();
-
-  if (error) {
-    throw new Error(`[whatsapp] integration lookup failed: ${error.message}`);
-  }
+  const data = await loadActiveRow(
+    supabase,
+    workspaceId,
+    "id, provider, enabled, config, credentials",
+  );
   if (!data || !isWhatsAppProvider(data.provider)) return null;
 
   return {
@@ -116,6 +139,26 @@ export async function loadWhatsAppIntegration(
     enabled: true,
     config: (data.config ?? {}) as Record<string, unknown>,
     credentials: (data.credentials ?? null) as Record<string, unknown> | null,
+  };
+}
+
+/**
+ * The active WhatsApp integration WITHOUT its credentials: for the callers
+ * that only read the workspace settings kept in its config (buffer window,
+ * handoff acknowledgement, Jev).
+ */
+export async function loadWhatsAppSettings(
+  supabase: SupabaseClient,
+  workspaceId: string,
+): Promise<WhatsAppSettingsRow | null> {
+  const data = await loadActiveRow(supabase, workspaceId, "id, provider, enabled, config");
+  if (!data || !isWhatsAppProvider(data.provider)) return null;
+
+  return {
+    id: data.id as string,
+    provider: data.provider,
+    enabled: true,
+    config: (data.config ?? {}) as Record<string, unknown>,
   };
 }
 

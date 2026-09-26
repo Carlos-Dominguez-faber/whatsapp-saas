@@ -10,7 +10,7 @@ import { trackJudgment } from "@/features/jev-judge/observe";
 import { previewWithoutJev } from "@/features/jev-judge/preview";
 import { checkBenchRateLimit } from "@/features/jev-judge/rate-limit";
 import { BenchTextSchema, JudgeViewSchema } from "@/features/jev-judge/schema";
-import { loadWhatsAppIntegration } from "@/features/inbox/services/whatsapp-provider";
+import { loadWhatsAppSettings } from "@/features/inbox/services/whatsapp-provider";
 
 const MODEL = "jev-latest";
 
@@ -101,6 +101,6 @@ async function savedUses(workspaceId: string): Promise<JevUses> {
     process.env.NEXT_PUBLIC_SUPABASE_URL!,
     process.env.SUPABASE_SERVICE_ROLE_KEY!,
   );
-  const whatsapp = await loadWhatsAppIntegration(svc, workspaceId);
+  const whatsapp = await loadWhatsAppSettings(svc, workspaceId);
   return readJevUses(whatsapp?.config);
 }

@@ -20,7 +20,7 @@ import { createClient as createSbClient } from "@supabase/supabase-js";
 import { dispatchText } from "./dispatch";
 import { DEFAULT_HANDOFF_ACK } from "../types/handoff";
 import {
-  loadWhatsAppIntegration,
+  loadWhatsAppSettings,
   WHATSAPP_NOT_CONNECTED,
 } from "./whatsapp-provider";
 
@@ -52,7 +52,7 @@ export async function getHandoffAckConfig(
 ): Promise<HandoffAckConfig> {
   const supabase = svc();
 
-  const whatsapp = await loadWhatsAppIntegration(supabase, workspaceId);
+  const whatsapp = await loadWhatsAppSettings(supabase, workspaceId);
 
   const config = (whatsapp?.config ?? {}) as {
     handoff_ack_enabled?: boolean;
