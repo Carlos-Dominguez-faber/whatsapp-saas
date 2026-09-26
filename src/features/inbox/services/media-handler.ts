@@ -108,7 +108,7 @@ export function validateMediaUrl(
  *
  * Returns null when:
  * - The URL fails SEC-08 host validation
- * - The YCloud download request fails (non-2xx)
+ * - The provider download request fails (non-2xx)
  * - The Supabase upload fails
  */
 export async function downloadAndStoreMedia(

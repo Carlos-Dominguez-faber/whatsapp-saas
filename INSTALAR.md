@@ -178,6 +178,10 @@ o **Kapso** si está en Estados Unidos (YCloud no opera ahí).
   conexión**: rellena el `phone_number_id` y el `waba_id` de Meta. Guía detallada:
   `docs/runbook-conectar-numero-kapso.md`.
 
+**Probar conexión** usa lo que está en pantalla, aunque no lo hayas guardado. La app
+no activa un proveedor sin API Key, Webhook Signing Secret y número (YCloud) o Phone
+Number ID (Kapso): el botón de guardar te dice qué falta.
+
 Guarda, copia el **Webhook URL** que muestra la app (ya trae el `wsid` y la ruta del
 proveedor elegido) → pégalo en los webhooks del proveedor y conecta el número.
 
@@ -211,6 +215,17 @@ su propia integración de WhatsApp (cada uno puede usar YCloud o Kapso).
   que el webhook del proveedor (YCloud o Kapso) apunte a tu URL con la ruta del
   proveedor activo, y que `OPENROUTER_API_KEY` tenga saldo. Si cambiaste de
   proveedor, el webhook del anterior ya no se acepta (responde 401).
+- **Qué pasa con lo que estaba en curso al cambiar de proveedor:**
+  - una respuesta que la IA estaba generando sale por el proveedor **nuevo**;
+  - si ese envío falla (por ejemplo, una API Key equivocada), la respuesta queda en
+    el inbox como mensaje **fallido**, con el error; la conversación no se
+    reintenta sola, así que reenvíala desde el inbox;
+  - los mensajes que ya había enviado el proveedor anterior se quedan en su último
+    estado (por ejemplo "enviado"): sus avisos de entregado/leído llegan a un
+    webhook que ya responde 401.
+
+  Por eso conviene probar la conexión antes de guardar, y cambiar en un momento
+  de poco tráfico.
 
 ## Actualizar a una versión nueva
 
@@ -229,7 +244,11 @@ El orden importa: el código nuevo puede depender de funciones o permisos que tr
 las migraciones, así que las migraciones van **antes** de `vercel --prod`.
 
 **Si instalaste desde la antigua rama `provider/kapso`** (Kapso), cámbiate a `main`,
-donde ahora viven los dos proveedores. Tus workspaces siguen con Kapso:
+donde ahora viven los dos proveedores. Cada workspace sigue con el proveedor que
+tenía **activo**: si tenía Kapso (o Kapso y YCloud a la vez), queda en Kapso; si solo
+tenía YCloud activo, queda en YCloud. Después del upgrade, revisa en
+**Configuración → Integraciones → WhatsApp** de cada workspace que el proveedor
+marcado como "activo" sea el que esperas.
 
 ```bash
 git fetch origin
@@ -240,8 +259,8 @@ SUPABASE_DB_PASSWORD='tu-contraseña-de-la-base' node scripts/setup.mjs db-push 
 vercel --prod
 ```
 
-`db-push` detecta las dos migraciones que solo existían en esa rama
-(`20260731000000/1`), las marca como incluidas y aplica las nuevas.
+`db-push` marca como revertidas las dos migraciones que solo existían en esa rama
+(`20260731000000/1`; su contenido ya viene en las de `main`) y aplica las nuevas.
 
 **Una sola vez, si tu instalación es anterior al 26-sep-2026** (endurecimiento de
 seguridad entre workspaces):
