@@ -404,15 +404,21 @@ las migraciones, así que las migraciones van **antes** de `vercel --prod`.
   quieres esa sincronización, quita el webhook de contactos en HighLevel.
   - Enlaza el contacto de HighLevel con el de WhatsApp que tenga el mismo
     teléfono, aunque esté escrito distinto (`+52 1…` y `+52…` cuentan como el
-    mismo número; un número sin código de país usa el del negocio). Si no existe,
-    lo crea.
+    mismo número). Un número de HighLevel sin código de país usa el del negocio
+    solo si tiene el largo de un número de ese país (10 dígitos en México); si
+    no, ese contacto no se enlaza por teléfono. Si no existe, lo crea.
   - No sobrescribe nada tuyo: **suma** sus etiquetas a las locales y solo llena
-    el nombre y el correo si estaban vacíos. Al revés, las etiquetas locales
-    siempre se mandan a HighLevel, incluso una lista vacía, para que una
-    etiqueta que quitaste no regrese.
+    el nombre y el correo si estaban vacíos.
+  - Al revés, al guardar un contacto aquí sus etiquetas se **agregan** en
+    HighLevel, nunca reemplazan las de allá (las de tus flujos de HighLevel se
+    quedan). Por eso quitar una etiqueta aquí no la quita en HighLevel, y la
+    siguiente sincronización desde HighLevel puede volver a traerla: quítala en
+    los dos lados.
   - Si dos contactos tuyos resultan ser la misma persona en HighLevel, no se
-    fusionan: queda un evento `hl_contact_link_conflict` que dice cuál tiene el
-    enlace.
+    fusionan ni se le pasa nada al duplicado: queda un evento
+    `hl_contact_link_conflict` (uno al día por contacto) que dice cuál tiene el
+    enlace, y el botón de sincronizar del contacto lo avisa en vez de decir que
+    salió bien.
   - Si al actualizar dos contactos de un workspace ya compartían el mismo id de
     HighLevel, `db-push` deja el enlace solo en el que se tocó más recientemente
     y lo avisa con un `WARNING` que lista cuáles se desenlazaron.

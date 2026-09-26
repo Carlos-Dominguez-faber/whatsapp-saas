@@ -16,10 +16,12 @@ function fakeBackend(opts: {
   contacts: Row[];
   hlContact?: Row;
   countryCode?: string;
+  /** Runs before a contacts PATCH: another request committing first. */
+  beforePatch?: () => void;
 }) {
   const writes: Array<{ method: string; body: Row }> = [];
   const events: Row[] = [];
-  const hlRequests: Array<{ method: string; body: Row | null }> = [];
+  const hlRequests: Array<{ method: string; path: string; body: Row | null }> = [];
   const fn = async (input: string | URL | Request, init?: RequestInit) => {
     const url = new URL(String(input));
     const method = init?.method ?? "GET";
@@ -35,13 +37,33 @@ function fakeBackend(opts: {
       return json(200, opts.countryCode ? [{ structured: { default_country_code: opts.countryCode } }] : []);
     }
     if (url.pathname.endsWith("/rest/v1/events")) {
+      if (method === "GET") {
+        // emitEventOncePerDay's lookup: type=eq.…, payload=cs.{…}
+        const type = url.searchParams.get("type")?.slice(3);
+        const cs = url.searchParams.get("payload");
+        const subset = cs ? (JSON.parse(cs.slice(3)) as Row) : {};
+        return json(
+          200,
+          events.filter(
+            (e) =>
+              e.type === type &&
+              Object.entries(subset).every(([k, v]) => (e.payload as Row)[k] === v),
+          ),
+        );
+      }
       events.push(JSON.parse(String(init?.body ?? "{}")));
       return new Response(null, { status: 201 });
     }
     if (url.hostname.includes("leadconnectorhq")) {
-      hlRequests.push({ method, body: init?.body ? JSON.parse(String(init.body)) : null });
+      hlRequests.push({
+        method,
+        path: url.pathname,
+        body: init?.body ? JSON.parse(String(init.body)) : null,
+      });
       if (method === "GET") return json(200, { contact: opts.hlContact });
-      return json(200, { contact: { id: "hl_pushed" } });
+      // PUT /contacts/:id answers with that contact; the upsert with "hl_pushed".
+      const updated = method === "PUT" ? url.pathname.split("/").pop() : null;
+      return json(200, { contact: { id: updated ?? "hl_pushed" } });
     }
     if (url.pathname.endsWith("/rest/v1/contacts")) {
       const filters = [...url.searchParams.entries()].flatMap(([k, v]) => {
@@ -53,7 +75,12 @@ function fakeBackend(opts: {
         return [];
       });
       const hits = opts.contacts.filter((c) => filters.every((f) => f(c)));
-      if (method === "GET") return json(200, hits);
+      if (method === "GET") {
+        // .single() asks for one object, not an array.
+        const one = new Headers(init?.headers).get("accept")?.includes("vnd.pgrst.object");
+        if (one) return hits.length === 1 ? json(200, hits[0]) : json(406, { message: "not one row" });
+        return json(200, hits);
+      }
       const body = JSON.parse(String(init?.body ?? "{}")) as Row;
       writes.push({ method, body });
       const next = (row: Row) => ({ ...row, ...body });
@@ -63,6 +90,7 @@ function fakeBackend(opts: {
           (c) => c !== row && c.workspace_id === next(row).workspace_id && c.hl_contact_id === body.hl_contact_id,
         );
       if (method === "PATCH") {
+        opts.beforePatch?.();
         if (hits.some(clash)) {
           return json(409, { code: "23505", message: "duplicate key value violates unique constraint" });
         }
@@ -170,23 +198,88 @@ test("the link is looked up only inside the workspace", async () => {
   assert.equal(contacts[1].workspace_id, "ws_a");
 });
 
-test("pushing a contact whose HighLevel id another contact holds leaves an event, not a merge", async () => {
+test("pushing a contact whose HighLevel id another contact holds is reported, not merged", async () => {
   const contacts: Row[] = [
-    { id: "ct_1", workspace_id: "ws_1", phone: "+525512345678", name: "Ana", tags: [], hl_contact_id: null, email: null },
+    { id: "ct_1", workspace_id: "ws_1", phone: "+525512345678", name: "Ana", tags: ["vip"], hl_contact_id: null, email: null },
     { id: "ct_2", workspace_id: "ws_1", phone: "+5215512345678", name: "Ana", tags: [], hl_contact_id: "hl_pushed", email: null },
   ];
-  const { fn, events } = fakeBackend({ contacts });
-  await withFetch(fn, () => syncContactToHL("ws_1", "ct_1"));
+  const { fn, events, hlRequests } = fakeBackend({ contacts });
+  let result: unknown;
+  await withFetch(fn, async () => {
+    result = await syncContactToHL("ws_1", "ct_1");
+    await syncContactToHL("ws_1", "ct_1");
+  });
+  assert.deepEqual((result as Row).linkConflict, { heldBy: "ct_2" }, "the caller learns it wasn't linked");
   assert.equal(contacts[0].hl_contact_id, null, "not linked: the index refused it");
-  assert.equal(events[0]?.type, "hl_contact_link_conflict");
-  assert.equal((events[0]?.payload as Row).held_by, "ct_2");
+  assert.equal(events.length, 1, "one event per contact per day, however many syncs");
+  assert.equal(events[0].type, "hl_contact_link_conflict");
+  assert.equal((events[0].payload as Row).held_by, "ct_2");
+  assert.ok(!hlRequests.some((r) => r.path.endsWith("/tags")), "the duplicate's tags aren't added");
+
+  // Another contact's conflict is its own event.
+  contacts.push({ id: "ct_3", workspace_id: "ws_1", phone: "+525512345678", name: "Ana", tags: [], hl_contact_id: null, email: null });
+  await withFetch(fn, () => syncContactToHL("ws_1", "ct_3"));
+  assert.deepEqual(
+    events.map((e) => (e.payload as Row).contact_id),
+    ["ct_1", "ct_3"],
+  );
 });
 
-test("tags go to HighLevel even when the local list is empty", async () => {
+test("a push never sends tags in the PUT (it replaces HighLevel's list); local tags are only added", async () => {
   const contacts: Row[] = [
-    { id: "ct_1", workspace_id: "ws_1", phone: "+525512345678", name: "Ana", tags: [], hl_contact_id: "hl_1", email: null },
+    { id: "ct_1", workspace_id: "ws_1", phone: "+525512345678", name: "Ana", tags: ["vip"], hl_contact_id: "hl_1", email: null },
   ];
   const { fn, hlRequests } = fakeBackend({ contacts });
   await withFetch(fn, () => syncContactToHL("ws_1", "ct_1"));
-  assert.deepEqual(hlRequests[0].body?.tags, []);
+  const put = hlRequests.find((r) => r.method === "PUT")!;
+  assert.equal("tags" in (put.body ?? {}), false);
+  const added = hlRequests.find((r) => r.path === "/contacts/hl_1/tags")!;
+  assert.equal(added.method, "POST");
+  assert.deepEqual(added.body, { tags: ["vip"] });
+});
+
+test("a push of a contact without tags touches no HighLevel tag, nor does the first upsert", async () => {
+  const contacts: Row[] = [
+    { id: "ct_1", workspace_id: "ws_1", phone: "+525512345678", name: "Ana", tags: [], hl_contact_id: null, email: null },
+  ];
+  const { fn, hlRequests } = fakeBackend({ contacts });
+  await withFetch(fn, () => syncContactToHL("ws_1", "ct_1"));
+  const upsert = hlRequests.find((r) => r.path === "/contacts/upsert")!;
+  assert.equal("tags" in (upsert.body ?? {}), false);
+  assert.ok(!hlRequests.some((r) => r.path.endsWith("/tags")));
+});
+
+test("a contact that turns out to be a duplicate gets nothing from HighLevel", async () => {
+  const contacts: Row[] = [
+    { id: "ct_1", workspace_id: "ws_1", phone: "+525512345678", name: null, email: null, tags: ["lead"], hl_contact_id: null },
+    { id: "ct_2", workspace_id: "ws_1", phone: "+15550009999", name: "Ana", email: null, tags: [], hl_contact_id: null },
+  ];
+  const { fn, events } = fakeBackend({
+    contacts,
+    hlContact: { id: "hl_9", phone: "+525512345678", firstName: "Ana", email: "ana@hl.com", tags: ["vip"] },
+    // Another sync links ct_2 to hl_9 first.
+    beforePatch: () => {
+      contacts[1].hl_contact_id = "hl_9";
+    },
+  });
+  await withFetch(fn, () => syncContactFromHL("ws_1", "hl_9"));
+  assert.equal(contacts[0].hl_contact_id, null);
+  assert.equal(contacts[0].name, null, "no name merged into the duplicate");
+  assert.equal(contacts[0].email, null);
+  assert.deepEqual(contacts[0].tags, ["lead"]);
+  assert.equal(events[0]?.type, "hl_contact_link_conflict");
+});
+
+test("a HighLevel number without a country code that doesn't fit the workspace's is left unmatched", async () => {
+  const contacts: Row[] = [
+    { id: "ct_1", workspace_id: "ws_1", phone: "+52612345678", tags: [], hl_contact_id: null },
+  ];
+  const { fn, writes } = fakeBackend({
+    contacts,
+    countryCode: "52",
+    hlContact: { id: "hl_es", phone: "612 345 678" },
+  });
+  await withFetch(fn, () => syncContactFromHL("ws_1", "hl_es"));
+  assert.equal(writes.length, 0, "neither matched to a junk number nor created with one");
+  assert.equal(contacts.length, 1);
 });
