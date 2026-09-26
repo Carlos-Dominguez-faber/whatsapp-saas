@@ -17,6 +17,8 @@ function svc() {
 // ──────────────────────────────────────────────────────────────────────────────
 // GET /api/tools/[workspaceId]
 // Returns all tools in the catalog with their enabled state for this workspace.
+// Each tool's config (e.g. a webhook URL) goes only to admins and managers, the
+// roles the tool_configs SELECT policy allows; everyone else gets config: null.
 // ──────────────────────────────────────────────────────────────────────────────
 export async function GET(
   _req: NextRequest,
@@ -57,12 +59,13 @@ export async function GET(
       ]),
     );
 
+    const canReadConfig = auth.role === "admin" || auth.role === "manager";
     const result = (tools ?? []).map((t) => {
       const cfg = configMap.get(t.id as string);
       return {
         tool: t,
         enabled: cfg?.enabled ?? false,
-        config: cfg?.config ?? null,
+        config: canReadConfig ? (cfg?.config ?? null) : null,
       };
     });
 

@@ -1,9 +1,11 @@
 // F8-D2: GET /api/conversations/[id]/events
 // Returns metrics + last 20 events for a conversation.
-// Auth required. Verifies conversation belongs to user's workspace.
+// Admins and managers of the conversation's workspace only — the same rule as
+// the events SELECT policy, since the reads below use the service role.
 
 import { NextRequest, NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
+import { requireWorkspaceMember } from "@/lib/auth/workspace-access";
 import {
   getConversationMetrics,
   getConversationEvents,
@@ -27,24 +29,12 @@ export async function GET(
 
     const { id: conversationId } = await params;
 
-    // 2. Resolve user workspace
-    const { data: member, error: memberError } = await supabase
-      .from("memberships")
-      .select("workspace_id")
-      .eq("user_id", user.id)
-      .limit(1)
-      .single();
-
-    if (memberError || !member) {
-      return NextResponse.json({ error: "No autorizado" }, { status: 401 });
-    }
-
-    // 3. Verify the conversation belongs to the user's workspace
+    // 2. Load through RLS — a non-member sees nothing (404). This also works
+    //    for users in several workspaces, unlike picking a first membership.
     const { data: conversation, error: convError } = await supabase
       .from("conversations")
       .select("id, workspace_id")
       .eq("id", conversationId)
-      .eq("workspace_id", member.workspace_id)
       .single();
 
     if (convError || !conversation) {
@@ -53,6 +43,13 @@ export async function GET(
         { status: 404 },
       );
     }
+
+    // 3. Events are for admins and managers (events_select policy).
+    const auth = await requireWorkspaceMember(
+      conversation.workspace_id as string,
+      { minRole: "manager" },
+    );
+    if (!auth.ok) return auth.response;
 
     // 4. Fetch metrics and events
     const [metrics, events] = await Promise.all([

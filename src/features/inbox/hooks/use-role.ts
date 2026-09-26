@@ -22,6 +22,7 @@ export function canTakeConversation(role: WorkspaceRole): boolean {
   return role === "agent" || role === "manager" || role === "admin";
 }
 
+// Same roles as the events SELECT policy (and /api/conversations/[id]/events).
 export function canViewObservability(role: WorkspaceRole): boolean {
-  return role !== "viewer";
+  return role === "admin" || role === "manager";
 }

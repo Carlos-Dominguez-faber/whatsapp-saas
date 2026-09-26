@@ -37,6 +37,10 @@ export default async function SettingsPage() {
   }
 
   const workspaceId = membership.workspace_id as string;
+  // The reads below use the service role, so they must apply the RLS rule
+  // themselves: integration and tool configs are for admins and managers.
+  const canReadConfig =
+    membership.role === "admin" || membership.role === "manager";
 
   const svc = createSbClient(
     process.env.NEXT_PUBLIC_SUPABASE_URL!,
@@ -85,7 +89,7 @@ export default async function SettingsPage() {
     );
   }
 
-  const maskedIntegrations = (integrationsData ?? []).map(
+  const maskedIntegrations = (canReadConfig ? (integrationsData ?? []) : []).map(
     (row: Record<string, unknown>) => ({
       provider: row.provider,
       enabled: row.enabled,
@@ -119,7 +123,9 @@ export default async function SettingsPage() {
       description: (tool.description as string | null) ?? "",
       sensitivity: (tool.sensitivity as string) ?? "read",
       enabled: enabledToolIds.has(tool.id as string),
-      config: configByToolId.get(tool.id as string) ?? null,
+      config: canReadConfig
+        ? (configByToolId.get(tool.id as string) ?? null)
+        : null,
     }),
   );
 
