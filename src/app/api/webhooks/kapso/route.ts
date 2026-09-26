@@ -91,7 +91,12 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
       config: Record<string, unknown>;
     };
 
-    let ws: IntegrationRow | null = null;
+    // Candidates: the ?wsid workspace's Kapso row, or — without wsid — every
+    // enabled Kapso row configured with this phone_number_id. A candidate is
+    // only accepted if the signature verifies with ITS secret, so another
+    // workspace that types the same phone_number_id can neither receive these
+    // events nor block the real owner's.
+    let candidates: IntegrationRow[] = [];
 
     if (wsidParam) {
       // E3: direct lookup by workspace_id — faster, no phone scan needed.
@@ -102,49 +107,37 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
         .eq("workspace_id", wsidParam)
         .eq("provider", "kapso")
         .eq("enabled", true)
-        .single();
-      ws = data ?? null;
-    } else {
-      // Fallback: match the Meta phone_number_id across enabled integrations.
-      const { data: integrations } = await supabase
+        .maybeSingle();
+      if (data) candidates = [data as IntegrationRow];
+    } else if (phoneNumberIdStr) {
+      const { data } = await supabase
         .from("integrations")
         .select("workspace_id, credentials, config")
         .eq("provider", "kapso")
         .eq("enabled", true)
-        .limit(10);
-
-      ws =
-        (integrations ?? []).find(
-          (i: IntegrationRow) =>
-            (i.config as { phone_number_id?: string }).phone_number_id ===
-            phoneNumberIdStr,
-        ) ?? null;
+        .eq("config->>phone_number_id", phoneNumberIdStr)
+        .limit(5);
+      candidates = (data ?? []) as IntegrationRow[];
     }
 
-    // No resolvable workspace → 401. A status update without a resolvable
-    // (and below, verified) workspace must NEVER fall through to 200.
+    // CRITICAL: verify the signature BEFORE acting on ANY event (status or
+    // inbound). No resolvable workspace, no secret or no valid signature → 401:
+    // a status update must NEVER fall through to 200 unverified. Decryption
+    // happens per candidate, only once we know which rows are in play.
+    let ws: IntegrationRow | null = null;
+    for (const candidate of candidates) {
+      const creds = (await decryptCredentials(
+        candidate.credentials,
+        candidate.workspace_id,
+        "kapso",
+      )) as { webhook_signing_secret?: string };
+      const secret = creds.webhook_signing_secret;
+      if (secret && verifyKapsoSignature(rawBody, sigHeader, secret)) {
+        ws = candidate;
+        break;
+      }
+    }
     if (!ws) {
-      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-    }
-
-    // The workspace was resolved via config / wsid — both plaintext — so
-    // decryption happens only after we know which row we need.
-    const creds = (await decryptCredentials(
-      ws.credentials,
-      ws.workspace_id,
-      "kapso",
-    )) as {
-      kapso_api_key?: string;
-      webhook_signing_secret?: string;
-    };
-
-    const webhookSecret = creds.webhook_signing_secret;
-    if (!webhookSecret) {
-      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-    }
-
-    // CRITICAL: verify the signature BEFORE acting on ANY event (status or inbound).
-    if (!verifyKapsoSignature(rawBody, sigHeader, webhookSecret)) {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
 
