@@ -10,6 +10,7 @@
 
 import { createClient as createSbClient } from "@supabase/supabase-js";
 import { decryptCredentials } from "@/shared/lib/integration-secrets";
+import { normalizePhone } from "./normalizer";
 
 const HL_BASE_URL = "https://services.leadconnectorhq.com";
 const HL_API_VERSION = "2021-07-28";
@@ -313,34 +314,90 @@ export async function syncContactFromHL(
     return;
   }
 
-  const supabase = svc();
-
-  const fullName =
-    [hlContact.firstName, hlContact.lastName]
-      .filter(Boolean)
-      .join(" ")
-      .trim() || null;
-
   if (!hlContact.phone) {
     console.warn("[HL] syncContactFromHL: HL contact has no phone, skipping");
     return;
   }
 
-  const { error } = await supabase.from("contacts").upsert(
-    {
-      workspace_id: workspaceId,
-      hl_contact_id: hlContactId,
-      phone: hlContact.phone,
-      ...(fullName !== null && { name: fullName }),
-      ...(hlContact.email && { email: hlContact.email }),
-      ...(hlContact.tags && { tags: hlContact.tags }),
-      updated_at: new Date().toISOString(),
-    },
-    { onConflict: "workspace_id,hl_contact_id", ignoreDuplicates: false },
-  );
+  const supabase = svc();
+  // Local contacts are stored in E.164 (normalizer.ts). HighLevel's number
+  // may come as "521…" or with spaces: normalized, it finds the same person
+  // instead of creating a second contact for them.
+  const phone = normalizePhone(hlContact.phone);
+  const fullName =
+    [hlContact.firstName, hlContact.lastName]
+      .filter(Boolean)
+      .join(" ")
+      .trim() || null;
+  const hlTags = Array.isArray(hlContact.tags) ? hlContact.tags : [];
 
+  // The contact already linked to this HighLevel id, else the one with this
+  // phone (typically created by WhatsApp before HighLevel knew about it).
+  const byHlId = await supabase
+    .from("contacts")
+    .select("id, tags, hl_contact_id")
+    .eq("workspace_id", workspaceId)
+    .eq("hl_contact_id", hlContactId)
+    .maybeSingle();
+  if (byHlId.error) {
+    console.error("[HL] syncContactFromHL lookup error:", byHlId.error.message);
+    return;
+  }
+  let existing = byHlId.data;
+  if (!existing) {
+    const byPhone = await supabase
+      .from("contacts")
+      .select("id, tags, hl_contact_id")
+      .eq("workspace_id", workspaceId)
+      .eq("phone", phone)
+      .maybeSingle();
+    if (byPhone.error) {
+      console.error("[HL] syncContactFromHL lookup error:", byPhone.error.message);
+      return;
+    }
+    existing = byPhone.data;
+  }
+
+  if (existing?.hl_contact_id && existing.hl_contact_id !== hlContactId) {
+    // This phone belongs to a contact linked to ANOTHER HighLevel contact:
+    // leave both alone rather than steal the link.
+    console.warn("[HL] syncContactFromHL: phone already linked to another HL contact");
+    return;
+  }
+
+  if (existing) {
+    // Tags are merged, never replaced: local tags (auto-tagging, the setter)
+    // must survive a sync from HighLevel. The local phone is kept: it is the
+    // WhatsApp identity of the conversation.
+    const localTags = Array.isArray(existing.tags) ? (existing.tags as string[]) : [];
+    const { error } = await supabase
+      .from("contacts")
+      .update({
+        hl_contact_id: hlContactId,
+        ...(fullName !== null && { name: fullName }),
+        ...(hlContact.email && { email: hlContact.email }),
+        tags: Array.from(new Set([...localTags, ...hlTags])),
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", existing.id)
+      .eq("workspace_id", workspaceId);
+    if (error) {
+      console.error("[HL] syncContactFromHL update error:", error.message);
+    }
+    return;
+  }
+
+  const { error } = await supabase.from("contacts").insert({
+    workspace_id: workspaceId,
+    hl_contact_id: hlContactId,
+    phone,
+    ...(fullName !== null && { name: fullName }),
+    ...(hlContact.email && { email: hlContact.email }),
+    tags: hlTags,
+  });
   if (error) {
-    console.error("[HL] syncContactFromHL upsert error:", error.message);
+    // 23505: a concurrent sync or inbound message created it first.
+    console.error("[HL] syncContactFromHL insert error:", error.message);
   }
 }
 

@@ -359,6 +359,12 @@ las migraciones, así que las migraciones van **antes** de `vercel --prod`.
   Los mensajes que se quedaron sin lote se recuperan solos en el siguiente minuto.
 - **Nuevo ajuste, apagado por defecto:** Configuración → Integraciones → WhatsApp →
   "Pasar a una persona si se acaba el presupuesto diario de IA".
+- El webhook de contactos de **HighLevel** ahora sí sincroniza (antes fallaba
+  siempre sin avisar): enlaza el contacto de HighLevel con el de WhatsApp que tenga
+  el mismo teléfono, **suma** sus etiquetas a las locales (no las reemplaza) y, si
+  no existe, lo crea. Si al actualizar dos contactos de un workspace compartían el
+  mismo id de HighLevel, `db-push` deja el enlace solo en el más reciente y lo
+  avisa con un `WARNING`.
 - Los horarios de HighLevel se consultan en la zona horaria del negocio
   (Configuración → Negocio) si el agente no pide otra.
 - La sincronización de plantillas de **YCloud** ahora sí trae tus plantillas (antes

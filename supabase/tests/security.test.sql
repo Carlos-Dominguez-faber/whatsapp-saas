@@ -8,7 +8,7 @@ BEGIN;
 CREATE EXTENSION IF NOT EXISTS pgtap WITH SCHEMA extensions;
 SET search_path = public, extensions;
 
-SELECT plan(84);
+SELECT plan(86);
 
 -- ── public.users: read-only for sessions ────────────────────────────────────
 SELECT ok(NOT has_table_privilege('authenticated', 'public.users', 'UPDATE'),
@@ -389,6 +389,20 @@ SELECT isnt(
   (SELECT batch_id FROM public.messages WHERE id = 'b0000000-0000-4000-8000-0000000000a2'),
   (SELECT batch_id FROM public.messages WHERE id = 'b0000000-0000-4000-8000-0000000000a1'),
   'a new message never joins an isolated batch');
+
+-- ── one local contact per HighLevel contact, per workspace ──────────────────
+UPDATE public.contacts SET hl_contact_id = 'hl-sec-1'
+ WHERE id = 'b0000000-0000-4000-8000-0000000000c1';
+SELECT throws_ok(
+  $$UPDATE public.contacts SET hl_contact_id = 'hl-sec-1'
+     WHERE id = 'b0000000-0000-4000-8000-0000000000c2'$$,
+  '23505', NULL, 'two contacts of a workspace cannot share a HighLevel id');
+INSERT INTO public.contacts (id, workspace_id, phone) VALUES
+  ('a0000000-0000-4000-8000-0000000000c1', 'a0000000-0000-4000-8000-000000000001', '+15550009999');
+SELECT lives_ok(
+  $$UPDATE public.contacts SET hl_contact_id = 'hl-sec-1'
+     WHERE id = 'a0000000-0000-4000-8000-0000000000c1'$$,
+  'another workspace may link its own contact to the same HighLevel id');
 
 SELECT * FROM finish();
 ROLLBACK;
