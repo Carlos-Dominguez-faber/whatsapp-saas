@@ -8,7 +8,7 @@ BEGIN;
 CREATE EXTENSION IF NOT EXISTS pgtap WITH SCHEMA extensions;
 SET search_path = public, extensions;
 
-SELECT plan(90);
+SELECT plan(93);
 
 -- ── public.users: read-only for sessions ────────────────────────────────────
 SELECT ok(NOT has_table_privilege('authenticated', 'public.users', 'UPDATE'),
@@ -350,34 +350,64 @@ SELECT ok(NOT EXISTS (
     SELECT 1 FROM public.claim_next_batch() c WHERE c.id = 'b0000000-0000-4000-8000-0000000000b2'),
   'a due batch waits while another batch of its conversation is being processed');
 
+INSERT INTO public.contacts (id, workspace_id, phone) VALUES
+  ('b0000000-0000-4000-8000-0000000000c7', 'b0000000-0000-4000-8000-000000000001', '+15550007777');
+INSERT INTO public.conversations (id, workspace_id, contact_id) VALUES
+  ('b0000000-0000-4000-8000-0000000000d7', 'b0000000-0000-4000-8000-000000000001',
+   'b0000000-0000-4000-8000-0000000000c7');
 INSERT INTO public.message_batches (id, workspace_id, conversation_id, status, silence_ms, flush_at, message_count, meta, updated_at) VALUES
   ('b0000000-0000-4000-8000-0000000000b3', 'b0000000-0000-4000-8000-000000000001',
    'b0000000-0000-4000-8000-0000000000d2', 'processing', 0, '1999-12-31', 1,
    '{"retry_count": 1}', now() - interval '8 minutes'),
   ('b0000000-0000-4000-8000-0000000000b4', 'b0000000-0000-4000-8000-000000000001',
    'b0000000-0000-4000-8000-0000000000d2', 'processing', 0, '1999-12-30', 1,
-   '{"retry_count": 3}', now() - interval '8 minutes');
+   '{"retry_count": 3}', now() - interval '8 minutes'),
+  -- Reclaimed twice past the limit and still stale: the backstop.
+  ('b0000000-0000-4000-8000-0000000000b9', 'b0000000-0000-4000-8000-000000000001',
+   'b0000000-0000-4000-8000-0000000000d7', 'processing', 0, '1999-12-29', 1,
+   '{"retry_count": 5}', now() - interval '8 minutes'),
+  ('b0000000-0000-4000-8000-0000000000ba', 'b0000000-0000-4000-8000-000000000001',
+   'b0000000-0000-4000-8000-0000000000d7', 'processing', 0, '1999-12-28', 1,
+   '{"retry_count": 5}', now() - interval '8 minutes');
+-- ba's reply went out; b9 has only a send WhatsApp didn't accept.
+INSERT INTO public.messages (workspace_id, conversation_id, direction, type, body, status, meta) VALUES
+  ('b0000000-0000-4000-8000-000000000001', 'b0000000-0000-4000-8000-0000000000d7',
+   'out', 'text', 'respuesta', 'sent', '{"batch_id": "b0000000-0000-4000-8000-0000000000ba"}'),
+  ('b0000000-0000-4000-8000-000000000001', 'b0000000-0000-4000-8000-0000000000d7',
+   'out', 'text', 'respuesta', 'failed',
+   '{"batch_id": "b0000000-0000-4000-8000-0000000000b9", "not_accepted": true}');
 SELECT is(
   (SELECT (c.meta->>'retry_count')::int FROM public.claim_next_batch() c
     WHERE c.id = 'b0000000-0000-4000-8000-0000000000b3'),
   2, 'a stale batch is reclaimed (7-minute lease) and the retry is counted');
 SELECT is(
   (SELECT status::text FROM public.message_batches WHERE id = 'b0000000-0000-4000-8000-0000000000b4'),
-  'cancelled', 'a stale batch that burned its retries is dead-lettered');
+  'processing', 'a stale batch just past its retries is left for buffer.ts to dead-letter');
+SELECT is(
+  (SELECT status::text FROM public.message_batches WHERE id = 'b0000000-0000-4000-8000-0000000000b9'),
+  'cancelled', 'the backstop dead-letters a batch whose every reclaim died');
 SELECT ok(EXISTS (
     SELECT 1 FROM public.events
      WHERE type = 'batch_dead_letter'
-       AND payload->>'batch_id' = 'b0000000-0000-4000-8000-0000000000b4'),
+       AND payload->>'batch_id' = 'b0000000-0000-4000-8000-0000000000b9'),
   'the dead-letter leaves an event');
 SELECT is(
-  (SELECT state::text FROM public.conversations WHERE id = 'b0000000-0000-4000-8000-0000000000d2'),
+  (SELECT state::text FROM public.conversations WHERE id = 'b0000000-0000-4000-8000-0000000000d7'),
   'handoff_pending', 'a dead-lettered batch hands its conversation to a person');
 SELECT ok(EXISTS (
     SELECT 1 FROM public.messages
-     WHERE conversation_id = 'b0000000-0000-4000-8000-0000000000d2'
+     WHERE conversation_id = 'b0000000-0000-4000-8000-0000000000d7'
        AND type = 'system' AND (meta->>'internal')::boolean
-       AND meta->>'batch_id' = 'b0000000-0000-4000-8000-0000000000b4'),
+       AND meta->>'batch_id' = 'b0000000-0000-4000-8000-0000000000b9'),
   'and leaves an internal note in the thread saying why');
+SELECT is(
+  (SELECT status::text FROM public.message_batches WHERE id = 'b0000000-0000-4000-8000-0000000000ba'),
+  'processed', 'the backstop closes a batch whose reply went out');
+SELECT ok(NOT EXISTS (
+    SELECT 1 FROM public.events
+     WHERE type = 'batch_dead_letter'
+       AND payload->>'batch_id' = 'b0000000-0000-4000-8000-0000000000ba'),
+  'without a dead letter');
 
 INSERT INTO public.messages (id, workspace_id, conversation_id, direction, type, body, wamid) VALUES
   ('b0000000-0000-4000-8000-0000000000a1', 'b0000000-0000-4000-8000-000000000001',
