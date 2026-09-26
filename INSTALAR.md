@@ -377,11 +377,24 @@ las migraciones, así que las migraciones van **antes** de `vercel --prod`.
 - **Nuevo ajuste, apagado por defecto:** Configuración → Integraciones → WhatsApp →
   "Pasar a una persona si se acaba el presupuesto diario de IA".
 - El webhook de contactos de **HighLevel** ahora sí sincroniza (antes fallaba
-  siempre sin avisar): enlaza el contacto de HighLevel con el de WhatsApp que tenga
-  el mismo teléfono, **suma** sus etiquetas a las locales (no las reemplaza) y, si
-  no existe, lo crea. Si al actualizar dos contactos de un workspace compartían el
-  mismo id de HighLevel, `db-push` deja el enlace solo en el más reciente y lo
-  avisa con un `WARNING`.
+  siempre sin avisar). **Es la primera vez que corre**: si tu HighLevel manda
+  webhooks de contactos, cada alta o cambio allá llega ahora a tu base, y cada uno
+  hace una lectura a la API de HighLevel (cuenta para sus límites de uso). Si no
+  quieres esa sincronización, quita el webhook de contactos en HighLevel.
+  - Enlaza el contacto de HighLevel con el de WhatsApp que tenga el mismo
+    teléfono, aunque esté escrito distinto (`+52 1…` y `+52…` cuentan como el
+    mismo número; un número sin código de país usa el del negocio). Si no existe,
+    lo crea.
+  - No sobrescribe nada tuyo: **suma** sus etiquetas a las locales y solo llena
+    el nombre y el correo si estaban vacíos. Al revés, las etiquetas locales
+    siempre se mandan a HighLevel, incluso una lista vacía, para que una
+    etiqueta que quitaste no regrese.
+  - Si dos contactos tuyos resultan ser la misma persona en HighLevel, no se
+    fusionan: queda un evento `hl_contact_link_conflict` que dice cuál tiene el
+    enlace.
+  - Si al actualizar dos contactos de un workspace ya compartían el mismo id de
+    HighLevel, `db-push` deja el enlace solo en el que se tocó más recientemente
+    y lo avisa con un `WARNING` que lista cuáles se desenlazaron.
 - Los horarios de HighLevel se consultan en la zona horaria del negocio
   (Configuración → Negocio) si el agente no pide otra.
 - La sincronización de plantillas de **YCloud** ahora sí trae tus plantillas (antes

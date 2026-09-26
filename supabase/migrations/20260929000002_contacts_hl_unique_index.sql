@@ -10,11 +10,15 @@
 -- HighLevel contact.
 --
 -- Existing duplicates would make CREATE UNIQUE INDEX fail and stop db push.
--- Instead, in each duplicated (workspace_id, hl_contact_id) group the most
--- recently updated contact keeps the link and the others are unlinked
--- (hl_contact_id → NULL); nothing else about them changes. A WARNING says how
--- many. The index is total, not partial: NULLs never collide in a unique
--- index, and a partial one could not back an ON CONFLICT from PostgREST.
+-- Instead, in each duplicated (workspace_id, hl_contact_id) group the contact
+-- touched most recently (highest updated_at, then created_at) keeps the link
+-- and the others are unlinked (hl_contact_id → NULL). Their data stays; only
+-- updated_at moves, because trg_contacts_updated_at stamps every UPDATE. A
+-- WARNING lists how many, with up to 20 of their ids.
+--
+-- The index is total, not partial: NULLs never collide in a unique index, and
+-- a partial one could not back an ON CONFLICT from PostgREST. It serves every
+-- lookup the two older partial indexes on the same columns did, so those go.
 --
 -- Idempotent over installs that applied #9's 20260906000000 (same index name).
 -- Without CONCURRENTLY: it can't run inside a migration's transaction.
@@ -22,33 +26,38 @@
 
 DO $$
 DECLARE
-  v_unlinked INT;
+  v_unlinked UUID[];
 BEGIN
   WITH ranked AS (
     SELECT id,
            row_number() OVER (
              PARTITION BY workspace_id, hl_contact_id
-             ORDER BY updated_at DESC NULLS LAST, created_at DESC, id
+             ORDER BY updated_at DESC, created_at DESC, id
            ) AS rn
       FROM public.contacts
      WHERE hl_contact_id IS NOT NULL
+  ), unlinked AS (
+    UPDATE public.contacts c
+       SET hl_contact_id = NULL
+      FROM ranked r
+     WHERE c.id = r.id AND r.rn > 1
+    RETURNING c.id
   )
-  UPDATE public.contacts c
-     SET hl_contact_id = NULL
-    FROM ranked r
-   WHERE c.id = r.id AND r.rn > 1;
+  SELECT array_agg(id) INTO v_unlinked FROM unlinked;
 
-  GET DIAGNOSTICS v_unlinked = ROW_COUNT;
-  IF v_unlinked > 0 THEN
+  IF v_unlinked IS NOT NULL THEN
     RAISE WARNING
-      'contacts: % contact(s) shared a HighLevel id with another contact of their workspace; only the most recently updated one keeps the link.',
-      v_unlinked;
+      'contacts: % contact(s) shared a HighLevel id with another contact of their workspace; only the one touched most recently keeps the link. Unlinked (up to 20): %',
+      cardinality(v_unlinked), v_unlinked[1:20];
   END IF;
 END
 $$;
 
 CREATE UNIQUE INDEX IF NOT EXISTS uq_contacts_workspace_hl_contact_id
   ON public.contacts (workspace_id, hl_contact_id);
+
+DROP INDEX IF EXISTS public.idx_contacts_hl;
+DROP INDEX IF EXISTS public.idx_contacts_hl_contact_id;
 
 -- ============================================================================
 -- End of migration: 20260929000002_contacts_hl_unique_index

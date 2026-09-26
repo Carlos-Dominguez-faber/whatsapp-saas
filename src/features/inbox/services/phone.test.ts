@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { normalizePhone, phoneKey, samePhone } from "./phone.ts";
+import { normalizePhone, phoneKey, phoneVariants, samePhone } from "./phone.ts";
 
 test("normalizePhone writes E.164 and uses the workspace code for local numbers", () => {
   assert.equal(normalizePhone("+52 998 123 4567"), "+529981234567");
@@ -25,4 +25,10 @@ test("different numbers stay different", () => {
   // A 13-digit number from another country keeps its digits.
   assert.equal(phoneKey("+4412345678901"), "4412345678901");
   assert.ok(!samePhone("+15550001111", "+525550001111"));
+});
+
+test("phoneVariants finds a Mexican mobile stored either way", () => {
+  assert.deepEqual(phoneVariants("5512345678", "52").sort(), ["+525512345678", "+5215512345678"].sort());
+  assert.ok(phoneVariants("+5215512345678").includes("+525512345678"));
+  assert.deepEqual(phoneVariants("+15550001111"), ["+15550001111"]);
 });

@@ -10,7 +10,7 @@
 
 import { createClient as createSbClient } from "@supabase/supabase-js";
 import { decryptCredentials } from "@/shared/lib/integration-secrets";
-import { normalizePhone } from "./normalizer";
+import { DEFAULT_COUNTRY_CODE, normalizePhone, phoneVariants } from "./phone";
 
 const HL_BASE_URL = "https://services.leadconnectorhq.com";
 const HL_API_VERSION = "2021-07-28";
@@ -216,13 +216,15 @@ export async function syncContactToHL(
   const contact = contactData as ContactRow;
   const { firstName, lastName } = splitName(contact.name);
 
-  // Create (with locationId) or update by hl_contact_id.
+  // Create (with locationId) or update by hl_contact_id. Tags always go, even
+  // an empty list: HighLevel→local syncs merge tags, so a tag removed here
+  // and left there would come back.
   const basePayload: Record<string, unknown> = {
     phone: contact.phone,
     ...(firstName && { firstName }),
     ...(lastName && { lastName }),
     ...(contact.email && { email: contact.email }),
-    ...(contact.tags && contact.tags.length > 0 && { tags: contact.tags }),
+    tags: contact.tags ?? [],
   };
 
   let hlId: string;
@@ -270,17 +272,75 @@ export async function syncContactToHL(
     return null;
   }
 
-  const { error: updateError } = await supabase
-    .from("contacts")
-    .update({ hl_contact_id: hlId, updated_at: new Date().toISOString() })
-    .eq("id", contactId)
-    .eq("workspace_id", workspaceId);
-
-  if (updateError) {
-    console.error("[HL] Failed to save hl_contact_id:", updateError.message);
-  }
+  await linkHLContact(supabase, workspaceId, contactId, hlId);
 
   return { hl_id: hlId };
+}
+
+/**
+ * Saves the HighLevel id on a local contact. A unique index allows one local
+ * contact per HighLevel contact, so a second one claiming the same id fails
+ * with 23505: two local records for one person (e.g. the same number stored
+ * two ways). They are never merged automatically — the contact that holds the
+ * id is named in an event and in the log, for the team to decide.
+ */
+export async function linkHLContact(
+  supabase: ReturnType<typeof svc>,
+  workspaceId: string,
+  contactId: string,
+  hlContactId: string,
+): Promise<boolean> {
+  const { error } = await supabase
+    .from("contacts")
+    .update({ hl_contact_id: hlContactId, updated_at: new Date().toISOString() })
+    .eq("id", contactId)
+    .eq("workspace_id", workspaceId);
+  if (!error) return true;
+
+  if (error.code === "23505") {
+    const { data: holder } = await supabase
+      .from("contacts")
+      .select("id")
+      .eq("workspace_id", workspaceId)
+      .eq("hl_contact_id", hlContactId)
+      .limit(1);
+    const heldBy = (holder as Array<{ id: string }> | null)?.[0]?.id ?? null;
+    console.warn("[HL] HighLevel contact already linked to another local contact", {
+      contactId,
+      heldBy,
+    });
+    await supabase
+      .from("events")
+      .insert({
+        type: "hl_contact_link_conflict",
+        level: "warn",
+        workspace_id: workspaceId,
+        payload: { contact_id: contactId, hl_contact_id: hlContactId, held_by: heldBy },
+      })
+      .then(
+        () => {},
+        () => {},
+      );
+    return false;
+  }
+
+  console.error("[HL] Failed to save hl_contact_id:", error.message);
+  return false;
+}
+
+/** The workspace's country code for numbers written without one. */
+async function workspaceCountryCode(
+  supabase: ReturnType<typeof svc>,
+  workspaceId: string,
+): Promise<string> {
+  const { data } = await supabase
+    .from("business_info")
+    .select("structured")
+    .eq("workspace_id", workspaceId)
+    .maybeSingle();
+  const code = (data?.structured as { default_country_code?: unknown } | null)
+    ?.default_country_code;
+  return typeof code === "string" && /^\d{1,4}$/.test(code) ? code : DEFAULT_COUNTRY_CODE;
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -320,10 +380,12 @@ export async function syncContactFromHL(
   }
 
   const supabase = svc();
-  // Local contacts are stored in E.164 (normalizer.ts). HighLevel's number
-  // may come as "521…" or with spaces: normalized, it finds the same person
-  // instead of creating a second contact for them.
-  const phone = normalizePhone(hlContact.phone);
+  // Local contacts are stored in E.164 (normalizer.ts). HighLevel's number may
+  // come local ("998 123 4567", completed with the workspace's country code)
+  // or as the other form of a Mexican/Argentinian mobile (+52 vs +52 1): the
+  // lookup tries every form the same line can be stored in.
+  const countryCode = await workspaceCountryCode(supabase, workspaceId);
+  const phone = normalizePhone(hlContact.phone, countryCode);
   const fullName =
     [hlContact.firstName, hlContact.lastName]
       .filter(Boolean)
@@ -333,29 +395,37 @@ export async function syncContactFromHL(
 
   // The contact already linked to this HighLevel id, else the one with this
   // phone (typically created by WhatsApp before HighLevel knew about it).
+  type LocalContact = {
+    id: string;
+    name: string | null;
+    email: string | null;
+    tags: unknown;
+    hl_contact_id: string | null;
+  };
   const byHlId = await supabase
     .from("contacts")
-    .select("id, tags, hl_contact_id")
+    .select("id, name, email, tags, hl_contact_id")
     .eq("workspace_id", workspaceId)
     .eq("hl_contact_id", hlContactId)
-    .maybeSingle();
+    .limit(1);
   if (byHlId.error) {
     console.error("[HL] syncContactFromHL lookup error:", byHlId.error.message);
     return;
   }
-  let existing = byHlId.data;
+  let existing = ((byHlId.data ?? []) as LocalContact[])[0] ?? null;
   if (!existing) {
     const byPhone = await supabase
       .from("contacts")
-      .select("id, tags, hl_contact_id")
+      .select("id, name, email, tags, hl_contact_id")
       .eq("workspace_id", workspaceId)
-      .eq("phone", phone)
-      .maybeSingle();
+      .in("phone", phoneVariants(hlContact.phone, countryCode));
     if (byPhone.error) {
       console.error("[HL] syncContactFromHL lookup error:", byPhone.error.message);
       return;
     }
-    existing = byPhone.data;
+    const matches = (byPhone.data ?? []) as LocalContact[];
+    // Prefer a contact not linked to anyone yet.
+    existing = matches.find((c) => !c.hl_contact_id) ?? matches[0] ?? null;
   }
 
   if (existing?.hl_contact_id && existing.hl_contact_id !== hlContactId) {
@@ -366,16 +436,15 @@ export async function syncContactFromHL(
   }
 
   if (existing) {
-    // Tags are merged, never replaced: local tags (auto-tagging, the setter)
-    // must survive a sync from HighLevel. The local phone is kept: it is the
-    // WhatsApp identity of the conversation.
+    // Nothing local is overwritten: tags are merged (auto-tagging and the
+    // setter's tags survive), name and email are filled only when empty, and
+    // the local phone stays — it is the conversation's WhatsApp identity.
     const localTags = Array.isArray(existing.tags) ? (existing.tags as string[]) : [];
     const { error } = await supabase
       .from("contacts")
       .update({
-        hl_contact_id: hlContactId,
-        ...(fullName !== null && { name: fullName }),
-        ...(hlContact.email && { email: hlContact.email }),
+        ...(!existing.name?.trim() && fullName !== null && { name: fullName }),
+        ...(!existing.email?.trim() && hlContact.email && { email: hlContact.email }),
         tags: Array.from(new Set([...localTags, ...hlTags])),
         updated_at: new Date().toISOString(),
       })
@@ -383,6 +452,10 @@ export async function syncContactFromHL(
       .eq("workspace_id", workspaceId);
     if (error) {
       console.error("[HL] syncContactFromHL update error:", error.message);
+      return;
+    }
+    if (existing.hl_contact_id !== hlContactId) {
+      await linkHLContact(supabase, workspaceId, existing.id, hlContactId);
     }
     return;
   }
@@ -505,14 +578,7 @@ export async function createHLOpportunity(
       email: contact.email,
     });
     if (hlContactId) {
-      await supabase
-        .from("contacts")
-        .update({
-          hl_contact_id: hlContactId,
-          updated_at: new Date().toISOString(),
-        })
-        .eq("id", contactId)
-        .eq("workspace_id", workspaceId);
+      await linkHLContact(supabase, workspaceId, contactId, hlContactId);
     }
   }
   if (!hlContactId) {
