@@ -46,7 +46,7 @@ interface ChatThreadProps {
 export function ChatThread({
   conversation,
   initialMessages,
-  currentUserId: _currentUserId,
+  currentUserId,
   role = "agent",
 }: ChatThreadProps) {
   const messages = useRealtimeMessages(conversation.id, initialMessages);
@@ -243,8 +243,12 @@ export function ChatThread({
               </RoleGate>
             )}
 
-            {/* Return to AI — gated by role (human_active only) */}
-            {conversation.state === "human_active" && (
+            {/* Return to AI — human_active only; the server lets admins,
+                managers and the assigned member do it, so hide it otherwise */}
+            {conversation.state === "human_active" &&
+              (role === "admin" ||
+                role === "manager" ||
+                conversation.assigned_to === currentUserId) && (
               <RoleGate role={role} check={canTakeConversation}>
                 <Button
                   type="button"

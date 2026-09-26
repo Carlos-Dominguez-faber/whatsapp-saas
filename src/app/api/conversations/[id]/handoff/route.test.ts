@@ -111,11 +111,21 @@ for (const action of ["request", "cancel"] as const) {
   });
 }
 
-test("403 for an agent the conversation is assigned to someone else", async () => {
+test("an agent can flag any thread for a human (request assigns nobody)", async () => {
+  transitions.length = 0;
+  memberRole = "agent";
+  convRow = { workspace_id: "ws_1", assigned_to: null };
+  const res = await POST(makeReq({ action: "request" }), params);
+  assert.equal(res.status, 200);
+  assert.equal(transitions.length, 1);
+  memberRole = "admin";
+});
+
+test("403 when an agent hands back to the AI a thread assigned to someone else", async () => {
   transitions.length = 0;
   memberRole = "agent";
   convRow = { workspace_id: "ws_1", assigned_to: "user_2" };
-  const res = await POST(makeReq({ action: "request" }), params);
+  const res = await POST(makeReq({ action: "cancel" }), params);
   assert.equal(res.status, 403);
   assert.equal(transitions.length, 0);
   memberRole = "admin";
@@ -141,13 +151,23 @@ test("200 for a manager not assigned to the conversation", async () => {
   memberRole = "admin";
 });
 
-test("200 for a viewer the conversation is assigned to (the policy allows the assignee)", async () => {
+test("200 for a viewer handing back the thread assigned to them (the policy allows the assignee)", async () => {
+  transitions.length = 0;
+  memberRole = "viewer";
+  convRow = { workspace_id: "ws_1", assigned_to: "user_1" };
+  const res = await POST(makeReq({ action: "cancel" }), params);
+  assert.equal(res.status, 200);
+  assert.equal(transitions.length, 1);
+  memberRole = "admin";
+});
+
+test("403 for a viewer flagging a thread for a human, even if assigned to them", async () => {
   transitions.length = 0;
   memberRole = "viewer";
   convRow = { workspace_id: "ws_1", assigned_to: "user_1" };
   const res = await POST(makeReq({ action: "request" }), params);
-  assert.equal(res.status, 200);
-  assert.equal(transitions.length, 1);
+  assert.equal(res.status, 403);
+  assert.equal(transitions.length, 0);
   memberRole = "admin";
 });
 

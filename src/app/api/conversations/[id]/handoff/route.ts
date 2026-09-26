@@ -4,8 +4,11 @@
 // caller's RLS client BEFORE anything runs with service role. A conversation
 // the caller cannot see is a 404 — the same answer as "does not exist", so
 // the endpoint cannot be used to probe other tenants' ids. Visibility is not
-// permission: both actions flip the AI on or off, so the caller must also pass
-// the conversations UPDATE policy, which the service-role write would skip.
+// permission, and the service-role write skips RLS, so the role is checked
+// here: 'request' only flags the thread for a human and assigns nobody, so any
+// operator (agent+) may raise it — the same bar as take. 'cancel' hands the
+// thread back to the AI, which the conversations UPDATE policy reserves to
+// admins/managers and the member it is assigned to.
 
 import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
@@ -13,6 +16,7 @@ import { createClient } from "@/lib/supabase/server";
 import {
   readJsonBody,
   requireConversationUpdate,
+  requireWorkspaceMember,
 } from "@/lib/auth/workspace-access";
 import { applyTransition } from "@/features/inbox/services/decision-engine";
 
@@ -61,9 +65,14 @@ export async function POST(
     );
   }
 
-  const auth = await requireConversationUpdate(
-    conv as { workspace_id: string; assigned_to: string | null },
-  );
+  const auth =
+    action === "request"
+      ? await requireWorkspaceMember(conv.workspace_id as string, {
+          minRole: "agent",
+        })
+      : await requireConversationUpdate(
+          conv as { workspace_id: string; assigned_to: string | null },
+        );
   if (!auth.ok) return auth.response;
 
   try {
