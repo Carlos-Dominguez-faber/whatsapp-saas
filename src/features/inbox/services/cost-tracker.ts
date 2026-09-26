@@ -56,6 +56,8 @@ export async function recordLlmUsage(opts: RecordLlmUsageOpts): Promise<void> {
         .from("events")
         .update({ conversation_id: conversationId, payload })
         .eq("id", reservationId)
+        .eq("workspace_id", workspaceId)
+        .eq("type", "llm_usage")
     : await supabase.from("events").insert({
         type: "llm_usage",
         level: "info",
@@ -285,6 +287,7 @@ export async function recordWorkspaceLlmCall(opts: {
         .update({ payload })
         .eq("id", opts.reservationId)
         .eq("workspace_id", opts.workspaceId)
+        .eq("type", opts.type)
     : await supabase.from("events").insert({
         type: opts.type,
         level: "info",

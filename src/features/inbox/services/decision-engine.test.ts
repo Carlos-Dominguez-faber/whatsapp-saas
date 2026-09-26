@@ -76,8 +76,14 @@ mock.module("./cost-tracker.ts", {
   },
 });
 let enabledTools: unknown[] = [];
+let enabledToolsError: Error | null = null;
 mock.module("@/features/tools/services/tool-configs.ts", {
-  exports: { getEnabledTools: async () => enabledTools },
+  exports: {
+    getEnabledTools: async () => {
+      if (enabledToolsError) throw enabledToolsError;
+      return enabledTools;
+    },
+  },
 });
 
 const notifyCalls: unknown[] = [];
@@ -105,6 +111,7 @@ function reset(queue: QueueEntry[] = [FOUND, { error: null }, { error: null }]) 
   rateLimitResult = { allowed: true };
   reserveCalls = 0;
   enabledTools = [];
+  enabledToolsError = null;
 }
 
 const DECIDE = {
@@ -185,6 +192,13 @@ test("decide reuses the reservation an earlier attempt made instead of reserving
   assert.equal(reserveCalls, 0);
   assert.equal(result.decision, "respond");
   assert.equal(result.reservationId, "res_prev");
+});
+
+test("decide loads the tools before reserving, so a failure there spends no slot", async () => {
+  reset([{ data: { state: "ai_active" }, error: null }]);
+  enabledToolsError = new Error("tool_configs unavailable");
+  await assert.rejects(() => decide(DECIDE), /tool_configs unavailable/);
+  assert.equal(reserveCalls, 0);
 });
 
 // ── applyTransition() ──────────────────────────────────────────────────

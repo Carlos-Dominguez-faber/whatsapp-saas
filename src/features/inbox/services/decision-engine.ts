@@ -35,8 +35,9 @@ export interface DecisionResult {
  *   1. Load conversation state from DB
  *   2. If state !== 'ai_active' → abstain
  *   3. detectsHandoffTrigger → if true, transition to handoff_pending and log
- *   4. reserveLlmTurn → if exceeded, return rate_limited
- *   5. → respond
+ *   4. load the enabled tools
+ *   5. reserveLlmTurn (last: nothing may throw after it) → if exceeded,
+ *      return rate_limited; otherwise respond
  */
 export async function decide(opts: {
   workspaceId: string;
@@ -90,7 +91,11 @@ export async function decide(opts: {
     return { decision: "handoff", reason: "handoff_trigger" };
   }
 
-  // 4. Rate limit check — atomically reserves a turn slot so two concurrent
+  // 4. Load the enabled tools first: once a turn slot is reserved nothing in
+  // here may throw, or the slot would be spent with no one holding its id.
+  const availableTools = await getEnabledTools(workspaceId);
+
+  // 5. Rate limit check — atomically reserves a turn slot so two concurrent
   // batches for the same contact can't both pass. A retry keeps its slot.
   const {
     allowed,
@@ -107,8 +112,6 @@ export async function decide(opts: {
     };
   }
 
-  // 5. All checks passed — load enabled tools and respond
-  const availableTools = await getEnabledTools(workspaceId);
   return { decision: "respond", reason: "normal", availableTools, reservationId };
 }
 

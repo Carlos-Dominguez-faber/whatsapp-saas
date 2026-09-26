@@ -323,6 +323,7 @@ test("recordWorkspaceLlmCall fills the reserved row, scoped to its workspace", a
   assert.deepEqual(updateCalls[0].eqArgs, [
     ["id", "res_w1"],
     ["workspace_id", "ws_1"],
+    ["type", "agent_test_chat"],
   ]);
   assert.deepEqual((updateCalls[0].row as { payload: unknown }).payload, {
     agent_id: "agent_1",
@@ -367,7 +368,11 @@ test("recordLlmUsage updates the reservation row in place when a reservationId i
   });
   assert.equal(insertedRows.length, 0);
   assert.equal(updateCalls.length, 1);
-  assert.deepEqual(updateCalls[0].eqArgs, [["id", "res_1"]]);
+  assert.deepEqual(updateCalls[0].eqArgs, [
+    ["id", "res_1"],
+    ["workspace_id", "ws_1"],
+    ["type", "llm_usage"],
+  ]);
   const row = updateCalls[0].row as { conversation_id: string; payload: Record<string, unknown> };
   assert.equal(row.conversation_id, "conv_1");
   assert.deepEqual(row.payload, {
