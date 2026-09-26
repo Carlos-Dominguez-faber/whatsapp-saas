@@ -289,11 +289,18 @@ export async function processNextBatch(): Promise<ProcessBatchResult> {
     }
 
     // ── 5. Decision engine: state check + handoff trigger + rate limits ──────
+    // A retry reuses the turn slot its first attempt reserved (kept in the
+    // batch meta below), so failing and retrying never costs a second slot.
+    const priorReservationId =
+      typeof batch.meta?.llm_reservation_id === "string"
+        ? batch.meta.llm_reservation_id
+        : undefined;
     const decisionResult = await decide({
       workspaceId: batch.workspace_id,
       conversationId: batch.conversation_id,
       mergedText,
       contactId: conversation.contact_id as string,
+      reservationId: priorReservationId,
     });
 
     const { decision, reason } = decisionResult;
@@ -302,6 +309,37 @@ export async function processNextBatch(): Promise<ProcessBatchResult> {
       console.info("[buffer] not responding:", decision, reason);
       await markBatchProcessed(batch.id, mergedText, supabase);
       return { processed: true, conversationId: batch.conversation_id };
+    }
+
+    if (decisionResult.reservationId) {
+      // The retry path below writes batch.meta back, carrying the slot along.
+      batch.meta = {
+        ...batch.meta,
+        llm_reservation_id: decisionResult.reservationId,
+      };
+    }
+
+    // ── 5b. SEC-06: daily budget, before anything that spends ───────────────
+    // A cut workspace must not pay for Jev or KB embeddings either. A database
+    // error throws into the retry path below.
+    const costPolicy = await enforceCostPolicy(batch.workspace_id);
+    if (costPolicy.policy === "cut") {
+      console.warn(
+        "[buffer] SEC-06 cost cut — aborting AI for workspace",
+        batch.workspace_id,
+      );
+      await markBatchProcessed(batch.id, mergedText, supabase);
+      return { processed: true, conversationId: batch.conversation_id };
+    }
+
+    // ── 5c. The workspace must have an active WhatsApp provider ─────────────
+    // Checked before Jev, the model and its tools run: the retry below re-runs
+    // the whole turn, and a reply with nowhere to go must not repeat model
+    // spend or tool side effects (bookings, CRM writes) on every attempt.
+    // dispatchText() loads and decrypts the credentials itself.
+    const whatsapp = await loadWhatsAppSettings(supabase, batch.workspace_id);
+    if (!whatsapp) {
+      throw new Error(`[buffer] ${WHATSAPP_NOT_CONNECTED}`);
     }
 
     // Jev runs only after state, keyword handoff and rate limit already passed.
@@ -323,16 +361,6 @@ export async function processNextBatch(): Promise<ProcessBatchResult> {
       conversationId: batch.conversation_id,
       contactId: conversation.contact_id as string,
     };
-
-    // ── 6b. The workspace must have an active WhatsApp provider ─────────────
-    // Checked before the model and its tools run: the retry below re-runs the
-    // whole turn, and a reply with nowhere to go must not repeat tool side
-    // effects (bookings, CRM writes) on every attempt. dispatchText() loads
-    // and decrypts the credentials itself.
-    const whatsapp = await loadWhatsAppSettings(supabase, batch.workspace_id);
-    if (!whatsapp) {
-      throw new Error(`[buffer] ${WHATSAPP_NOT_CONNECTED}`);
-    }
 
     // ── 6c. Resolve conversational memory window (WS2: configurable) ─────────
     // The workspace's WhatsApp integration config carries
@@ -405,23 +433,13 @@ export async function processNextBatch(): Promise<ProcessBatchResult> {
       },
     });
 
-    // ── 7b. SEC-06: enforce cost policy before calling LLM ───────────────────
-    const costPolicy = await enforceCostPolicy(batch.workspace_id);
+    // ── 7b. SEC-06: a degraded budget keeps the prompt, switches the model ──
     const { systemPrompt: finalSystemPrompt, model: costModel } =
       await buildCostAwareSystemPrompt(
         batch.workspace_id,
         fullSystemPrompt,
         costPolicy.policy,
       );
-
-    if (costPolicy.policy === "cut") {
-      console.warn(
-        "[buffer] SEC-06 cost cut — aborting AI for workspace",
-        batch.workspace_id,
-      );
-      await markBatchProcessed(batch.id, mergedText, supabase);
-      return { processed: true, conversationId: batch.conversation_id };
-    }
 
     // ── 8. Generate AI reply with tool-calling support ───────────────────────
     // Resolve workspace model (falls back to env default or gpt-4o-mini).

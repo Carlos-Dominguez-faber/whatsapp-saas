@@ -66,8 +66,14 @@ mock.module("@supabase/supabase-js", {
 let rateLimitResult: { allowed: boolean; reason?: string; reservationId?: string } = {
   allowed: true,
 };
+let reserveCalls = 0;
 mock.module("./cost-tracker.ts", {
-  exports: { reserveLlmTurn: async () => rateLimitResult },
+  exports: {
+    reserveLlmTurn: async () => {
+      reserveCalls++;
+      return rateLimitResult;
+    },
+  },
 });
 let enabledTools: unknown[] = [];
 mock.module("@/features/tools/services/tool-configs.ts", {
@@ -97,6 +103,7 @@ function reset(queue: QueueEntry[] = [FOUND, { error: null }, { error: null }]) 
   notifyCalls.length = 0;
   notifyShouldReject = false;
   rateLimitResult = { allowed: true };
+  reserveCalls = 0;
   enabledTools = [];
 }
 
@@ -167,6 +174,17 @@ test("decide returns 'respond' with the enabled tools and the reservationId", as
     availableTools: [fakeTool],
     reservationId: "res_1",
   });
+});
+
+test("decide reuses the reservation an earlier attempt made instead of reserving again", async () => {
+  reset([{ data: { state: "ai_active" }, error: null }]);
+  // A fresh reservation would be denied: the contact is at the limit now,
+  // counting the slot this batch itself took on its first attempt.
+  rateLimitResult = { allowed: false, reason: "rate_limit_contact_hour" };
+  const result = await decide({ ...DECIDE, reservationId: "res_prev" });
+  assert.equal(reserveCalls, 0);
+  assert.equal(result.decision, "respond");
+  assert.equal(result.reservationId, "res_prev");
 });
 
 // ── applyTransition() ──────────────────────────────────────────────────

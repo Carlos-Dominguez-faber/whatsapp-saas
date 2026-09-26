@@ -43,6 +43,11 @@ export async function decide(opts: {
   conversationId: string;
   mergedText: string;
   contactId: string;
+  /**
+   * The turn slot an earlier attempt of the same batch already reserved. A
+   * retry reuses it instead of spending a second slot of the hourly limit.
+   */
+  reservationId?: string;
 }): Promise<DecisionResult> {
   const { workspaceId, conversationId, mergedText, contactId } = opts;
   const supabase = svc();
@@ -86,12 +91,14 @@ export async function decide(opts: {
   }
 
   // 4. Rate limit check — atomically reserves a turn slot so two concurrent
-  // batches for the same contact can't both pass.
+  // batches for the same contact can't both pass. A retry keeps its slot.
   const {
     allowed,
     reason: rateLimitReason,
     reservationId,
-  } = await reserveLlmTurn(workspaceId, contactId);
+  } = opts.reservationId
+    ? { allowed: true, reason: undefined, reservationId: opts.reservationId }
+    : await reserveLlmTurn(workspaceId, contactId);
 
   if (!allowed) {
     return {
