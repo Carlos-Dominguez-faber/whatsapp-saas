@@ -15,7 +15,7 @@ import {
   readJevUses,
   type JevUses,
 } from "@/features/jev-judge/uses";
-import { WHATSAPP_PROVIDER } from "@/features/inbox/services/whatsapp-provider";
+import { loadWhatsAppIntegration } from "@/features/inbox/services/whatsapp-provider";
 
 const MODEL = "jev-latest";
 const IDLE = { suppressReply: false, ownsStage: false };
@@ -87,14 +87,9 @@ async function loadRuntime(
   supabase: SupabaseClient,
   workspaceId: string,
 ): Promise<{ enabled: boolean; uses: JevUses }> {
-  const { data } = await supabase
-    .from("integrations")
-    .select("config")
-    .eq("workspace_id", workspaceId)
-    .eq("provider", WHATSAPP_PROVIDER)
-    .eq("enabled", true)
-    .maybeSingle();
-  const config = data?.config ?? null;
+  // Jev's settings live in the workspace's WhatsApp integration config.
+  const whatsapp = await loadWhatsAppIntegration(supabase, workspaceId);
+  const config = whatsapp?.config ?? null;
   const row = (config ?? {}) as { jev_enabled?: unknown };
   return { enabled: row.jev_enabled === true, uses: readJevUses(config) };
 }

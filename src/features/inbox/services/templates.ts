@@ -1,10 +1,18 @@
 /**
- * templates.ts — Template management: list, sync from YCloud, helpers.
+ * templates.ts — Template management: list, sync from the workspace's WhatsApp
+ * provider (YCloud or Kapso), helpers.
  */
 
 import { createClient as createSbClient } from "@supabase/supabase-js";
 import { fetchYCloudTemplates } from "./ycloud-client";
-import { decryptCredentials } from "@/shared/lib/integration-secrets";
+import { fetchKapsoTemplates } from "./kapso-client";
+import {
+  decryptWhatsAppCredentials,
+  loadWhatsAppIntegration,
+  whatsappApiKey,
+  WHATSAPP_NOT_CONNECTED,
+  type WhatsAppProvider,
+} from "./whatsapp-provider";
 
 function svc() {
   return createSbClient(
@@ -41,28 +49,28 @@ export interface TemplateRow {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// YCloud API shape (raw response)
+// Meta template shape (raw response — both providers relay Meta's)
 // ──────────────────────────────────────────────────────────────────────────────
 
-interface YCloudTemplateComponent {
+interface MetaTemplateComponent {
   type: string;
   text?: string;
   parameters?: unknown[];
   [key: string]: unknown;
 }
 
-interface YCloudTemplate {
+interface MetaTemplate {
   id?: string;
   name?: string;
   language?: string;
   category?: string;
   status?: string;
-  components?: YCloudTemplateComponent[];
+  components?: MetaTemplateComponent[];
   [key: string]: unknown;
 }
 
-// Maps YCloud status strings to our enum
-const YCLOUD_STATUS_MAP: Record<string, TemplateRow["status"]> = {
+// Maps Meta status strings to our enum
+const META_STATUS_MAP: Record<string, TemplateRow["status"]> = {
   APPROVED: "approved",
   PENDING: "submitted",
   PENDING_DELETION: "submitted",
@@ -71,12 +79,19 @@ const YCLOUD_STATUS_MAP: Record<string, TemplateRow["status"]> = {
   DISABLED: "paused",
 };
 
-function mapYCloudStatus(raw: string): TemplateRow["status"] {
-  return YCLOUD_STATUS_MAP[raw.toUpperCase()] ?? "submitted";
+function mapTemplateStatus(raw: string): TemplateRow["status"] {
+  return META_STATUS_MAP[raw.toUpperCase()] ?? "submitted";
 }
 
-// Extracts the body text from YCloud components array
-function extractBodyText(components: YCloudTemplateComponent[]): string {
+// templates.category is CHECK-constrained to lowercase; Meta reports UPPERCASE.
+const TEMPLATE_CATEGORIES = new Set(["marketing", "utility", "authentication"]);
+function normalizeCategory(raw: unknown): string {
+  const value = typeof raw === "string" ? raw.toLowerCase() : "";
+  return TEMPLATE_CATEGORIES.has(value) ? value : "utility";
+}
+
+// Extracts the body text from the Meta components array
+function extractBodyText(components: MetaTemplateComponent[]): string {
   const bodyComp = components.find((c) => c.type?.toUpperCase() === "BODY");
   return typeof bodyComp?.text === "string" ? bodyComp.text : "";
 }
@@ -111,42 +126,52 @@ export async function listTemplates(
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// syncTemplatesFromYCloud
+// syncTemplates — pulls the workspace's templates from its WhatsApp provider
 // ──────────────────────────────────────────────────────────────────────────────
 
-export async function syncTemplatesFromYCloud(
+async function fetchProviderTemplates(
+  provider: WhatsAppProvider,
+  apiKey: string,
+  config: Record<string, unknown>,
+): Promise<unknown[]> {
+  if (provider === "kapso") {
+    // Kapso's template endpoints are Meta's, scoped to a WABA id in the path.
+    // It is configured per workspace — the API can't discover it without it.
+    const wabaId = (config.waba_id as string | undefined) ?? "";
+    if (!wabaId) {
+      throw new Error(
+        "[templates] falta waba_id en la configuración de Kapso del workspace",
+      );
+    }
+    return fetchKapsoTemplates(apiKey, wabaId);
+  }
+  return fetchYCloudTemplates(apiKey);
+}
+
+export async function syncTemplates(
   workspaceId: string,
 ): Promise<{ synced: number; errors: number }> {
   const supabase = svc();
 
-  // 1. Load YCloud integration credentials
-  const { data: integration, error: intError } = await supabase
-    .from("integrations")
-    .select("credentials")
-    .eq("workspace_id", workspaceId)
-    .eq("provider", "ycloud")
-    .eq("enabled", true)
-    .single();
-
-  if (intError || !integration) {
-    throw new Error(
-      `[templates] YCloud integration not found: ${intError?.message}`,
-    );
+  // 1. Load the workspace's WhatsApp integration
+  const whatsapp = await loadWhatsAppIntegration(supabase, workspaceId);
+  if (!whatsapp) {
+    throw new Error(`[templates] ${WHATSAPP_NOT_CONNECTED}`);
   }
 
-  const credentials = await decryptCredentials(
-    integration.credentials as Record<string, unknown>,
-    workspaceId,
-    "ycloud",
-  );
-  const apiKey = (credentials.ycloud_api_key as string | undefined) ?? "";
+  const credentials = await decryptWhatsAppCredentials(whatsapp, workspaceId);
+  const apiKey = whatsappApiKey(whatsapp.provider, credentials);
 
   if (!apiKey || apiKey === "placeholder") {
     return { synced: 0, errors: 0 };
   }
 
-  // 2. Fetch templates from YCloud
-  const records = await fetchYCloudTemplates(apiKey);
+  // 2. Fetch templates from the provider
+  const records = await fetchProviderTemplates(
+    whatsapp.provider,
+    apiKey,
+    whatsapp.config,
+  );
 
   let synced = 0;
   let errors = 0;
@@ -154,11 +179,11 @@ export async function syncTemplatesFromYCloud(
   // 3. Upsert each template
   for (const raw of records) {
     try {
-      const t = raw as YCloudTemplate;
+      const t = raw as MetaTemplate;
       const name = typeof t.name === "string" ? t.name : "";
       const language = typeof t.language === "string" ? t.language : "es";
-      const category = typeof t.category === "string" ? t.category : "UTILITY";
-      const status = mapYCloudStatus(
+      const category = normalizeCategory(t.category);
+      const status = mapTemplateStatus(
         typeof t.status === "string" ? t.status : "PENDING",
       );
       const components = Array.isArray(t.components) ? t.components : [];

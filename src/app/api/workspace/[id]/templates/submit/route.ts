@@ -1,8 +1,10 @@
-// Phase 4: submit a draft template to YCloud (Meta approval).
-//
-// We don't store the wabaId, so we resolve it from the registered phone number
-// at submit time, build the YCloud `components` from the stored rich fields, and
+// Phase 4: submit a draft template for Meta approval through the workspace's
+// WhatsApp provider, build Meta's `components` from the stored rich fields, and
 // flip the row to status='submitted' on success.
+//
+// The WABA id differs by provider: YCloud's is resolved from the registered
+// phone number and goes in the body; Kapso's is configured per workspace
+// (the API can't discover it) and goes in the request path.
 
 import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
@@ -14,13 +16,22 @@ import {
   YCloudError,
 } from "@/features/inbox/services/ycloud-client";
 import {
-  buildYCloudPayload,
+  createKapsoTemplate,
+  KapsoError,
+} from "@/features/inbox/services/kapso-client";
+import {
+  decryptWhatsAppCredentials,
+  loadWhatsAppIntegration,
+  whatsappApiKey,
+  WHATSAPP_PROVIDER_LABELS,
+} from "@/features/inbox/services/whatsapp-provider";
+import {
+  buildTemplatePayload,
   createTemplateSchema,
   type CreateTemplateInput,
   type TemplateButton,
   type TemplateVariable,
 } from "@/features/settings/lib/template-form";
-import { decryptCredentials } from "@/shared/lib/integration-secrets";
 
 function svc() {
   return createSbClient(
@@ -133,42 +144,57 @@ export async function POST(
     );
   }
 
-  // ── Load YCloud credentials ───────────────────────────────────────────────
-  const { data: integration } = await db
-    .from("integrations")
-    .select("credentials, config")
-    .eq("workspace_id", workspaceId)
-    .eq("provider", "ycloud")
-    .eq("enabled", true)
-    .maybeSingle();
-
-  const credentials = await decryptCredentials(
-    integration?.credentials as Record<string, unknown> | null,
-    workspaceId,
-    "ycloud",
-  );
-  const config = (integration?.config ?? {}) as Record<string, unknown>;
-  const apiKey = (credentials.ycloud_api_key as string | undefined) ?? "";
-  const phoneNumber = (config.phone_number as string | undefined) ?? "";
+  // ── Load the workspace's WhatsApp provider ────────────────────────────────
+  const whatsapp = await loadWhatsAppIntegration(db, workspaceId);
+  if (!whatsapp) {
+    return NextResponse.json(
+      {
+        error:
+          "Conecta WhatsApp (YCloud o Kapso) en Integraciones antes de enviar plantillas",
+      },
+      { status: 400 },
+    );
+  }
+  const label = WHATSAPP_PROVIDER_LABELS[whatsapp.provider];
+  const credentials = await decryptWhatsAppCredentials(whatsapp, workspaceId);
+  const apiKey = whatsappApiKey(whatsapp.provider, credentials);
 
   if (!apiKey || apiKey === "placeholder") {
     return NextResponse.json(
-      { error: "Configura la API key de YCloud antes de enviar plantillas" },
-      { status: 400 },
-    );
-  }
-  if (!phoneNumber) {
-    return NextResponse.json(
-      { error: "Falta el número de WhatsApp en la configuración de YCloud" },
+      { error: `Configura la API key de ${label} antes de enviar plantillas` },
       { status: 400 },
     );
   }
 
-  // ── Resolve wabaId + create on YCloud ─────────────────────────────────────
+  // ── Create on the provider ────────────────────────────────────────────────
   try {
-    const wabaId = await resolveWabaId(apiKey, phoneNumber);
-    const payload = buildYCloudPayload(wabaId, valid.data);
-    const result = await createYCloudTemplate(apiKey, payload);
+    const payload = buildTemplatePayload(valid.data);
+    let result: { id: string };
+
+    if (whatsapp.provider === "kapso") {
+      const wabaId = (whatsapp.config.waba_id as string | undefined) ?? "";
+      if (!wabaId) {
+        return NextResponse.json(
+          {
+            error:
+              "Falta el WABA ID en la configuración de Kapso — sin él no se pueden crear plantillas",
+          },
+          { status: 400 },
+        );
+      }
+      result = await createKapsoTemplate(apiKey, wabaId, payload);
+    } else {
+      const phoneNumber =
+        (whatsapp.config.phone_number as string | undefined) ?? "";
+      if (!phoneNumber) {
+        return NextResponse.json(
+          { error: "Falta el número de WhatsApp en la configuración de YCloud" },
+          { status: 400 },
+        );
+      }
+      const wabaId = await resolveWabaId(apiKey, phoneNumber);
+      result = await createYCloudTemplate(apiKey, { wabaId, ...payload });
+    }
 
     const { data: updated, error: updateError } = await db
       .from("templates")
@@ -186,19 +212,19 @@ export async function POST(
 
     if (updateError) {
       console.error("[templates/submit] update error:", updateError);
-      // The template WAS created on YCloud; surface success but warn.
+      // The template WAS created on the provider; surface success but warn.
       return NextResponse.json({
         data: { ...row, status: "submitted" },
-        warning: "Enviada a YCloud, pero no se pudo actualizar el estado local",
+        warning: `Enviada a ${label}, pero no se pudo actualizar el estado local`,
       });
     }
 
     return NextResponse.json({ data: updated });
   } catch (err) {
-    if (err instanceof YCloudError) {
-      console.error("[templates/submit] YCloud error:", err.status, err.body);
+    if (err instanceof YCloudError || err instanceof KapsoError) {
+      console.error(`[templates/submit] ${label} error:`, err.status, err.body);
       return NextResponse.json(
-        { error: `YCloud rechazó la plantilla: ${err.message}` },
+        { error: `${label} rechazó la plantilla: ${err.message}` },
         { status: 502 },
       );
     }

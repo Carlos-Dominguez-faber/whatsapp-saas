@@ -27,6 +27,10 @@ import {
 } from "./conversation-history";
 import { getSetterConfig, evaluateLead } from "./setter";
 import { syncContactToHL, createHLOpportunity } from "./highlevel-client";
+import {
+  loadWhatsAppIntegration,
+  WHATSAPP_NOT_CONNECTED,
+} from "./whatsapp-provider";
 
 const DEFAULT_SILENCE_MS = 30_000; // 30 seconds silence window
 const MAX_BATCH_RETRIES = 3;
@@ -321,17 +325,12 @@ export async function processNextBatch(): Promise<ProcessBatchResult> {
     };
 
     // ── 6b. Resolve conversational memory window (WS2: configurable) ─────────
-    // The YCloud integration config carries message_history_window; clamp to
-    // [5, 50] and default to 10 when unset or non-numeric.
-    const { data: ycloudCfg } = await supabase
-      .from("integrations")
-      .select("config")
-      .eq("workspace_id", batch.workspace_id)
-      .eq("provider", "ycloud")
-      .eq("enabled", true)
-      .maybeSingle();
+    // The workspace's WhatsApp integration config carries
+    // message_history_window; clamp to [5, 50] and default to 10 when unset or
+    // non-numeric.
+    const whatsapp = await loadWhatsAppIntegration(supabase, batch.workspace_id);
     const rawWindow = Number(
-      (ycloudCfg?.config as { message_history_window?: number } | null)
+      (whatsapp?.config as { message_history_window?: number } | undefined)
         ?.message_history_window,
     );
     const historyWindow = Number.isFinite(rawWindow)
@@ -441,19 +440,11 @@ export async function processNextBatch(): Promise<ProcessBatchResult> {
       completionTokens: reply.outputTokens,
     });
 
-    // ── 9. Load YCloud integration credentials ──────────────────────────────
-    const { data: integration, error: intError } = await supabase
-      .from("integrations")
-      // Only an existence check — dispatchText() loads and decrypts the
-      // credentials itself, so there is no reason to pull secrets here.
-      .select("workspace_id")
-      .eq("workspace_id", batch.workspace_id)
-      .eq("provider", "ycloud")
-      .eq("enabled", true)
-      .single();
-
-    if (intError || !integration) {
-      throw new Error(`YCloud integration not found: ${intError?.message}`);
+    // ── 9. The workspace must have an active WhatsApp provider ──────────────
+    // Only an existence check (reusing 6b's lookup) — dispatchText() loads and
+    // decrypts the credentials itself.
+    if (!whatsapp) {
+      throw new Error(`[buffer] ${WHATSAPP_NOT_CONNECTED}`);
     }
 
     // ── 10a. Dispatch via single exit point (SEC-04) ────────────────────────

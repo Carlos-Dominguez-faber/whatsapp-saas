@@ -19,6 +19,10 @@
 import { createClient as createSbClient } from "@supabase/supabase-js";
 import { dispatchText } from "./dispatch";
 import { DEFAULT_HANDOFF_ACK } from "../types/handoff";
+import {
+  loadWhatsAppIntegration,
+  WHATSAPP_NOT_CONNECTED,
+} from "./whatsapp-provider";
 
 export { DEFAULT_HANDOFF_ACK };
 
@@ -38,8 +42,8 @@ export interface HandoffAckConfig {
 }
 
 /**
- * Reads the per-workspace acknowledgement settings from the YCloud integration
- * config — the same jsonb bag that already carries message_history_window.
+ * Reads the per-workspace acknowledgement settings from the WhatsApp
+ * integration config — the same jsonb bag that carries message_history_window.
  * Defaults to enabled so a workspace that never touches the setting still gives
  * the contact a reply instead of silence.
  */
@@ -48,14 +52,9 @@ export async function getHandoffAckConfig(
 ): Promise<HandoffAckConfig> {
   const supabase = svc();
 
-  const { data } = await supabase
-    .from("integrations")
-    .select("config")
-    .eq("workspace_id", workspaceId)
-    .eq("provider", "ycloud")
-    .maybeSingle();
+  const whatsapp = await loadWhatsAppIntegration(supabase, workspaceId);
 
-  const config = (data?.config ?? {}) as {
+  const config = (whatsapp?.config ?? {}) as {
     handoff_ack_enabled?: boolean;
     handoff_ack_message?: string;
   };
@@ -175,9 +174,9 @@ export async function notifyHandoffPending(
     }
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    // A workspace with no YCloud integration yet is a normal state during
+    // A workspace with no WhatsApp provider yet is a normal state during
     // onboarding, not an incident worth an error-level event.
-    const notConnected = message.includes("YCloud integration not found");
+    const notConnected = message.includes(WHATSAPP_NOT_CONNECTED);
     await logEvent(
       workspaceId,
       conversationId,

@@ -5,17 +5,17 @@
  * routes can import it. Text-header only for now (media headers are a later
  * add-on). Categories are stored lowercase (consistent with the existing
  * `templates` rows, `template_library`, and the CRUD API) and only uppercased
- * at the YCloud submission boundary via `buildYCloudPayload`.
+ * at the submission boundary via `buildTemplatePayload`.
  */
 
 import { z } from "zod";
 
-// Language is fixed to "es" for now (matches the YCloud account + the CRUD API
+// Language is fixed to "es" for now (matches the provider accounts + the CRUD API
 // literal). Kept as a constant so widening it later is a one-line change.
 export const TEMPLATE_LANGUAGE = "es" as const;
 
-// Stored lowercase. Meta/YCloud only accept the uppercase form on creation, so
-// we uppercase at the submit boundary (see buildYCloudPayload).
+// Stored lowercase. Meta (via YCloud or Kapso) only accepts the uppercase form
+// on creation, so we uppercase at the submit boundary (see buildTemplatePayload).
 export const TEMPLATE_CATEGORIES = ["utility", "marketing"] as const;
 export type TemplateCategory = (typeof TEMPLATE_CATEGORIES)[number];
 
@@ -95,28 +95,29 @@ export function sanitizeTemplateName(raw: string): string {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// YCloud payload builder (pure) — mirrors POST /v2/whatsapp/templates
+// Template payload builder (pure) — Meta's message_templates shape, which both
+// providers accept: YCloud (POST /v2/whatsapp/templates, wabaId in the body) and
+// Kapso (POST /{waba_id}/message_templates, wabaId in the path).
 // ──────────────────────────────────────────────────────────────────────────────
 
-export type YCloudButton =
+export type MetaTemplateButton =
   | { type: "QUICK_REPLY"; text: string }
   | { type: "URL"; text: string; url: string }
   | { type: "PHONE_NUMBER"; text: string; phone_number: string };
 
-export interface YCloudComponent {
+export interface MetaTemplateComponent {
   type: "HEADER" | "BODY" | "FOOTER" | "BUTTONS";
   format?: "TEXT";
   text?: string;
   example?: { header_text?: string[]; body_text?: string[][] };
-  buttons?: YCloudButton[];
+  buttons?: MetaTemplateButton[];
 }
 
-export interface YCloudTemplatePayload {
-  wabaId: string;
+export interface MetaTemplatePayload {
   name: string;
   language: string;
   category: string; // UPPERCASE
-  components: YCloudComponent[];
+  components: MetaTemplateComponent[];
 }
 
 /** Looks up the user-provided example for a {{n}}, falling back to a sample. */
@@ -125,7 +126,7 @@ function exampleForIndex(variables: TemplateVariable[], index: number): string {
   return found && found.length > 0 ? found : `Ejemplo ${index}`;
 }
 
-function toYCloudButton(btn: TemplateButton): YCloudButton {
+function toMetaButton(btn: TemplateButton): MetaTemplateButton {
   if (btn.type === "quick_reply") {
     return { type: "QUICK_REPLY", text: btn.text };
   }
@@ -136,19 +137,19 @@ function toYCloudButton(btn: TemplateButton): YCloudButton {
 }
 
 /**
- * Builds the YCloud `components` array from builder input. Meta requires an
+ * Builds Meta's `components` array from builder input. Meta requires an
  * `example` for every component that contains a {{n}} variable, so we always
  * emit non-empty samples for header/body variables.
  */
-export function buildYCloudComponents(
+export function buildTemplateComponents(
   input: CreateTemplateInput,
-): YCloudComponent[] {
-  const components: YCloudComponent[] = [];
+): MetaTemplateComponent[] {
+  const components: MetaTemplateComponent[] = [];
 
   // HEADER (text only)
   if (input.header_type === "text" && input.header_text.trim()) {
     const headerVars = detectBodyVariables(input.header_text);
-    const header: YCloudComponent = {
+    const header: MetaTemplateComponent = {
       type: "HEADER",
       format: "TEXT",
       text: input.header_text,
@@ -165,7 +166,7 @@ export function buildYCloudComponents(
 
   // BODY (required)
   const bodyVars = detectBodyVariables(input.body_template);
-  const body: YCloudComponent = { type: "BODY", text: input.body_template };
+  const body: MetaTemplateComponent = { type: "BODY", text: input.body_template };
   if (bodyVars.length > 0) {
     body.example = {
       body_text: [
@@ -184,23 +185,24 @@ export function buildYCloudComponents(
   if (input.buttons.length > 0) {
     components.push({
       type: "BUTTONS",
-      buttons: input.buttons.map(toYCloudButton),
+      buttons: input.buttons.map(toMetaButton),
     });
   }
 
   return components;
 }
 
-/** Full create payload for YCloud (category uppercased here). */
-export function buildYCloudPayload(
-  wabaId: string,
+/**
+ * Full create payload (category uppercased here). The WABA id is added by the
+ * provider: YCloud takes it in the body, Kapso in the request path.
+ */
+export function buildTemplatePayload(
   input: CreateTemplateInput,
-): YCloudTemplatePayload {
+): MetaTemplatePayload {
   return {
-    wabaId,
     name: input.name,
     language: TEMPLATE_LANGUAGE,
     category: input.category.toUpperCase(),
-    components: buildYCloudComponents(input),
+    components: buildTemplateComponents(input),
   };
 }
