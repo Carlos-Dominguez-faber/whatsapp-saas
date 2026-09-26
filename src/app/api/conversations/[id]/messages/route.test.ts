@@ -101,10 +101,14 @@ test("a viewer neither sends nor sleeps the bot", async () => {
   convRow = { workspace_id: "ws_1", window_expires_at: null, ai_enabled: false };
 });
 
-test("an agent can send", async () => {
+test("an agent can send, through the conversation's own workspace", async () => {
   dispatchCalls.length = 0;
   memberResult = { ok: true, userId: "user_1", role: "agent" };
   const res = await POST(makeReq({ body: "hola" }), params);
   assert.equal(res.status, 200);
   assert.equal(dispatchCalls.length, 1);
+  assert.equal(
+    (dispatchCalls[0] as { workspaceId?: string }).workspaceId,
+    convRow.workspace_id,
+  );
 });

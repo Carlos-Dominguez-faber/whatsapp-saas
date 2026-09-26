@@ -28,7 +28,12 @@ mock.module("@/lib/auth/workspace-access.ts", {
 });
 
 // ── Service-role memberships table ───────────────────────────────────────────
-type Membership = { user_id: string; role: string; is_active: boolean };
+type Membership = {
+  workspace_id: string;
+  user_id: string;
+  role: string;
+  is_active: boolean;
+};
 let memberships: Membership[] = [];
 let writes: Array<{ kind: string; row: unknown }> = [];
 
@@ -42,7 +47,7 @@ function membershipsTable() {
       return q;
     },
     eq: (col: string, val: unknown) => {
-      if (col !== "workspace_id") filters.push((m) => (m as any)[col] === val);
+      filters.push((m) => (m as any)[col] === val);
       return q;
     },
     neq: (col: string, val: unknown) => {
@@ -104,10 +109,13 @@ function reset(role: typeof actorRole) {
   actorRole = role;
   writes = [];
   memberships = [
-    { user_id: U_ADMIN, role: "admin", is_active: true },
-    { user_id: U_MANAGER, role: "manager", is_active: true },
-    { user_id: U_AGENT, role: "agent", is_active: true },
-    { user_id: "u_admin", role: "admin", is_active: true },
+    { workspace_id: "ws_1", user_id: U_ADMIN, role: "admin", is_active: true },
+    { workspace_id: "ws_1", user_id: U_MANAGER, role: "manager", is_active: true },
+    { workspace_id: "ws_1", user_id: U_AGENT, role: "agent", is_active: true },
+    { workspace_id: "ws_1", user_id: "u_admin", role: "admin", is_active: true },
+    // Another tenant: must never count for, or leak into, ws_1's decisions.
+    { workspace_id: "ws_2", user_id: U_AGENT, role: "admin", is_active: true },
+    { workspace_id: "ws_2", user_id: "u_other_admin", role: "admin", is_active: true },
   ];
 }
 
@@ -181,4 +189,19 @@ test("unknown member → 404", async () => {
     params,
   );
   assert.equal(res.status, 404);
+});
+
+test("an admin of another workspace does not count as ws_1's remaining admin", async () => {
+  reset("admin");
+  memberships = memberships.filter((m) => !(m.workspace_id === "ws_1" && m.user_id === "u_admin"));
+  const res = await PATCH(req("PATCH", { userId: U_ADMIN, is_active: false }), params);
+  assert.equal(res.status, 409);
+  assert.equal(writes.length, 0);
+});
+
+test("the ceiling uses the target's role in THIS workspace, not in another one", async () => {
+  reset("manager");
+  // U_AGENT is admin in ws_2 but an agent in ws_1: a ws_1 manager may manage them.
+  const res = await PATCH(req("PATCH", { userId: U_AGENT, role: "viewer" }), params);
+  assert.equal(res.status, 200);
 });
