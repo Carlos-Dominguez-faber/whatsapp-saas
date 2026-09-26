@@ -7,8 +7,8 @@
  */
 
 import {
-  fetchPinned,
-  validateWebhookUrl,
+  fetchPinnedFollowingRedirects,
+  RedirectRefusedError,
 } from "@/features/tools/services/ssrf-guard";
 
 const FETCH_TIMEOUT_MS = 15_000;
@@ -65,11 +65,12 @@ export function htmlToText(html: string): string {
  * Downloads `rawUrl` and returns its readable text. Throws a user-friendly
  * Error on invalid/blocked URLs, non-HTML responses, or fetch failures.
  *
- * Every hop — the URL itself and each redirect — is resolved and checked
- * against private/internal ranges, then fetched over a connection pinned to
- * that checked address (fetchPinned), so neither a redirect nor a DNS answer
- * that changes between the check and the request can reach the internal
- * network. The whole exchange shares one deadline.
+ * Every hop — the URL itself and each redirect (at most 3) — is resolved and
+ * checked against private/internal ranges, then fetched over a connection
+ * pinned to that checked address (fetchPinnedFollowingRedirects), so neither
+ * a redirect nor a DNS answer that changes between the check and the request
+ * can reach the internal network. Compressed bodies are decoded, and the
+ * 2 MB cap applies after decoding. The whole exchange shares one deadline.
  */
 export async function fetchUrlText(rawUrl: string): Promise<string> {
   let url: URL;
@@ -78,77 +79,67 @@ export async function fetchUrlText(rawUrl: string): Promise<string> {
   } catch {
     throw new Error("URL inválida");
   }
-
-  const deadline = Date.now() + FETCH_TIMEOUT_MS;
-  let html: string | null = null;
-
-  for (let hop = 0; html === null; hop++) {
-    if (url.protocol !== "http:" && url.protocol !== "https:") {
-      throw new Error("Solo se permiten URLs http(s)");
-    }
-    const check = await validateWebhookUrl(url.toString(), { allowHttp: true });
-    if (check.error === "Cannot resolve hostname") {
-      throw new Error("No se encontró el dominio de la URL");
-    }
-    if (check.error || !check.resolvedIp) {
-      throw new Error("URL no permitida");
-    }
-
-    const remaining = deadline - Date.now();
-    if (remaining <= 0) {
-      throw new Error("La página tardó demasiado en responder");
-    }
-
-    let res;
-    try {
-      res = await fetchPinned(url.toString(), check.resolvedIp, {
-        method: "GET",
-        headers: {
-          "User-Agent": "Mozilla/5.0 (compatible; AgenteWA-KB/1.0)",
-          Accept: "text/html,application/xhtml+xml,text/plain",
-          // node:http does not decompress; ask for the plain body.
-          "Accept-Encoding": "identity",
-        },
-        timeoutMs: remaining,
-        maxResponseBytes: MAX_HTML_BYTES,
-      });
-    } catch (err) {
-      if (err instanceof Error && err.message === "Tool timeout") {
-        throw new Error("La página tardó demasiado en responder");
-      }
-      throw new Error("No se pudo descargar la URL");
-    }
-
-    if (res.status >= 300 && res.status < 400) {
-      const location = res.headers.location;
-      if (!location || hop >= MAX_REDIRECTS) {
-        throw new Error("La página redirige demasiadas veces");
-      }
-      try {
-        url = new URL(location, url);
-      } catch {
-        throw new Error("La página redirige a una URL inválida");
-      }
-      continue;
-    }
-
-    if (res.status < 200 || res.status >= 300) {
-      throw new Error(`La página respondió ${res.status}`);
-    }
-    const contentType = String(res.headers["content-type"] ?? "");
-    if (
-      !contentType.includes("text/html") &&
-      !contentType.includes("text/plain") &&
-      !contentType.includes("application/xhtml")
-    ) {
-      throw new Error("La URL no devolvió una página de texto/HTML");
-    }
-    html = res.bodyText;
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    throw new Error("Solo se permiten URLs http(s)");
   }
 
-  const text = htmlToText(html);
+  let res;
+  try {
+    res = await fetchPinnedFollowingRedirects(url.toString(), {
+      allowHttp: true,
+      maxRedirects: MAX_REDIRECTS,
+      method: "GET",
+      headers: {
+        "User-Agent": "Mozilla/5.0 (compatible; AgenteWA-KB/1.0)",
+        Accept: "text/html,application/xhtml+xml,text/plain",
+        "Accept-Encoding": "gzip, deflate, br",
+      },
+      timeoutMs: FETCH_TIMEOUT_MS,
+      maxResponseBytes: MAX_HTML_BYTES,
+      decompress: true,
+    });
+  } catch (err) {
+    throw new Error(scrapeErrorMessage(err));
+  }
+
+  if (res.status < 200 || res.status >= 300) {
+    throw new Error(`La página respondió ${res.status}`);
+  }
+  const contentType = String(res.headers["content-type"] ?? "");
+  if (
+    !contentType.includes("text/html") &&
+    !contentType.includes("text/plain") &&
+    !contentType.includes("application/xhtml")
+  ) {
+    throw new Error("La URL no devolvió una página de texto/HTML");
+  }
+
+  const text = htmlToText(res.bodyText);
   if (text.length < 20) {
     throw new Error("No se pudo extraer contenido legible de la URL");
   }
   return text;
+}
+
+/** Turns a fetch failure into the message the KB form shows. */
+function scrapeErrorMessage(err: unknown): string {
+  const message = err instanceof Error ? err.message : "";
+  if (err instanceof RedirectRefusedError) {
+    if (message === "Cannot resolve hostname") {
+      // Also what an IPv6-only site gets: only A records are looked up.
+      return "No se encontró el dominio de la URL (o solo tiene IPv6, que no se admite)";
+    }
+    if (message.startsWith("Too many redirects")) {
+      return "La página redirige demasiadas veces";
+    }
+    if (message === "Invalid redirect location") {
+      return "La página redirige a una URL inválida";
+    }
+    return "URL no permitida";
+  }
+  if (message === "Tool timeout") return "La página tardó demasiado en responder";
+  if (message.startsWith("Unsupported content-encoding")) {
+    return "La página respondió en un formato comprimido que no se puede leer";
+  }
+  return "No se pudo descargar la URL";
 }
