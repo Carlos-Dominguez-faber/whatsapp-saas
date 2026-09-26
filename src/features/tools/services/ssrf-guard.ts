@@ -1,5 +1,8 @@
 import { resolve4 } from "node:dns/promises";
+import type { IncomingHttpHeaders } from "node:http";
+import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
+import { isIPv4 } from "node:net";
 
 const PRIVATE_RANGES: RegExp[] = [
   /^0\./, // 0.0.0.0/8 — on Linux, connecting to 0.0.0.0 reaches localhost
@@ -11,8 +14,6 @@ const PRIVATE_RANGES: RegExp[] = [
   /^100\.6[4-9]\.|^100\.[7-9]\d\.|^100\.1[01]\d\.|^100\.12[0-7]\./, // CGNAT
   /^2(2[4-9]|3\d)\./, // 224.0.0.0/4 multicast
   /^2(4\d|5[0-5])\./, // 240.0.0.0/4 reserved (includes 255.255.255.255 broadcast)
-  /^::1$/, // IPv6 loopback
-  /^fc|^fd/i, // IPv6 ULA
 ];
 
 export interface WebhookUrlCheck {
@@ -20,14 +21,25 @@ export interface WebhookUrlCheck {
   resolvedIp?: string;
 }
 
+export interface ValidateUrlOptions {
+  /** Also accept plain http:// (the KB scraper reads public web pages). */
+  allowHttp?: boolean;
+}
+
 /**
- * SEC-08: Validates a webhook URL before fetching, and returns the IPv4
- * address it resolved so the caller can pin the real request to that exact
- * address (see fetchPinned) instead of re-resolving DNS later — closing the
- * DNS-rebinding window where a low-TTL hostname could answer differently
- * between this check and the request.
+ * SEC-08: Validates a URL before fetching, and returns the IPv4 address it
+ * resolved so the caller can pin the real request to that exact address (see
+ * fetchPinned) instead of re-resolving DNS later — closing the DNS-rebinding
+ * window where a low-TTL hostname could answer differently between this check
+ * and the request.
+ *
+ * Only IPv4 is supported: IPv6 literals are rejected and hostnames resolve
+ * through A records, so an IPv6-only host fails closed.
  */
-export async function validateWebhookUrl(url: string): Promise<WebhookUrlCheck> {
+export async function validateWebhookUrl(
+  url: string,
+  opts: ValidateUrlOptions = {},
+): Promise<WebhookUrlCheck> {
   let parsed: URL;
   try {
     parsed = new URL(url);
@@ -35,14 +47,33 @@ export async function validateWebhookUrl(url: string): Promise<WebhookUrlCheck> 
     return { error: "Invalid URL" };
   }
 
-  if (parsed.protocol !== "https:") {
-    return { error: "Only HTTPS webhooks are allowed (SEC-08)" };
+  if (
+    parsed.protocol !== "https:" &&
+    !(opts.allowHttp && parsed.protocol === "http:")
+  ) {
+    return {
+      error: opts.allowHttp
+        ? "Only http(s) URLs are allowed (SEC-08)"
+        : "Only HTTPS webhooks are allowed (SEC-08)",
+    };
   }
 
+  // WHATWG URL already normalizes decimal/hex/short IPv4 forms (2130706433,
+  // 0x7f.1) to dotted quads, so an IPv4 literal is checked as-is. An IPv6
+  // literal keeps its brackets in `hostname`.
   let addresses: string[] = [];
-  try {
-    addresses = await resolve4(parsed.hostname);
-  } catch {
+  if (isIPv4(parsed.hostname)) {
+    addresses = [parsed.hostname];
+  } else if (parsed.hostname.startsWith("[")) {
+    return { error: "IPv6 addresses are not supported (SEC-08)" };
+  } else {
+    try {
+      addresses = await resolve4(parsed.hostname);
+    } catch {
+      return { error: "Cannot resolve hostname" };
+    }
+  }
+  if (addresses.length === 0) {
     return { error: "Cannot resolve hostname" };
   }
 
@@ -66,6 +97,8 @@ export interface PinnedRequestOptions {
 
 export interface PinnedResponse {
   status: number;
+  /** Response headers (e.g. content-type, or location on a 3xx). */
+  headers: IncomingHttpHeaders;
   bodyText: string;
   truncated: boolean;
 }
@@ -74,8 +107,8 @@ export interface PinnedResponse {
  * Sends a request to `url` over a connection pinned to `resolvedIp` — the
  * `lookup` override means no second DNS resolution happens between
  * validateWebhookUrl and this call. Never follows redirects: a 3xx comes
- * back with an empty body for the caller to reject, since following it
- * would require re-validating an entirely different host.
+ * back with an empty body (and its `location` header) for the caller to
+ * reject or to re-validate as a brand-new URL before following it.
  *
  * `opts.timeoutMs` is an ABSOLUTE deadline for the whole exchange, not just
  * the socket-inactivity `timeout` that node:https offers: a webhook that
@@ -93,8 +126,16 @@ export function fetchPinned(
     const parsed = new URL(url);
     const cap = opts.maxResponseBytes ?? Infinity;
     let settled = false;
+    const isHttp = parsed.protocol === "http:";
+    const request = isHttp ? httpRequest : httpsRequest;
+    // node:https streams a string body chunked; some receivers reject that,
+    // and fetch() used to send a Content-Length.
+    const headers =
+      opts.body !== undefined
+        ? { ...opts.headers, "Content-Length": String(Buffer.byteLength(opts.body)) }
+        : opts.headers;
 
-    const req = httpsRequest(
+    const req = request(
       {
         hostname: parsed.hostname,
         // Node's `net`/`tls` Happy Eyeballs (autoSelectFamily, default on
@@ -122,18 +163,19 @@ export function fetchPinned(
           options: unknown,
           callback: (err: NodeJS.ErrnoException | null, address: string, family: number) => void,
         ) => void,
-        port: parsed.port || 443,
+        port: parsed.port || (isHttp ? 80 : 443),
         path: `${parsed.pathname}${parsed.search}`,
         method: opts.method,
-        headers: opts.headers,
+        headers,
         timeout: opts.timeoutMs,
       },
       (res) => {
         const status = res.statusCode ?? 0;
+        const resHeaders = res.headers ?? {};
         if (status >= 300 && status < 400) {
           res.resume();
           settled = true;
-          resolve({ status, bodyText: "", truncated: false });
+          resolve({ status, headers: resHeaders, bodyText: "", truncated: false });
           return;
         }
 
@@ -147,7 +189,7 @@ export function fetchPinned(
             truncated = true;
             settled = true;
             req.destroy();
-            resolve({ status, bodyText: Buffer.concat(chunks).toString("utf8"), truncated });
+            resolve({ status, headers: resHeaders, bodyText: Buffer.concat(chunks).toString("utf8"), truncated });
             return;
           }
           const remaining = cap - total;
@@ -158,13 +200,13 @@ export function fetchPinned(
             truncated = true;
             settled = true;
             req.destroy();
-            resolve({ status, bodyText: Buffer.concat(chunks).toString("utf8"), truncated });
+            resolve({ status, headers: resHeaders, bodyText: Buffer.concat(chunks).toString("utf8"), truncated });
           }
         });
         res.on("end", () => {
           if (settled) return;
           settled = true;
-          resolve({ status, bodyText: Buffer.concat(chunks).toString("utf8"), truncated });
+          resolve({ status, headers: resHeaders, bodyText: Buffer.concat(chunks).toString("utf8"), truncated });
         });
         res.on("error", (err) => {
           if (settled) return;
@@ -187,7 +229,7 @@ export function fetchPinned(
       settled = true;
       reject(err);
     });
-    if (opts.body) req.write(opts.body);
+    if (opts.body !== undefined) req.write(opts.body);
     req.end();
   }).finally(() => clearTimeout(deadline));
 }

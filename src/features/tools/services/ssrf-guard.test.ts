@@ -24,7 +24,10 @@ interface FakeReqOptions {
 }
 
 let lastReqOptions: FakeReqOptions | null = null;
+let lastReqModule: "http" | "https" | null = null;
+let lastReqBody = "";
 let fakeResponseStatus = 200;
+let fakeResponseHeaders: Record<string, string> = {};
 let fakeResponseChunks: Buffer[] = [];
 let fakeResponseThrows: Error | null = null;
 /** Simulates a webhook that opens the response and then never ends it. */
@@ -32,7 +35,9 @@ let fakeResponseHangs = false;
 
 class FakeRequest extends EventEmitter {
   destroyed = false;
-  write() {}
+  write(chunk: string) {
+    lastReqBody += chunk;
+  }
   end() {}
   destroy(err?: Error) {
     this.destroyed = true;
@@ -40,13 +45,13 @@ class FakeRequest extends EventEmitter {
   }
 }
 
-mock.module("node:https", {
-  exports: {
-    request: (
+function fakeRequest(module: "http" | "https") {
+  return (
       options: FakeReqOptions,
       callback: (res: EventEmitter & { statusCode: number }) => void,
     ) => {
       lastReqOptions = options;
+      lastReqModule = module;
       const req = new FakeRequest();
       queueMicrotask(() => {
         if (fakeResponseThrows) {
@@ -58,6 +63,7 @@ mock.module("node:https", {
           resume: () => void;
         };
         res.statusCode = fakeResponseStatus;
+        (res as unknown as { headers: Record<string, string> }).headers = fakeResponseHeaders;
         res.resume = () => {}; // IncomingMessage.resume() — fetchPinned calls it to drain a redirect body
         callback(res);
         if (fakeResponseHangs) return; // no data, no "end" — the deadline must fire
@@ -65,15 +71,20 @@ mock.module("node:https", {
         res.emit("end");
       });
       return req;
-    },
-  },
-});
+    };
+}
+
+mock.module("node:https", { exports: { request: fakeRequest("https") } });
+mock.module("node:http", { exports: { request: fakeRequest("http") } });
 
 const { validateWebhookUrl, fetchPinned } = await import("./ssrf-guard.ts");
 
 function reset() {
   lastReqOptions = null;
+  lastReqModule = null;
+  lastReqBody = "";
   fakeResponseStatus = 200;
+  fakeResponseHeaders = {};
   fakeResponseChunks = [];
   fakeResponseThrows = null;
   fakeResponseHangs = false;
@@ -123,6 +134,39 @@ test("blocks private/internal IPv4 ranges", async () => {
     const result = await validateWebhookUrl("https://internal.example.com/webhook");
     assert.deepEqual(result, {
       error: `Blocked: ${ip} is a private/internal IP address (SEC-08 anti-SSRF)`,
+    });
+  }
+});
+
+test("allowHttp accepts http:// and still rejects other schemes", async () => {
+  resolve4Impl = async () => ["8.8.8.8"];
+  assert.deepEqual(
+    await validateWebhookUrl("http://public.example.com/", { allowHttp: true }),
+    { error: null, resolvedIp: "8.8.8.8" },
+  );
+  assert.deepEqual(await validateWebhookUrl("ftp://public.example.com/", { allowHttp: true }), {
+    error: "Only http(s) URLs are allowed (SEC-08)",
+  });
+});
+
+test("checks an IPv4 literal directly, including the decimal form, without DNS", async () => {
+  resolve4Impl = async () => {
+    throw new Error("an IP literal must not go through DNS");
+  };
+  for (const url of ["http://127.0.0.1/", "http://2130706433/", "http://0x7f.1/", "https://10.1.2.3/hook"]) {
+    const result = await validateWebhookUrl(url, { allowHttp: true });
+    assert.match(result.error ?? "", /private\/internal IP/, url);
+  }
+  assert.deepEqual(await validateWebhookUrl("https://8.8.4.4/hook"), {
+    error: null,
+    resolvedIp: "8.8.4.4",
+  });
+});
+
+test("rejects IPv6 literals, which the IPv4-only pinning cannot check", async () => {
+  for (const url of ["https://[::1]/hook", "https://[::ffff:127.0.0.1]/hook", "https://[fd00::1]/"]) {
+    assert.deepEqual(await validateWebhookUrl(url), {
+      error: "IPv6 addresses are not supported (SEC-08)",
     });
   }
 });
@@ -227,6 +271,44 @@ test("fetchPinned treats a 3xx response as an empty body without following it", 
 
   assert.equal(result.status, 302);
   assert.equal(result.bodyText, "");
+});
+
+test("fetchPinned hands back the response headers, including a redirect's location", async () => {
+  reset();
+  fakeResponseStatus = 301;
+  fakeResponseHeaders = { location: "https://www.example.com/" };
+  const result = await fetchPinned("https://public.example.com/", "8.8.8.8", {
+    method: "GET",
+    headers: {},
+    timeoutMs: 5000,
+  });
+  assert.equal(result.headers.location, "https://www.example.com/");
+});
+
+test("fetchPinned sends a Content-Length instead of a chunked body", async () => {
+  reset();
+  const body = JSON.stringify({ nota: "café" });
+  await fetchPinned("https://public.example.com/hook", "8.8.8.8", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body,
+    timeoutMs: 5000,
+  });
+  assert.equal(lastReqOptions!.headers["Content-Length"], String(Buffer.byteLength(body)));
+  assert.equal(lastReqBody, body);
+});
+
+test("fetchPinned uses node:http and port 80 for an http:// URL", async () => {
+  reset();
+  fakeResponseChunks = [Buffer.from("hola")];
+  const result = await fetchPinned("http://public.example.com/page", "8.8.8.8", {
+    method: "GET",
+    headers: {},
+    timeoutMs: 5000,
+  });
+  assert.equal(lastReqModule, "http");
+  assert.equal(lastReqOptions!.port, 80);
+  assert.equal(result.bodyText, "hola");
 });
 
 test("fetchPinned truncates the body at maxResponseBytes instead of buffering it all", async () => {
