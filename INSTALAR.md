@@ -20,8 +20,8 @@ super admin y deja el cron corriendo. Tarda ~15 minutos.
 | **OpenRouter** | El modelo de IA (LLM)          | Pago por uso   |
 
 El agente instala lo demás (Node, los CLIs de Supabase y Vercel). Cuando termine,
-te da tu URL de producción: entras con tu super admin, ves un workspace demo y
-puedes onboardear a tu primer cliente.
+te da tu URL de producción: entras con tu super admin al panel de agencia y
+creas tu primer workspace de cliente.
 
 > Si todavía no tienes un agente: instala Claude Code (claude.ai/download), ábrelo
 > en la carpeta de este proyecto, arrastra este archivo al chat y escribe "instálalo".
@@ -207,9 +207,13 @@ su propia integración de YCloud.
 ```bash
 git pull                 # o reemplaza los archivos del proyecto
 npm install
+supabase login           # solo si esta máquina no tiene sesión del CLI
 SUPABASE_DB_PASSWORD='tu-contraseña-de-la-base' node scripts/setup.mjs db-push   # SIEMPRE antes del deploy
 vercel --prod            # redeploy
 ```
+
+Corre las migraciones en un momento de poco tráfico: algunas reconstruyen
+restricciones de tablas grandes (mensajes) y las bloquean unos segundos.
 
 El orden importa: el código nuevo puede depender de funciones o permisos que traen
 las migraciones, así que las migraciones van **antes** de `vercel --prod`.
@@ -228,8 +232,11 @@ seguridad entre workspaces):
    **SQL Editor**, corre esto y revisa cada resultado:
 
    ```sql
-   -- a) Super admins: deben ser SOLO los que tú creaste.
-   SELECT id, email, created_at FROM public.users WHERE is_super_admin;
+   -- a) Super admins: deben ser SOLO los que tú creaste. Fíjate en la columna
+   --    `cuenta` (el email real de login; `perfil` pudo haberse editado).
+   SELECT p.id, a.email AS cuenta, p.email AS perfil, p.created_at
+     FROM public.users p JOIN auth.users a ON a.id = p.id
+    WHERE p.is_super_admin;
 
    -- b) Cuentas que se registraron solas (sin perfil): bórralas en
    --    Authentication → Users si no las reconoces.
@@ -239,33 +246,50 @@ seguridad entre workspaces):
 
    -- c) Admins por workspace, los más recientes primero: busca a alguien que no
    --    diste de alta tú.
-   SELECT w.name AS workspace, u.email, m.role, m.is_active, m.created_at
+   SELECT w.name AS workspace, a.email AS cuenta, m.role, m.is_active, m.created_at
      FROM public.memberships m
-     JOIN public.users u ON u.id = m.user_id
+     JOIN auth.users a ON a.id = m.user_id
      JOIN public.workspaces w ON w.id = m.workspace_id
     WHERE m.role = 'admin' ORDER BY m.created_at DESC;
 
    -- d) Perfiles cuyo email no coincide con su cuenta real.
    SELECT p.id, p.email AS perfil, a.email AS cuenta
      FROM public.users p JOIN auth.users a ON a.id = p.id
-    WHERE p.email <> a.email;
+    WHERE lower(p.email) <> lower(a.email);
    ```
 
-   Si `db-push` avisó `WARNING: ... existing rows point at another workspace`,
-   hay filas que apuntan a datos de otro workspace. Encuéntralas con:
+   Si `db-push` avisó `WARNING: ... point at another workspace`, hay filas que
+   apuntan a datos de otro workspace. Encuéntralas con:
 
    ```sql
-   SELECT 'messages' AS tabla, m.id FROM public.messages m
-     JOIN public.conversations c ON c.id = m.conversation_id
-    WHERE c.workspace_id <> m.workspace_id
-   UNION ALL
-   SELECT 'message_batches', b.id FROM public.message_batches b
-     JOIN public.conversations c ON c.id = b.conversation_id
-    WHERE c.workspace_id <> b.workspace_id
-   UNION ALL
-   SELECT 'conversations', c.id FROM public.conversations c
-     JOIN public.contacts ct ON ct.id = c.contact_id
-    WHERE ct.workspace_id <> c.workspace_id;
+   SELECT 'messages.conversation_id' AS relacion, x.id FROM public.messages x JOIN public.conversations r ON r.id = x.conversation_id WHERE r.workspace_id <> x.workspace_id
+   UNION ALL SELECT 'messages.batch_id', x.id FROM public.messages x JOIN public.message_batches r ON r.id = x.batch_id WHERE r.workspace_id <> x.workspace_id
+   UNION ALL SELECT 'messages.template_id', x.id FROM public.messages x JOIN public.templates r ON r.id = x.template_id WHERE r.workspace_id <> x.workspace_id
+   UNION ALL SELECT 'message_batches.conversation_id', x.id FROM public.message_batches x JOIN public.conversations r ON r.id = x.conversation_id WHERE r.workspace_id <> x.workspace_id
+   UNION ALL SELECT 'events.conversation_id', x.id FROM public.events x JOIN public.conversations r ON r.id = x.conversation_id WHERE r.workspace_id <> x.workspace_id
+   UNION ALL SELECT 'conversations.contact_id', x.id FROM public.conversations x JOIN public.contacts r ON r.id = x.contact_id WHERE r.workspace_id <> x.workspace_id
+   UNION ALL SELECT 'appointments.contact_id', x.id FROM public.appointments x JOIN public.contacts r ON r.id = x.contact_id WHERE r.workspace_id <> x.workspace_id
+   UNION ALL SELECT 'appointments.conversation_id', x.id FROM public.appointments x JOIN public.conversations r ON r.id = x.conversation_id WHERE r.workspace_id <> x.workspace_id
+   UNION ALL SELECT 'appointments.schedule_id', x.id FROM public.appointments x JOIN public.schedules r ON r.id = x.schedule_id WHERE r.workspace_id <> x.workspace_id
+   UNION ALL SELECT 'kb_chunks.document_id', x.id FROM public.kb_chunks x JOIN public.kb_documents r ON r.id = x.document_id WHERE r.workspace_id <> x.workspace_id
+   UNION ALL SELECT 'agents.prompt_id', x.id FROM public.agents x JOIN public.prompts r ON r.id = x.prompt_id WHERE r.workspace_id <> x.workspace_id
+   UNION ALL SELECT 'prompts.active_version_id', x.id FROM public.prompts x JOIN public.prompt_versions r ON r.id = x.active_version_id WHERE r.workspace_id <> x.workspace_id
+   UNION ALL SELECT 'prompt_versions.prompt_id', x.id FROM public.prompt_versions x JOIN public.prompts r ON r.id = x.prompt_id WHERE r.workspace_id <> x.workspace_id;
+   ```
+
+   Bórralas (o corrígelas) y después vuelve a validar las restricciones para
+   que cubran también las filas viejas:
+
+   ```sql
+   DO $$
+   DECLARE r record;
+   BEGIN
+     FOR r IN SELECT conrelid::regclass AS t, conname FROM pg_constraint
+               WHERE conname LIKE 'fk\_%\_same\_workspace' AND NOT convalidated LOOP
+       EXECUTE format('ALTER TABLE %s VALIDATE CONSTRAINT %I', r.t, r.conname);
+     END LOOP;
+   END
+   $$;
    ```
 
    Quita el flag con `UPDATE public.users SET is_super_admin = false WHERE id = '...'`,
