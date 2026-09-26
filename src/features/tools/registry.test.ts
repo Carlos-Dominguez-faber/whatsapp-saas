@@ -84,3 +84,49 @@ test("retries a non-write tool up to the configured retry count (pre-existing be
     globalThis.fetch = originalFetch;
   }
 });
+
+test("onStart runs before the tool, and its callId pairs it with onExecuted", async () => {
+  const seen: string[] = [];
+  let startId = "";
+  registry.register({
+    name: "test_write_ok",
+    description: "test tool",
+    sensitivity: "write",
+    schema: z.object({}),
+    enabledFor: () => true,
+    run: async () => {
+      seen.push("run");
+      return { ok: true, output: null };
+    },
+  });
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () => new Response(null, { status: 204 })) as typeof fetch;
+  try {
+    await registry.run("test_write_ok", {}, ctx, {
+      onStart: (s) => {
+        seen.push(`start:${s.sensitivity}`);
+        startId = s.callId;
+      },
+      onExecuted: (e) => {
+        seen.push(`executed:${e.ok}`);
+        assert.equal(e.callId, startId);
+      },
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  assert.deepEqual(seen, ["start:write", "run", "executed:true"]);
+});
+
+test("a tool whose onStart throws never runs, and run() rejects with that error", async () => {
+  const { callCount } = registerFailingTool("test_write_unrecorded", "write", 0);
+  await assert.rejects(
+    registry.run("test_write_unrecorded", {}, ctx, {
+      onStart: () => {
+        throw new Error("could not record the write");
+      },
+    }),
+    /could not record the write/,
+  );
+  assert.equal(callCount(), 0);
+});
