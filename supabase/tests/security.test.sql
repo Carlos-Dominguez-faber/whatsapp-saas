@@ -8,7 +8,7 @@ BEGIN;
 CREATE EXTENSION IF NOT EXISTS pgtap WITH SCHEMA extensions;
 SET search_path = public, extensions;
 
-SELECT plan(51);
+SELECT plan(75);
 
 -- ── public.users: read-only for sessions ────────────────────────────────────
 SELECT ok(NOT has_table_privilege('authenticated', 'public.users', 'UPDATE'),
@@ -47,6 +47,26 @@ SELECT ok(has_function_privilege('service_role',
   'public.save_whatsapp_integration(uuid, public.integration_provider, boolean, jsonb, jsonb, text[])', 'EXECUTE'),
   'service_role can execute save_whatsapp_integration()');
 
+-- ── LLM budget functions: service role only ─────────────────────────────────
+SELECT ok(NOT has_function_privilege('anon', 'public.reserve_llm_turn(uuid, text, integer)', 'EXECUTE'),
+  'anon cannot execute reserve_llm_turn()');
+SELECT ok(NOT has_function_privilege('authenticated', 'public.reserve_llm_turn(uuid, text, integer)', 'EXECUTE'),
+  'authenticated cannot execute reserve_llm_turn()');
+SELECT ok(has_function_privilege('service_role', 'public.reserve_llm_turn(uuid, text, integer)', 'EXECUTE'),
+  'service_role can execute reserve_llm_turn()');
+SELECT ok(NOT has_function_privilege('anon', 'public.sum_daily_llm_tokens(uuid, timestamptz)', 'EXECUTE'),
+  'anon cannot execute sum_daily_llm_tokens()');
+SELECT ok(NOT has_function_privilege('authenticated', 'public.sum_daily_llm_tokens(uuid, timestamptz)', 'EXECUTE'),
+  'authenticated cannot execute sum_daily_llm_tokens()');
+SELECT ok(has_function_privilege('service_role', 'public.sum_daily_llm_tokens(uuid, timestamptz)', 'EXECUTE'),
+  'service_role can execute sum_daily_llm_tokens()');
+SELECT ok(NOT has_function_privilege('anon', 'public.reserve_workspace_llm_call(uuid, text, integer)', 'EXECUTE'),
+  'anon cannot execute reserve_workspace_llm_call()');
+SELECT ok(NOT has_function_privilege('authenticated', 'public.reserve_workspace_llm_call(uuid, text, integer)', 'EXECUTE'),
+  'authenticated cannot execute reserve_workspace_llm_call()');
+SELECT ok(has_function_privilege('service_role', 'public.reserve_workspace_llm_call(uuid, text, integer)', 'EXECUTE'),
+  'service_role can execute reserve_workspace_llm_call()');
+
 -- ── message_batches: written by the service-role pipeline only ──────────────
 SELECT ok(NOT has_table_privilege('authenticated', 'public.message_batches', 'INSERT'),
   'authenticated cannot INSERT message_batches');
@@ -82,6 +102,35 @@ INSERT INTO public.prompts (id, workspace_id, name, scope) VALUES
 INSERT INTO public.prompt_versions (id, workspace_id, prompt_id, version, body) VALUES
   ('b0000000-0000-4000-8000-0000000000f2', 'b0000000-0000-4000-8000-000000000001',
    'b0000000-0000-4000-8000-0000000000f1', 1, 'B secret prompt');
+
+-- ── LLM budget functions: behavior ───────────────────────────────────────────
+SELECT is((SELECT allowed FROM public.reserve_llm_turn('a0000000-0000-4000-8000-000000000001', 'contact-x', 2)),
+  true, 'reserve_llm_turn allows the first turn under the hourly limit');
+SELECT is((SELECT allowed FROM public.reserve_llm_turn('a0000000-0000-4000-8000-000000000001', 'contact-x', 2)),
+  true, 'reserve_llm_turn allows the turn that reaches the limit');
+SELECT is((SELECT allowed FROM public.reserve_llm_turn('a0000000-0000-4000-8000-000000000001', 'contact-x', 2)),
+  false, 'reserve_llm_turn denies once the contact is at the hourly limit');
+SELECT throws_ok(
+  $$SELECT * FROM public.reserve_workspace_llm_call('a0000000-0000-4000-8000-000000000001', 'llm_usage', 5)$$,
+  '22023', NULL,
+  'reserve_workspace_llm_call refuses a type other than the manager tools');
+SELECT is((SELECT allowed FROM public.reserve_workspace_llm_call('a0000000-0000-4000-8000-000000000001', 'template_generate', 1)),
+  true, 'reserve_workspace_llm_call allows a draft under the hourly limit');
+SELECT is((SELECT allowed FROM public.reserve_workspace_llm_call('a0000000-0000-4000-8000-000000000001', 'template_generate', 1)),
+  false, 'reserve_workspace_llm_call denies once the workspace is at the hourly limit');
+INSERT INTO public.events (workspace_id, type, payload) VALUES
+  ('b0000000-0000-4000-8000-000000000001', 'llm_usage', '{"total_tokens": 100}'),
+  ('b0000000-0000-4000-8000-000000000001', 'template_generate', '{"total_tokens": 20}'),
+  ('b0000000-0000-4000-8000-000000000001', 'agent_test_chat', '{"total_tokens": 3}'),
+  ('b0000000-0000-4000-8000-000000000001', 'cost_alert', '{"total_tokens": 1000}'),
+  ('a0000000-0000-4000-8000-000000000001', 'llm_usage', '{"total_tokens": 5000}');
+SELECT is(public.sum_daily_llm_tokens('b0000000-0000-4000-8000-000000000001', now() - interval '1 day'),
+  123::bigint, 'sum_daily_llm_tokens adds agent turns, template drafts and playground calls of one workspace');
+INSERT INTO public.events (workspace_id, type, payload) VALUES
+  ('b0000000-0000-4000-8000-000000000001', 'llm_usage', '{"total_tokens": "99999999999999999999999"}'),
+  ('b0000000-0000-4000-8000-000000000001', 'llm_usage', '{"total_tokens": "-5"}');
+SELECT is(public.sum_daily_llm_tokens('b0000000-0000-4000-8000-000000000001', now() - interval '1 day'),
+  123::bigint, 'sum_daily_llm_tokens ignores a total_tokens that would overflow bigint instead of failing');
 
 -- ── cross-workspace references are rejected ─────────────────────────────────
 SELECT throws_ok(
@@ -236,6 +285,42 @@ SELECT isnt_empty(
 SELECT is_empty(
   $$SELECT 1 FROM public.users WHERE email = 'sec-b@test.local'$$,
   'a user cannot read the users of a workspace they do not belong to');
+RESET ROLE;
+
+-- ── sessions cannot write the events the budget reads ───────────────────────
+-- Even an admin of the workspace: the type check does not depend on the role,
+-- so what an admin cannot insert, an agent cannot either.
+SET LOCAL ROLE authenticated;
+SELECT set_config('request.jwt.claims',
+  '{"sub":"b0000000-0000-4000-8000-0000000000e1","role":"authenticated"}', true);
+SELECT throws_ok(
+  $$INSERT INTO public.events (workspace_id, type, payload)
+    VALUES ('b0000000-0000-4000-8000-000000000001', 'llm_usage', '{"total_tokens": 999999}')$$,
+  '42501', NULL, 'a session cannot insert llm_usage (fake spend that cuts the agent off)');
+SELECT throws_ok(
+  $$INSERT INTO public.events (workspace_id, type, payload)
+    VALUES ('b0000000-0000-4000-8000-000000000001', 'template_generate', '{}')$$,
+  '42501', NULL, 'a session cannot insert template_generate');
+SELECT throws_ok(
+  $$INSERT INTO public.events (workspace_id, type, payload)
+    VALUES ('b0000000-0000-4000-8000-000000000001', 'agent_test_chat', '{}')$$,
+  '42501', NULL, 'a session cannot insert agent_test_chat');
+SELECT throws_ok(
+  $$INSERT INTO public.events (workspace_id, type, payload)
+    VALUES ('b0000000-0000-4000-8000-000000000001', 'cost_cut', '{}')$$,
+  '42501', NULL, 'a session cannot pre-empt the daily cost_cut event');
+SELECT throws_ok(
+  $$INSERT INTO public.events (workspace_id, type, payload)
+    VALUES ('b0000000-0000-4000-8000-000000000001', 'cost_alert', '{}')$$,
+  '42501', NULL, 'a session cannot pre-empt the daily cost_alert event');
+SELECT throws_ok(
+  $$INSERT INTO public.events (workspace_id, type, payload)
+    VALUES ('b0000000-0000-4000-8000-000000000001', 'model_outside_catalog', '{}')$$,
+  '42501', NULL, 'a session cannot pre-empt the daily model_outside_catalog event');
+SELECT lives_ok(
+  $$INSERT INTO public.events (workspace_id, type, payload)
+    VALUES ('b0000000-0000-4000-8000-000000000001', 'note_viewed', '{}')$$,
+  'a session still inserts other event types in its workspace');
 RESET ROLE;
 
 SELECT * FROM finish();

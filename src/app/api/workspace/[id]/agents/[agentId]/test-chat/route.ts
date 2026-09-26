@@ -24,11 +24,19 @@ import {
 } from "@/features/inbox/services/business-info";
 import { getEnabledTools } from "@/features/tools/services/tool-configs";
 import type { AgentConfig } from "@/features/agents/types";
+import { isCatalogModel } from "@/features/agents/lib/model-catalog";
+import { guardWorkspaceLlmCall } from "@/features/inbox/services/llm-call-guard";
+import { recordWorkspaceLlmCall } from "@/features/inbox/services/cost-tracker";
+import { enforceModelPolicy } from "@/features/inbox/services/model-policy";
 
 // POST /api/workspace/[id]/agents/[agentId]/test-chat
 // In-UI playground: replies with the agent's model + (draft or published) prompt
 // WITHOUT sending WhatsApp or persisting a conversation. Token cost is logged to
-// `events` (type='agent_test_chat'), never to recordLlmUsage.
+// `events` (type='agent_test_chat'), never to recordLlmUsage; those rows count
+// toward the workspace's daily budget and an hourly cap.
+
+// The whole conversation the playground may send in one request.
+const MAX_TOTAL_CHARS = 40_000;
 
 const Schema = z.object({
   messages: z
@@ -41,7 +49,11 @@ const Schema = z.object({
     .min(1)
     .max(20),
   draftPromptBody: z.string().max(50_000).optional(),
-  modelOverride: z.string().max(120).optional(),
+  // Only the curated catalog: the playground spends the workspace's key.
+  modelOverride: z
+    .string()
+    .refine((id) => isCatalogModel(id), "Modelo no permitido")
+    .optional(),
 });
 
 function svc() {
@@ -85,6 +97,17 @@ export async function POST(
     );
   }
 
+  const totalChars = parsed.data.messages.reduce(
+    (sum, m) => sum + m.content.length,
+    0,
+  );
+  if (totalChars > MAX_TOTAL_CHARS) {
+    return NextResponse.json(
+      { error: "La conversación de prueba es demasiado larga. Reiníciala." },
+      { status: 400 },
+    );
+  }
+
   const db = svc();
 
   // Load the agent and defend against IDOR (workspace mismatch).
@@ -100,11 +123,33 @@ export async function POST(
     );
   }
 
-  // Resolve model + system prompt.
-  const model =
+  // Resolve model + system prompt. The playground spends the workspace's key,
+  // so an agent model outside the catalog is refused here (production turns
+  // keep using it). The workspace default is validated when it is saved.
+  const agentModel = agent.model as string | null;
+  if (!parsed.data.modelOverride && agentModel && !isCatalogModel(agentModel)) {
+    return NextResponse.json(
+      {
+        error: `El modelo de este agente (${agentModel}) ya no está en el catálogo. Elige uno del catálogo para probarlo.`,
+      },
+      { status: 400 },
+    );
+  }
+  // The resolved model also goes through the runtime policy: on the platform
+  // key a workspace default outside the catalog (a legacy config.model, or a
+  // direct write) is swapped for the platform default.
+  const model = await enforceModelPolicy(
+    db,
+    workspaceId,
     parsed.data.modelOverride ??
-    (agent.model as string | null) ??
-    (await getWorkspaceModel(workspaceId));
+      agentModel ??
+      (await getWorkspaceModel(workspaceId)),
+    "agent_test_chat",
+  );
+
+  // Budget and hourly cap before anything that spends, KB embeddings included.
+  const guard = await guardWorkspaceLlmCall(workspaceId, "agent_test_chat");
+  if (!guard.ok) return guard.response;
 
   let promptBody = parsed.data.draftPromptBody;
   let guardrails: PromptGuardrails | null = null;
@@ -179,23 +224,17 @@ export async function POST(
       },
     });
 
-    // Best-effort observability — never blocks the response.
-    void db
-      .from("events")
-      .insert({
-        workspace_id: workspaceId,
-        type: "agent_test_chat",
-        payload: {
-          agent_id: agentId,
-          model,
-          input_tokens: reply.promptTokens,
-          output_tokens: reply.completionTokens,
-        },
-      })
-      .then(
-        () => undefined,
-        () => undefined,
-      );
+    // Fills in the reserved row; its total_tokens counts toward the daily
+    // budget. Never throws.
+    await recordWorkspaceLlmCall({
+      reservationId: guard.reservationId,
+      workspaceId,
+      type: "agent_test_chat",
+      model,
+      promptTokens: reply.promptTokens,
+      completionTokens: reply.completionTokens,
+      extra: { agent_id: agentId },
+    });
 
     return NextResponse.json({
       text: reply.text,

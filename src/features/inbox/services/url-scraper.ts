@@ -6,25 +6,15 @@
  * entities. Good enough for most marketing/info pages; can be upgraded later.
  */
 
+import {
+  fetchPinnedFollowingRedirects,
+  RedirectRefusedError,
+} from "@/features/tools/services/ssrf-guard";
+
 const FETCH_TIMEOUT_MS = 15_000;
 const MAX_TEXT_LENGTH = 200_000;
-
-/** Basic SSRF guard: refuse localhost / private network hosts. */
-function isBlockedHost(hostname: string): boolean {
-  const host = hostname.toLowerCase();
-  return (
-    host === "localhost" ||
-    host === "0.0.0.0" ||
-    host === "::1" ||
-    host.endsWith(".local") ||
-    host.endsWith(".internal") ||
-    /^127\./.test(host) ||
-    /^10\./.test(host) ||
-    /^192\.168\./.test(host) ||
-    /^169\.254\./.test(host) ||
-    /^172\.(1[6-9]|2\d|3[01])\./.test(host)
-  );
-}
+const MAX_HTML_BYTES = 2_000_000;
+const MAX_REDIRECTS = 3;
 
 function decodeEntities(s: string): string {
   return s
@@ -74,6 +64,13 @@ export function htmlToText(html: string): string {
 /**
  * Downloads `rawUrl` and returns its readable text. Throws a user-friendly
  * Error on invalid/blocked URLs, non-HTML responses, or fetch failures.
+ *
+ * Every hop — the URL itself and each redirect (at most 3) — is resolved and
+ * checked against private/internal ranges, then fetched over a connection
+ * pinned to that checked address (fetchPinnedFollowingRedirects), so neither
+ * a redirect nor a DNS answer that changes between the check and the request
+ * can reach the internal network. Compressed bodies are decoded, and the
+ * 2 MB cap applies after decoding. The whole exchange shares one deadline.
  */
 export async function fetchUrlText(rawUrl: string): Promise<string> {
   let url: URL;
@@ -82,50 +79,71 @@ export async function fetchUrlText(rawUrl: string): Promise<string> {
   } catch {
     throw new Error("URL inválida");
   }
-
   if (url.protocol !== "http:" && url.protocol !== "https:") {
     throw new Error("Solo se permiten URLs http(s)");
   }
-  if (isBlockedHost(url.hostname)) {
-    throw new Error("URL no permitida");
-  }
 
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
-  let html: string;
+  let res;
   try {
-    const res = await fetch(url.toString(), {
-      signal: controller.signal,
-      redirect: "follow",
+    res = await fetchPinnedFollowingRedirects(url.toString(), {
+      allowHttp: true,
+      maxRedirects: MAX_REDIRECTS,
+      method: "GET",
       headers: {
         "User-Agent": "Mozilla/5.0 (compatible; AgenteWA-KB/1.0)",
         Accept: "text/html,application/xhtml+xml,text/plain",
+        // deflate is left out: servers disagree on its framing (zlib or raw).
+        "Accept-Encoding": "gzip, br",
       },
+      timeoutMs: FETCH_TIMEOUT_MS,
+      maxResponseBytes: MAX_HTML_BYTES,
+      decompress: true,
     });
-    if (!res.ok) {
-      throw new Error(`La página respondió ${res.status}`);
-    }
-    const contentType = res.headers.get("content-type") ?? "";
-    if (
-      !contentType.includes("text/html") &&
-      !contentType.includes("text/plain") &&
-      !contentType.includes("application/xhtml")
-    ) {
-      throw new Error("La URL no devolvió una página de texto/HTML");
-    }
-    html = await res.text();
   } catch (err) {
-    if (err instanceof Error && err.name === "AbortError") {
-      throw new Error("La página tardó demasiado en responder");
-    }
-    throw err instanceof Error ? err : new Error("No se pudo descargar la URL");
-  } finally {
-    clearTimeout(timeout);
+    throw new Error(scrapeErrorMessage(err));
   }
 
-  const text = htmlToText(html);
+  if (res.status < 200 || res.status >= 300) {
+    throw new Error(`La página respondió ${res.status}`);
+  }
+  const contentType = String(res.headers["content-type"] ?? "");
+  if (
+    !contentType.includes("text/html") &&
+    !contentType.includes("text/plain") &&
+    !contentType.includes("application/xhtml")
+  ) {
+    throw new Error("La URL no devolvió una página de texto/HTML");
+  }
+
+  const text = htmlToText(res.bodyText);
   if (text.length < 20) {
     throw new Error("No se pudo extraer contenido legible de la URL");
   }
   return text;
+}
+
+/** Turns a fetch failure into the message the KB form shows. */
+function scrapeErrorMessage(err: unknown): string {
+  const message = err instanceof Error ? err.message : "";
+  if (err instanceof RedirectRefusedError) {
+    if (message === "Cannot resolve hostname") {
+      // Also what an IPv6-only site gets: only A records are looked up.
+      return "No se encontró el dominio de la URL (o solo tiene IPv6, que no se admite)";
+    }
+    if (message.startsWith("Too many redirects")) {
+      return "La página redirige demasiadas veces";
+    }
+    if (message === "Invalid redirect location") {
+      return "La página redirige a una URL inválida";
+    }
+    return "URL no permitida";
+  }
+  if (message === "Tool timeout") return "La página tardó demasiado en responder";
+  if (
+    message.startsWith("Unsupported content-encoding") ||
+    message.startsWith("Unreadable compressed body")
+  ) {
+    return "La página respondió en un formato comprimido que no se puede leer";
+  }
+  return "No se pudo descargar la URL";
 }

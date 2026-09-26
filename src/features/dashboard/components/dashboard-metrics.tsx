@@ -139,11 +139,13 @@ export function DashboardMetrics({
           value={metrics.handoffPending.toLocaleString("es")}
           icon={<AlertCircle className="h-4 w-4" aria-hidden="true" />}
         />
-        <KpiCard
-          label="Costo LLM esta semana"
-          value={formatCost(metrics.llmCostWeekUsd)}
-          icon={<DollarSign className="h-4 w-4" aria-hidden="true" />}
-        />
+        {metrics.llmCostWeekUsd !== null && (
+          <KpiCard
+            label="Costo LLM esta semana"
+            value={formatCost(metrics.llmCostWeekUsd)}
+            icon={<DollarSign className="h-4 w-4" aria-hidden="true" />}
+          />
+        )}
         <KpiCard
           label="Templates enviados (semana)"
           value={metrics.templatesSentWeek.toLocaleString("es")}

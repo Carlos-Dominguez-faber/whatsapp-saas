@@ -92,7 +92,16 @@ export async function getOpenRouterApiKey(
 ): Promise<string> {
   const envKey = process.env.OPENROUTER_API_KEY ?? "";
   if (!workspaceId) return envKey;
+  return (await readWorkspaceOpenRouterKey(workspaceId)) ?? envKey;
+}
 
+/**
+ * The workspace's own OpenRouter key, or null when its calls run on the
+ * platform (agency) key from OPENROUTER_API_KEY.
+ */
+export async function readWorkspaceOpenRouterKey(
+  workspaceId: string,
+): Promise<string | null> {
   try {
     const db = svcClient(
       process.env.NEXT_PUBLIC_SUPABASE_URL!,
@@ -113,9 +122,9 @@ export async function getOpenRouterApiKey(
     const key = creds.openrouter_api_key;
     if (typeof key === "string" && key.length > 0) return key;
   } catch {
-    // Non-fatal — fall through to env key
+    // Non-fatal — the caller falls back to the platform key
   }
-  return envKey;
+  return null;
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -173,9 +182,10 @@ export async function generateReply(
     maxOutputTokens: 1024,
   });
 
-  // AI SDK v6 exposes inputTokens / outputTokens; map to stable naming
-  const promptTokens = result.usage?.inputTokens ?? 0;
-  const completionTokens = result.usage?.outputTokens ?? 0;
+  // AI SDK v6 exposes inputTokens / outputTokens; map to stable naming.
+  // totalUsage sums every step (usage is the last step only).
+  const promptTokens = result.totalUsage?.inputTokens ?? 0;
+  const completionTokens = result.totalUsage?.outputTokens ?? 0;
 
   return {
     text: result.text,
@@ -247,10 +257,12 @@ export async function generateChatReply(params: {
     }),
   );
 
+  // totalUsage, not usage: with tools the model runs up to 5 steps, and usage
+  // only reports the last one.
   return {
     text: result.text,
-    promptTokens: result.usage?.inputTokens ?? 0,
-    completionTokens: result.usage?.outputTokens ?? 0,
+    promptTokens: result.totalUsage?.inputTokens ?? 0,
+    completionTokens: result.totalUsage?.outputTokens ?? 0,
   };
 }
 
@@ -333,10 +345,12 @@ export async function generateWithTools(
     maxOutputTokens: 1024,
   });
 
+  // totalUsage, not usage: a tool turn runs up to 5 steps, and usage only
+  // reports the last one — the budget would see a fraction of the real spend.
   return {
     text: result.text,
-    inputTokens: result.usage?.inputTokens ?? 0,
-    outputTokens: result.usage?.outputTokens ?? 0,
+    inputTokens: result.totalUsage?.inputTokens ?? 0,
+    outputTokens: result.totalUsage?.outputTokens ?? 0,
     toolCallsExecuted: result.steps?.length ?? 0,
   };
 }

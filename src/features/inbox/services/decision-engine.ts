@@ -8,7 +8,7 @@ import {
   detectsHandoffTrigger,
   type ConversationState,
 } from "./state-machine";
-import { checkRateLimits } from "./cost-tracker";
+import { reserveLlmTurn } from "./cost-tracker";
 import { getEnabledTools } from "@/features/tools/services/tool-configs";
 import type { Tool } from "@/features/tools/core/tool";
 
@@ -25,6 +25,7 @@ export interface DecisionResult {
   decision: Decision;
   reason: string;
   availableTools?: Tool[];
+  reservationId?: string;
 }
 
 /**
@@ -34,14 +35,20 @@ export interface DecisionResult {
  *   1. Load conversation state from DB
  *   2. If state !== 'ai_active' → abstain
  *   3. detectsHandoffTrigger → if true, transition to handoff_pending and log
- *   4. checkRateLimits → if exceeded, return rate_limited
- *   5. → respond
+ *   4. load the enabled tools
+ *   5. reserveLlmTurn (last: nothing may throw after it) → if exceeded,
+ *      return rate_limited; otherwise respond
  */
 export async function decide(opts: {
   workspaceId: string;
   conversationId: string;
   mergedText: string;
   contactId: string;
+  /**
+   * The turn slot an earlier attempt of the same batch already reserved. A
+   * retry reuses it instead of spending a second slot of the hourly limit.
+   */
+  reservationId?: string;
 }): Promise<DecisionResult> {
   const { workspaceId, conversationId, mergedText, contactId } = opts;
   const supabase = svc();
@@ -67,31 +74,36 @@ export async function decide(opts: {
 
   // 3. Detect handoff trigger in message text
   if (detectsHandoffTrigger(mergedText)) {
-    // This used to UPDATE the row inline, which meant the most common handoff
-    // path — the contact asking for a human — skipped applyTransition() and
-    // therefore every side effect hanging off it. Route it through the same
-    // function as the other two paths.
+    // Route through the single choke point for state changes so every side
+    // effect of entering handoff_pending (event log, contact notification)
+    // fires. This no longer swallows the error: if it throws, decide()
+    // propagates it instead of reporting a successful handoff that never
+    // happened. processNextBatch() (buffer.ts) already retries transient
+    // failures with backoff and dead-letters after MAX_BATCH_RETRIES — that
+    // is the correct place for this to be handled, not a second bespoke
+    // retry here.
     if (canTransition(currentState, "handoff_pending")) {
-      try {
-        await applyTransition(conversationId, "handoff_pending", {
-          trigger: "keyword",
-        });
-      } catch (err) {
-        console.error(
-          "[decision-engine] failed to transition to handoff_pending:",
-          err,
-        );
-      }
+      await applyTransition(conversationId, "handoff_pending", {
+        trigger: "keyword",
+      });
     }
 
     return { decision: "handoff", reason: "handoff_trigger" };
   }
 
-  // 4. Rate limit check
-  const { allowed, reason: rateLimitReason } = await checkRateLimits(
-    workspaceId,
-    contactId,
-  );
+  // 4. Load the enabled tools first: once a turn slot is reserved nothing in
+  // here may throw, or the slot would be spent with no one holding its id.
+  const availableTools = await getEnabledTools(workspaceId);
+
+  // 5. Rate limit check — atomically reserves a turn slot so two concurrent
+  // batches for the same contact can't both pass. A retry keeps its slot.
+  const {
+    allowed,
+    reason: rateLimitReason,
+    reservationId,
+  } = opts.reservationId
+    ? { allowed: true, reason: undefined, reservationId: opts.reservationId }
+    : await reserveLlmTurn(workspaceId, contactId);
 
   if (!allowed) {
     return {
@@ -100,9 +112,7 @@ export async function decide(opts: {
     };
   }
 
-  // 5. All checks passed — load enabled tools and respond
-  const availableTools = await getEnabledTools(workspaceId);
-  return { decision: "respond", reason: "normal", availableTools };
+  return { decision: "respond", reason: "normal", availableTools, reservationId };
 }
 
 export interface TransitionOptions {

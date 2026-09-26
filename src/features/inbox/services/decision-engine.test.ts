@@ -4,8 +4,8 @@ import { test, mock } from "node:test";
 process.env.NEXT_PUBLIC_SUPABASE_URL = "https://fake.supabase.co";
 process.env.SUPABASE_SERVICE_ROLE_KEY = "fake-service-key";
 
-// applyTransition() tests, ported from 14aefa2 (PR #8) together with the
-// workspace scope they cover. decide() is exercised by the route tests.
+// decide() and applyTransition() tests, ported from 14aefa2 (PR #8) together
+// with the workspace scope they cover.
 
 interface QueueEntry {
   data?: unknown;
@@ -63,11 +63,27 @@ const fakeClient = {
 mock.module("@supabase/supabase-js", {
   exports: { createClient: () => fakeClient },
 });
+let rateLimitResult: { allowed: boolean; reason?: string; reservationId?: string } = {
+  allowed: true,
+};
+let reserveCalls = 0;
 mock.module("./cost-tracker.ts", {
-  exports: { checkRateLimits: async () => ({ allowed: true }) },
+  exports: {
+    reserveLlmTurn: async () => {
+      reserveCalls++;
+      return rateLimitResult;
+    },
+  },
 });
+let enabledTools: unknown[] = [];
+let enabledToolsError: Error | null = null;
 mock.module("@/features/tools/services/tool-configs.ts", {
-  exports: { getEnabledTools: async () => [] },
+  exports: {
+    getEnabledTools: async () => {
+      if (enabledToolsError) throw enabledToolsError;
+      return enabledTools;
+    },
+  },
 });
 
 const notifyCalls: unknown[] = [];
@@ -81,7 +97,7 @@ mock.module("./handoff-notifier.ts", {
   },
 });
 
-const { applyTransition } = await import("./decision-engine.ts");
+const { decide, applyTransition } = await import("./decision-engine.ts");
 
 const FOUND = { data: { state: "ai_active", workspace_id: "ws_1" }, error: null };
 
@@ -92,7 +108,100 @@ function reset(queue: QueueEntry[] = [FOUND, { error: null }, { error: null }]) 
   inserts = [];
   notifyCalls.length = 0;
   notifyShouldReject = false;
+  rateLimitResult = { allowed: true };
+  reserveCalls = 0;
+  enabledTools = [];
+  enabledToolsError = null;
 }
+
+const DECIDE = {
+  workspaceId: "ws_1",
+  conversationId: "conv_1",
+  mergedText: "hola, tengo una consulta",
+  contactId: "contact_1",
+};
+
+// ── decide() ────────────────────────────────────────────────────────────
+
+test("decide abstains when the conversation lookup fails", async () => {
+  reset([{ data: null, error: { message: "not found" } }]);
+  const result = await decide({ ...DECIDE, conversationId: "conv_missing" });
+  assert.deepEqual(result, { decision: "abstain", reason: "conversation_not_found" });
+});
+
+test("decide abstains when the conversation is not in ai_active state", async () => {
+  reset([{ data: { state: "paused" }, error: null }]);
+  const result = await decide(DECIDE);
+  assert.deepEqual(result, { decision: "abstain", reason: "state:paused" });
+});
+
+test("decide moves a handoff phrase to handoff_pending and returns 'handoff'", async () => {
+  reset([{ data: { state: "ai_active" }, error: null }, FOUND, { error: null }, { error: null }]);
+  const result = await decide({ ...DECIDE, mergedText: "quiero hablar con un humano" });
+  assert.deepEqual(result, { decision: "handoff", reason: "handoff_trigger" });
+  assert.equal(updates.length, 1);
+  assert.equal((updates[0].row as { state: string }).state, "handoff_pending");
+  assert.deepEqual(notifyCalls, [
+    { workspaceId: "ws_1", conversationId: "conv_1", trigger: "keyword" },
+  ]);
+});
+
+test("decide rejects when the transition itself fails, instead of reporting a handoff", async () => {
+  reset([{ data: { state: "ai_active" }, error: null }, { data: null, error: { message: "boom" } }]);
+  await assert.rejects(
+    () => decide({ ...DECIDE, mergedText: "necesito hablar con alguien" }),
+    /conversation not found: boom/,
+  );
+});
+
+test("decide still returns 'handoff' when only the notification fails", async () => {
+  reset([{ data: { state: "ai_active" }, error: null }, FOUND, { error: null }, { error: null }]);
+  notifyShouldReject = true;
+  const result = await decide({ ...DECIDE, mergedText: "quiero hablar con un humano" });
+  assert.deepEqual(result, { decision: "handoff", reason: "handoff_trigger" });
+  assert.equal(notifyCalls.length, 1);
+});
+
+test("decide returns 'rate_limited' when reserveLlmTurn denies", async () => {
+  reset([{ data: { state: "ai_active" }, error: null }]);
+  rateLimitResult = { allowed: false, reason: "rate_limit_contact_hour" };
+  const result = await decide(DECIDE);
+  assert.deepEqual(result, { decision: "rate_limited", reason: "rate_limit_contact_hour" });
+});
+
+test("decide returns 'respond' with the enabled tools and the reservationId", async () => {
+  reset([{ data: { state: "ai_active" }, error: null }]);
+  const fakeTool = { name: "check_availability" } as never;
+  enabledTools = [fakeTool];
+  rateLimitResult = { allowed: true, reservationId: "res_1" };
+  const result = await decide(DECIDE);
+  assert.deepEqual(result, {
+    decision: "respond",
+    reason: "normal",
+    availableTools: [fakeTool],
+    reservationId: "res_1",
+  });
+});
+
+test("decide reuses the reservation an earlier attempt made instead of reserving again", async () => {
+  reset([{ data: { state: "ai_active" }, error: null }]);
+  // A fresh reservation would be denied: the contact is at the limit now,
+  // counting the slot this batch itself took on its first attempt.
+  rateLimitResult = { allowed: false, reason: "rate_limit_contact_hour" };
+  const result = await decide({ ...DECIDE, reservationId: "res_prev" });
+  assert.equal(reserveCalls, 0);
+  assert.equal(result.decision, "respond");
+  assert.equal(result.reservationId, "res_prev");
+});
+
+test("decide loads the tools before reserving, so a failure there spends no slot", async () => {
+  reset([{ data: { state: "ai_active" }, error: null }]);
+  enabledToolsError = new Error("tool_configs unavailable");
+  await assert.rejects(() => decide(DECIDE), /tool_configs unavailable/);
+  assert.equal(reserveCalls, 0);
+});
+
+// ── applyTransition() ──────────────────────────────────────────────────
 
 test("scopes both the lookup and the update to workspaceId when it is given", async () => {
   reset();

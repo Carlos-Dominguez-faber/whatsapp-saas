@@ -3,7 +3,11 @@ import { generateWithTools, getWorkspaceModel } from "./openrouter";
 import { recordLlmUsage } from "./cost-tracker";
 import { dispatchText, dispatchTemplate } from "./dispatch";
 import { decide, applyTransition } from "./decision-engine";
-import { applyJevToBatch } from "@/features/jev-judge/apply";
+import {
+  applyJevToBatch,
+  type JevBatchEffect,
+} from "@/features/jev-judge/apply";
+import { enforceModelPolicy } from "./model-policy";
 import type { ToolContext } from "@/features/tools/core/tool";
 import { resolveSystemPrompt } from "./prompt-resolver";
 import { buildSystemPrompt } from "./prompt-builder";
@@ -245,7 +249,7 @@ async function consolidateBatch(
 //   2. No batch available → return { processed: false }
 //   3. consolidateBatch → mergedText
 //   4. Load conversation (ai_enabled, workspace_id, contact info)
-//   5. checkRateLimits
+//   5. decide(): state, handoff keyword, atomic hourly reservation
 //   6. generateReply with consolidated text
 //   7. recordLlmUsage
 //   8. sendText via the workspace's WhatsApp provider (or insert dev_mode outbound)
@@ -289,11 +293,18 @@ export async function processNextBatch(): Promise<ProcessBatchResult> {
     }
 
     // ── 5. Decision engine: state check + handoff trigger + rate limits ──────
+    // A retry reuses the turn slot its first attempt reserved (kept in the
+    // batch meta below), so failing and retrying never costs a second slot.
+    const priorReservationId =
+      typeof batch.meta?.llm_reservation_id === "string"
+        ? batch.meta.llm_reservation_id
+        : undefined;
     const decisionResult = await decide({
       workspaceId: batch.workspace_id,
       conversationId: batch.conversation_id,
       mergedText,
       contactId: conversation.contact_id as string,
+      reservationId: priorReservationId,
     });
 
     const { decision, reason } = decisionResult;
@@ -304,15 +315,54 @@ export async function processNextBatch(): Promise<ProcessBatchResult> {
       return { processed: true, conversationId: batch.conversation_id };
     }
 
-    // Jev runs only after state, keyword handoff and rate limit already passed.
+    if (decisionResult.reservationId) {
+      // The retry path below writes batch.meta back, carrying the slot along.
+      batch.meta = {
+        ...batch.meta,
+        llm_reservation_id: decisionResult.reservationId,
+      };
+    }
+
+    // ── 5b. Jev, before the workspace's own checks ─────────────────────────
+    // Jev runs on the platform key, outside the workspace budget, and may hand
+    // the conversation to a person or suppress the reply — which must keep
+    // working on a day the budget is spent, and needs no WhatsApp provider.
+    // A retry reuses the verdict of its first attempt instead of judging again.
     // A failure falls through to the existing reply. It never downgrades customer.
-    const jev = await applyJevToBatch(supabase, {
-      workspaceId: batch.workspace_id,
-      conversationId: batch.conversation_id,
-      contactId: conversation.contact_id as string,
-      mergedText,
-    });
+    const cachedJev = batch.meta?.jev_verdict;
+    const jev: JevBatchEffect = isJevVerdict(cachedJev)
+      ? cachedJev
+      : await applyJevToBatch(supabase, {
+          workspaceId: batch.workspace_id,
+          conversationId: batch.conversation_id,
+          contactId: conversation.contact_id as string,
+          mergedText,
+        });
     if (jev.suppressReply) {
+      await markBatchProcessed(batch.id, mergedText, supabase);
+      return { processed: true, conversationId: batch.conversation_id };
+    }
+    batch.meta = { ...batch.meta, jev_verdict: jev };
+
+    // ── 5c. The workspace must have an active WhatsApp provider ─────────────
+    // Checked before the model and its tools run: the retry below re-runs the
+    // turn, and a reply with nowhere to go must not repeat model spend or tool
+    // side effects (bookings, CRM writes) on every attempt. dispatchText()
+    // loads and decrypts the credentials itself.
+    const whatsapp = await loadWhatsAppSettings(supabase, batch.workspace_id);
+    if (!whatsapp) {
+      throw new Error(`[buffer] ${WHATSAPP_NOT_CONNECTED}`);
+    }
+
+    // ── 5d. SEC-06: daily budget, before the KB search and the model ────────
+    // A cut workspace must not pay for KB embeddings either. A database error
+    // throws into the retry path below.
+    const costPolicy = await enforceCostPolicy(batch.workspace_id);
+    if (costPolicy.policy === "cut") {
+      console.warn(
+        "[buffer] SEC-06 cost cut — aborting AI for workspace",
+        batch.workspace_id,
+      );
       await markBatchProcessed(batch.id, mergedText, supabase);
       return { processed: true, conversationId: batch.conversation_id };
     }
@@ -323,16 +373,6 @@ export async function processNextBatch(): Promise<ProcessBatchResult> {
       conversationId: batch.conversation_id,
       contactId: conversation.contact_id as string,
     };
-
-    // ── 6b. The workspace must have an active WhatsApp provider ─────────────
-    // Checked before the model and its tools run: the retry below re-runs the
-    // whole turn, and a reply with nowhere to go must not repeat tool side
-    // effects (bookings, CRM writes) on every attempt. dispatchText() loads
-    // and decrypts the credentials itself.
-    const whatsapp = await loadWhatsAppSettings(supabase, batch.workspace_id);
-    if (!whatsapp) {
-      throw new Error(`[buffer] ${WHATSAPP_NOT_CONNECTED}`);
-    }
 
     // ── 6c. Resolve conversational memory window (WS2: configurable) ─────────
     // The workspace's WhatsApp integration config carries
@@ -405,8 +445,7 @@ export async function processNextBatch(): Promise<ProcessBatchResult> {
       },
     });
 
-    // ── 7b. SEC-06: enforce cost policy before calling LLM ───────────────────
-    const costPolicy = await enforceCostPolicy(batch.workspace_id);
+    // ── 7b. SEC-06: a degraded budget keeps the prompt, switches the model ──
     const { systemPrompt: finalSystemPrompt, model: costModel } =
       await buildCostAwareSystemPrompt(
         batch.workspace_id,
@@ -414,20 +453,20 @@ export async function processNextBatch(): Promise<ProcessBatchResult> {
         costPolicy.policy,
       );
 
-    if (costPolicy.policy === "cut") {
-      console.warn(
-        "[buffer] SEC-06 cost cut — aborting AI for workspace",
-        batch.workspace_id,
-      );
-      await markBatchProcessed(batch.id, mergedText, supabase);
-      return { processed: true, conversationId: batch.conversation_id };
-    }
-
     // ── 8. Generate AI reply with tool-calling support ───────────────────────
     // Resolve workspace model (falls back to env default or gpt-4o-mini).
     // costModel from SEC-06 takes priority when cost policy is degraded.
+    // On the platform key a model outside the catalog is swapped for the
+    // platform default, however it got saved (enforceModelPolicy).
     const workspaceModel = await getWorkspaceModel(batch.workspace_id);
-    const model = costModel ?? workspaceModel;
+    const model =
+      costModel ??
+      (await enforceModelPolicy(
+        supabase,
+        batch.workspace_id,
+        workspaceModel,
+        "agent_turn",
+      ));
 
     const reply = await generateWithTools({
       systemPrompt: finalSystemPrompt,
@@ -441,6 +480,9 @@ export async function processNextBatch(): Promise<ProcessBatchResult> {
 
     // ── 8. Record LLM usage ──────────────────────────────────────────────────
     await recordLlmUsage({
+      // Fill in the slot decide() reserved instead of inserting a second row:
+      // both would count toward the contact's hourly limit.
+      reservationId: decisionResult.reservationId,
       workspaceId: batch.workspace_id,
       conversationId: batch.conversation_id,
       contactId: conversation.contact_id as string,
@@ -448,6 +490,13 @@ export async function processNextBatch(): Promise<ProcessBatchResult> {
       promptTokens: reply.inputTokens,
       completionTokens: reply.outputTokens,
     });
+    // The slot now holds this attempt's spend. Should a later step throw, the
+    // retry's model call is new spend: it reserves and records its own row
+    // instead of overwriting this one.
+    if ("llm_reservation_id" in batch.meta) {
+      const { llm_reservation_id: _recorded, ...rest } = batch.meta;
+      batch.meta = rest;
+    }
 
     // ── 10a. Dispatch via single exit point (SEC-04) ────────────────────────
     const dispatchResult = await dispatchText({
@@ -553,6 +602,13 @@ export async function processNextBatch(): Promise<ProcessBatchResult> {
       error: errorMsg,
     };
   }
+}
+
+function isJevVerdict(value: unknown): value is JevBatchEffect {
+  const v = value as Partial<JevBatchEffect> | null | undefined;
+  return (
+    typeof v?.suppressReply === "boolean" && typeof v?.ownsStage === "boolean"
+  );
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

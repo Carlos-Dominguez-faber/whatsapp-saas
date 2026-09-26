@@ -2,24 +2,15 @@
 
 import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
-import { createClient } from "@/lib/supabase/server";
+import { requireWorkspaceMember } from "@/lib/auth/workspace-access";
 import { generateReply } from "@/features/inbox/services/openrouter";
+import { guardWorkspaceLlmCall } from "@/features/inbox/services/llm-call-guard";
+import { recordWorkspaceLlmCall } from "@/features/inbox/services/cost-tracker";
 
-// ── Shared auth helper ────────────────────────────────────────────────────────
-
-async function resolveMember(
-  supabase: Awaited<ReturnType<typeof createClient>>,
-  workspaceId: string,
-  userId: string,
-) {
-  const { data } = await supabase
-    .from("memberships")
-    .select("role")
-    .eq("workspace_id", workspaceId)
-    .eq("user_id", userId)
-    .maybeSingle();
-  return data;
-}
+// Drafts are created by whoever manages templates; the model the route uses
+// is the env default (generateReply without a model).
+const DRAFT_MODEL =
+  process.env.OPENROUTER_DEFAULT_MODEL ?? "openai/gpt-4o-mini";
 
 // ── Validation ────────────────────────────────────────────────────────────────
 
@@ -52,20 +43,9 @@ export async function POST(
 ) {
   const { id: workspaceId } = await params;
 
-  const supabase = await createClient();
-  const {
-    data: { user },
-    error: authError,
-  } = await supabase.auth.getUser();
-
-  if (authError || !user) {
-    return NextResponse.json({ error: "No autorizado" }, { status: 401 });
-  }
-
-  const member = await resolveMember(supabase, workspaceId, user.id);
-  if (!member) {
-    return NextResponse.json({ error: "Acceso denegado" }, { status: 403 });
-  }
+  // Each draft spends the workspace's OpenRouter key: managers and admins only.
+  const auth = await requireWorkspaceMember(workspaceId, { minRole: "manager" });
+  if (!auth.ok) return auth.response;
 
   let body: unknown;
   try {
@@ -86,11 +66,24 @@ export async function POST(
 
   const userMessage = `Crea una plantilla de WhatsApp para: ${description}. Categoría: ${category}. Caso de uso: ${useCase}. Devuelve SOLO el texto de la plantilla, sin explicaciones.`;
 
+  const guard = await guardWorkspaceLlmCall(workspaceId, "template_generate");
+  if (!guard.ok) return guard.response;
+
   try {
     const result = await generateReply({
       systemPrompt: SYSTEM_PROMPT,
       userMessage,
       workspaceId,
+    });
+
+    await recordWorkspaceLlmCall({
+      reservationId: guard.reservationId,
+      workspaceId,
+      type: "template_generate",
+      model: DRAFT_MODEL,
+      promptTokens: result.promptTokens,
+      completionTokens: result.completionTokens,
+      extra: { user_id: auth.userId },
     });
 
     return NextResponse.json({ body: result.text.trim() });

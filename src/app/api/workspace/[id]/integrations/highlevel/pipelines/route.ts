@@ -12,7 +12,9 @@ export async function GET(
 ) {
   const { id: workspaceId } = await params;
 
-  const auth = await requireWorkspaceMember(workspaceId);
+  // Reads the workspace's HighLevel integration with the service role: same
+  // roles as the integrations SELECT policy (admin, manager).
+  const auth = await requireWorkspaceMember(workspaceId, { minRole: "manager" });
   if (!auth.ok) return auth.response;
 
   const pipelines = await listHLPipelines(workspaceId);

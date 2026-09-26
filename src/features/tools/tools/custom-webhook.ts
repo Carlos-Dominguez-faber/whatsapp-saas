@@ -1,7 +1,12 @@
 import { createClient as createSbClient } from "@supabase/supabase-js";
 import { z } from "zod";
 import type { Tool, ToolContext, ToolResult } from "../core/tool";
-import { validateWebhookUrl } from "../services/ssrf-guard";
+import {
+  fetchPinnedFollowingRedirects,
+  firstStatusOf,
+  RedirectRefusedError,
+  validateWebhookUrl,
+} from "../services/ssrf-guard";
 import {
   resolveTemplate,
   type WebhookField,
@@ -105,10 +110,11 @@ async function run(args: Args, ctx: ToolContext): Promise<ToolResult> {
     return { ok: false, output: null, error: "No webhook URL configured" };
   }
 
-  // SEC-08: validate URL before fetching.
-  const urlError = await validateWebhookUrl(webhookUrl);
-  if (urlError) {
-    return { ok: false, output: null, error: urlError };
+  // SEC-08: validate URL before fetching, and keep the IP it resolved to so
+  // the request below is pinned to it (no second DNS lookup = no rebinding).
+  const { error: urlError, resolvedIp } = await validateWebhookUrl(webhookUrl);
+  if (urlError || !resolvedIp) {
+    return { ok: false, output: null, error: urlError ?? "Cannot resolve hostname" };
   }
 
   // Resolve variables and build the payload from the configured fields.
@@ -130,17 +136,47 @@ async function run(args: Args, ctx: ToolContext): Promise<ToolResult> {
           note: values.note,
         };
 
-  const res = await fetch(webhookUrl, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ workspace_id: ctx.workspaceId, payload }),
-    signal: AbortSignal.timeout(8_000),
-  });
+  // Redirects are followed (up to 3), each target validated and pinned like
+  // the URL itself: Google Apps Script web apps, for one, answer every POST
+  // with a 302 after running it, and treating that as a failure would make
+  // the agent retry an action that already happened. Webhooks stay HTTPS-only
+  // on every hop.
+  let res;
+  try {
+    res = await fetchPinnedFollowingRedirects(webhookUrl, {
+      resolvedIp,
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ workspace_id: ctx.workspaceId, payload }),
+      timeoutMs: 8_000,
+      maxResponseBytes: 0,
+    });
+  } catch (err) {
+    // The POST itself was answered with a redirect: the webhook already got
+    // the call, only a later hop failed. Reporting it as failed would invite
+    // the agent to send it again.
+    const firstStatus = firstStatusOf(err);
+    if (firstStatus !== undefined && firstStatus >= 300 && firstStatus < 400) {
+      return {
+        ok: true,
+        output: {
+          status: firstStatus,
+          redirect_followed: false,
+          note: "El webhook recibió la llamada; su redirect no se pudo seguir. No la repitas.",
+        },
+      };
+    }
+    if (err instanceof RedirectRefusedError) {
+      return { ok: false, output: null, error: err.message };
+    }
+    throw err;
+  }
+  const ok = res.status >= 200 && res.status < 300;
 
   return {
-    ok: res.ok,
+    ok,
     output: { status: res.status },
-    error: res.ok ? undefined : `HTTP ${res.status}`,
+    error: ok ? undefined : `HTTP ${res.status}`,
   };
 }
 

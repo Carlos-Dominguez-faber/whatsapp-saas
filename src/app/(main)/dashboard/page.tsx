@@ -30,8 +30,12 @@ export default async function DashboardPage() {
     );
   }
 
+  const canSeeLlmCost =
+    membership.role === "admin" || membership.role === "manager";
   const [metrics, recentConversations] = await Promise.all([
-    getWorkspaceMetrics(membership.workspace_id),
+    getWorkspaceMetrics(membership.workspace_id, {
+      includeLlmCost: canSeeLlmCost,
+    }),
     getRecentConversations(membership.workspace_id, 5),
   ]);
 

@@ -122,6 +122,15 @@ const FLAT_MODELS: { provider: ProviderKey; model: CatalogModel }[] =
 
 export const ALL_CATALOG_IDS: string[] = FLAT_MODELS.map((m) => m.model.id);
 
+/** Whether `id` is a model the catalog offers (what the API accepts on save). */
+export function isCatalogModel(id: string | null | undefined): boolean {
+  return typeof id === "string" && ALL_CATALOG_IDS.includes(id);
+}
+
+/** Error shown when a save names a model outside the catalog. */
+export const MODEL_NOT_IN_CATALOG =
+  "Modelo no permitido: elige uno del catálogo.";
+
 export function findCatalogModel(
   id: string | null | undefined,
 ): { provider: ProviderKey; model: CatalogModel } | undefined {
