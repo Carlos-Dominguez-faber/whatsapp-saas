@@ -57,8 +57,36 @@ mock.module("@/features/inbox/services/media-handler.ts", {
 mock.module("@/features/inbox/services/media-understanding.ts", {
   exports: { transcribeAudio: unused, describeImage: unused },
 });
+const events: Array<{ workspaceId: string; type: string; payload: Record<string, unknown> }> = [];
+mock.module("@/features/inbox/services/daily-events.ts", {
+  exports: {
+    emitEventOncePerDay: async (
+      _db: unknown,
+      workspaceId: string,
+      type: string,
+      _level: string,
+      payload: Record<string, unknown>,
+    ) => {
+      events.push({ workspaceId, type, payload });
+    },
+  },
+});
+// after() needs a request scope; here it just runs the callback.
+const afterTasks: Array<Promise<unknown>> = [];
+mock.module("next/server", {
+  exports: {
+    NextRequest,
+    NextResponse: (await import("next/server")).NextResponse,
+    after: (task: () => unknown) => {
+      afterTasks.push(Promise.resolve().then(task));
+    },
+  },
+});
+async function settled() {
+  await Promise.all(afterTasks.splice(0));
+}
 
-const ROW = {
+const ROW: { workspace_id: string; credentials: Record<string, unknown>; config: Record<string, unknown> } = {
   workspace_id: "ws_1",
   credentials: { webhook_signing_secret: "yc-secret" },
   config: { phone_number: "+15550000000" },
@@ -136,10 +164,45 @@ test("a failed YCloud status carries the reason, translated", async () => {
 
 test("a message for another number on this workspace's URL is ignored, not filed here", async () => {
   inboundCalls = 0;
+  events.length = 0;
   const res = await inbound("+15559999999", { type: "text", text: { body: "hola" } });
   assert.equal(res.status, 200);
   assert.equal((await res.json()).ignored, "destination_mismatch");
   assert.equal(inboundCalls, 0);
+  await settled();
+  assert.deepEqual(
+    events.map((e) => [e.workspaceId, e.type]),
+    [["ws_1", "inbound_destination_mismatch"]],
+    "left as an event for the workspace, not only in the logs",
+  );
+});
+
+test("a number configured in national format is not enforced: the message is filed, with an event", async () => {
+  const original = ROW.config;
+  for (const national of ["998 123 4567", "(998) 123-4567", "555-123-4567"]) {
+    ROW.config = { phone_number: national };
+    inboundCalls = 0;
+    events.length = 0;
+    const res = await inbound("+15551234567", { type: "reaction", reaction: { emoji: "👍" } });
+    assert.equal(res.status, 200, national);
+    assert.equal(inboundCalls, 1, `${national}: filed, never lost`);
+    await settled();
+    assert.equal(events[0]?.type, "inbound_destination_unchecked", national);
+  }
+  ROW.config = original;
+});
+
+test("a phone_number that isn't a string never breaks the webhook", async () => {
+  const original = ROW.config;
+  for (const odd of [15550000000, { number: "+1555" }, null]) {
+    ROW.config = { phone_number: odd };
+    inboundCalls = 0;
+    const res = await inbound("+15550000000", { type: "reaction", reaction: { emoji: "👍" } });
+    assert.equal(res.status, 200, JSON.stringify(odd));
+    assert.equal(inboundCalls, 1);
+  }
+  ROW.config = original;
+  await settled();
 });
 
 test("the workspace's own number matches even written another way", async () => {
