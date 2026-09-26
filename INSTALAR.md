@@ -275,10 +275,27 @@ su propia integración de WhatsApp (cada uno puede usar YCloud o Kapso).
   respuesta: una persona confirma, en vez de repetir la acción. En los dos últimos
   casos queda una nota interna en la conversación que lo explica.
 - **Hay eventos `batch_dead_letter`:** el lote falló y agotó sus 3 reintentos; el
-  `error` del evento dice por qué. La conversación pasa a una persona y queda una
-  nota interna en ella. Si fue al revisar el presupuesto (`reserve_llm_turn failed` /
+  `error` del evento dice por qué. La conversación pasa a una persona (con el
+  aviso al contacto y la notificación al equipo, si los tienes activos) y queda una
+  nota interna en ella; para que la IA vuelva a contestar, reactívala en la
+  conversación. Si fue al revisar el presupuesto (`reserve_llm_turn failed` /
   `sum_daily_llm_tokens failed`), la base no respondió en ese momento: revisa el
   estado de tu proyecto de Supabase.
+- **Hay eventos `handoff_failed`:** la conversación tenía que pasar a una persona
+  pero el cambio falló, así que la IA sigue activa. Queda una nota interna en la
+  conversación; revísala tú.
+- **Hay eventos `inbound_destination_mismatch`:** llegó al webhook de YCloud de
+  este workspace un mensaje para otro número, y se ignoró. Si es tu número, revisa
+  el que tienes en Configuración → Integraciones → YCloud.
+- **Hay eventos `inbound_destination_unchecked`:** el número de YCloud está guardado
+  sin lada internacional, así que no se puede comprobar que cada mensaje que llega
+  sea para él (se aceptan todos). Escríbelo como `+52 998 123 4567` y guarda.
+- **Sincronizar o enviar plantillas dice "No encontramos el número de WhatsApp de
+  este espacio":** el número guardado en Integraciones → YCloud no está entre los de
+  tu cuenta de YCloud. Corrígelo y vuelve a intentar.
+- **Un mensaje saliente dice "WhatsApp no aceptó este envío por ahora":** WhatsApp
+  limitó los envíos; la IA lo vuelve a intentar en unos minutos (el reintento aparece
+  como otro mensaje).
 - **Una nota interna dice "No se envió esta respuesta":** la IA respondió, pero la
   ventana de 24 horas ya había vencido o el contacto pidió no recibir mensajes. La
   nota trae el texto por si quieres retomarlo con una plantilla.
@@ -366,10 +383,14 @@ las migraciones, así que las migraciones van **antes** de `vercel --prod`.
   su respuesta, la conversación pasa a una persona: nunca se repite la acción.
 - Si una persona toma la conversación mientras la IA está respondiendo, esa
   respuesta ya no se envía.
-- Un lote atorado (la función murió a medio turno) se retoma a los 7 minutos, con
-  un máximo de 3 intentos. Si se agotan, o si un lote falla 3 veces, la
-  conversación pasa a una persona con una nota interna, y queda un
-  `batch_dead_letter` en `events`.
+- Un lote que falla por algo que puede ser una caída (el modelo, WhatsApp o la base
+  no responden) se reintenta a 1, 5 y 15 minutos, así que una caída de unos minutos
+  no pasa a una persona cada conversación activa. Un lote atorado (la función murió
+  a medio turno) se retoma a los 7 minutos. Si se agotan los 3 reintentos, la
+  conversación pasa a una persona igual que con una palabra clave (con el aviso al
+  contacto y la notificación al equipo), queda una nota interna y un
+  `batch_dead_letter` en `events`. Si la respuesta ya había salido, el lote solo se
+  cierra.
 - Un mensaje que llegó pero no quedó en ningún lote (falló la base justo al
   guardarlo) se recupera en la siguiente pasada del cron, siempre que tenga entre
   2 y 15 minutos, la IA siga encendida en esa conversación y el contacto no haya
@@ -380,12 +401,18 @@ las migraciones, así que las migraciones van **antes** de `vercel --prod`.
   (Configuración → Negocio) si el agente no pide otra.
 - La sincronización de plantillas de **YCloud** ahora sí trae tus plantillas (antes
   traía cero), y solo las de la cuenta de WhatsApp (WABA) del número del workspace,
-  hasta 1,000. Después de actualizar, sincroniza en Configuración → Templates y
-  revisa que aparezcan.
+  hasta 1,000. Si ese número no está en tu cuenta de YCloud, sincronizar y enviar
+  plantillas avisan en vez de usar el WABA de otro número. Después de actualizar,
+  sincroniza en Configuración → Templates y revisa que aparezcan.
 - Si la zona horaria del negocio no es válida (por ejemplo `-05:00` o `EST`), se usa
   `America/Mexico_City`. Guárdala como zona IANA, por ejemplo `America/Bogota`.
-- El webhook de **YCloud** configurado con `?wsid=` ignora (y registra en el log) los
-  mensajes dirigidos a otro número que no sea el del workspace.
+- El webhook de **YCloud** configurado con `?wsid=` ignora los mensajes dirigidos a
+  otro número que no sea el del workspace, y lo deja en `events` una vez al día.
+  Solo lo comprueba si el número está guardado con lada internacional: si lo
+  escribiste como `998 123 4567`, los mensajes se aceptan y un evento diario te
+  pide corregirlo. Al guardar, el número se escribe en formato internacional
+  (`+52…`) si tu cuenta de YCloud lo confirma o si lo escribiste con lada; si no,
+  se guarda como lo escribiste y un aviso te dice cómo corregirlo.
 - Las rutas del buffer y los webhooks pueden durar hasta 300 segundos. Vercel lo
   permite en el plan Hobby con **Fluid Compute**, que viene activo en proyectos
   nuevos; en uno viejo, actívalo en Vercel → Settings → Functions.
