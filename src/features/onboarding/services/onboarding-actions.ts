@@ -12,9 +12,12 @@ export const OnboardingSchema = z.object({
   businessName: z.string().min(1, "El nombre del negocio es requerido"),
   industry: z.string().optional(),
   description: z.string().optional(),
-  ycloudApiKey: z.string().optional(),
-  ycloudPhone: z.string().optional(),
-  ycloudSigningSecret: z.string().optional(),
+  whatsappProvider: z.enum(["ycloud", "kapso"]).default("ycloud"),
+  whatsappApiKey: z.string().optional(),
+  whatsappPhone: z.string().optional(),
+  whatsappSigningSecret: z.string().optional(),
+  kapsoPhoneNumberId: z.string().optional(),
+  kapsoWabaId: z.string().optional(),
 });
 
 export type OnboardingInput = z.infer<typeof OnboardingSchema>;
@@ -249,25 +252,34 @@ export async function completeOnboarding(
     });
   }
 
-  // 9. Save YCloud integration (if credentials provided)
-  if (data.ycloudApiKey) {
+  // 9. Save the WhatsApp integration (if credentials provided) with the
+  //    provider the workspace chose: YCloud or Kapso.
+  if (data.whatsappApiKey) {
+    const provider = data.whatsappProvider;
     const { error: intError } = await serviceClient
       .from("integrations")
       .insert({
         workspace_id: workspaceId,
-        provider: "ycloud",
+        provider,
         enabled: true,
         credentials: await encryptCredentials(
           {
-            ycloud_api_key: data.ycloudApiKey,
-            webhook_signing_secret: data.ycloudSigningSecret ?? "",
+            [provider === "kapso" ? "kapso_api_key" : "ycloud_api_key"]:
+              data.whatsappApiKey,
+            webhook_signing_secret: data.whatsappSigningSecret ?? "",
           },
           workspaceId,
-          "ycloud",
+          provider,
         ),
-        config: {
-          phone_number: data.ycloudPhone ?? "",
-        },
+        config:
+          provider === "kapso"
+            ? {
+                phone_number: data.whatsappPhone ?? "",
+                // Meta's ids: phone_number_id sends, waba_id manages templates.
+                phone_number_id: data.kapsoPhoneNumberId ?? "",
+                waba_id: data.kapsoWabaId ?? "",
+              }
+            : { phone_number: data.whatsappPhone ?? "" },
         oauth_tokens: {},
       });
 

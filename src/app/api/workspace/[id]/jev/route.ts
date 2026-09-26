@@ -6,10 +6,7 @@ import {
 } from "@/lib/auth/workspace-access";
 import { JevPatchSchema } from "@/features/jev-judge/schema";
 import { writeJevPatch } from "@/features/jev-judge/uses";
-import {
-  WHATSAPP_PROVIDER,
-  WHATSAPP_PROVIDER_LABEL,
-} from "@/features/inbox/services/whatsapp-provider";
+import { loadWhatsAppSettings } from "@/features/inbox/services/whatsapp-provider";
 
 export async function PATCH(
   req: NextRequest,
@@ -30,24 +27,21 @@ export async function PATCH(
     process.env.NEXT_PUBLIC_SUPABASE_URL!,
     process.env.SUPABASE_SERVICE_ROLE_KEY!,
   );
-  const { data: existing } = await svc
-    .from("integrations")
-    .select("id, config")
-    .eq("workspace_id", workspaceId)
-    .eq("provider", WHATSAPP_PROVIDER)
-    .maybeSingle();
+  // Jev's settings live in the workspace's active WhatsApp integration.
+  const existing = await loadWhatsAppSettings(svc, workspaceId);
 
   if (!existing) {
     return NextResponse.json(
       {
-        error: `Conecta ${WHATSAPP_PROVIDER_LABEL} en Integraciones antes de prender Jev.`,
+        error:
+          "Conecta WhatsApp (YCloud o Kapso) en Integraciones antes de prender Jev.",
       },
       { status: 409 },
     );
   }
 
   const config = writeJevPatch(
-    (existing.config as Record<string, unknown> | null) ?? {},
+    existing.config,
     parsed.data,
   );
   const { error } = await svc

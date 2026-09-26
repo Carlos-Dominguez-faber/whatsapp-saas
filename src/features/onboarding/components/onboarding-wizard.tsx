@@ -18,6 +18,15 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
+import {
+  describeKapsoNumber,
+  e164FromDisplay,
+  KapsoNumberSelect,
+  WhatsAppProviderPicker,
+  WHATSAPP_LABEL,
+  type KapsoNumberOption,
+  type WhatsAppProviderId,
+} from "@/features/settings/components/whatsapp-provider-picker";
 import { completeOnboarding } from "../services/onboarding-actions";
 import type { OnboardingInput } from "../services/onboarding-actions";
 
@@ -30,9 +39,14 @@ interface WizardState {
   businessName: string;
   industry: string;
   description: string;
-  ycloudApiKey: string;
-  ycloudPhone: string;
-  ycloudSigningSecret: string;
+  whatsappProvider: WhatsAppProviderId;
+  whatsappApiKey: string;
+  whatsappPhone: string;
+  whatsappSigningSecret: string;
+  /** Kapso only: Meta's phone number id (what actually sends) */
+  kapsoPhoneNumberId: string;
+  /** Kapso only: WhatsApp Business Account id (templates) */
+  kapsoWabaId: string;
 }
 
 // ─── Use case cards data ──────────────────────────────────────────────────────
@@ -220,20 +234,26 @@ function Step2({
   );
 }
 
-// ─── Step 3 — YCloud connection ───────────────────────────────────────────────
+// ─── Step 3 — WhatsApp connection (YCloud or Kapso) ───────────────────────────
 
 function Step3({
   state,
   onChange,
   isTesting,
   onTest,
+  kapsoChoices,
+  onPickKapsoNumber,
 }: {
   state: WizardState;
   onChange: (patch: Partial<WizardState>) => void;
   isTesting: boolean;
   onTest: () => void;
+  kapsoChoices: KapsoNumberOption[];
+  onPickKapsoNumber: (n: KapsoNumberOption) => void;
 }) {
   const [copied, setCopied] = useState(false);
+  const provider = state.whatsappProvider;
+  const label = WHATSAPP_LABEL[provider];
 
   const webhookPlaceholder =
     "[Se generará al guardar — podrás copiarlo desde Configuración]";
@@ -248,7 +268,7 @@ function Step3({
     <div className="space-y-6">
       <div>
         <h1 className="font-display text-2xl font-semibold text-foreground">
-          Conectar YCloud
+          Conectar WhatsApp
         </h1>
         <p className="mt-1 text-sm text-muted-foreground">
           Opcional. Podrás configurar esto más tarde desde Configuración →
@@ -258,36 +278,96 @@ function Step3({
 
       <div className="space-y-4">
         <div className="space-y-2">
-          <Label htmlFor="ycloud-key">API Key YCloud</Label>
+          <Label id="onboarding-provider-label">Proveedor</Label>
+          <WhatsAppProviderPicker
+            value={provider}
+            onChange={(p) => {
+              if (p === provider) return;
+              // Keys, secrets and Meta ids belong to one provider: never send
+              // YCloud's key to Kapso's test (or the other way around).
+              onChange({
+                whatsappProvider: p,
+                whatsappApiKey: "",
+                whatsappSigningSecret: "",
+                kapsoPhoneNumberId: "",
+                kapsoWabaId: "",
+              });
+            }}
+            labelledBy="onboarding-provider-label"
+          />
+          <p className="text-xs text-muted-foreground">
+            Si tu número o tus clientes están en Estados Unidos, usa Kapso
+            (YCloud no opera ahí).
+          </p>
+        </div>
+
+        <div className="space-y-2">
+          <Label htmlFor="whatsapp-key">API Key {label}</Label>
           <Input
-            id="ycloud-key"
+            id="whatsapp-key"
             type="password"
-            placeholder="yk_..."
-            value={state.ycloudApiKey}
-            onChange={(e) => onChange({ ycloudApiKey: e.target.value })}
+            placeholder={provider === "kapso" ? "kapso_..." : "yk_..."}
+            value={state.whatsappApiKey}
+            onChange={(e) => onChange({ whatsappApiKey: e.target.value })}
             autoComplete="off"
           />
         </div>
 
         <div className="space-y-2">
-          <Label htmlFor="ycloud-phone">Número de WhatsApp (E.164)</Label>
+          <Label htmlFor="whatsapp-phone">Número de WhatsApp (E.164)</Label>
           <Input
-            id="ycloud-phone"
+            id="whatsapp-phone"
             type="tel"
             placeholder="+521234567890"
-            value={state.ycloudPhone}
-            onChange={(e) => onChange({ ycloudPhone: e.target.value })}
+            value={state.whatsappPhone}
+            onChange={(e) => onChange({ whatsappPhone: e.target.value })}
           />
         </div>
 
+        {provider === "kapso" && (
+          <>
+            <div className="space-y-2">
+              <Label htmlFor="kapso-phone-number-id">Phone Number ID (Meta)</Label>
+              <Input
+                id="kapso-phone-number-id"
+                inputMode="numeric"
+                placeholder="123456789012345"
+                value={state.kapsoPhoneNumberId}
+                onChange={(e) => onChange({ kapsoPhoneNumberId: e.target.value })}
+              />
+              <p className="text-xs text-muted-foreground">
+                Se autocompleta al probar la conexión.
+              </p>
+            </div>
+            {kapsoChoices.length > 0 && (
+              <KapsoNumberSelect
+                id="onboarding-kapso-number"
+                numbers={kapsoChoices}
+                value={state.kapsoPhoneNumberId}
+                onPick={onPickKapsoNumber}
+              />
+            )}
+            <div className="space-y-2">
+              <Label htmlFor="kapso-waba-id">WABA ID</Label>
+              <Input
+                id="kapso-waba-id"
+                inputMode="numeric"
+                placeholder="123456789012345"
+                value={state.kapsoWabaId}
+                onChange={(e) => onChange({ kapsoWabaId: e.target.value })}
+              />
+            </div>
+          </>
+        )}
+
         <div className="space-y-2">
-          <Label htmlFor="ycloud-secret">Webhook Signing Secret</Label>
+          <Label htmlFor="whatsapp-secret">Webhook Signing Secret</Label>
           <Input
-            id="ycloud-secret"
+            id="whatsapp-secret"
             type="password"
             placeholder="whsec_..."
-            value={state.ycloudSigningSecret}
-            onChange={(e) => onChange({ ycloudSigningSecret: e.target.value })}
+            value={state.whatsappSigningSecret}
+            onChange={(e) => onChange({ whatsappSigningSecret: e.target.value })}
             autoComplete="off"
           />
         </div>
@@ -321,7 +401,7 @@ function Step3({
           </p>
         </div>
 
-        {state.ycloudApiKey && (
+        {state.whatsappApiKey && (
           <Button
             type="button"
             variant="outline"
@@ -372,12 +452,15 @@ function Step4({
         {state.industry && <Row label="Industria" value={state.industry} />}
         <Row label="Tipo de agente" value={useCaseLabel} />
         <Row label="Prompt inicial" value="Generado automáticamente" />
-        {state.ycloudApiKey && (
-          <Row label="YCloud" value="Credenciales guardadas" />
+        {state.whatsappApiKey && (
+          <Row
+            label={WHATSAPP_LABEL[state.whatsappProvider]}
+            value="Credenciales guardadas"
+          />
         )}
         <Row
           label="Webhook URL"
-          value={`/api/webhooks/ycloud?wsid=${workspaceId}`}
+          value={`/api/webhooks/${state.whatsappProvider}?wsid=${workspaceId}`}
           mono
         />
       </div>
@@ -424,6 +507,8 @@ export function OnboardingWizard() {
   const [step, setStep] = useState(0);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [isTesting, setIsTesting] = useState(false);
+  // Kapso numbers to choose from when the project has more than one.
+  const [kapsoChoices, setKapsoChoices] = useState<KapsoNumberOption[]>([]);
   const [completedWorkspaceId, setCompletedWorkspaceId] = useState<
     string | null
   >(null);
@@ -433,13 +518,20 @@ export function OnboardingWizard() {
     businessName: "",
     industry: "",
     description: "",
-    ycloudApiKey: "",
-    ycloudPhone: "",
-    ycloudSigningSecret: "",
+    whatsappProvider: "ycloud",
+    whatsappApiKey: "",
+    whatsappPhone: "",
+    whatsappSigningSecret: "",
+    kapsoPhoneNumberId: "",
+    kapsoWabaId: "",
   });
 
   function patch(update: Partial<WizardState>) {
     setState((prev) => ({ ...prev, ...update }));
+    // Numbers listed for one key (or provider) mean nothing for another.
+    if ("whatsappApiKey" in update || "whatsappProvider" in update) {
+      setKapsoChoices([]);
+    }
   }
 
   function canAdvance(): boolean {
@@ -469,9 +561,12 @@ export function OnboardingWizard() {
         businessName: state.businessName.trim(),
         industry: state.industry.trim() || undefined,
         description: state.description.trim() || undefined,
-        ycloudApiKey: state.ycloudApiKey.trim() || undefined,
-        ycloudPhone: state.ycloudPhone.trim() || undefined,
-        ycloudSigningSecret: state.ycloudSigningSecret.trim() || undefined,
+        whatsappProvider: state.whatsappProvider,
+        whatsappApiKey: state.whatsappApiKey.trim() || undefined,
+        whatsappPhone: state.whatsappPhone.trim() || undefined,
+        whatsappSigningSecret: state.whatsappSigningSecret.trim() || undefined,
+        kapsoPhoneNumberId: state.kapsoPhoneNumberId.trim() || undefined,
+        kapsoWabaId: state.kapsoWabaId.trim() || undefined,
       };
 
       const result = await completeOnboarding(input);
@@ -491,34 +586,59 @@ export function OnboardingWizard() {
     }
   }
 
-  async function handleTestYCloud() {
-    if (!state.ycloudApiKey) return;
+  async function handleTestConnection() {
+    if (!state.whatsappApiKey) return;
+    const provider = state.whatsappProvider;
+    const label = WHATSAPP_LABEL[provider];
     setIsTesting(true);
     try {
       // Proxy through the server so the API key isn't exposed to the browser
       // and the request isn't CORS-blocked.
-      const res = await fetch("/api/integrations/ycloud/test", {
+      const res = await fetch(`/api/integrations/${provider}/test`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ apiKey: state.ycloudApiKey }),
+        body: JSON.stringify({ apiKey: state.whatsappApiKey }),
       });
       const json = (await res.json()) as {
         ok?: boolean;
         balance?: { balance?: number; currency?: string };
+        phoneNumbers?: KapsoNumberOption[];
         error?: string;
       };
-      if (json.ok) {
-        const balance =
-          typeof json.balance?.balance === "number"
-            ? json.balance.balance
-            : "?";
-        const currency = json.balance?.currency ?? "";
-        toast.success(`YCloud conectado — Saldo: ${balance} ${currency}`);
-      } else {
+      if (!json.ok) {
         toast.error(json.error ?? "API Key inválida o sin acceso");
+        return;
+      }
+      if (provider === "kapso") {
+        // Kapso lists the project's numbers (connected production first).
+        // With one, fill in the Meta ids the user would otherwise copy by
+        // hand; with several, let them choose — it may be another client's.
+        const numbers = json.phoneNumbers ?? [];
+        if (numbers.length > 1 && !state.kapsoPhoneNumberId) {
+          setKapsoChoices(numbers);
+          toast.success(
+            `${label} conectado — hay ${numbers.length} números en el proyecto: elige el de este negocio`,
+          );
+          return;
+        }
+        const first = numbers[0];
+        patch({
+          kapsoPhoneNumberId: state.kapsoPhoneNumberId || first?.phone_number_id || "",
+          kapsoWabaId: state.kapsoWabaId || first?.waba_id || "",
+          whatsappPhone:
+            state.whatsappPhone || e164FromDisplay(first?.display_phone_number),
+        });
+        toast.success(
+          `${label} conectado${first ? ` — ${describeKapsoNumber(first)}` : ""}`,
+        );
+      } else {
+        const balance =
+          typeof json.balance?.balance === "number" ? json.balance.balance : "?";
+        const currency = json.balance?.currency ?? "";
+        toast.success(`${label} conectado — Saldo: ${balance} ${currency}`);
       }
     } catch {
-      toast.error("No se pudo conectar con YCloud");
+      toast.error(`No se pudo conectar con ${label}`);
     } finally {
       setIsTesting(false);
     }
@@ -543,7 +663,17 @@ export function OnboardingWizard() {
           state={state}
           onChange={patch}
           isTesting={isTesting}
-          onTest={handleTestYCloud}
+          onTest={handleTestConnection}
+          kapsoChoices={state.whatsappProvider === "kapso" ? kapsoChoices : []}
+          onPickKapsoNumber={(n) => {
+            patch({
+              kapsoPhoneNumberId: n.phone_number_id ?? "",
+              kapsoWabaId: n.waba_id ?? "",
+              whatsappPhone: e164FromDisplay(n.display_phone_number) || state.whatsappPhone,
+            });
+            setKapsoChoices([]);
+            toast.info(`Elegiste ${describeKapsoNumber(n)}`);
+          }}
         />
       )}
       {step === 3 && completedWorkspaceId && (

@@ -17,10 +17,19 @@ import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
 import { DEFAULT_HANDOFF_ACK } from "@/features/inbox/types/handoff";
 import { ModelPicker } from "@/features/agents/components/model-picker";
+import {
+  describeKapsoNumber,
+  e164FromDisplay,
+  KapsoNumberSelect,
+  WhatsAppProviderPicker,
+  WHATSAPP_LABEL,
+  type KapsoNumberOption,
+  type WhatsAppProviderId,
+} from "./whatsapp-provider-picker";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
-type Provider = "ycloud" | "openrouter" | "highlevel";
+type Provider = "ycloud" | "kapso" | "openrouter" | "highlevel";
 
 type IntegrationData = {
   provider: Provider;
@@ -101,48 +110,119 @@ function Section({
   );
 }
 
-// ─── YCloud section ───────────────────────────────────────────────────────────
+// ─── WhatsApp section (provider per workspace: YCloud or Kapso) ───────────────
 
-function YCloudSection({
+function WhatsAppSection({
   workspaceId,
-  initial,
+  ycloud,
+  kapso,
   onSaved,
 }: {
   workspaceId: string;
-  initial: IntegrationData | undefined;
+  ycloud: IntegrationData | undefined;
+  kapso: IntegrationData | undefined;
   onSaved: () => void;
 }) {
-  const [apiKey, setApiKey] = useState(
-    initial?.credentials?.ycloud_api_key ?? "",
+  // The provider this workspace talks through today (at most one is enabled).
+  const active: WhatsAppProviderId | null = kapso?.enabled
+    ? "kapso"
+    : ycloud?.enabled
+      ? "ycloud"
+      : null;
+  const [selected, setSelected] = useState<WhatsAppProviderId>(
+    active ?? (kapso && !ycloud ? "kapso" : "ycloud"),
   );
-  const [phone, setPhone] = useState(
-    (initial?.config?.phone_number as string | undefined) ?? "",
+  // Workspace-level settings live in the active row (the server carries them
+  // over when the provider changes).
+  const settings = (active === "kapso" ? kapso : ycloud)?.config ?? {};
+
+  // YCloud credentials
+  const [ycApiKey, setYcApiKey] = useState(
+    ycloud?.credentials?.ycloud_api_key ?? "",
   );
-  const [secret, setSecret] = useState(
-    initial?.credentials?.webhook_signing_secret ?? "",
+  const [ycPhone, setYcPhone] = useState(
+    (ycloud?.config?.phone_number as string | undefined) ?? "",
   );
+  const [ycSecret, setYcSecret] = useState(
+    ycloud?.credentials?.webhook_signing_secret ?? "",
+  );
+  // Kapso credentials — Kapso sends by Meta's phone_number_id (the E.164
+  // number is kept for display and the CRM) and needs the WABA id for
+  // templates.
+  const [kpApiKey, setKpApiKey] = useState(
+    kapso?.credentials?.kapso_api_key ?? "",
+  );
+  const [kpPhone, setKpPhone] = useState(
+    (kapso?.config?.phone_number as string | undefined) ?? "",
+  );
+  const [kpPhoneNumberId, setKpPhoneNumberId] = useState(
+    (kapso?.config?.phone_number_id as string | undefined) ?? "",
+  );
+  const [kpWabaId, setKpWabaId] = useState(
+    (kapso?.config?.waba_id as string | undefined) ?? "",
+  );
+  const [kpSecret, setKpSecret] = useState(
+    kapso?.credentials?.webhook_signing_secret ?? "",
+  );
+
   const [bufferSeconds, setBufferSeconds] = useState<number>(
-    (initial?.config?.buffer_silence_seconds as number | undefined) ?? 30,
+    (settings.buffer_silence_seconds as number | undefined) ?? 30,
   );
   const [messagesInMemory, setMessagesInMemory] = useState<number>(
-    (initial?.config?.message_history_window as number | undefined) ?? 10,
+    (settings.message_history_window as number | undefined) ?? 10,
   );
   // Handoff acknowledgement: defaults to on, so a workspace that never opens
   // this screen still replies to the contact instead of going silent.
   const [handoffAckEnabled, setHandoffAckEnabled] = useState<boolean>(
-    (initial?.config?.handoff_ack_enabled as boolean | undefined) !== false,
+    (settings.handoff_ack_enabled as boolean | undefined) !== false,
   );
   const [handoffAckMessage, setHandoffAckMessage] = useState<string>(
-    (initial?.config?.handoff_ack_message as string | undefined) ?? "",
+    (settings.handoff_ack_message as string | undefined) ?? "",
   );
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
   const [copied, setCopied] = useState(false);
+  // Kapso numbers to choose from, when a test with a typed key found several.
+  const [kapsoChoices, setKapsoChoices] = useState<KapsoNumberOption[]>([]);
 
+  const label = WHATSAPP_LABEL[selected];
+  const webhookPath = `/api/webhooks/${selected}?wsid=${workspaceId}`;
   const webhookUrl =
     typeof window !== "undefined"
-      ? `${window.location.origin}/api/webhooks/ycloud?wsid=${workspaceId}`
-      : `/api/webhooks/ycloud?wsid=${workspaceId}`;
+      ? `${window.location.origin}${webhookPath}`
+      : webhookPath;
+  const switching = active !== null && active !== selected;
+
+  // Same rule as the server (422): without key, secret and sender id the
+  // provider cannot talk. "••••••" means stored, which counts.
+  const missing = (
+    selected === "kapso"
+      ? [
+          [kpApiKey, "la API Key"],
+          [kpSecret, "el Webhook Signing Secret"],
+          [kpPhoneNumberId, "el Phone Number ID"],
+        ]
+      : [
+          [ycApiKey, "la API Key"],
+          [ycSecret, "el Webhook Signing Secret"],
+          [ycPhone, "el número de WhatsApp"],
+        ]
+  )
+    .filter(([value]) => !value.trim())
+    .map(([, what]) => what);
+
+  function pickKapsoNumber(n: KapsoNumberOption, how: "filled" | "picked") {
+    setKpPhoneNumberId(n.phone_number_id ?? "");
+    setKpWabaId(n.waba_id ?? "");
+    const e164 = e164FromDisplay(n.display_phone_number);
+    if (e164) setKpPhone(e164);
+    setKapsoChoices([]);
+    toast.info(
+      how === "filled"
+        ? `Rellené los datos con ${describeKapsoNumber(n)} — revisa y guarda`
+        : `Elegiste ${describeKapsoNumber(n)} — prueba la conexión y guarda`,
+    );
+  }
 
   function handleCopy() {
     navigator.clipboard.writeText(webhookUrl).then(() => {
@@ -154,24 +234,58 @@ function YCloudSection({
   async function handleTest() {
     setTesting(true);
     try {
+      // What is on screen, saved or not: the server falls back to the stored
+      // value for anything masked ("••••••") or left out.
       const res = await fetch(
         `/api/workspace/${workspaceId}/integrations/test`,
         {
           method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(
+            selected === "kapso"
+              ? {
+                  provider: "kapso",
+                  apiKey: kpApiKey,
+                  config: {
+                    phone_number_id: kpPhoneNumberId.trim(),
+                    waba_id: kpWabaId.trim(),
+                  },
+                }
+              : { provider: "ycloud", apiKey: ycApiKey },
+          ),
         },
       );
       const json = (await res.json()) as {
         ok: boolean;
         error?: string;
-        balance?: unknown;
+        warnings?: string[];
+        balance?: { balance?: unknown; currency?: unknown };
+        phoneNumbers?: KapsoNumberOption[];
       };
       if (json.ok) {
-        const bal = json.balance as Record<string, unknown> | undefined;
-        const display = bal
-          ? ` — Saldo: ${bal.balance ?? "?"} ${bal.currency ?? ""}`
-          : "";
-        toast.success(`YCloud conectado${display}`);
+        const detail =
+          selected === "ycloud"
+            ? json.balance
+              ? ` — Saldo: ${json.balance.balance ?? "?"} ${json.balance.currency ?? ""}`
+              : ""
+            : json.phoneNumbers?.[0]
+              ? ` — ${describeKapsoNumber(json.phoneNumbers[0])}`
+              : "";
+        setKapsoChoices([]);
+        toast.success(`${label} conectado${detail}`);
+        for (const warning of json.warnings ?? []) toast.warning(warning);
       } else {
+        // Kapso with a typed key: a failed test lists the project's numbers
+        // (connected production first). One and nothing filled in → fill it;
+        // otherwise let them choose — never assume which client's number it is.
+        const numbers = json.phoneNumbers ?? [];
+        if (selected === "kapso" && numbers.length > 0) {
+          if (numbers.length === 1 && !kpPhoneNumberId.trim()) {
+            pickKapsoNumber(numbers[0], "filled");
+          } else {
+            setKapsoChoices(numbers);
+          }
+        }
         toast.error(json.error ?? "Error al probar la conexión");
       }
     } catch {
@@ -183,28 +297,52 @@ function YCloudSection({
 
   async function handleSave() {
     setSaving(true);
+    const shared = {
+      buffer_silence_seconds: bufferSeconds,
+      message_history_window: messagesInMemory,
+      handoff_ack_enabled: handoffAckEnabled,
+      handoff_ack_message: handoffAckMessage.trim(),
+    };
+    const payload =
+      selected === "kapso"
+        ? {
+            provider: "kapso",
+            credentials: {
+              kapso_api_key: kpApiKey,
+              webhook_signing_secret: kpSecret,
+            },
+            config: {
+              phone_number: kpPhone,
+              phone_number_id: kpPhoneNumberId.trim(),
+              waba_id: kpWabaId.trim(),
+              ...shared,
+            },
+          }
+        : {
+            provider: "ycloud",
+            credentials: {
+              ycloud_api_key: ycApiKey,
+              webhook_signing_secret: ycSecret,
+            },
+            config: { phone_number: ycPhone, ...shared },
+          };
     try {
       const res = await fetch(`/api/workspace/${workspaceId}/integrations`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          provider: "ycloud",
-          credentials: {
-            ycloud_api_key: apiKey,
-            webhook_signing_secret: secret,
-          },
-          config: {
-            phone_number: phone,
-            buffer_silence_seconds: bufferSeconds,
-            message_history_window: messagesInMemory,
-            handoff_ack_enabled: handoffAckEnabled,
-            handoff_ack_message: handoffAckMessage.trim(),
-          },
-        }),
+        body: JSON.stringify(payload),
       });
-      const json = (await res.json()) as { ok?: boolean; error?: string };
+      const json = (await res.json()) as {
+        ok?: boolean;
+        error?: string;
+        switchedFrom?: string;
+      };
       if (json.ok) {
-        toast.success("Configuración de YCloud guardada");
+        toast.success(
+          json.switchedFrom
+            ? `Listo: este workspace ahora usa ${label}`
+            : `Configuración de ${label} guardada`,
+        );
         onSaved();
       } else {
         toast.error(json.error ?? "Error al guardar");
@@ -218,45 +356,142 @@ function YCloudSection({
 
   return (
     <Section
-      title="YCloud (WhatsApp)"
-      description="Conecta tu número de WhatsApp Business a través de YCloud."
+      title="WhatsApp"
+      description="Conecta tu número de WhatsApp Business con YCloud o con Kapso (Kapso funciona en Estados Unidos)."
       defaultOpen
     >
       <div className="grid gap-4">
         <div className="space-y-2">
-          <Label htmlFor="ycloud-api-key">API Key</Label>
-          <Input
-            id="ycloud-api-key"
-            type="password"
-            placeholder="yk_..."
-            value={apiKey}
-            onChange={(e) => setApiKey(e.target.value)}
-            autoComplete="off"
+          <Label id="whatsapp-provider-label">Proveedor</Label>
+          <WhatsAppProviderPicker
+            value={selected}
+            onChange={setSelected}
+            active={active}
+            labelledBy="whatsapp-provider-label"
           />
+          {switching && (
+            <p className="text-xs text-amber-500">
+              Al guardar, este workspace deja de usar {WHATSAPP_LABEL[active]} y
+              pasa a {label}. La configuración de {WHATSAPP_LABEL[active]} queda
+              guardada por si vuelves, y sus webhooks dejan de aceptarse: los
+              mensajes que ya envió dejan de actualizar su estado (entregado,
+              leído), y una respuesta que la IA esté preparando en ese momento
+              sale por {label}. Prueba la conexión antes de guardar.
+            </p>
+          )}
         </div>
 
-        <div className="space-y-2">
-          <Label htmlFor="ycloud-phone">Número de WhatsApp (E.164)</Label>
-          <Input
-            id="ycloud-phone"
-            type="tel"
-            placeholder="+521234567890"
-            value={phone}
-            onChange={(e) => setPhone(e.target.value)}
-          />
-        </div>
-
-        <div className="space-y-2">
-          <Label htmlFor="ycloud-secret">Webhook Signing Secret</Label>
-          <Input
-            id="ycloud-secret"
-            type="password"
-            placeholder="whsec_..."
-            value={secret}
-            onChange={(e) => setSecret(e.target.value)}
-            autoComplete="off"
-          />
-        </div>
+        {selected === "ycloud" ? (
+          <>
+            <div className="space-y-2">
+              <Label htmlFor="ycloud-api-key">API Key</Label>
+              <Input
+                id="ycloud-api-key"
+                type="password"
+                placeholder="yk_..."
+                value={ycApiKey}
+                onChange={(e) => setYcApiKey(e.target.value)}
+                autoComplete="off"
+              />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="ycloud-phone">Número de WhatsApp (E.164)</Label>
+              <Input
+                id="ycloud-phone"
+                type="tel"
+                placeholder="+521234567890"
+                value={ycPhone}
+                onChange={(e) => setYcPhone(e.target.value)}
+              />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="ycloud-secret">Webhook Signing Secret</Label>
+              <Input
+                id="ycloud-secret"
+                type="password"
+                placeholder="whsec_..."
+                value={ycSecret}
+                onChange={(e) => setYcSecret(e.target.value)}
+                autoComplete="off"
+              />
+            </div>
+          </>
+        ) : (
+          <>
+            <div className="space-y-2">
+              <Label htmlFor="kapso-api-key">API Key</Label>
+              <Input
+                id="kapso-api-key"
+                type="password"
+                placeholder="kapso_..."
+                value={kpApiKey}
+                onChange={(e) => {
+                  setKpApiKey(e.target.value);
+                  setKapsoChoices([]);
+                }}
+                autoComplete="off"
+              />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="kapso-phone">Número de WhatsApp (E.164)</Label>
+              <Input
+                id="kapso-phone"
+                type="tel"
+                placeholder="+15551234567"
+                value={kpPhone}
+                onChange={(e) => setKpPhone(e.target.value)}
+              />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="kapso-phone-number-id">Phone Number ID (Meta)</Label>
+              <Input
+                id="kapso-phone-number-id"
+                inputMode="numeric"
+                placeholder="123456789012345"
+                value={kpPhoneNumberId}
+                onChange={(e) => setKpPhoneNumberId(e.target.value)}
+              />
+              <p className="text-xs text-muted-foreground">
+                El ID numérico del número en Meta, no el número en sí. Sin esto
+                no se puede enviar ningún mensaje. Lo encuentras en el dashboard
+                de Kapso, o escribe la API Key y prueba la conexión para elegirlo.
+              </p>
+            </div>
+            {kapsoChoices.length > 0 && (
+              <KapsoNumberSelect
+                id="kapso-number-choice"
+                numbers={kapsoChoices}
+                value={kpPhoneNumberId}
+                onPick={(n) => pickKapsoNumber(n, "picked")}
+              />
+            )}
+            <div className="space-y-2">
+              <Label htmlFor="kapso-waba-id">WABA ID</Label>
+              <Input
+                id="kapso-waba-id"
+                inputMode="numeric"
+                placeholder="123456789012345"
+                value={kpWabaId}
+                onChange={(e) => setKpWabaId(e.target.value)}
+              />
+              <p className="text-xs text-muted-foreground">
+                ID de la cuenta de WhatsApp Business. Necesario para las
+                plantillas.
+              </p>
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="kapso-secret">Webhook Signing Secret</Label>
+              <Input
+                id="kapso-secret"
+                type="password"
+                placeholder="whsec_..."
+                value={kpSecret}
+                onChange={(e) => setKpSecret(e.target.value)}
+                autoComplete="off"
+              />
+            </div>
+          </>
+        )}
 
         <div className="space-y-2">
           <Label>Webhook URL</Label>
@@ -282,16 +517,16 @@ function YCloudSection({
             </Button>
           </div>
           <p className="text-xs text-muted-foreground">
-            Pega esta URL en la configuración de webhooks de YCloud.
+            Pega esta URL en la configuración de webhooks de {label}.
           </p>
         </div>
 
         <div className="space-y-2">
-          <Label htmlFor="ycloud-buffer">
+          <Label htmlFor="whatsapp-buffer">
             Tiempo de espera del buffer (segundos)
           </Label>
           <Input
-            id="ycloud-buffer"
+            id="whatsapp-buffer"
             type="number"
             min={3}
             max={120}
@@ -310,9 +545,9 @@ function YCloudSection({
         </div>
 
         <div className="space-y-2">
-          <Label htmlFor="ycloud-memory">Mensajes en memoria de la IA</Label>
+          <Label htmlFor="whatsapp-memory">Mensajes en memoria de la IA</Label>
           <Input
-            id="ycloud-memory"
+            id="whatsapp-memory"
             type="number"
             min={5}
             max={50}
@@ -332,17 +567,17 @@ function YCloudSection({
 
         <div className="space-y-2 border-t border-border/60 pt-4">
           <div className="flex items-center justify-between gap-4">
-            <Label htmlFor="ycloud-handoff-ack">
+            <Label htmlFor="whatsapp-handoff-ack">
               Avisar al contacto cuando pasa a un humano
             </Label>
             <Switch
-              id="ycloud-handoff-ack"
+              id="whatsapp-handoff-ack"
               checked={handoffAckEnabled}
               onCheckedChange={setHandoffAckEnabled}
             />
           </div>
           <Textarea
-            id="ycloud-handoff-ack-message"
+            id="whatsapp-handoff-ack-message"
             rows={2}
             maxLength={500}
             disabled={!handoffAckEnabled}
@@ -377,15 +612,21 @@ function YCloudSection({
             type="button"
             size="sm"
             onClick={handleSave}
-            disabled={saving}
+            disabled={saving || missing.length > 0}
             aria-busy={saving}
+            aria-describedby={missing.length > 0 ? "whatsapp-missing" : undefined}
           >
             {saving && (
               <Loader2 className="h-4 w-4 mr-2 animate-spin" aria-hidden />
             )}
-            Guardar
+            {switching ? `Guardar y cambiar a ${label}` : "Guardar"}
           </Button>
         </div>
+        {missing.length > 0 && (
+          <p id="whatsapp-missing" className="text-xs text-muted-foreground">
+            Para guardar {label} falta {missing.join(", ")}.
+          </p>
+        )}
       </div>
     </Section>
   );
@@ -842,14 +1083,18 @@ export function IntegrationsTab({ workspaceId, initialIntegrations }: Props) {
   }, [workspaceId]);
 
   const ycloud = findIntegration(integrations, "ycloud");
+  const kapso = findIntegration(integrations, "kapso");
   const openrouter = findIntegration(integrations, "openrouter");
   const highlevel = findIntegration(integrations, "highlevel");
 
   return (
     <div className="space-y-6">
-      <YCloudSection
+      <WhatsAppSection
+        // Remount when the active provider changes so the form reloads it.
+        key={`${ycloud?.enabled ?? "-"}:${kapso?.enabled ?? "-"}`}
         workspaceId={workspaceId}
-        initial={ycloud}
+        ycloud={ycloud}
+        kapso={kapso}
         onSaved={refresh}
       />
       <Separator />

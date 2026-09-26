@@ -57,12 +57,15 @@ export function CreateWorkspaceSheet({ open, onClose, onCreated }: Props) {
   const [clientEmail, setClientEmail] = useState("");
   const [clientPassword, setClientPassword] = useState("");
   const [useCase, setUseCase] = useState<UseCase>("general");
-  const [webhookUrl, setWebhookUrl] = useState<string | null>(null);
+  const [webhookUrls, setWebhookUrls] = useState<{
+    ycloud: string;
+    kapso: string;
+  } | null>(null);
   const [credentials, setCredentials] = useState<{
     email: string;
     password: string;
   } | null>(null);
-  const [copied, setCopied] = useState(false);
+  const [copied, setCopied] = useState<"ycloud" | "kapso" | null>(null);
   const [copiedCred, setCopiedCred] = useState(false);
   const [saving, startSave] = useTransition();
 
@@ -72,18 +75,18 @@ export function CreateWorkspaceSheet({ open, onClose, onCreated }: Props) {
     setClientEmail("");
     setClientPassword("");
     setUseCase("general");
-    setWebhookUrl(null);
+    setWebhookUrls(null);
     setCredentials(null);
-    setCopied(false);
+    setCopied(null);
     setCopiedCred(false);
     onClose();
   }
 
-  function handleCopy() {
-    if (!webhookUrl) return;
-    navigator.clipboard.writeText(webhookUrl);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 2000);
+  function handleCopy(provider: "ycloud" | "kapso") {
+    if (!webhookUrls) return;
+    navigator.clipboard.writeText(webhookUrls[provider]);
+    setCopied(provider);
+    setTimeout(() => setCopied(null), 2000);
   }
 
   function handleCopyCredentials() {
@@ -110,7 +113,7 @@ export function CreateWorkspaceSheet({ open, onClose, onCreated }: Props) {
         return;
       }
 
-      setWebhookUrl(result.webhookUrl ?? null);
+      setWebhookUrls(result.webhookUrls ?? null);
       setCredentials(result.clientCredentials ?? null);
       toast.success("Workspace creado correctamente");
       onCreated();
@@ -136,7 +139,7 @@ export function CreateWorkspaceSheet({ open, onClose, onCreated }: Props) {
           </SheetDescription>
         </SheetHeader>
 
-        {webhookUrl ? (
+        {webhookUrls ? (
           // Success state — show webhook URL
           <div className="mt-6 space-y-5">
             {credentials && (
@@ -182,31 +185,38 @@ export function CreateWorkspaceSheet({ open, onClose, onCreated }: Props) {
                 Workspace creado
               </p>
               <p className="text-xs text-muted-foreground">
-                Comparte esta URL de webhook con tu cliente para conectar
-                YCloud:
+                El cliente elige su proveedor de WhatsApp en Configuración →
+                Integraciones. Comparte la URL de webhook del que vaya a usar:
               </p>
-              <div className="flex items-center gap-2 mt-1">
-                <code className="flex-1 rounded bg-muted px-2 py-1.5 font-mono text-xs text-foreground break-all">
-                  {webhookUrl}
-                </code>
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="sm"
-                  className="shrink-0"
-                  aria-label="Copiar URL"
-                  onClick={handleCopy}
-                >
-                  {copied ? (
-                    <CheckCheck
-                      className="h-4 w-4 text-primary"
-                      aria-hidden="true"
-                    />
-                  ) : (
-                    <Copy className="h-4 w-4" aria-hidden="true" />
-                  )}
-                </Button>
-              </div>
+              {(["ycloud", "kapso"] as const).map((provider) => (
+                <div key={provider} className="space-y-1 mt-1">
+                  <p className="text-xs font-medium text-foreground">
+                    {provider === "kapso" ? "Kapso (Estados Unidos)" : "YCloud"}
+                  </p>
+                  <div className="flex items-center gap-2">
+                    <code className="flex-1 rounded bg-muted px-2 py-1.5 font-mono text-xs text-foreground break-all">
+                      {webhookUrls[provider]}
+                    </code>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      className="shrink-0"
+                      aria-label={`Copiar URL de ${provider === "kapso" ? "Kapso" : "YCloud"}`}
+                      onClick={() => handleCopy(provider)}
+                    >
+                      {copied === provider ? (
+                        <CheckCheck
+                          className="h-4 w-4 text-primary"
+                          aria-hidden="true"
+                        />
+                      ) : (
+                        <Copy className="h-4 w-4" aria-hidden="true" />
+                      )}
+                    </Button>
+                  </div>
+                </div>
+              ))}
             </div>
 
             <Button variant="outline" className="w-full" onClick={handleClose}>

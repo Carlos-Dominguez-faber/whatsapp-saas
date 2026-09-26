@@ -16,7 +16,7 @@ super admin y deja el cron corriendo. Tarda ~15 minutos.
 | -------------- | ------------------------------ | -------------- |
 | **Supabase**   | Base de datos + Auth + Storage | Free sirve     |
 | **Vercel**     | Hospedaje de la app            | Hobby (gratis) |
-| **YCloud**     | Número de WhatsApp (proveedor) | Según su plan  |
+| **YCloud** o **Kapso** | Número de WhatsApp (proveedor; Kapso si estás en EE. UU.) | Según su plan  |
 | **OpenRouter** | El modelo de IA (LLM)          | Pago por uso   |
 
 El agente instala lo demás (Node, los CLIs de Supabase y Vercel). Cuando termine,
@@ -85,8 +85,8 @@ npm install
 > Cuando esté listo: **Settings → API**, y copia estos 3 valores.
 
 Pídele las 3 keys de Supabase (y, si ya la tiene, la de OpenRouter) y córrelas
-inline. Esto **genera los 3 secrets** y escribe `.env.local`. (YCloud NO va aquí:
-se configura por workspace en la app, paso 10.)
+inline. Esto **genera los 3 secrets** y escribe `.env.local`. (El proveedor de
+WhatsApp NO va aquí: se configura por workspace en la app, paso 11.)
 
 ```bash
 NEXT_PUBLIC_SUPABASE_URL='https://xxxx.supabase.co' \
@@ -168,12 +168,37 @@ entra con tu super admin, y en el **panel de agencia** (`/workspaces`) dale **cr
 workspace**. La app lo arma completo (prompt, agentes, business info e integración).
 Este es el flujo real que repetirás por cada cliente.
 
-**11. Conecta YCloud en ESE workspace.** Dentro del workspace, ve a
-**Settings → Integraciones**: pega la **API Key** y el **Webhook Signing Secret** de
-YCloud (cada cliente tiene los suyos), y copia el **Webhook URL** que muestra la app
-(ya trae el `wsid` correcto) → pégalo en **YCloud → Webhooks** y conecta el número.
+**11. Conecta WhatsApp en ESE workspace.** Dentro del workspace, ve a
+**Settings → Integraciones → WhatsApp** y elige el proveedor del cliente: **YCloud**,
+o **Kapso** si está en Estados Unidos (YCloud no opera ahí).
 
-**12. Verificación final.** Desde un teléfono, manda un WhatsApp al número de YCloud.
+- **YCloud:** pega la **API Key**, el número (E.164) y el **Webhook Signing Secret**
+  (cada cliente tiene los suyos).
+- **Kapso:** pega la **API Key** y el **Webhook Signing Secret**, y pulsa **Probar
+  conexión**: rellena el `phone_number_id` y el `waba_id` de Meta. El
+  `phone_number_id` **no es el número de teléfono**: si los confundes, todos los
+  envíos fallan con 400.
+
+**Probar conexión** usa lo que está en pantalla, aunque no lo hayas guardado. La app
+no activa un proveedor sin API Key, Webhook Signing Secret y número (YCloud) o Phone
+Number ID (Kapso): el botón de guardar te dice qué falta.
+
+Guarda, copia el **Webhook URL** que muestra la app (ya trae el `wsid` y la ruta del
+proveedor elegido) → pégalo en los webhooks del proveedor y conecta el número.
+
+En **Kapso**, al crear el webhook con el mismo signing secret, suscribe los cinco
+eventos: `whatsapp.message.received` (trae los mensajes) y `sent`, `delivered`,
+`read` y `failed` (mueven el estado; con coexistence, `sent` es además por donde
+llega la respuesta del humano desde el celular).
+
+> ⚠️ **El buffering de webhooks de Kapso debe quedar APAGADO** (`buffer_enabled:
+> false`). Si se activa, Kapso agrupa los mensajes en un sobre `{batch:true,
+> data:[…]}` que este webhook no procesa, y el agente se queda callado sin dar
+> error. La app ya tiene su propio buffer (`buffer_silence_seconds`); dos sobran.
+> Si queda encendido lo verás en los logs de Vercel como
+> `[kapso] webhook batching is ON`.
+
+**12. Verificación final.** Desde un teléfono, manda un WhatsApp al número conectado.
 En ~1 minuto (cuando dispare el cron) el agente debe responder. Si no, revisa las
 corridas del cron:
 
@@ -185,7 +210,7 @@ order by start_time desc limit 5;
 ```
 
 **13. Más clientes.** Repite los pasos 10–11 por cada cliente nuevo: un workspace +
-su propia integración de YCloud.
+su propia integración de WhatsApp (cada uno puede usar YCloud o Kapso).
 
 ---
 
@@ -200,7 +225,36 @@ su propia integración de YCloud.
 - **`vercel-env` dice "already exists":** esa var ya estaba; actualízala en el
   dashboard de Vercel → Settings → Environment Variables.
 - **El agente no responde al WhatsApp:** revisa `cron.job_run_details` (paso 12),
-  que el webhook de YCloud apunte a tu URL, y que `OPENROUTER_API_KEY` tenga saldo.
+  que el webhook del proveedor (YCloud o Kapso) apunte a tu URL con la ruta del
+  proveedor activo, y que `OPENROUTER_API_KEY` tenga saldo. Si cambiaste de
+  proveedor, el webhook del anterior ya no se acepta (responde 401).
+- **Kapso: no llegan los mensajes.** Lo primero es ver qué intentó entregar Kapso
+  (el endpoint lleva guion bajo; con guion medio da 404):
+
+  ```bash
+  curl -sS "https://api.kapso.ai/platform/v1/webhook_deliveries?per_page=10" \
+    -H "X-API-Key: $KAPSO_API_KEY"
+  ```
+
+  - **sin entregas:** el webhook no existe o no está `active` en Kapso;
+  - **`401`:** el signing secret de Kapso no es el de la app, o el
+    `phone_number_id` del evento no es el del workspace (el `?wsid=` de la URL
+    apunta a otro workspace);
+  - **`200` pero nada en el inbox:** el evento llegó y se descartó; revisa los logs
+    de Vercel (por ejemplo, el buffering de Kapso encendido). Un 200 no prueba que
+    el mensaje se guardó;
+  - **`5xx`:** error de la app; revisa los logs de Vercel.
+- **Qué pasa con lo que estaba en curso al cambiar de proveedor:**
+  - una respuesta que la IA estaba generando sale por el proveedor **nuevo**;
+  - si ese envío falla (por ejemplo, una API Key equivocada), la respuesta queda en
+    el inbox como mensaje **fallido**, con el error; la conversación no se
+    reintenta sola, así que reenvíala desde el inbox;
+  - los mensajes que ya había enviado el proveedor anterior se quedan en su último
+    estado (por ejemplo "enviado"): sus avisos de entregado/leído llegan a un
+    webhook que ya responde 401.
+
+  Por eso conviene probar la conexión antes de guardar, y cambiar en un momento
+  de poco tráfico.
 
 ## Actualizar a una versión nueva
 
@@ -217,6 +271,25 @@ restricciones de tablas grandes (mensajes) y las bloquean unos segundos.
 
 El orden importa: el código nuevo puede depender de funciones o permisos que traen
 las migraciones, así que las migraciones van **antes** de `vercel --prod`.
+
+**Si instalaste desde la antigua rama `provider/kapso`** (Kapso), cámbiate a `main`,
+donde ahora viven los dos proveedores. Cada workspace sigue con el proveedor que
+tenía **activo**: si tenía Kapso (o Kapso y YCloud a la vez), queda en Kapso; si solo
+tenía YCloud activo, queda en YCloud. Después del upgrade, revisa en
+**Configuración → Integraciones → WhatsApp** de cada workspace que el proveedor
+marcado como "activo" sea el que esperas.
+
+```bash
+git fetch origin
+git checkout main
+git pull
+npm install
+SUPABASE_DB_PASSWORD='tu-contraseña-de-la-base' node scripts/setup.mjs db-push   # repara el historial de migraciones solo
+vercel --prod
+```
+
+`db-push` marca como revertidas las dos migraciones que solo existían en esa rama
+(`20260731000000/1`; su contenido ya viene en las de `main`) y aplica las nuevas.
 
 **Una sola vez, si tu instalación es anterior al 26-sep-2026** (endurecimiento de
 seguridad entre workspaces):

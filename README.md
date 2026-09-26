@@ -48,49 +48,40 @@ Supabase/Vercel.
 | Estilos   | Tailwind CSS + shadcn/ui                     |
 | Backend   | Supabase (Auth + PostgreSQL + RLS + Storage) |
 | IA        | OpenRouter (LLM gateway)                     |
-| WhatsApp  | YCloud (ver abajo)                           |
+| WhatsApp  | YCloud o Kapso, por workspace (ver abajo)    |
 | Hosting   | Vercel                                       |
 
 ## Elegir proveedor de WhatsApp
 
-El proveedor no es intercambiable por configuración: su API define la forma de los
-envíos, el payload de los webhooks y el esquema de firma. Por eso vive en una
-rama, no en una variable de entorno.
+Cada **workspace** elige su proveedor en **Settings → Integraciones → WhatsApp**:
+**YCloud** o **Kapso**. Los dos viven en `main` y en la misma instalación. Una
+agencia puede tener clientes de Estados Unidos en Kapso y de Latinoamérica en
+YCloud.
 
-| Rama | Proveedor | Cuándo usarla |
+| | YCloud | Kapso |
 | --- | --- | --- |
-| `main` | **YCloud** | Por defecto |
-| `provider/kapso` | **Kapso** | **Obligatoria en Estados Unidos** — YCloud no opera ahí |
-
-```bash
-# YCloud (por defecto)
-git clone https://github.com/Carlos-Dominguez-faber/whatsapp-saas.git
-
-# Kapso
-git clone -b provider/kapso https://github.com/Carlos-Dominguez-faber/whatsapp-saas.git
-```
-
-### En qué se diferencian
-
-| | YCloud (`main`) | Kapso (`provider/kapso`) |
-| --- | --- | --- |
-| Disponible en EE.UU. | ❌ | ✅ |
+| Disponible en EE. UU. | ❌ | ✅ |
 | Identidad del emisor | `phone_number` (E.164) | `phone_number_id` de Meta |
+| Plantillas | WABA resuelto desde el número | `waba_id` configurado (se autocompleta) |
 | Firma del webhook | con timestamp, ventana anti-replay de 300 s | HMAC-SHA256 sin timestamp |
-| Nombre del evento | en el body | en el header `X-Webhook-Event` |
-| Coexistence | no soportado | soportado |
+| Coexistence (responder desde la app en el celular) | no soportado | soportado |
 | Prueba de conexión | `GET /balance` | listado de números del proyecto |
+| Webhook | `/api/webhooks/ycloud?wsid=…` | `/api/webhooks/kapso?wsid=…` |
 
-La rama de Kapso pide **dos IDs de Meta** que YCloud no necesita —`phone_number_id`
-y `waba_id`— y ambos se autocompletan al pulsar «Probar conexión» en
-Settings → Integraciones. Trae además dos migraciones propias y soporte de
-**coexistence**: si el mismo número se usa también desde la app de WhatsApp
-Business en un celular, esas respuestas humanas se guardan y la conversación pasa
-a `human_active` para que el agente no conteste encima de la persona.
+Solo puede haber **un proveedor activo por workspace**. Al cambiarlo, el anterior
+queda guardado, desactivado, por si vuelves. Los ajustes del workspace (buffer,
+memoria, aviso de handoff, Jev) se trasladan solos, y los webhooks del proveedor
+anterior dejan de aceptarse.
 
-> `provider/kapso` incluye todo lo de `main` más el cambio de proveedor. Las
-> mejoras que no son del proveedor (inbox, KB, agente) se llevan allá con
-> `git merge main`.
+Con Kapso, `phone_number_id` y `waba_id` se autocompletan al pulsar «Probar
+conexión». Con **coexistence**, si el mismo número se usa también desde la app
+de WhatsApp Business en un celular, esas respuestas humanas se guardan y la
+conversación pasa a `human_active` para que el agente no conteste encima de la
+persona. Guía paso a paso: el paso 11 de [`INSTALAR.md`](INSTALAR.md).
+
+> La antigua rama `provider/kapso` quedó congelada: todo vive en `main`. Si
+> instalaste desde esa rama, cambia a `main` como indica INSTALAR.md →
+> "Actualizar".
 
 ## Desarrollo local
 
@@ -135,12 +126,12 @@ scripts/
 
 Ver [`.env.local.example`](.env.local.example). Las de Supabase y OpenRouter las
 pegas tú; `ENCRYPTION_KEY`, `BUFFER_PROCESS_SECRET` y `CRON_SECRET` las **genera**
-`scripts/setup.mjs`. **YCloud y HighLevel NO son env vars** — se configuran por
-workspace en Settings → Integraciones.
+`scripts/setup.mjs`. **YCloud, Kapso y HighLevel NO son env vars** — se configuran
+por workspace en Settings → Integraciones.
 
 ### Credenciales de integraciones
 
-Lo que guardas en Settings → Integraciones (API key de YCloud, signing secret,
+Lo que guardas en Settings → Integraciones (API key de YCloud o Kapso, signing secret,
 PIT de HighLevel) se cifra con **AES-256-GCM** antes de tocar la base. La llave
 es `ENCRYPTION_KEY` y vive solo en el entorno del servidor: quien tenga acceso
 de lectura a Postgres ve ciphertext, no las keys.

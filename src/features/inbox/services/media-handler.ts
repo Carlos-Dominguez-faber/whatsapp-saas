@@ -1,4 +1,5 @@
 import { createClient as createSbClient } from "@supabase/supabase-js";
+import type { WhatsAppProvider } from "./whatsapp-provider";
 
 function svc() {
   return createSbClient(
@@ -7,7 +8,11 @@ function svc() {
   );
 }
 
-const ALLOWED_YCLOUD_HOST = "api.ycloud.com";
+/** SEC-08: the only host each provider may make us download media from. */
+const ALLOWED_MEDIA_HOST: Record<WhatsAppProvider, string> = {
+  ycloud: "api.ycloud.com",
+  kapso: "api.kapso.ai",
+};
 const BUCKET = "whatsapp-media";
 
 /** MIME type → file extension map */
@@ -43,6 +48,7 @@ export interface MediaMeta {
   storage_path: string;
   mime_type: string;
   ycloud_media_id?: string;
+  kapso_media_id?: string;
   /** Caption from image / video payloads */
   caption?: string;
   /** Original filename from document payloads */
@@ -55,10 +61,16 @@ export interface MediaMeta {
 }
 
 export interface DownloadAndStoreOptions {
-  /** YCloud direct download URL (must be on api.ycloud.com — SEC-08) */
+  /** Provider the webhook came from — decides the allowed host and auth. */
+  provider: WhatsAppProvider;
+  /**
+   * Download URL from the webhook payload, on the provider's host (SEC-08).
+   * Kapso's is pre-signed with an EXPIRING token: pass it straight from the
+   * webhook, never a value read back out of storage.
+   */
   link: string;
-  /** YCloud workspace API key — sent as X-API-Key header */
-  apiKey: string;
+  /** YCloud only: the workspace API key, sent as X-API-Key. */
+  apiKey?: string;
   /** Forge workspace ID used as first path segment in storage */
   workspaceId: string;
   /** Conversation ID used as second path segment in storage */
@@ -69,51 +81,58 @@ export interface DownloadAndStoreOptions {
   filename?: string;
   /** Caption text for images / videos */
   caption?: string;
-  /** YCloud media ID from the payload */
-  ycloudMediaId?: string;
+  /** Provider media ID from the payload */
+  mediaId?: string;
 }
 
 /**
- * SEC-08: Validates that the URL host is exactly api.ycloud.com.
+ * SEC-08: Validates that the URL host is exactly the provider's media host.
  * Returns false on any parse error.
  */
-export function validateYCloudUrl(url: string): boolean {
+export function validateMediaUrl(
+  provider: WhatsAppProvider,
+  url: string,
+): boolean {
   try {
-    return new URL(url).hostname === ALLOWED_YCLOUD_HOST;
+    return new URL(url).hostname === ALLOWED_MEDIA_HOST[provider];
   } catch {
     return false;
   }
 }
 
 /**
- * Downloads a media file from YCloud and stores it in the whatsapp-media
- * Supabase Storage bucket.
+ * Downloads a media file from the WhatsApp provider and stores it in the
+ * whatsapp-media Supabase Storage bucket.
  *
  * Storage path: {workspaceId}/{conversationId}/{timestamp}-{filename}.{ext}
  *
  * Returns null when:
  * - The URL fails SEC-08 host validation
- * - The YCloud download request fails (non-2xx)
+ * - The provider download request fails (non-2xx)
  * - The Supabase upload fails
  */
 export async function downloadAndStoreMedia(
   opts: DownloadAndStoreOptions,
 ): Promise<MediaMeta | null> {
-  // SEC-08: block requests to non-YCloud hosts
-  if (!validateYCloudUrl(opts.link)) {
+  // SEC-08: block requests to any host but the provider's
+  if (!validateMediaUrl(opts.provider, opts.link)) {
     console.error(
-      "[media-handler] SEC-08 violation — URL host is not api.ycloud.com:",
+      `[media-handler] SEC-08 violation — URL host is not ${ALLOWED_MEDIA_HOST[opts.provider]}:`,
       opts.link,
     );
     return null;
   }
 
-  // Download from YCloud
+  // Download. YCloud wants the API key; Kapso's URL carries its own signed
+  // token (a 401/403 there usually means the URL sat around and expired).
   let response: Response;
   try {
-    response = await fetch(opts.link, {
-      headers: { "X-API-Key": opts.apiKey },
-    });
+    response = await fetch(
+      opts.link,
+      opts.provider === "ycloud"
+        ? { headers: { "X-API-Key": opts.apiKey ?? "" } }
+        : undefined,
+    );
   } catch (err) {
     console.error("[media-handler] fetch failed:", err);
     return null;
@@ -121,7 +140,7 @@ export async function downloadAndStoreMedia(
 
   if (!response.ok) {
     console.error(
-      `[media-handler] YCloud download returned ${response.status} for ${opts.link}`,
+      `[media-handler] ${opts.provider} download returned ${response.status} for ${opts.link}`,
     );
     return null;
   }
@@ -163,7 +182,10 @@ export async function downloadAndStoreMedia(
     size_bytes: buffer.byteLength,
   };
 
-  if (opts.ycloudMediaId) meta.ycloud_media_id = opts.ycloudMediaId;
+  if (opts.mediaId) {
+    if (opts.provider === "kapso") meta.kapso_media_id = opts.mediaId;
+    else meta.ycloud_media_id = opts.mediaId;
+  }
   if (opts.caption) meta.caption = opts.caption;
   if (opts.filename) meta.filename = opts.filename;
 

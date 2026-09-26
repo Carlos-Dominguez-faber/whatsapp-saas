@@ -6,10 +6,17 @@
  */
 
 import { createClient as createSbClient } from "@supabase/supabase-js";
-import { sendText, sendTemplate } from "./ycloud-client";
-import type { TemplateParams } from "./ycloud-client";
 import { formatWhatsAppMarkdown } from "./text-formatter";
-import { decryptCredentials } from "@/shared/lib/integration-secrets";
+import {
+  decryptWhatsAppCredentials,
+  loadWhatsAppIntegration,
+  WHATSAPP_NOT_CONNECTED,
+} from "./whatsapp-provider";
+import {
+  whatsappSender,
+  type TemplateComponents,
+  type WhatsAppSender,
+} from "./whatsapp-sender";
 
 function svc() {
   return createSbClient(
@@ -38,7 +45,7 @@ export interface DispatchTemplateParams {
   templateName: string;
   /** Defaults to 'es'. NEVER use 'es_PA' — Movinsa gotcha */
   templateLanguage?: string;
-  components?: TemplateParams["components"];
+  components?: TemplateComponents;
   senderUserId?: string;
 }
 
@@ -52,11 +59,6 @@ export interface DispatchResult {
 // Internal helpers
 // ──────────────────────────────────────────────────────────────────────────────
 
-interface IntegrationRow {
-  credentials: Record<string, unknown>;
-  config: Record<string, unknown>;
-}
-
 interface ContactPhoneRow {
   phone: string;
   opt_in: boolean | null;
@@ -67,34 +69,20 @@ interface ConversationWindowRow {
   contact_id: string;
 }
 
-async function loadIntegration(
+/**
+ * The sender for the workspace's active WhatsApp provider (YCloud or Kapso).
+ * dispatch never names a provider itself.
+ */
+async function loadSender(
   workspaceId: string,
   supabase: ReturnType<typeof svc>,
-): Promise<{ apiKey: string; fromPhone: string }> {
-  const { data, error } = await supabase
-    .from("integrations")
-    .select("credentials, config")
-    .eq("workspace_id", workspaceId)
-    .eq("provider", "ycloud")
-    .eq("enabled", true)
-    .single();
-
-  if (error || !data) {
-    throw new Error(
-      `[dispatch] YCloud integration not found: ${error?.message}`,
-    );
+): Promise<WhatsAppSender> {
+  const row = await loadWhatsAppIntegration(supabase, workspaceId);
+  if (!row) {
+    throw new Error(`[dispatch] ${WHATSAPP_NOT_CONNECTED}`);
   }
-
-  const row = data as IntegrationRow;
-  const creds = await decryptCredentials(
-    row.credentials,
-    workspaceId,
-    "ycloud",
-  );
-  return {
-    apiKey: (creds.ycloud_api_key as string | undefined) ?? "",
-    fromPhone: (row.config.phone_number as string | undefined) ?? "",
-  };
+  const credentials = await decryptWhatsAppCredentials(row, workspaceId);
+  return whatsappSender(row.provider, credentials, row.config);
 }
 
 /**
@@ -169,7 +157,7 @@ export async function dispatchText(
   } = params;
 
   // Normalise Markdown → WhatsApp formatting (e.g. **bold** → *bold*) once, so
-  // both the YCloud send and the persisted message match what the user receives.
+  // both the provider send and the persisted message match what the user receives.
   const body = formatWhatsAppMarkdown(rawBody);
 
   const supabase = svc();
@@ -195,31 +183,26 @@ export async function dispatchText(
     return { ok: false, error: "WINDOW_EXPIRED" };
   }
 
-  // 3. Load YCloud credentials
-  const { apiKey, fromPhone } = await loadIntegration(workspaceId, supabase);
+  // 3. Resolve the workspace's WhatsApp provider
+  const sender = await loadSender(workspaceId, supabase);
 
-  // 4. Send via YCloud (skip if placeholder / dev mode)
-  // YCloud returns its own `id` synchronously and assigns the WhatsApp `wamid`
-  // asynchronously (delivered via a status webhook). A 2xx response means the
-  // message was accepted for delivery, even when `wamid` is still empty.
+  // 4. Send (skip if placeholder / dev mode). A 2xx means the message was
+  // accepted for delivery. Kapso returns the WhatsApp `wamid` synchronously;
+  // YCloud returns its own id and delivers the `wamid` later via a status
+  // webhook, so `wamid` may still be empty here.
   let wamid: string | undefined;
-  let ycloudId: string | undefined;
-  const realSend = Boolean(apiKey && apiKey !== "placeholder");
+  let providerMessageId: string | undefined;
+  const realSend = sender.live;
 
   if (realSend) {
     try {
-      const sent = await sendText({
-        apiKey,
-        from: fromPhone,
-        to: toPhone,
-        body,
-      });
-      wamid = sent.wamid || undefined;
-      ycloudId = sent.id || undefined;
+      const sent = await sender.sendText(toPhone, body);
+      wamid = sent.wamid;
+      providerMessageId = sent.providerMessageId;
     } catch (sendErr) {
       const errMsg =
         sendErr instanceof Error ? sendErr.message : String(sendErr);
-      console.error("[dispatch] YCloud sendText error:", errMsg);
+      console.error(`[dispatch] ${sender.label} sendText error:`, errMsg);
 
       // Persist failed message for audit
       await supabase.from("messages").insert({
@@ -247,12 +230,13 @@ export async function dispatchText(
     type: "text",
     body,
     wamid: wamid ?? null,
-    // A real YCloud send is 'sent'; only a placeholder key stays a dev no-op.
+    // A real send is 'sent'; only a placeholder key stays a dev no-op.
     status: realSend ? "sent" : "queued",
     sender_user_id: senderUserId ?? null,
     meta: {
       dev_mode: realSend ? undefined : true,
-      ycloud_id: ycloudId,
+      // YCloud's own message id, kept to reconcile its status webhooks.
+      ycloud_id: sender.provider === "ycloud" ? providerMessageId : undefined,
       override_admin: overrideAdmin || undefined,
     },
   });
@@ -301,17 +285,15 @@ export async function dispatchTemplate(
   // SEC-10: Block outbound to opted-out contacts
   if (!loaded.optIn) return OPT_OUT;
 
-  // 2. Load YCloud credentials
-  const { apiKey, fromPhone } = await loadIntegration(workspaceId, supabase);
+  // 2. Resolve the workspace's WhatsApp provider
+  const sender = await loadSender(workspaceId, supabase);
 
-  // 3. Send template via YCloud
+  // 3. Send the template
   let wamid: string | undefined;
 
-  if (apiKey && apiKey !== "placeholder") {
+  if (sender.live) {
     try {
-      const sent = await sendTemplate({
-        apiKey,
-        from: fromPhone,
+      const sent = await sender.sendTemplate({
         to: toPhone,
         templateName,
         language: templateLanguage,
@@ -321,7 +303,7 @@ export async function dispatchTemplate(
     } catch (sendErr) {
       const errMsg =
         sendErr instanceof Error ? sendErr.message : String(sendErr);
-      console.error("[dispatch] YCloud sendTemplate error:", errMsg);
+      console.error(`[dispatch] ${sender.label} sendTemplate error:`, errMsg);
 
       await supabase.from("messages").insert({
         workspace_id: workspaceId,

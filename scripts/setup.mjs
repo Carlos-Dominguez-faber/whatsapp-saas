@@ -204,6 +204,19 @@ function cmdEnv() {
   log("➡️  NEXT_PUBLIC_APP_URL se setea después del deploy con: set-app-url <url>");
 }
 
+// Migrations that only existed on the retired provider/kapso branch. Their
+// content lives on main as 20260927000000/1 (idempotent), so an install coming
+// from that branch just needs them marked as reverted in its history — or
+// `supabase db push` refuses ("Remote migration versions not found").
+// Marking a version that was never applied is a no-op, so this always runs:
+// no parsing of the CLI's table output.
+const RETIRED_KAPSO_BRANCH_MIGRATIONS = ["20260731000000", "20260731000001"];
+
+function repairRetiredMigrations() {
+  log("Historial de migraciones: marco como revertidas las de la antigua rama provider/kapso (no-op si nunca se aplicaron).");
+  run(`supabase migration repair --status reverted ${RETIRED_KAPSO_BRANCH_MIGRATIONS.join(" ")}`);
+}
+
 function cmdDbPush(args) {
   ensureCli("supabase", "https://supabase.com/docs/guides/cli");
   const env = readEnvFile(ENV_PATH);
@@ -214,6 +227,7 @@ function cmdDbPush(args) {
   log(`Linking Supabase project: ${ref}`);
   log("(Si pide la DB password y corres esto sin interacción, exporta SUPABASE_DB_PASSWORD primero.)");
   run(`supabase link --project-ref ${ref}`);
+  repairRetiredMigrations();
   run("supabase db push");
   ok("Migraciones aplicadas (incluye pg_cron + pg_net).");
   log("➡️  Después del deploy: set-app-url <url> y luego cron-sql para agendar el buffer-flush.");

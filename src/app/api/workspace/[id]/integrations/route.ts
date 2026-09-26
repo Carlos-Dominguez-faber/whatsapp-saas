@@ -10,9 +10,15 @@ import {
   encryptCredentials,
   decryptCredentials,
 } from "@/shared/lib/integration-secrets";
+import {
+  isWhatsAppProvider,
+  missingWhatsAppFields,
+  WHATSAPP_PROVIDER_LABELS,
+  WORKSPACE_WHATSAPP_SETTINGS,
+} from "@/features/inbox/services/whatsapp-provider";
 
 const IntegrationSchema = z.object({
-  provider: z.enum(["ycloud", "openrouter", "highlevel"]),
+  provider: z.enum(["ycloud", "kapso", "openrouter", "highlevel"]),
   enabled: z.boolean().optional(),
   credentials: z.record(z.string(), z.string()).optional(),
   config: z.record(z.string(), z.unknown()).optional(),
@@ -156,25 +162,84 @@ export async function PUT(
   ) {
     mergedCreds.highlevel_webhook_secret = randomBytes(24).toString("hex");
   }
+  const provider = parsed.data.provider;
+  const enabled = parsed.data.enabled ?? true;
+
+  // A WhatsApp provider only becomes the active one when it can actually talk:
+  // activating it disables the other, and without a key, secret or sender id
+  // replies would be dropped silently. Checked against what is stored plus what
+  // this request brings (masked values keep the stored ones).
+  if (isWhatsAppProvider(provider) && enabled) {
+    const missing = missingWhatsAppFields(provider, mergedCreds, {
+      ...((existing?.config as Record<string, unknown> | null) ?? {}),
+      ...(parsed.data.config ?? {}),
+    });
+    if (missing.length > 0) {
+      return NextResponse.json(
+        {
+          error: `Para activar ${WHATSAPP_PROVIDER_LABELS[provider]} falta ${missing.join(", ")}.`,
+          missing,
+        },
+        { status: 422 },
+      );
+    }
+  }
+
+  // Encrypt the whole merged set before writing anything: incoming plaintext
+  // gets wrapped, values already stored encrypted are left untouched, and a
+  // legacy plaintext row is migrated in place the first time it is saved.
+  let encryptedCreds: Record<string, unknown>;
+  try {
+    encryptedCreds = await encryptCredentials(mergedCreds, workspaceId, provider);
+  } catch (err) {
+    console.error(
+      "[PUT /api/workspace/[id]/integrations] encrypt error:",
+      err instanceof Error ? err.message : "unknown",
+    );
+    return NextResponse.json(
+      { error: "No se pudo guardar la integración. Intenta de nuevo." },
+      { status: 500 },
+    );
+  }
+
+  // WhatsApp (YCloud ↔ Kapso): only one may be active per workspace (unique
+  // index). save_whatsapp_integration() disables the one being replaced and
+  // saves this one in a single transaction, carrying the workspace-level
+  // settings over (what the UI sends > the active provider's > this row's
+  // own). The replaced row keeps its credentials, so switching back needs no
+  // re-entry.
+  if (isWhatsAppProvider(provider)) {
+    const { data: switchedFrom, error } = await svc.rpc("save_whatsapp_integration", {
+      p_workspace_id: workspaceId,
+      p_provider: provider,
+      p_enabled: enabled,
+      p_credentials: encryptedCreds,
+      p_config: parsed.data.config ?? {},
+      p_workspace_keys: [...WORKSPACE_WHATSAPP_SETTINGS],
+    });
+    if (error) {
+      console.error("[PUT /api/workspace/[id]/integrations] save error:", error.message);
+      return NextResponse.json(
+        { error: "No se pudo guardar la integración. Intenta de nuevo." },
+        { status: 500 },
+      );
+    }
+    return NextResponse.json({
+      ok: true,
+      ...(typeof switchedFrom === "string" && switchedFrom ? { switchedFrom } : {}),
+    });
+  }
+
   const mergedConfig = {
     ...((existing?.config as object) ?? {}),
     ...(parsed.data.config ?? {}),
   };
 
-  // Encrypt the whole merged set: incoming plaintext gets wrapped, values
-  // already stored encrypted are left untouched, and a legacy plaintext row is
-  // migrated in place the first time it is saved.
-  const encryptedCreds = await encryptCredentials(
-    mergedCreds,
-    workspaceId,
-    parsed.data.provider,
-  );
-
   const { error } = await svc.from("integrations").upsert(
     {
       workspace_id: workspaceId,
-      provider: parsed.data.provider,
-      enabled: parsed.data.enabled ?? true,
+      provider,
+      enabled,
       credentials: encryptedCreds,
       config: mergedConfig,
       updated_at: new Date().toISOString(),

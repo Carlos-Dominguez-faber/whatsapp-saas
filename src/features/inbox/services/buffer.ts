@@ -27,6 +27,10 @@ import {
 } from "./conversation-history";
 import { getSetterConfig, evaluateLead } from "./setter";
 import { syncContactToHL, createHLOpportunity } from "./highlevel-client";
+import {
+  loadWhatsAppSettings,
+  WHATSAPP_NOT_CONNECTED,
+} from "./whatsapp-provider";
 
 const DEFAULT_SILENCE_MS = 30_000; // 30 seconds silence window
 const MAX_BATCH_RETRIES = 3;
@@ -244,7 +248,7 @@ async function consolidateBatch(
 //   5. checkRateLimits
 //   6. generateReply with consolidated text
 //   7. recordLlmUsage
-//   8. sendText via ycloud-client (or insert dev_mode outbound)
+//   8. sendText via the workspace's WhatsApp provider (or insert dev_mode outbound)
 //   9. Mark batch 'processed', persist merged_text
 //  10. On error: increment retry counter; if > MAX_BATCH_RETRIES → cancel_batch()
 // ──────────────────────────────────────────────────────────────────────────────
@@ -320,25 +324,29 @@ export async function processNextBatch(): Promise<ProcessBatchResult> {
       contactId: conversation.contact_id as string,
     };
 
-    // ── 6b. Resolve conversational memory window (WS2: configurable) ─────────
-    // The YCloud integration config carries message_history_window; clamp to
-    // [5, 50] and default to 10 when unset or non-numeric.
-    const { data: ycloudCfg } = await supabase
-      .from("integrations")
-      .select("config")
-      .eq("workspace_id", batch.workspace_id)
-      .eq("provider", "ycloud")
-      .eq("enabled", true)
-      .maybeSingle();
+    // ── 6b. The workspace must have an active WhatsApp provider ─────────────
+    // Checked before the model and its tools run: the retry below re-runs the
+    // whole turn, and a reply with nowhere to go must not repeat tool side
+    // effects (bookings, CRM writes) on every attempt. dispatchText() loads
+    // and decrypts the credentials itself.
+    const whatsapp = await loadWhatsAppSettings(supabase, batch.workspace_id);
+    if (!whatsapp) {
+      throw new Error(`[buffer] ${WHATSAPP_NOT_CONNECTED}`);
+    }
+
+    // ── 6c. Resolve conversational memory window (WS2: configurable) ─────────
+    // The workspace's WhatsApp integration config carries
+    // message_history_window; clamp to [5, 50] and default to 10 when unset or
+    // non-numeric.
     const rawWindow = Number(
-      (ycloudCfg?.config as { message_history_window?: number } | null)
-        ?.message_history_window,
+      (whatsapp.config as { message_history_window?: number })
+        .message_history_window,
     );
     const historyWindow = Number.isFinite(rawWindow)
       ? Math.min(50, Math.max(5, rawWindow))
       : 10;
 
-    // ── 6c. Load prior conversation turns (WS1: memory injection) ────────────
+    // ── 6d. Load prior conversation turns (WS1: memory injection) ────────────
     const history = await getConversationHistory(batch.conversation_id, {
       limit: historyWindow,
       excludeBatchId: batch.id,
@@ -440,21 +448,6 @@ export async function processNextBatch(): Promise<ProcessBatchResult> {
       promptTokens: reply.inputTokens,
       completionTokens: reply.outputTokens,
     });
-
-    // ── 9. Load YCloud integration credentials ──────────────────────────────
-    const { data: integration, error: intError } = await supabase
-      .from("integrations")
-      // Only an existence check — dispatchText() loads and decrypts the
-      // credentials itself, so there is no reason to pull secrets here.
-      .select("workspace_id")
-      .eq("workspace_id", batch.workspace_id)
-      .eq("provider", "ycloud")
-      .eq("enabled", true)
-      .single();
-
-    if (intError || !integration) {
-      throw new Error(`YCloud integration not found: ${intError?.message}`);
-    }
 
     // ── 10a. Dispatch via single exit point (SEC-04) ────────────────────────
     const dispatchResult = await dispatchText({
