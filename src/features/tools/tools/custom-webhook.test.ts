@@ -51,23 +51,26 @@ mock.module("@supabase/supabase-js", {
 let sslCheckError: string | null = null;
 let resolvedIp: string | undefined = "8.8.8.8";
 const pinnedIps: string[] = [];
+class RedirectRefusedError extends Error {}
+let redirectRefusal: string | null = null;
 mock.module("../services/ssrf-guard.ts", {
   exports: {
     validateWebhookUrl: async () => ({ error: sslCheckError, resolvedIp }),
+    RedirectRefusedError,
     // Delegates to globalThis.fetch so each test can stub the network, while
-    // recording which IP the request was pinned to.
-    fetchPinned: async (
+    // recording which IP the first hop was pinned to.
+    fetchPinnedFollowingRedirects: async (
       url: string,
-      ip: string,
-      opts: { method: string; headers: Record<string, string>; body?: string },
+      opts: { resolvedIp?: string; method: string; headers: Record<string, string>; body?: string },
     ) => {
-      pinnedIps.push(ip);
+      pinnedIps.push(opts.resolvedIp ?? "");
+      if (redirectRefusal) throw new RedirectRefusedError(redirectRefusal);
       const res = await globalThis.fetch(url, {
         method: opts.method,
         headers: opts.headers,
         body: opts.body,
       });
-      return { status: res.status, bodyText: "", truncated: false };
+      return { status: res.status, headers: {}, bodyText: "", truncated: false, url };
     },
   },
 });
@@ -78,6 +81,7 @@ const ctx: ToolContext = { workspaceId: "ws_1", conversationId: "conv_1", contac
 
 function reset() {
   responseQueue = [];
+  redirectRefusal = null;
   sslCheckError = null;
   resolvedIp = "8.8.8.8";
   pinnedIps.length = 0;
@@ -216,6 +220,24 @@ test("returns ok:false with the HTTP status when the webhook responds with an er
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+test("a redirect to a blocked target is reported as a failed call, not a crash", async () => {
+  reset();
+  redirectRefusal = "Blocked: 10.0.0.5 is a private/internal IP address (SEC-08 anti-SSRF)";
+  responseQueue = [
+    { data: { id: "tool_1" }, error: null },
+    { data: { config: { webhook_url: "https://hooks.example/wh" } }, error: null },
+    { data: null, error: null },
+    { data: null, error: null },
+    { data: null, error: null },
+  ];
+  const result = await customWebhookTool.run({}, ctx);
+  assert.deepEqual(result, {
+    ok: false,
+    output: null,
+    error: "Blocked: 10.0.0.5 is a private/internal IP address (SEC-08 anti-SSRF)",
+  });
 });
 
 test("resolves a configured payload field's {{token}} against the loaded variable values", async () => {

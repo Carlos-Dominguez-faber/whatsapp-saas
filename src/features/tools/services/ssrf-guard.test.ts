@@ -23,6 +23,10 @@ interface FakeReqOptions {
   timeout: number;
 }
 
+// Per-request responses for redirect chains; when empty, the single fake
+// response below is used.
+let responseQueue: Array<{ status: number; headers?: Record<string, string>; chunks?: Buffer[] }> = [];
+const requests: Array<{ module: string; options: FakeReqOptions; req: FakeRequest }> = [];
 let lastReqOptions: FakeReqOptions | null = null;
 let lastReqModule: "http" | "https" | null = null;
 let lastReqBody = "";
@@ -35,8 +39,10 @@ let fakeResponseHangs = false;
 
 class FakeRequest extends EventEmitter {
   destroyed = false;
+  body = "";
   write(chunk: string) {
     lastReqBody += chunk;
+    this.body += chunk;
   }
   end() {}
   destroy(err?: Error) {
@@ -53,6 +59,8 @@ function fakeRequest(module: "http" | "https") {
       lastReqOptions = options;
       lastReqModule = module;
       const req = new FakeRequest();
+      requests.push({ module, options, req });
+      const queued = responseQueue.shift();
       queueMicrotask(() => {
         if (fakeResponseThrows) {
           req.emit("error", fakeResponseThrows);
@@ -62,12 +70,13 @@ function fakeRequest(module: "http" | "https") {
           statusCode: number;
           resume: () => void;
         };
-        res.statusCode = fakeResponseStatus;
-        (res as unknown as { headers: Record<string, string> }).headers = fakeResponseHeaders;
+        res.statusCode = queued?.status ?? fakeResponseStatus;
+        (res as unknown as { headers: Record<string, string> }).headers =
+          queued?.headers ?? fakeResponseHeaders;
         res.resume = () => {}; // IncomingMessage.resume() — fetchPinned calls it to drain a redirect body
         callback(res);
         if (fakeResponseHangs) return; // no data, no "end" — the deadline must fire
-        for (const chunk of fakeResponseChunks) res.emit("data", chunk);
+        for (const chunk of queued?.chunks ?? fakeResponseChunks) res.emit("data", chunk);
         res.emit("end");
       });
       return req;
@@ -77,9 +86,16 @@ function fakeRequest(module: "http" | "https") {
 mock.module("node:https", { exports: { request: fakeRequest("https") } });
 mock.module("node:http", { exports: { request: fakeRequest("http") } });
 
-const { validateWebhookUrl, fetchPinned } = await import("./ssrf-guard.ts");
+const {
+  validateWebhookUrl,
+  fetchPinned,
+  fetchPinnedFollowingRedirects,
+  RedirectRefusedError,
+} = await import("./ssrf-guard.ts");
 
 function reset() {
+  responseQueue = [];
+  requests.length = 0;
   lastReqOptions = null;
   lastReqModule = null;
   lastReqBody = "";
@@ -359,3 +375,137 @@ test("fetchPinned with maxResponseBytes: 0 discards the body entirely (async mod
   assert.equal(result.bodyText, "");
   assert.equal(result.truncated, true);
 });
+
+// ── validateWebhookUrl: DNS bound and extra reserved ranges ─────────────────
+
+test("a DNS lookup that never answers is cut off instead of holding the request", async () => {
+  resolve4Impl = () => new Promise<string[]>(() => {});
+  const started = Date.now();
+  const result = await validateWebhookUrl("https://slow-dns.example/hook", { dnsTimeoutMs: 20 });
+  assert.deepEqual(result, { error: "DNS lookup timed out" });
+  assert.ok(Date.now() - started < 1000);
+});
+
+test("blocks the documentation, benchmarking and IETF-reserved ranges", async () => {
+  for (const ip of ["192.0.0.8", "192.0.2.5", "198.18.0.1", "198.19.255.1", "198.51.100.7", "203.0.113.9", "240.0.0.1"]) {
+    resolve4Impl = async () => [ip];
+    const result = await validateWebhookUrl("https://reserved.example.com/hook");
+    assert.match(result.error ?? "", /private\/internal IP/, ip);
+  }
+});
+
+// ── fetchPinnedFollowingRedirects ───────────────────────────────────────────
+
+test("a POST answered with 302 continues as a GET without body (Apps Script /exec)", async () => {
+  reset();
+  resolve4Impl = async () => ["8.8.8.8"];
+  responseQueue = [
+    { status: 302, headers: { location: "https://script.googleusercontent.com/macros/echo?user_content_key=abc" } },
+    { status: 200, headers: {}, chunks: [Buffer.from("ok")] },
+  ];
+  const result = await fetchPinnedFollowingRedirects("https://script.google.com/macros/s/X/exec", {
+    resolvedIp: "8.8.8.8",
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: '{"a":1}',
+    timeoutMs: 5000,
+  });
+  assert.equal(result.status, 200);
+  assert.equal(result.url, "https://script.googleusercontent.com/macros/echo?user_content_key=abc");
+  assert.equal(requests.length, 2);
+  assert.equal(requests[0].options.method, "POST");
+  assert.equal(requests[1].options.method, "GET");
+  assert.equal(requests[1].req.body, "");
+  assert.equal(requests[1].options.headers["Content-Type"], undefined);
+  assert.equal(requests[1].options.headers["Content-Length"], undefined);
+});
+
+test("307 and 308 keep the method and the body", async () => {
+  for (const status of [307, 308]) {
+    reset();
+    resolve4Impl = async () => ["8.8.8.8"];
+    responseQueue = [
+      { status, headers: { location: "/v2/hook" } },
+      { status: 200, headers: {} },
+    ];
+    await fetchPinnedFollowingRedirects("https://hooks.example.com/hook", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: '{"a":1}',
+      timeoutMs: 5000,
+    });
+    assert.equal(requests[1].options.method, "POST", String(status));
+    assert.equal(requests[1].req.body, '{"a":1}', String(status));
+    assert.equal(requests[1].options.path, "/v2/hook");
+  }
+});
+
+test("a redirect into a private range is refused before any request reaches it", async () => {
+  reset();
+  resolve4Impl = async (host) => (host === "internal.example.com" ? ["10.0.0.5"] : ["8.8.8.8"]);
+  responseQueue = [{ status: 302, headers: { location: "https://internal.example.com/admin" } }];
+  await assert.rejects(
+    () =>
+      fetchPinnedFollowingRedirects("https://hooks.example.com/hook", {
+        method: "GET",
+        headers: {},
+        timeoutMs: 5000,
+      }),
+    (err: unknown) => err instanceof RedirectRefusedError && /10\.0\.0\.5/.test((err as Error).message),
+  );
+  assert.equal(requests.length, 1);
+});
+
+test("webhooks stay HTTPS on every hop; http:// is followed only when allowed", async () => {
+  reset();
+  resolve4Impl = async () => ["8.8.8.8"];
+  responseQueue = [{ status: 301, headers: { location: "http://hooks.example.com/hook" } }];
+  await assert.rejects(
+    () => fetchPinnedFollowingRedirects("https://hooks.example.com/hook", { method: "GET", headers: {}, timeoutMs: 5000 }),
+    RedirectRefusedError,
+  );
+
+  reset();
+  responseQueue = [
+    { status: 301, headers: { location: "http://www.example.com/" } },
+    { status: 200, headers: {} },
+  ];
+  const result = await fetchPinnedFollowingRedirects("https://example.com/", {
+    allowHttp: true,
+    method: "GET",
+    headers: {},
+    timeoutMs: 5000,
+  });
+  assert.equal(result.status, 200);
+  assert.equal(requests[1].module, "http");
+});
+
+test("more than maxRedirects redirects are refused", async () => {
+  reset();
+  resolve4Impl = async () => ["8.8.8.8"];
+  responseQueue = Array.from({ length: 5 }, (_, i) => ({ status: 302, headers: { location: `/${i + 1}` } }));
+  await assert.rejects(
+    () => fetchPinnedFollowingRedirects("https://hooks.example.com/0", { method: "GET", headers: {}, timeoutMs: 5000 }),
+    /Too many redirects/,
+  );
+  assert.equal(requests.length, 4);
+});
+
+test("credentials do not follow a redirect to another host", async () => {
+  reset();
+  resolve4Impl = async () => ["8.8.8.8"];
+  responseQueue = [
+    { status: 307, headers: { location: "https://other.example.net/hook" } },
+    { status: 200, headers: {} },
+  ];
+  await fetchPinnedFollowingRedirects("https://hooks.example.com/hook", {
+    method: "POST",
+    headers: { Authorization: "Bearer s3cret", "Content-Type": "application/json" },
+    body: "{}",
+    timeoutMs: 5000,
+  });
+  assert.equal(requests[0].options.headers.Authorization, "Bearer s3cret");
+  assert.equal(requests[1].options.headers.Authorization, undefined);
+  assert.equal(requests[1].options.headers["Content-Type"], "application/json");
+});
+

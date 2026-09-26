@@ -1,8 +1,14 @@
 import { resolve4 } from "node:dns/promises";
-import type { IncomingHttpHeaders } from "node:http";
+import type { IncomingHttpHeaders, IncomingMessage } from "node:http";
 import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { isIPv4 } from "node:net";
+import type { Readable } from "node:stream";
+import {
+  createBrotliDecompress,
+  createGunzip,
+  createInflate,
+} from "node:zlib";
 
 const PRIVATE_RANGES: RegExp[] = [
   /^0\./, // 0.0.0.0/8 — on Linux, connecting to 0.0.0.0 reaches localhost
@@ -14,7 +20,15 @@ const PRIVATE_RANGES: RegExp[] = [
   /^100\.6[4-9]\.|^100\.[7-9]\d\.|^100\.1[01]\d\.|^100\.12[0-7]\./, // CGNAT
   /^2(2[4-9]|3\d)\./, // 224.0.0.0/4 multicast
   /^2(4\d|5[0-5])\./, // 240.0.0.0/4 reserved (includes 255.255.255.255 broadcast)
+  /^192\.0\.0\./, // 192.0.0.0/24 IETF protocol assignments
+  /^192\.0\.2\./, // 192.0.2.0/24 TEST-NET-1
+  /^198\.1[89]\./, // 198.18.0.0/15 benchmarking
+  /^198\.51\.100\./, // 198.51.100.0/24 TEST-NET-2
+  /^203\.0\.113\./, // 203.0.113.0/24 TEST-NET-3
 ];
+
+// A DNS answer that never comes must not hold the request past its deadline.
+const DEFAULT_DNS_TIMEOUT_MS = 5_000;
 
 export interface WebhookUrlCheck {
   error: string | null;
@@ -24,6 +38,8 @@ export interface WebhookUrlCheck {
 export interface ValidateUrlOptions {
   /** Also accept plain http:// (the KB scraper reads public web pages). */
   allowHttp?: boolean;
+  /** Upper bound for the DNS lookup (default 5 s). */
+  dnsTimeoutMs?: number;
 }
 
 /**
@@ -67,10 +83,26 @@ export async function validateWebhookUrl(
   } else if (parsed.hostname.startsWith("[")) {
     return { error: "IPv6 addresses are not supported (SEC-08)" };
   } else {
+    let timer: ReturnType<typeof setTimeout> | undefined;
     try {
-      addresses = await resolve4(parsed.hostname);
-    } catch {
-      return { error: "Cannot resolve hostname" };
+      addresses = await Promise.race([
+        resolve4(parsed.hostname),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(
+            () => reject(new Error("DNS lookup timed out")),
+            opts.dnsTimeoutMs ?? DEFAULT_DNS_TIMEOUT_MS,
+          );
+        }),
+      ]);
+    } catch (err) {
+      return {
+        error:
+          err instanceof Error && err.message === "DNS lookup timed out"
+            ? "DNS lookup timed out"
+            : "Cannot resolve hostname",
+      };
+    } finally {
+      clearTimeout(timer);
     }
   }
   if (addresses.length === 0) {
@@ -93,6 +125,12 @@ export interface PinnedRequestOptions {
   timeoutMs: number;
   /** 0 discards the body entirely (fire-and-forget); omit for no cap. */
   maxResponseBytes?: number;
+  /**
+   * Decode a gzip/deflate/br body (the cap then applies to the decoded bytes,
+   * so a small compressed body cannot expand past it). Any other encoding is
+   * rejected.
+   */
+  decompress?: boolean;
 }
 
 export interface PinnedResponse {
@@ -126,6 +164,7 @@ export function fetchPinned(
     const parsed = new URL(url);
     const cap = opts.maxResponseBytes ?? Infinity;
     let settled = false;
+    let abortDecoder: (() => void) | undefined;
     const isHttp = parsed.protocol === "http:";
     const request = isHttp ? httpRequest : httpsRequest;
     // node:https streams a string body chunked; some receivers reject that,
@@ -179,15 +218,36 @@ export function fetchPinned(
           return;
         }
 
+        let body: Readable = res;
+        if (opts.decompress) {
+          const decoder = decoderFor(res);
+          if (decoder === "unsupported") {
+            res.resume();
+            settled = true;
+            reject(
+              new Error(`Unsupported content-encoding: ${res.headers["content-encoding"]}`),
+            );
+            return;
+          }
+          if (decoder) {
+            body = res.pipe(decoder);
+            // Only an abort (cap reached, deadline) tears the decoder down: on
+            // a normal finish the request closes before the decoder has
+            // flushed, and destroying it then would swallow its "end".
+            abortDecoder = () => decoder.destroy();
+          }
+        }
+
         const chunks: Buffer[] = [];
         let total = 0;
         let truncated = false;
 
-        res.on("data", (chunk: Buffer) => {
+        body.on("data", (chunk: Buffer) => {
           if (settled) return;
           if (total >= cap) {
             truncated = true;
             settled = true;
+            abortDecoder?.();
             req.destroy();
             resolve({ status, headers: resHeaders, bodyText: Buffer.concat(chunks).toString("utf8"), truncated });
             return;
@@ -199,16 +259,17 @@ export function fetchPinned(
           if (chunk.length > remaining) {
             truncated = true;
             settled = true;
+            abortDecoder?.();
             req.destroy();
             resolve({ status, headers: resHeaders, bodyText: Buffer.concat(chunks).toString("utf8"), truncated });
           }
         });
-        res.on("end", () => {
+        body.on("end", () => {
           if (settled) return;
           settled = true;
           resolve({ status, headers: resHeaders, bodyText: Buffer.concat(chunks).toString("utf8"), truncated });
         });
-        res.on("error", (err) => {
+        body.on("error", (err) => {
           if (settled) return;
           settled = true;
           reject(err);
@@ -219,6 +280,7 @@ export function fetchPinned(
     deadline = setTimeout(() => {
       if (settled) return;
       settled = true;
+      abortDecoder?.();
       req.destroy();
       reject(new Error("Tool timeout"));
     }, opts.timeoutMs);
@@ -232,4 +294,121 @@ export function fetchPinned(
     if (opts.body !== undefined) req.write(opts.body);
     req.end();
   }).finally(() => clearTimeout(deadline));
+}
+
+function decoderFor(res: IncomingMessage) {
+  const encoding = String(res.headers["content-encoding"] ?? "identity")
+    .trim()
+    .toLowerCase();
+  switch (encoding) {
+    case "":
+    case "identity":
+      return null;
+    case "gzip":
+    case "x-gzip":
+      return createGunzip();
+    case "deflate":
+      return createInflate();
+    case "br":
+      return createBrotliDecompress();
+    default:
+      return "unsupported" as const;
+  }
+}
+
+/** A redirect the caller must not follow: blocked target, bad location or too many hops. */
+export class RedirectRefusedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "RedirectRefusedError";
+  }
+}
+
+export interface FollowRedirectOptions extends PinnedRequestOptions {
+  /** Also accept http:// for the URL and every redirect target. */
+  allowHttp?: boolean;
+  /** Redirects to follow at most (default 3). */
+  maxRedirects?: number;
+  /** The IP a validateWebhookUrl(url) call already checked, for the first hop. */
+  resolvedIp?: string;
+}
+
+/**
+ * fetchPinned() that follows redirects safely: every target is validated like
+ * a brand-new URL (scheme, private ranges) and fetched over a connection
+ * pinned to the address that was checked. 301/302/303 continue as a GET
+ * without body (what browsers and fetch() do); 307/308 keep the method and
+ * body. One absolute deadline covers every hop.
+ *
+ * Throws RedirectRefusedError when a hop fails validation, the location is
+ * invalid, or there are more than `maxRedirects` redirects.
+ */
+export async function fetchPinnedFollowingRedirects(
+  url: string,
+  opts: FollowRedirectOptions,
+): Promise<PinnedResponse & { url: string }> {
+  const deadline = Date.now() + opts.timeoutMs;
+  const maxRedirects = opts.maxRedirects ?? 3;
+  let current = url;
+  let method = opts.method;
+  let body = opts.body;
+  let headers = { ...opts.headers };
+  let knownIp = opts.resolvedIp;
+
+  for (let hop = 0; ; hop++) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) throw new Error("Tool timeout");
+
+    let ip = knownIp;
+    if (!ip) {
+      const check = await validateWebhookUrl(current, {
+        allowHttp: opts.allowHttp,
+        dnsTimeoutMs: remaining,
+      });
+      if (check.error === "DNS lookup timed out") throw new Error("Tool timeout");
+      if (check.error || !check.resolvedIp) {
+        throw new RedirectRefusedError(check.error ?? "Cannot resolve hostname");
+      }
+      ip = check.resolvedIp;
+    }
+    knownIp = undefined;
+
+    const res = await fetchPinned(current, ip, {
+      method,
+      headers,
+      body,
+      timeoutMs: Math.max(1, deadline - Date.now()),
+      maxResponseBytes: opts.maxResponseBytes,
+      decompress: opts.decompress,
+    });
+
+    const location = res.headers.location;
+    if (res.status < 300 || res.status >= 400 || res.status === 304 || !location) {
+      return { ...res, url: current };
+    }
+    if (hop >= maxRedirects) {
+      throw new RedirectRefusedError(`Too many redirects (more than ${maxRedirects})`);
+    }
+
+    let next: URL;
+    try {
+      next = new URL(location, current);
+    } catch {
+      throw new RedirectRefusedError("Invalid redirect location");
+    }
+    if (new URL(current).origin !== next.origin) {
+      // Like fetch(): credentials meant for one host never follow to another.
+      headers = Object.fromEntries(
+        Object.entries(headers).filter(([k]) => !/^(authorization|cookie)$/i.test(k)),
+      );
+    }
+    if (res.status === 301 || res.status === 302 || res.status === 303) {
+      if (method !== "GET" && method !== "HEAD") method = "GET";
+      body = undefined;
+      headers = Object.fromEntries(
+        Object.entries(headers).filter(([k]) => !/^content-(type|length)$/i.test(k)),
+      );
+    }
+    current = next.toString();
+  }
 }

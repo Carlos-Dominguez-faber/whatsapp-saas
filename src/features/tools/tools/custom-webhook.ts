@@ -1,7 +1,11 @@
 import { createClient as createSbClient } from "@supabase/supabase-js";
 import { z } from "zod";
 import type { Tool, ToolContext, ToolResult } from "../core/tool";
-import { fetchPinned, validateWebhookUrl } from "../services/ssrf-guard";
+import {
+  fetchPinnedFollowingRedirects,
+  RedirectRefusedError,
+  validateWebhookUrl,
+} from "../services/ssrf-guard";
 import {
   resolveTemplate,
   type WebhookField,
@@ -131,15 +135,27 @@ async function run(args: Args, ctx: ToolContext): Promise<ToolResult> {
           note: values.note,
         };
 
-  // fetchPinned never follows redirects: a 3xx comes back as a non-ok status
-  // instead of silently re-targeting an unvalidated host.
-  const res = await fetchPinned(webhookUrl, resolvedIp, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ workspace_id: ctx.workspaceId, payload }),
-    timeoutMs: 8_000,
-    maxResponseBytes: 0,
-  });
+  // Redirects are followed (up to 3), each target validated and pinned like
+  // the URL itself: Google Apps Script web apps, for one, answer every POST
+  // with a 302 after running it, and treating that as a failure would make
+  // the agent retry an action that already happened. Webhooks stay HTTPS-only
+  // on every hop.
+  let res;
+  try {
+    res = await fetchPinnedFollowingRedirects(webhookUrl, {
+      resolvedIp,
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ workspace_id: ctx.workspaceId, payload }),
+      timeoutMs: 8_000,
+      maxResponseBytes: 0,
+    });
+  } catch (err) {
+    if (err instanceof RedirectRefusedError) {
+      return { ok: false, output: null, error: err.message };
+    }
+    throw err;
+  }
   const ok = res.status >= 200 && res.status < 300;
 
   return {
