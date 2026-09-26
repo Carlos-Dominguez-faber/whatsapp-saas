@@ -51,7 +51,11 @@ export async function POST(req: NextRequest) {
   }
 
   return NextResponse.json(
-    { workspaceId: result.workspaceId, webhookUrl: result.webhookUrl },
+    {
+      workspaceId: result.workspaceId,
+      webhookUrls: result.webhookUrls,
+      webhookUrl: result.webhookUrl,
+    },
     { status: 201 },
   );
 }

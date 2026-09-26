@@ -118,7 +118,7 @@ export function WorkspacesTable({ workspaces }: Props) {
             "Workspace",
             "Miembros",
             "Conversaciones",
-            "YCloud",
+            "WhatsApp",
             "Creado",
             "",
           ].map((h) => (
@@ -199,18 +199,18 @@ export function WorkspacesTable({ workspaces }: Props) {
               </p>
             </div>
 
-            {/* YCloud badge */}
+            {/* WhatsApp provider badge */}
             <div className="flex items-center gap-2 md:block">
               <span className="text-xs text-muted-foreground md:hidden">
-                YCloud:
+                WhatsApp:
               </span>
-              {workspace.ycloud_connected ? (
+              {workspace.whatsapp_provider ? (
                 <Badge
                   variant="outline"
                   className="border-success/30 bg-success/10 text-success gap-1 w-fit"
                 >
                   <Wifi className="h-3 w-3" aria-hidden="true" />
-                  Conectado
+                  {workspace.whatsapp_provider === "kapso" ? "Kapso" : "YCloud"}
                 </Badge>
               ) : (
                 <Badge

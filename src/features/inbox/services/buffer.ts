@@ -248,7 +248,7 @@ async function consolidateBatch(
 //   5. checkRateLimits
 //   6. generateReply with consolidated text
 //   7. recordLlmUsage
-//   8. sendText via ycloud-client (or insert dev_mode outbound)
+//   8. sendText via the workspace's WhatsApp provider (or insert dev_mode outbound)
 //   9. Mark batch 'processed', persist merged_text
 //  10. On error: increment retry counter; if > MAX_BATCH_RETRIES → cancel_batch()
 // ──────────────────────────────────────────────────────────────────────────────

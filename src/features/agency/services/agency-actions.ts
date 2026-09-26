@@ -272,9 +272,19 @@ export async function createWorkspaceForClient(
       "NEXT_PUBLIC_APP_URL no está configurada — no se puede generar el webhook URL del workspace.",
     );
   }
-  const webhookUrl = `${baseUrl}/api/webhooks/ycloud?wsid=${workspaceId}`;
+  // The provider (YCloud or Kapso) is chosen later in Integraciones; hand
+  // out both webhook URLs.
+  const webhookUrls = {
+    ycloud: `${baseUrl}/api/webhooks/ycloud?wsid=${workspaceId}`,
+    kapso: `${baseUrl}/api/webhooks/kapso?wsid=${workspaceId}`,
+  };
 
-  return { workspaceId, webhookUrl, clientCredentials };
+  return {
+    workspaceId,
+    webhookUrls,
+    webhookUrl: webhookUrls.ycloud,
+    clientCredentials,
+  };
 }
 
 /**
@@ -338,11 +348,12 @@ export async function getAllWorkspacesWithStats(): Promise<GetWorkspacesResult> 
     .select("workspace_id")
     .in("workspace_id", ids);
 
-  // YCloud integrations
+  // Active WhatsApp integrations (YCloud or Kapso — at most one per workspace)
   const { data: integrations } = await service
     .from("integrations")
-    .select("workspace_id, enabled")
-    .eq("provider", "ycloud")
+    .select("workspace_id, provider")
+    .in("provider", ["ycloud", "kapso"])
+    .eq("enabled", true)
     .in("workspace_id", ids);
 
   // Build lookup maps
@@ -358,10 +369,10 @@ export async function getAllWorkspacesWithStats(): Promise<GetWorkspacesResult> 
     convMap.set(id, (convMap.get(id) ?? 0) + 1);
   }
 
-  const ycloudMap = new Map<string, boolean>();
+  const whatsappMap = new Map<string, "ycloud" | "kapso">();
   for (const i of integrations ?? []) {
-    const row = i as { workspace_id: string; enabled: boolean };
-    ycloudMap.set(row.workspace_id, row.enabled);
+    const row = i as { workspace_id: string; provider: "ycloud" | "kapso" };
+    whatsappMap.set(row.workspace_id, row.provider);
   }
 
   const result: WorkspaceWithStats[] = (
@@ -378,7 +389,7 @@ export async function getAllWorkspacesWithStats(): Promise<GetWorkspacesResult> 
     created_at: w.created_at,
     member_count: memberMap.get(w.id) ?? 0,
     conversation_count: convMap.get(w.id) ?? 0,
-    ycloud_connected: ycloudMap.get(w.id) ?? false,
+    whatsapp_provider: whatsappMap.get(w.id) ?? null,
   }));
 
   return { workspaces: result };

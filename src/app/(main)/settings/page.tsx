@@ -6,6 +6,7 @@ import { listAgents } from "@/features/agents/services/agent-queries";
 import { SettingsShell } from "@/features/settings/components/settings-shell";
 import { countJudgmentsToday } from "@/features/jev-judge/usage";
 import { readJevUses } from "@/features/jev-judge/uses";
+import { isWhatsAppProvider } from "@/features/inbox/services/whatsapp-provider";
 
 export default async function SettingsPage() {
   const supabase = await createClient();
@@ -65,10 +66,13 @@ export default async function SettingsPage() {
   ]);
 
   const initialAgents = await listAgents(svc, workspaceId);
-  const ycloud = (integrationsData ?? []).find(
-    (row) => row.provider === "ycloud",
+  // Jev's settings live in the workspace's active WhatsApp integration
+  // (YCloud or Kapso — at most one is enabled).
+  const whatsapp = (integrationsData ?? []).find(
+    (row) => row.enabled && isWhatsAppProvider(row.provider),
   );
-  const ycloudConfig = (ycloud?.config as Record<string, unknown> | null) ?? {};
+  const whatsappConfig =
+    (whatsapp?.config as Record<string, unknown> | null) ?? {};
   const judgmentsToday = await countJudgmentsToday(svc, workspaceId);
 
   // Mask credentials server-side before passing to client components
@@ -128,8 +132,8 @@ export default async function SettingsPage() {
       initialIntegrations={maskedIntegrations}
       initialAgents={initialAgents}
       jev={{
-        enabled: ycloudConfig.jev_enabled === true,
-        uses: readJevUses(ycloudConfig),
+        enabled: whatsappConfig.jev_enabled === true,
+        uses: readJevUses(whatsappConfig),
         keyReady: Boolean(process.env.TYPESAFE_API_KEY),
         judgmentsToday,
       }}

@@ -5,7 +5,8 @@ export interface WorkspaceWithStats {
   created_at: string;
   member_count: number;
   conversation_count: number;
-  ycloud_connected: boolean;
+  /** The workspace's active WhatsApp provider, or null when not connected. */
+  whatsapp_provider: "ycloud" | "kapso" | null;
 }
 
 export type UseCase = "setter" | "soporte" | "agendamiento" | "general";
@@ -27,12 +28,16 @@ export interface ClientCredentials {
 export type CreateWorkspaceResult =
   | {
       workspaceId: string;
+      /** Webhook URL per WhatsApp provider — the client picks one in Integraciones. */
+      webhookUrls: { ycloud: string; kapso: string };
+      /** YCloud's webhook URL (kept for API callers from before Kapso). */
       webhookUrl: string;
       clientCredentials?: ClientCredentials | null;
       error?: never;
     }
   | {
       workspaceId?: never;
+      webhookUrls?: never;
       webhookUrl?: never;
       clientCredentials?: never;
       error: string;
