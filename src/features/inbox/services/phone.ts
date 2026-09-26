@@ -139,3 +139,49 @@ export function phoneVariants(phone: string, defaultCountryCode?: string): strin
   if (key.length === 12 && key.startsWith("54")) variants.add(`+549${key.slice(2)}`);
   return [...variants];
 }
+
+/**
+ * Digits of a national (significant) number, per country code: the lengths a
+ * number written without its country code can have there. Countries not
+ * listed have no known format.
+ */
+const NATIONAL_NUMBER_LENGTHS: Record<string, number[]> = {
+  "1": [10], // United States, Canada, Dominican Republic…
+  "34": [9], // Spain
+  "51": [9], // Peru
+  "52": [10], // Mexico
+  "53": [8], // Cuba
+  "54": [10], // Argentina
+  "55": [10, 11], // Brazil
+  "56": [9], // Chile
+  "57": [10], // Colombia
+  "58": [10], // Venezuela
+  "502": [8], // Guatemala
+  "503": [8], // El Salvador
+  "504": [8], // Honduras
+  "505": [8], // Nicaragua
+  "506": [8], // Costa Rica
+  "507": [8], // Panama
+  "591": [8], // Bolivia
+  "593": [9], // Ecuador
+  "595": [9], // Paraguay
+  "598": [8], // Uruguay
+};
+
+/**
+ * A number from another system (HighLevel) in E.164, or null when it can't be
+ * placed with certainty. One written with its country code keeps it. One
+ * written without it takes the workspace's code only when its length (after
+ * a trunk `0`) fits that country's national numbers; anything else stays
+ * unmatched rather than becoming a junk number.
+ */
+export function phoneWithCountryCode(
+  phone: string,
+  defaultCountryCode: string,
+): string | null {
+  const international = internationalDigits(phone);
+  if (international) return `+${international}`;
+  const national = phone.replace(/\D/g, "").replace(/^0/, "");
+  const lengths = NATIONAL_NUMBER_LENGTHS[defaultCountryCode];
+  return lengths?.includes(national.length) ? `+${defaultCountryCode}${national}` : null;
+}

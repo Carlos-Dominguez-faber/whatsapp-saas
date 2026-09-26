@@ -8,6 +8,7 @@ import {
   phoneKey,
   phoneString,
   phoneVariants,
+  phoneWithCountryCode,
   samePhone,
 } from "./phone.ts";
 
@@ -89,4 +90,16 @@ test("phoneVariants finds a Mexican mobile stored either way", () => {
   assert.deepEqual(phoneVariants("5512345678", "52").sort(), ["+525512345678", "+5215512345678"].sort());
   assert.ok(phoneVariants("+5215512345678").includes("+525512345678"));
   assert.deepEqual(phoneVariants("+15550001111"), ["+15550001111"]);
+});
+
+test("a HighLevel number takes the workspace's code only when it fits that country's format", () => {
+  assert.equal(phoneWithCountryCode("998 123 4567", "52"), "+529981234567");
+  assert.equal(phoneWithCountryCode("+1 555 123 4567", "52"), "+15551234567", "its own code wins");
+  assert.equal(phoneWithCountryCode("0052 998 123 4567", "57"), "+529981234567");
+  assert.equal(phoneWithCountryCode("011 2345 6789", "54"), "+541123456789", "after the trunk 0");
+  assert.equal(phoneWithCountryCode("612 345 678", "34"), "+34612345678");
+  assert.equal(phoneWithCountryCode("1234567", "52"), null, "too short for Mexico");
+  assert.equal(phoneWithCountryCode("612 345 678", "52"), null, "a Spanish length in a Mexican workspace");
+  assert.equal(phoneWithCountryCode("998 123 4567", "49"), null, "no known format");
+  assert.equal(phoneWithCountryCode("ext. 12", "52"), null);
 });
