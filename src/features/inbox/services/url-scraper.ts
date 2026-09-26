@@ -6,25 +6,15 @@
  * entities. Good enough for most marketing/info pages; can be upgraded later.
  */
 
+import {
+  fetchPinned,
+  validateWebhookUrl,
+} from "@/features/tools/services/ssrf-guard";
+
 const FETCH_TIMEOUT_MS = 15_000;
 const MAX_TEXT_LENGTH = 200_000;
-
-/** Basic SSRF guard: refuse localhost / private network hosts. */
-function isBlockedHost(hostname: string): boolean {
-  const host = hostname.toLowerCase();
-  return (
-    host === "localhost" ||
-    host === "0.0.0.0" ||
-    host === "::1" ||
-    host.endsWith(".local") ||
-    host.endsWith(".internal") ||
-    /^127\./.test(host) ||
-    /^10\./.test(host) ||
-    /^192\.168\./.test(host) ||
-    /^169\.254\./.test(host) ||
-    /^172\.(1[6-9]|2\d|3[01])\./.test(host)
-  );
-}
+const MAX_HTML_BYTES = 2_000_000;
+const MAX_REDIRECTS = 3;
 
 function decodeEntities(s: string): string {
   return s
@@ -74,6 +64,12 @@ export function htmlToText(html: string): string {
 /**
  * Downloads `rawUrl` and returns its readable text. Throws a user-friendly
  * Error on invalid/blocked URLs, non-HTML responses, or fetch failures.
+ *
+ * Every hop — the URL itself and each redirect — is resolved and checked
+ * against private/internal ranges, then fetched over a connection pinned to
+ * that checked address (fetchPinned), so neither a redirect nor a DNS answer
+ * that changes between the check and the request can reach the internal
+ * network. The whole exchange shares one deadline.
  */
 export async function fetchUrlText(rawUrl: string): Promise<string> {
   let url: URL;
@@ -83,29 +79,63 @@ export async function fetchUrlText(rawUrl: string): Promise<string> {
     throw new Error("URL inválida");
   }
 
-  if (url.protocol !== "http:" && url.protocol !== "https:") {
-    throw new Error("Solo se permiten URLs http(s)");
-  }
-  if (isBlockedHost(url.hostname)) {
-    throw new Error("URL no permitida");
-  }
+  const deadline = Date.now() + FETCH_TIMEOUT_MS;
+  let html: string | null = null;
 
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
-  let html: string;
-  try {
-    const res = await fetch(url.toString(), {
-      signal: controller.signal,
-      redirect: "follow",
-      headers: {
-        "User-Agent": "Mozilla/5.0 (compatible; AgenteWA-KB/1.0)",
-        Accept: "text/html,application/xhtml+xml,text/plain",
-      },
-    });
-    if (!res.ok) {
+  for (let hop = 0; html === null; hop++) {
+    if (url.protocol !== "http:" && url.protocol !== "https:") {
+      throw new Error("Solo se permiten URLs http(s)");
+    }
+    const check = await validateWebhookUrl(url.toString(), { allowHttp: true });
+    if (check.error === "Cannot resolve hostname") {
+      throw new Error("No se encontró el dominio de la URL");
+    }
+    if (check.error || !check.resolvedIp) {
+      throw new Error("URL no permitida");
+    }
+
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) {
+      throw new Error("La página tardó demasiado en responder");
+    }
+
+    let res;
+    try {
+      res = await fetchPinned(url.toString(), check.resolvedIp, {
+        method: "GET",
+        headers: {
+          "User-Agent": "Mozilla/5.0 (compatible; AgenteWA-KB/1.0)",
+          Accept: "text/html,application/xhtml+xml,text/plain",
+          // node:http does not decompress; ask for the plain body.
+          "Accept-Encoding": "identity",
+        },
+        timeoutMs: remaining,
+        maxResponseBytes: MAX_HTML_BYTES,
+      });
+    } catch (err) {
+      if (err instanceof Error && err.message === "Tool timeout") {
+        throw new Error("La página tardó demasiado en responder");
+      }
+      throw new Error("No se pudo descargar la URL");
+    }
+
+    if (res.status >= 300 && res.status < 400) {
+      const location = res.headers.location;
+      if (!location || hop >= MAX_REDIRECTS) {
+        throw new Error("La página redirige demasiadas veces");
+      }
+      try {
+        url = new URL(location, url);
+      } catch {
+        throw new Error("La página redirige a una URL inválida");
+      }
+      continue;
+    }
+
+    if (res.status < 200 || res.status >= 300) {
       throw new Error(`La página respondió ${res.status}`);
     }
-    const contentType = res.headers.get("content-type") ?? "";
+    const contentType = String(res.headers["content-type"] ?? "");
     if (
       !contentType.includes("text/html") &&
       !contentType.includes("text/plain") &&
@@ -113,14 +143,7 @@ export async function fetchUrlText(rawUrl: string): Promise<string> {
     ) {
       throw new Error("La URL no devolvió una página de texto/HTML");
     }
-    html = await res.text();
-  } catch (err) {
-    if (err instanceof Error && err.name === "AbortError") {
-      throw new Error("La página tardó demasiado en responder");
-    }
-    throw err instanceof Error ? err : new Error("No se pudo descargar la URL");
-  } finally {
-    clearTimeout(timeout);
+    html = res.bodyText;
   }
 
   const text = htmlToText(html);
