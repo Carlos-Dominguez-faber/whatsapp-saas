@@ -255,6 +255,17 @@ su propia integración de WhatsApp (cada uno puede usar YCloud o Kapso).
 
   Por eso conviene probar la conexión antes de guardar, y cambiar en un momento
   de poco tráfico.
+- **En los logs de Vercel sale `reserve_llm_turn is missing` o
+  `sum_daily_llm_tokens is missing`:** desplegaste antes de `db-push`. El agente
+  sigue respondiendo, pero sin el tope por hora ni el presupuesto diario hasta que
+  corras `setup.mjs db-push`.
+- **Hay eventos `batch_dead_letter` y el agente no contestó:** el lote falló y agotó
+  sus 3 reintentos; el `error` del evento dice por qué. Si fue al revisar el presupuesto
+  (`reserve_llm_turn failed` / `sum_daily_llm_tokens failed`), la base no respondió
+  en ese momento: revisa el estado de tu proyecto de Supabase.
+- **"URL no permitida" al agregar una URL a la base de conocimiento:** solo se leen
+  páginas públicas. Se rechazan las IPs privadas o internas (también detrás de un
+  redirect) y los sitios que solo tienen IPv6. Se siguen hasta 3 redirects.
 
 ## Actualizar a una versión nueva
 
@@ -271,6 +282,19 @@ restricciones de tablas grandes (mensajes) y las bloquean unos segundos.
 
 El orden importa: el código nuevo puede depender de funciones o permisos que traen
 las migraciones, así que las migraciones van **antes** de `vercel --prod`.
+
+**Cambios de permisos y límites (versión de finales de sep-2026):**
+
+- Solo un **admin** del workspace guarda cambios en **Integraciones**; un manager
+  las ve y puede probar la conexión.
+- Generar una plantilla con IA pide rol **manager** o superior.
+- Por workspace y por hora: hasta **20** plantillas generadas con IA y **60**
+  mensajes en la prueba de agentes. Sus tokens cuentan en el presupuesto diario.
+- El presupuesto diario sigue en **1,000,000 tokens** por workspace (se reinicia a
+  las 00:00 UTC); desde 800,000 el agente responde con un modelo más barato.
+- El panel de observabilidad del inbox es solo para admins y managers.
+- Si al revisar el presupuesto la base no responde, el lote se reintenta (y tras 3
+  reintentos queda como `batch_dead_letter` en `events`) en vez de perderse sin aviso.
 
 **Si instalaste desde la antigua rama `provider/kapso`** (Kapso), cámbiate a `main`,
 donde ahora viven los dos proveedores. Cada workspace sigue con el proveedor que
