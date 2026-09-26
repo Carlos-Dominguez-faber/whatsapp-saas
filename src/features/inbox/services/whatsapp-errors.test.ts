@@ -121,11 +121,11 @@ test("código desconocido → fallback genérico, sin reventar", () => {
   assertNoLeak(err.message);
 });
 
-test("sin código + HTTP 503 → fallback por status, reintentable", () => {
+test("sin código + HTTP 503 → el envío pudo haber salido: revisar antes de reenviar", () => {
   const err = parseWhatsAppError({}, 503);
   assert.equal(err.code, null);
-  assert.equal(err.retryable, true);
-  assert.match(err.message, /no está disponible/);
+  assert.match(err.message, /es posible que el mensaje sí haya llegado/);
+  assert.equal(wasNotAccepted(err), false, "never re-sent automatically");
   assertNoLeak(err.message);
 });
 

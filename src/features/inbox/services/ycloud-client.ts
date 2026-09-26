@@ -5,6 +5,10 @@ const YCLOUD_MESSAGES_URL = `${YCLOUD_BASE_URL}/whatsapp/messages`;
 const YCLOUD_TEMPLATES_URL = `${YCLOUD_BASE_URL}/whatsapp/templates`;
 const YCLOUD_PHONE_NUMBERS_URL = `${YCLOUD_BASE_URL}/whatsapp/phoneNumbers`;
 
+// A send that hangs must not eat the function's time budget. Past this, the
+// message may or may not have left: dispatch treats it as a final failure.
+const SEND_TIMEOUT_MS = 20_000;
+
 export class YCloudError extends Error {
   readonly status: number;
   readonly body: unknown;
@@ -45,6 +49,7 @@ export async function sendText(
 
   const response = await fetch(YCLOUD_MESSAGES_URL, {
     method: "POST",
+    signal: AbortSignal.timeout(SEND_TIMEOUT_MS),
     headers: {
       "Content-Type": "application/json",
       "X-API-Key": apiKey,
@@ -127,6 +132,7 @@ export async function sendTemplate(
 
   const response = await fetch(YCLOUD_MESSAGES_URL, {
     method: "POST",
+    signal: AbortSignal.timeout(SEND_TIMEOUT_MS),
     headers: {
       "Content-Type": "application/json",
       "X-API-Key": apiKey,

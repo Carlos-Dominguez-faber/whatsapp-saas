@@ -46,6 +46,10 @@ function extractKapsoErrorMessage(body: unknown): string | null {
 }
 
 /** Single place where every Kapso call parses its response and raises. */
+// A call that hangs must not eat the function's time budget. For a send, past
+// this the message may or may not have left: dispatch treats it as final.
+const KAPSO_TIMEOUT_MS = 20_000;
+
 async function kapsoFetch(
   url: string,
   apiKey: string,
@@ -53,6 +57,7 @@ async function kapsoFetch(
   context: string,
 ): Promise<Record<string, unknown>> {
   const response = await fetch(url, {
+    signal: AbortSignal.timeout(KAPSO_TIMEOUT_MS),
     ...init,
     headers: {
       ...(init.body ? { "Content-Type": "application/json" } : {}),
