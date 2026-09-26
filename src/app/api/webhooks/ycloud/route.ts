@@ -38,21 +38,28 @@ type MessageStatus = OrderedStatus | "failed";
 
 async function handleStatusUpdate(
   supabase: ReturnType<typeof svc>,
+  workspaceId: string,
   wamid: string,
   newStatus: string,
 ): Promise<void> {
+  // Scoped to the workspace whose signing secret verified this webhook: a
+  // wamid is only unique per workspace, and a tenant signs its own events.
   const { data: msg } = await supabase
     .from("messages")
     .select("id, status")
+    .eq("workspace_id", workspaceId)
     .eq("wamid", wamid)
-    .single();
+    .maybeSingle();
 
   // Message not found — can happen for outbound we didn't track
   if (!msg) return;
 
   const current = msg.status as MessageStatus | null;
 
-  // 'failed' is terminal — always apply regardless of current state
+  // 'failed' is terminal: a late 'sent'/'delivered' must not resurrect it.
+  if (current === "failed") return;
+
+  // 'failed' always applies over any other state
   if (newStatus === "failed") {
     await supabase
       .from("messages")
@@ -185,7 +192,12 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
         body as { whatsappMessage?: { wamid?: string; status?: string } }
       ).whatsappMessage;
       if (statusData?.wamid && statusData?.status) {
-        await handleStatusUpdate(supabase, statusData.wamid, statusData.status);
+        await handleStatusUpdate(
+          supabase,
+          ws.workspace_id,
+          statusData.wamid,
+          statusData.status,
+        );
       }
       return NextResponse.json({ received: true });
     }
