@@ -154,3 +154,29 @@ test("a tool still running when the turn fails is waited for, so its outcome is 
   }
   assert.equal(reported.length, 1, "reported before generateWithTools rejected");
 });
+
+test("a start hook that fails on the last step still fails the turn, even if the model finishes", async () => {
+  registryRun = async (name, _a, _c, opts) => {
+    await opts.onStart?.({ callId: "c1", name, sensitivity: "write" });
+    return { ok: true };
+  };
+  // The SDK returns normally: the failed tool was the last step's.
+  generateImpl = async ({ tools }) => {
+    await tools!.book.execute({}).catch(() => {});
+    return { text: "Listo, te agendé.", usage: LAST_STEP, totalUsage: ALL_STEPS, steps: [{}] };
+  };
+  try {
+    await assert.rejects(
+      generateWithTools({
+        ...toolParams,
+        onToolStart: async () => {
+          throw new Error("checkpoint not saved");
+        },
+      } as never),
+      /checkpoint not saved/,
+    );
+  } finally {
+    generateImpl = null;
+    registryRun = async () => null;
+  }
+});

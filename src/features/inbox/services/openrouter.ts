@@ -401,6 +401,9 @@ export async function generateWithTools(
     await Promise.allSettled([...inFlight]);
     throw startFailure ?? err;
   }
+  // On the last step the SDK may finish without noticing the abort: a reply
+  // written as if the unrecorded tool had run must not go out.
+  if (startFailure) throw startFailure;
 
   // totalUsage, not usage: a tool turn runs up to 5 steps, and usage only
   // reports the last one — the budget would see a fraction of the real spend.

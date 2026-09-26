@@ -281,6 +281,10 @@ su propia integración de WhatsApp (cada uno puede usar YCloud o Kapso).
   conversación. Si fue al revisar el presupuesto (`reserve_llm_turn failed` /
   `sum_daily_llm_tokens failed`), la base no respondió en ese momento: revisa el
   estado de tu proyecto de Supabase.
+- **Hay eventos `batch_retry_transient`:** un lote falló por algo que puede ser una
+  caída (el modelo, WhatsApp o la base no respondieron) y se va a reintentar a 1, 5
+  y 15 minutos. Uno suelto no es problema; muchos seguidos indican una caída en
+  curso: revisa el estado de tu proveedor de IA, de WhatsApp y de Supabase.
 - **Hay eventos `handoff_failed`:** la conversación tenía que pasar a una persona
   pero el cambio falló, así que la IA sigue activa. Queda una nota interna en la
   conversación; revísala tú.
