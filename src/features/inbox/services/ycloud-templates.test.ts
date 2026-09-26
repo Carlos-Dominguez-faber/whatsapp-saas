@@ -1,9 +1,13 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-const { templateListItems, templateOfficialId, fetchYCloudTemplates } = await import(
-  "./ycloud-client.ts"
-);
+const {
+  templateListItems,
+  templateOfficialId,
+  fetchYCloudTemplates,
+  resolveWabaId,
+  WabaNotFoundError,
+} = await import("./ycloud-client.ts");
 
 function quietWarn<T>(fn: () => T): { result: T; warnings: unknown[][] } {
   const warnings: unknown[][] = [];
@@ -98,6 +102,65 @@ test("a list longer than the page cap is flagged as cut", async () => {
     assert.equal(result.truncated, true);
   } finally {
     console.warn = originalWarn;
+    restore();
+  }
+});
+
+function withPhoneNumberPages(pages: Array<Array<{ phoneNumber: string; wabaId: string }>>) {
+  const urls: URL[] = [];
+  const original = globalThis.fetch;
+  globalThis.fetch = (async (input: string | URL | Request) => {
+    const url = new URL(String(input));
+    urls.push(url);
+    const n = Number(url.searchParams.get("page"));
+    const total = pages.reduce((sum, p) => sum + p.length, 0);
+    return new Response(JSON.stringify({ items: pages[n - 1] ?? [], total }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }) as typeof fetch;
+  return { urls, restore: () => (globalThis.fetch = original) };
+}
+
+const numbers = (n: number, from = 0) =>
+  Array.from({ length: n }, (_, i) => ({
+    phoneNumber: `+1555${String(from + i).padStart(7, "0")}`,
+    wabaId: `waba_other_${from + i}`,
+  }));
+
+test("the WABA is the configured number's, even written as +52 when YCloud has +52 1", async () => {
+  const { restore } = withPhoneNumberPages([
+    [
+      { phoneNumber: "+15550000001", wabaId: "waba_us" },
+      { phoneNumber: "+5219981234567", wabaId: "waba_mx" },
+    ],
+  ]);
+  try {
+    assert.equal(await resolveWabaId("key", "+529981234567"), "waba_mx");
+    assert.equal(await resolveWabaId("key", "998 123 4567"), "waba_mx", "national format");
+  } finally {
+    restore();
+  }
+});
+
+test("the WABA lookup reads every page of numbers", async () => {
+  const { urls, restore } = withPhoneNumberPages([
+    numbers(100),
+    [{ phoneNumber: "+5219981234567", wabaId: "waba_mx" }],
+  ]);
+  try {
+    assert.equal(await resolveWabaId("key", "+529981234567"), "waba_mx");
+  } finally {
+    restore();
+  }
+  assert.equal(urls.length, 2);
+});
+
+test("a number not on the account throws: never another number's WABA", async () => {
+  const { restore } = withPhoneNumberPages([[{ phoneNumber: "+15550000001", wabaId: "waba_us" }]]);
+  try {
+    await assert.rejects(resolveWabaId("key", "+529981234567"), WabaNotFoundError);
+  } finally {
     restore();
   }
 });

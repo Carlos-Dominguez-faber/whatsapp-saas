@@ -5,6 +5,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
 import { syncTemplates } from "@/features/inbox/services/templates";
 import { WHATSAPP_NOT_CONNECTED } from "@/features/inbox/services/whatsapp-provider";
+import { WabaNotFoundError } from "@/features/inbox/services/ycloud-client";
 
 // ── Shared auth helper ────────────────────────────────────────────────────────
 
@@ -73,6 +74,9 @@ export async function POST(
         },
         { status: 422 },
       );
+    }
+    if (err instanceof WabaNotFoundError) {
+      return NextResponse.json({ error: err.message }, { status: 422 });
     }
     if (message.includes("falta waba_id")) {
       return NextResponse.json(

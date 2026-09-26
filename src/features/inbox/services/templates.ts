@@ -10,6 +10,7 @@ import {
   templateOfficialId,
 } from "./ycloud-client";
 import { fetchKapsoTemplates } from "./kapso-client";
+import { phoneString } from "./phone";
 import {
   decryptWhatsAppCredentials,
   loadWhatsAppIntegration,
@@ -155,7 +156,7 @@ async function fetchProviderTemplates(
     return { items: await fetchKapsoTemplates(apiKey, wabaId), truncated: false };
   }
   // YCloud's key reaches every WABA of the account: only this number's.
-  const phoneNumber = (config.phone_number as string | undefined) ?? "";
+  const phoneNumber = phoneString(config.phone_number) ?? "";
   if (!phoneNumber) {
     throw new Error(
       "[templates] falta el número de WhatsApp en la configuración de YCloud del workspace",
