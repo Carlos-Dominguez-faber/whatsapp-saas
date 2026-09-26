@@ -1,9 +1,11 @@
 /**
- * ycloud-status.ts — applies a YCloud message status webhook to its message.
+ * message-status.ts — applies a provider status event (sent / delivered /
+ * read / failed) to the outbound message it refers to.
  *
- * Called only after the webhook signature was verified against the secret of
- * `workspaceId`, so the lookup is scoped to that workspace: a wamid is unique
- * per workspace only, and a tenant can sign events with its own secret.
+ * Provider webhooks call it only after verifying the signature against the
+ * secret of `workspaceId`, so the lookup is scoped to that workspace: a wamid
+ * is unique per workspace only, and a tenant can sign events with its own
+ * secret.
  */
 
 import type { SupabaseClient } from "@supabase/supabase-js";
@@ -13,7 +15,7 @@ const STATUS_ORDER = ["queued", "sent", "delivered", "read"] as const;
 type OrderedStatus = (typeof STATUS_ORDER)[number];
 type MessageStatus = OrderedStatus | "failed";
 
-export async function applyYCloudStatus(
+export async function applyMessageStatus(
   supabase: SupabaseClient,
   workspaceId: string,
   wamid: string,

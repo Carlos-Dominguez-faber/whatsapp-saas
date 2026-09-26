@@ -19,7 +19,7 @@ import {
   describeImage,
 } from "@/features/inbox/services/media-understanding";
 import { decryptCredentials } from "@/shared/lib/integration-secrets";
-import { applyYCloudStatus } from "@/features/inbox/services/ycloud-status";
+import { applyMessageStatus } from "@/features/inbox/services/message-status";
 
 // Keep the function alive long enough for the best-effort fast path below
 // (sleep through the buffer window + AI generation). The cron is the fallback.
@@ -141,7 +141,7 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
         body as { whatsappMessage?: { wamid?: string; status?: string } }
       ).whatsappMessage;
       if (statusData?.wamid && statusData?.status) {
-        await applyYCloudStatus(
+        await applyMessageStatus(
           supabase,
           ws.workspace_id,
           statusData.wamid,
