@@ -74,17 +74,31 @@ export function MembersSheet({ workspaceId, onClose }: Props) {
     setConfirmUserId(userId);
   }
 
-  function handleReset(userId: string) {
+  function handleReset(member: WorkspaceMember) {
     if (!workspaceId) return;
-    const confirmOtherWorkspaces = confirmOthers;
+    // The workspaces the admin confirmed, as shown: the server resets only
+    // if they are still exactly the person's other workspaces.
+    const confirmedWorkspaceIds = confirmOthers
+      ? member.otherWorkspaces.map((w) => w.id)
+      : [];
     setConfirmUserId(null);
     setConfirmOthers(false);
     startReset(async () => {
-      const result = await resetMemberPassword(workspaceId, userId, {
-        confirmOtherWorkspaces,
+      const result = await resetMemberPassword(workspaceId, member.userId, {
+        confirmedWorkspaceIds,
       });
       if (result.error) {
         toast.error(result.error);
+        const current = result.otherWorkspaces;
+        if (current) {
+          // Show the current list and ask again.
+          setMembers((prev) =>
+            prev?.map((m) =>
+              m.userId === member.userId ? { ...m, otherWorkspaces: current } : m,
+            ) ?? prev,
+          );
+          setConfirmUserId(member.userId);
+        }
         return;
       }
       setCredentials({ email: result.email ?? "", password: result.password ?? "" });
@@ -223,8 +237,8 @@ export function MembersSheet({ workspaceId, onClose }: Props) {
                           También está activo en:
                         </p>
                         <ul className="list-disc pl-4 text-xs text-foreground">
-                          {member.otherWorkspaces.map((name) => (
-                            <li key={name}>{name}</li>
+                          {member.otherWorkspaces.map((w) => (
+                            <li key={w.id}>{w.name}</li>
                           ))}
                         </ul>
                         <label className="flex items-start gap-2 text-xs text-foreground">
@@ -248,7 +262,7 @@ export function MembersSheet({ workspaceId, onClose }: Props) {
                           resetting ||
                           (member.otherWorkspaces.length > 0 && !confirmOthers)
                         }
-                        onClick={() => handleReset(member.userId)}
+                        onClick={() => handleReset(member)}
                       >
                         Confirmar reset
                       </Button>

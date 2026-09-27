@@ -9,6 +9,7 @@ import type {
   CreateWorkspaceResult,
   GetWorkspacesResult,
   GetWorkspaceMembersResult,
+  OtherWorkspace,
   ResetMemberPasswordResult,
   WorkspaceMember,
   WorkspaceWithStats,
@@ -529,7 +530,7 @@ export async function getWorkspaceMembers(
   // A password is global to the person, not to this workspace: list where
   // else each member is active so the sheet can name those workspaces before
   // a reset.
-  const otherWorkspaces = new Map<string, string[]>();
+  const otherWorkspaces = new Map<string, OtherWorkspace[]>();
   const userIds = rows.map((row) => row.user_id);
   if (userIds.length > 0) {
     let active: ActiveMembershipRow[];
@@ -541,9 +542,9 @@ export async function getWorkspaceMembers(
     }
     for (const row of active) {
       if (row.workspace_id === workspaceId) continue;
-      const names = otherWorkspaces.get(row.user_id) ?? [];
-      names.push(row.workspaces?.name ?? row.workspace_id);
-      otherWorkspaces.set(row.user_id, names);
+      const list = otherWorkspaces.get(row.user_id) ?? [];
+      list.push(otherWorkspaceOf(row));
+      otherWorkspaces.set(row.user_id, list);
     }
   }
 
@@ -561,10 +562,20 @@ export async function getWorkspaceMembers(
   return { members };
 }
 
+function otherWorkspaceOf(row: ActiveMembershipRow): OtherWorkspace {
+  return { id: row.workspace_id, name: row.workspaces?.name ?? row.workspace_id };
+}
+
+/**
+ * Resets a member's password. When the person is active in other workspaces
+ * too, `confirmedWorkspaceIds` must be exactly the ids of those workspaces as
+ * the admin saw them: if the list changed since, nothing happens and the
+ * current one comes back to confirm again.
+ */
 export async function resetMemberPassword(
   workspaceId: string,
   userId: string,
-  opts: { confirmOtherWorkspaces?: boolean } = {},
+  opts: { confirmedWorkspaceIds?: string[] } = {},
 ): Promise<ResetMemberPasswordResult> {
   const adminId = await assertSuperAdmin();
   if (!adminId) return { error: "No autorizado" };
@@ -619,11 +630,17 @@ export async function resetMemberPassword(
     return { error: "No se pudo resetear la clave" };
   }
   const others = active.filter((row) => row.workspace_id !== workspaceId);
-  if (others.length > 0 && opts.confirmOtherWorkspaces !== true) {
+  const otherIds = [...new Set(others.map((row) => row.workspace_id))].sort();
+  const confirmed = [...new Set(opts.confirmedWorkspaceIds ?? [])].sort();
+  const matches =
+    otherIds.length === confirmed.length && otherIds.every((id, i) => id === confirmed[i]);
+  if (!matches) {
     return {
       error:
-        "Esta persona también está en otros workspaces y su clave nueva aplicará en todos. Confírmalo para continuar.",
-      otherWorkspaces: others.map((row) => row.workspaces?.name ?? row.workspace_id),
+        confirmed.length === 0
+          ? "Esta persona también está en otros workspaces y su clave nueva aplicará en todos. Confírmalo para continuar."
+          : "Los workspaces de esta persona cambiaron desde que los viste. Revisa la lista y confirma otra vez.",
+      otherWorkspaces: others.map(otherWorkspaceOf),
     };
   }
   const affected = [...new Set([workspaceId, ...active.map((row) => row.workspace_id)])];
@@ -663,10 +680,12 @@ export async function resetMemberPassword(
       workspace_id: ws,
       type: "member_password_reset",
       level: "warn",
+      // Which client's workspace it was done from stays in the server-only
+      // audit: each workspace's log doesn't learn another client's id.
       payload: {
         actor_user_id: adminId,
         target_user_id: userId,
-        performed_in: workspaceId,
+        from_agency: true,
         outcome,
       },
     })),

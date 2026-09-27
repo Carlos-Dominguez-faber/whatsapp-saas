@@ -316,7 +316,7 @@ test("getWorkspaceMembers maps rows and names each member's other workspaces", a
         isActive: true,
         isSuperAdmin: false,
         isSelf: false,
-        otherWorkspaces: ["Tienda Dos"],
+        otherWorkspaces: [{ id: "ws_2", name: "Tienda Dos" }],
       },
       {
         userId: "admin1",
@@ -382,38 +382,71 @@ test("resetMemberPassword generates a new password, audits it append-only and re
   );
 });
 
-test("resetMemberPassword refuses someone active elsewhere unless confirmed, naming those workspaces", async () => {
-  currentAuthClient = fakeAuthClient({ user: { id: "admin1" }, isSuperAdmin: true });
-  const rows = [
-    ...ONLY_HERE,
-    { user_id: "target1", workspace_id: "ws_2", workspaces: { name: "Tienda Dos" } },
-  ];
-  const refused = fakeService({
+const ELSEWHERE = [
+  ...ONLY_HERE,
+  { user_id: "target1", workspace_id: "ws_2", workspaces: { name: "Tienda Dos" } },
+];
+const resetService = (activeMembershipRows = ELSEWHERE) =>
+  fakeService({
     membership: { user_id: "target1", is_active: true },
     userEmail: "cliente@empresa.com",
-    activeMembershipRows: rows,
+    activeMembershipRows,
   });
+
+test("resetMemberPassword refuses someone active elsewhere unless those workspaces are confirmed", async () => {
+  currentAuthClient = fakeAuthClient({ user: { id: "admin1" }, isSuperAdmin: true });
+  const refused = resetService();
   currentServiceClient = refused.client;
   const first = await resetMemberPassword("ws_1", "target1");
-  assert.deepEqual(first.otherWorkspaces, ["Tienda Dos"]);
+  assert.deepEqual(first.otherWorkspaces, [{ id: "ws_2", name: "Tienda Dos" }]);
   assert.ok(first.error);
   assert.equal(refused.updateCalls.length, 0);
   assert.equal(refused.auditRows.length, 0);
 
-  const confirmed = fakeService({
-    membership: { user_id: "target1", is_active: true },
-    userEmail: "cliente@empresa.com",
-    activeMembershipRows: rows,
-  });
+  const confirmed = resetService();
   currentServiceClient = confirmed.client;
-  const second = await resetMemberPassword("ws_1", "target1", { confirmOtherWorkspaces: true });
+  const second = await resetMemberPassword("ws_1", "target1", { confirmedWorkspaceIds: ["ws_2"] });
   assert.equal(second.error, undefined);
   assert.deepEqual(confirmed.auditRows[0].affected_workspace_ids, ["ws_1", "ws_2"]);
-  // The reset is recorded in every workspace where the person is active.
+  // The reset is recorded in every workspace where the person is active...
   assert.deepEqual(
     confirmed.eventRows.map((e) => e.workspace_id),
     ["ws_1", "ws_2"],
   );
+  // ...without telling one client's log another client's workspace id.
+  for (const e of confirmed.eventRows) {
+    assert.deepEqual(e.payload, {
+      actor_user_id: "admin1",
+      target_user_id: "target1",
+      from_agency: true,
+      outcome: "done",
+    });
+  }
+});
+
+test("resetMemberPassword refuses when the workspaces changed since the admin saw them, and returns the current ones", async () => {
+  currentAuthClient = fakeAuthClient({ user: { id: "admin1" }, isSuperAdmin: true });
+  // The admin saw (and confirmed) only ws_2; the person joined ws_3 since.
+  const now = resetService([
+    ...ELSEWHERE,
+    { user_id: "target1", workspace_id: "ws_3", workspaces: { name: "Tienda Tres" } },
+  ]);
+  currentServiceClient = now.client;
+  const result = await resetMemberPassword("ws_1", "target1", { confirmedWorkspaceIds: ["ws_2"] });
+  assert.match(result.error ?? "", /cambiaron/);
+  assert.deepEqual(result.otherWorkspaces, [
+    { id: "ws_2", name: "Tienda Dos" },
+    { id: "ws_3", name: "Tienda Tres" },
+  ]);
+  assert.equal(now.updateCalls.length, 0);
+  assert.equal(now.auditRows.length, 0);
+
+  // Confirming workspaces the person is no longer in doesn't pass either.
+  const gone = resetService(ONLY_HERE);
+  currentServiceClient = gone.client;
+  const stale = await resetMemberPassword("ws_1", "target1", { confirmedWorkspaceIds: ["ws_2"] });
+  assert.deepEqual(stale.otherWorkspaces, []);
+  assert.equal(gone.updateCalls.length, 0);
 });
 
 test("resetMemberPassword refuses the caller's own account without touching auth", async () => {
