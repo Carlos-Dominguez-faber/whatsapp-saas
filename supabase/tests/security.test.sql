@@ -8,7 +8,7 @@ BEGIN;
 CREATE EXTENSION IF NOT EXISTS pgtap WITH SCHEMA extensions;
 SET search_path = public, extensions;
 
-SELECT plan(127);
+SELECT plan(128);
 
 -- ── public.users: read-only for sessions ────────────────────────────────────
 SELECT ok(NOT has_table_privilege('authenticated', 'public.users', 'UPDATE'),
@@ -589,6 +589,11 @@ SELECT lives_ok(
     ON CONFLICT (workspace_id, hl_appointment_id)
     DO UPDATE SET scheduled_at = EXCLUDED.scheduled_at, status = EXCLUDED.status$$,
   'the index backs the write-back''s upsert on (workspace_id, hl_appointment_id)');
+SELECT is(
+  (SELECT indexdef ILIKE '% WHERE %' FROM pg_indexes
+    WHERE schemaname = 'public' AND indexname = 'uq_appointments_workspace_hl_appointment_id'),
+  false,
+  'the appointments HighLevel index is total, not partial');
 SELECT ok(
   (SELECT schema #> '{properties,timezone}' IS NULL FROM public.tools WHERE key = 'check_availability'),
   'check_availability no longer takes a time zone from the model');

@@ -19,13 +19,16 @@
 --
 -- Total, not partial: NULLs never collide in a unique index (rows booked
 -- without HighLevel carry no id), and a partial one could not back the
--- write-back's ON CONFLICT from PostgREST.
+-- write-back's ON CONFLICT from PostgREST (42P10). CREATE ... IF NOT EXISTS
+-- only compares names, so an earlier partial index by this name (a test
+-- database that ran a draft of this migration) is dropped and recreated.
 -- Without CONCURRENTLY: it can't run inside the DO block's transaction.
 -- ============================================================================
 
 DO $$
 DECLARE
   v_unlinked UUID[];
+  v_indexdef TEXT;
 BEGIN
   LOCK TABLE public.appointments IN SHARE ROW EXCLUSIVE MODE;
 
@@ -51,6 +54,15 @@ BEGIN
     RAISE WARNING
       'appointments: % appointment(s) shared a HighLevel id with another of their workspace; only one keeps it (a live one first, then the one touched most recently). Unlinked (up to 20): %',
       cardinality(v_unlinked), v_unlinked[1:20];
+  END IF;
+
+  SELECT indexdef INTO v_indexdef
+    FROM pg_indexes
+   WHERE schemaname = 'public'
+     AND indexname = 'uq_appointments_workspace_hl_appointment_id';
+  IF v_indexdef IS NOT NULL AND v_indexdef ILIKE '% WHERE %' THEN
+    RAISE NOTICE 'appointments: replacing the partial uq_appointments_workspace_hl_appointment_id with a total one';
+    DROP INDEX public.uq_appointments_workspace_hl_appointment_id;
   END IF;
 
   CREATE UNIQUE INDEX IF NOT EXISTS uq_appointments_workspace_hl_appointment_id
