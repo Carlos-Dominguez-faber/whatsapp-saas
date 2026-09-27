@@ -169,10 +169,10 @@ test("reports the HighLevel error when the API call itself fails", async () => {
       ctx,
     );
     assert.equal(result.ok, false);
-    assert.match(result.error ?? "", /\(400\)/);
+    // A taken slot: nothing was booked, and the model checks availability again.
+    assert.match(result.error ?? "", /check_availability/);
     assert.doesNotMatch(result.error ?? "", /Slot not available/);
-    // A person follows up: the buffer hands off after the reply.
-    assert.deepEqual(result.output, { needs_human: true });
+    assert.equal(result.output, null, "no needs_human: only unknown outcomes hand off");
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -311,6 +311,14 @@ test("business zone unset: the HighLevel zone reads the slot, and the booking ca
   assert.equal((bookingOf(calls)?.body as { startTime: string }).startTime, "2027-06-12T10:00:00-05:00");
   const local = calls.find((c) => c.url.includes("/rest/v1/appointments") && c.method === "POST");
   assert.equal((local?.body as { scheduled_at: string }).scheduled_at, "2027-06-12T15:00:00.000Z");
+});
+
+test("another 4xx is a plain failure: nothing was booked, no handoff", async () => {
+  const { fn } = mockFetch({ hlStatus: 401, hlBody: { message: "Invalid JWT" }, appointmentInsertStatus: 201 });
+  const result = await runWith(fn as typeof fetch, { datetime_iso: "2027-06-12T10:00:00-06:00" });
+  assert.equal(result.ok, false);
+  assert.match(result.error ?? "", /\(401\)/);
+  assert.equal(result.output, null);
 });
 
 test("a past slot is refused", async () => {

@@ -51,6 +51,9 @@ interface HLAppointmentResponse {
 
 const BOOKING_TIMEOUT_MS = 8_000;
 
+/** HighLevel's wording when the slot was taken (or never free). */
+const SLOT_TAKEN = /slot|no longer available|not available|unavailable|already booked/i;
+
 const UNKNOWN_BOOKING =
   "No pude confirmar si la cita quedó agendada. No le digas al cliente que se agendó ni que falló: dile que una persona del equipo lo confirmará.";
 
@@ -173,16 +176,22 @@ async function run(args: Args, ctx: ToolContext): Promise<ToolResult> {
   if (!res.ok) {
     // The raw body is HighLevel's own wording (English, internal ids): log
     // it, but give the model a plain reason it can relay.
-    console.error(
-      `[schedule_highlevel] HighLevel ${res.status}:`,
-      (await res.text()).slice(0, 300),
-    );
+    const detail = (await res.text()).slice(0, 300);
+    console.error(`[schedule_highlevel] HighLevel ${res.status}:`, detail);
+    // Only an unknown outcome hands off (the buffer does, for a write that
+    // may have happened); a refusal booked nothing.
     if (res.status >= 500) throw new UnknownOutcomeError(UNKNOWN_BOOKING);
+    if (SLOT_TAKEN.test(detail)) {
+      return {
+        ok: false,
+        output: null,
+        error: "Ese horario ya no está disponible, así que la cita NO se agendó. Consulta otra vez check_availability y ofrécele al cliente otro horario.",
+      };
+    }
     return {
       ok: false,
-      // A person follows up: the buffer hands the conversation off after the reply.
-      output: { needs_human: true },
-      error: `El calendario de HighLevel respondió con un error (${res.status}); no se pudo agendar la cita. Dile al cliente que una persona del equipo lo revisará.`,
+      output: null,
+      error: `El calendario de HighLevel respondió con un error (${res.status}); no se pudo agendar la cita. Dile al cliente que lo revisarás o pásalo a una persona.`,
     };
   }
 
