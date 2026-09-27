@@ -1245,3 +1245,27 @@ test("a person who took the conversation during the turn keeps it: no farewell, 
   assert.equal(dispatchArgs.length, 0);
   assert.equal(transitions.length, 0);
 });
+
+test("a write whose outcome is unknown, followed by a reply, leaves a note for the team", async () => {
+  reset();
+  generated = {
+    text: "No pude confirmar si tu cita se canceló; una persona del equipo lo revisará.",
+    tools: [{ name: "cancel_highlevel", sensitivity: "write", ok: null }],
+  };
+  const result = await processNextBatch();
+  assert.equal(result.processed, true);
+  assert.equal(dispatchArgs.length, 1);
+  const note = notes().find((n) => (n.meta as Row).reason === "write_tool_unfinished");
+  assert.ok(note, "a person is told to check");
+  assert.match(String(note!.body), /cancel_highlevel/);
+});
+
+test("a confirmed write followed by a reply leaves no note", async () => {
+  reset();
+  generated = {
+    text: "Listo, cancelé tu cita.",
+    tools: [{ name: "cancel_highlevel", sensitivity: "write", ok: true }],
+  };
+  await processNextBatch();
+  assert.equal(notes().length, 0);
+});

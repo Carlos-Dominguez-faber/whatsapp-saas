@@ -1,6 +1,6 @@
 -- ============================================================
 -- Migration: 20260930000000_seed_highlevel_cancel_reschedule_tools
--- Agente WhatsApp — seed the HighLevel cancel/reschedule tools
+-- Agente WhatsApp — seed the HighLevel cancel/reschedule/list tools
 --
 -- Same reasoning as 20260617000001_seed_check_availability_tool:
 -- cancel_highlevel and reschedule_highlevel are implemented and registered in
@@ -24,7 +24,11 @@ INSERT INTO public.tools (key, name, description, schema, sensitivity) VALUES
   ('reschedule_highlevel', 'Reagendar cita en HighLevel',
    'Moves the contact''s HighLevel appointment from the confirmed date and time to a new one',
    '{"type":"object","properties":{"appointment_datetime_iso":{"type":"string"},"new_datetime_iso":{"type":"string"}},"required":["appointment_datetime_iso","new_datetime_iso"]}',
-   'write')
+   'write'),
+  ('list_highlevel_appointments', 'Ver citas en HighLevel',
+   'Lists the conversation contact''s upcoming HighLevel appointments with their exact date and time',
+   '{"type":"object","properties":{}}',
+   'read')
 ON CONFLICT (key) DO UPDATE
   SET name = EXCLUDED.name,
       description = EXCLUDED.description,

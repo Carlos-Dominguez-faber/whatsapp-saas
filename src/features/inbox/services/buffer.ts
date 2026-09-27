@@ -661,6 +661,7 @@ export async function processNextBatch(): Promise<ProcessBatchResult> {
         progress,
         pendingHandoff,
       );
+      await noteUnconfirmedWrites(supabase, batch, writeRuns);
       return done();
     }
 
@@ -1019,6 +1020,7 @@ export async function processNextBatch(): Promise<ProcessBatchResult> {
       progress,
       handoffReason,
     );
+    await noteUnconfirmedWrites(supabase, batch, writeRuns);
     if (!delivered) {
       return done();
     }
@@ -1366,6 +1368,27 @@ async function addInternalNote(
   if (error) {
     console.error("[buffer] internal note failed:", error.message);
   }
+}
+
+/**
+ * A write whose outcome is unknown (it threw, timed out, or HighLevel didn't
+ * confirm) and the agent still replied: the reply can't say what happened,
+ * so a person is told to check. One note per batch.
+ */
+async function noteUnconfirmedWrites(
+  supabase: ReturnType<typeof svc>,
+  batch: MessageBatch,
+  writeRuns: WriteRun[],
+): Promise<void> {
+  const unconfirmed = writeRuns.filter((w) => w.ok === null);
+  if (unconfirmed.length === 0) return;
+  const tools = [...new Set(unconfirmed.map((w) => w.name))].join(", ");
+  await addInternalNote(
+    supabase,
+    batch,
+    `La IA ejecutó una acción (${tools}) cuyo resultado no se pudo confirmar. Revisa qué quedó hecho.`,
+    "write_tool_unfinished",
+  );
 }
 
 /**
