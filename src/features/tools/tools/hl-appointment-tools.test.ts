@@ -3,6 +3,7 @@ import { test } from "node:test";
 import { cancelHighLevelTool } from "./cancel-highlevel.ts";
 import { rescheduleHighLevelTool } from "./reschedule-highlevel.ts";
 import { listHighLevelAppointmentsTool } from "./list-highlevel-appointments.ts";
+import { parseHLTime } from "../lib/hl-appointment.ts";
 import type { ToolContext } from "../core/tool";
 
 process.env.NEXT_PUBLIC_SUPABASE_URL = "https://fake.supabase.co";
@@ -64,6 +65,8 @@ function hlFetch(opts: {
   hlContactEvents?: Array<Record<string, unknown>>;
   /** GET /calendars/events/appointments/{id} → { event } (null: 404). */
   hlEvent?: Record<string, unknown> | null;
+  /** The same, per appointment id; ids not listed fall back to hlEvent. */
+  hlEvents?: Record<string, Record<string, unknown> | null>;
   hlEventStatus?: number;
   putStatus?: number;
   putThrows?: boolean;
@@ -117,10 +120,12 @@ function hlFetch(opts: {
         if (opts.putThrows) throw new Error("socket hang up");
         return json(opts.putStatus ?? 200, {});
       }
-      if (opts.hlEvent === null) return json(404, {});
+      const id = url.split("/").pop()!;
+      const event = opts.hlEvents && id in opts.hlEvents ? opts.hlEvents[id] : opts.hlEvent;
+      if (event === null) return json(404, {});
       // By default HighLevel has it live, with no start time to compare.
       return json(opts.hlEventStatus ?? 200, {
-        event: opts.hlEvent ?? { appointmentStatus: "confirmed" },
+        event: event ?? { appointmentStatus: "confirmed" },
       });
     }
     throw new Error(`unexpected fetch: ${method} ${url}`);
@@ -297,9 +302,9 @@ test("cancel: the HighLevel fallback needs a calendar, matches it, and reads bar
   }
 });
 
-test("cancel: a write tool with a 25 s budget, and nothing runs without a real contact", async () => {
+test("cancel: a write tool with a 30 s budget, and nothing runs without a real contact", async () => {
   assert.equal(cancelHighLevelTool.sensitivity, "write");
-  assert.equal(cancelHighLevelTool.preferredTimeoutMs, 25_000);
+  assert.equal(cancelHighLevelTool.preferredTimeoutMs, 30_000);
   const fake = hlFetch({});
   const result = await withFetch(fake, () =>
     cancelHighLevelTool.run({ appointment_datetime_iso: CONFIRMED }, { ...ctx, contactId: "" }),
@@ -365,7 +370,10 @@ test("reschedule: a retry finds it already moved — only with the recorded orig
 });
 
 test("reschedule: a cancelled appointment is not moved; a past or unknown time is refused", async () => {
-  const cancelled = hlFetch({ local: [{ ...active("a1", CONFIRMED_UTC), status: "cancelled" }] });
+  const cancelled = hlFetch({
+    local: [{ ...active("a1", CONFIRMED_UTC), status: "cancelled" }],
+    hlEvent: { appointmentStatus: "cancelled" },
+  });
   const r1 = await withFetch(cancelled, () =>
     rescheduleHighLevelTool.run(
       { appointment_datetime_iso: CONFIRMED, new_datetime_iso: NEW_TIME },
@@ -401,7 +409,7 @@ test("reschedule: an unknown outcome throws and leaves a note", async () => {
     /No pude confirmar/,
   );
   assert.equal(notesIn(fake.calls).length, 1);
-  assert.equal(rescheduleHighLevelTool.preferredTimeoutMs, 25_000);
+  assert.equal(rescheduleHighLevelTool.preferredTimeoutMs, 30_000);
 });
 
 // ── list_highlevel_appointments ─────────────────────────────────────────────
@@ -654,6 +662,7 @@ test("list: HighLevel is asked even with local rows; merged by id, HighLevel's s
       // Booked through the booking link: only HighLevel knows it.
       { id: "hl_x", calendarId: "cal_1", appointmentStatus: "booked", startTime: "2030-06-16 09:00:00" },
     ],
+    hlEvents: { hl_x: { appointmentStatus: "booked", startTime: "2030-06-16T09:00:00-06:00" } },
   });
   const result = await withFetch(fake, () => listHighLevelAppointmentsTool.run({}, ctx));
   const out = result.output as { appointments: Array<{ datetime_iso: string }> };
@@ -676,4 +685,101 @@ test("list: with the business zone unset, times are written in HighLevel's zone"
   const result = await withFetch(fake, () => listHighLevelAppointmentsTool.run({}, ctx));
   const out = result.output as { appointments: Array<{ datetime_iso: string }> };
   assert.deepEqual(out.appointments.map((a) => a.datetime_iso), ["2030-06-12T10:00:00-05:00"]);
+});
+
+// ── HighLevel confirms what the local rows say ──────────────────────────────
+
+const patchesOf = (calls: FetchCall[]) =>
+  calls.filter((c) => c.method === "PATCH" && c.url.includes("/rest/v1/appointments"));
+
+test("cancel: marks every local row of that HighLevel appointment, by its HighLevel id", async () => {
+  const fake = hlFetch({ local: [active("a1", CONFIRMED_UTC)] });
+  await withFetch(fake, () => cancelHighLevelTool.run({ appointment_datetime_iso: CONFIRMED }, ctx));
+  const [patch] = patchesOf(fake.calls);
+  assert.ok(decodeURIComponent(patch.url).includes("hl_appointment_id=eq.hl_a1"), patch.url);
+  assert.ok(!patch.url.includes("id=eq.a1"), patch.url);
+  assert.deepEqual(patch.body, { status: "cancelled" });
+});
+
+test("cancel: a live local row HighLevel no longer has is synced, and the live one at that time is cancelled", async () => {
+  // a1 is still booked here, but staff deleted it in HighLevel (404); the
+  // customer booked hl_b at the same time through the link.
+  const fake = hlFetch({
+    calendarId: "cal_1",
+    contactHlId: "hl_c1",
+    local: [active("a1", CONFIRMED_UTC)],
+    hlContactEvents: [
+      { id: "hl_b", calendarId: "cal_1", appointmentStatus: "confirmed", startTime: "2030-06-12 10:00:00" },
+    ],
+    hlEvents: { hl_a1: null },
+  });
+  const result = await withFetch(fake, () =>
+    cancelHighLevelTool.run({ appointment_datetime_iso: CONFIRMED }, ctx),
+  );
+  assert.deepEqual(result.output, { cancelled: true }, "not 'already cancelled'");
+  assert.deepEqual(puts(fake.calls).map((p) => p.url.split("/").pop()), ["hl_b"]);
+  // a1's row now says what HighLevel says.
+  assert.ok(
+    patchesOf(fake.calls).some((p) => decodeURIComponent(p.url).includes("hl_appointment_id=eq.hl_a1")),
+  );
+});
+
+test("cancel: a live local row HighLevel cancelled, and nothing else at that time: already cancelled, row synced", async () => {
+  const fake = hlFetch({
+    calendarId: "cal_1",
+    contactHlId: "hl_c1",
+    local: [active("a1", CONFIRMED_UTC)],
+    hlContactEvents: [
+      { id: "hl_a1", calendarId: "cal_1", appointmentStatus: "cancelled", startTime: "2030-06-12 10:00:00" },
+    ],
+    hlEvent: { appointmentStatus: "cancelled" },
+  });
+  const result = await withFetch(fake, () =>
+    cancelHighLevelTool.run({ appointment_datetime_iso: CONFIRMED }, ctx),
+  );
+  assert.deepEqual(result.output, { cancelled: true, already_cancelled: true });
+  assert.equal(puts(fake.calls).length, 0);
+  assert.equal(patchesOf(fake.calls).length, 1);
+});
+
+test("list: a local row keeps its own time; HighLevel's bare time only says whether it's live", async () => {
+  const fake = hlFetch({
+    calendarId: "cal_1",
+    contactHlId: "hl_c1",
+    local: [active("a1", CONFIRMED_UTC)],
+    hlContactEvents: [
+      // Read in a guessed zone, this bare time would be an hour off.
+      { id: "hl_a1", calendarId: "cal_1", appointmentStatus: "confirmed", startTime: "2030-06-12 11:00:00" },
+      // Only HighLevel knows it: its time comes from the appointment itself.
+      { id: "hl_x", calendarId: "cal_1", appointmentStatus: "booked", startTime: "2030-06-16 08:00:00" },
+    ],
+    hlEvents: { hl_x: { appointmentStatus: "booked", startTime: "2030-06-16T09:00:00-06:00" } },
+  });
+  const result = await withFetch(fake, () => listHighLevelAppointmentsTool.run({}, ctx));
+  const out = result.output as { appointments: Array<{ datetime_iso: string }> };
+  assert.deepEqual(out.appointments.map((a) => a.datetime_iso), [
+    "2030-06-12T10:00:00-06:00",
+    "2030-06-16T09:00:00-06:00",
+  ]);
+  const read = fake.calls.filter((c) => c.url.includes("/calendars/events/appointments/"));
+  assert.deepEqual(read.map((c) => c.url.split("/").pop()), ["hl_x"], "only the HighLevel-only one is read");
+  assert.equal(read[0].headers.Version, "2021-04-15");
+});
+
+test("parseHLTime: an explicit offset is the instant it names, even at a wall clock the zone skips", () => {
+  // 2026-03-29 02:30 never happens in Madrid (02:00 → 03:00), but 02:30Z does.
+  assert.equal(
+    new Date(parseHLTime("2026-03-29T02:30:00Z", "Europe/Madrid")!).toISOString(),
+    "2026-03-29T02:30:00.000Z",
+  );
+  assert.equal(
+    new Date(parseHLTime("2026-06-12T10:00:00-05:00", "Europe/Madrid")!).toISOString(),
+    "2026-06-12T15:00:00.000Z",
+  );
+  // A bare time is still read in the zone, and a skipped one has no instant.
+  assert.equal(parseHLTime("2026-03-29 02:30:00", "Europe/Madrid"), null);
+  assert.equal(
+    new Date(parseHLTime("2026-06-12 10:00:00", "Europe/Madrid")!).toISOString(),
+    "2026-06-12T08:00:00.000Z",
+  );
 });

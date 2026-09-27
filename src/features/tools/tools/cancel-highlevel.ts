@@ -5,9 +5,9 @@ import {
   APPOINTMENT_TOOL_TIMEOUT_MS,
   confirmedInstantError,
   describeInstant,
-  fetchHLEvent,
   hlTimeZone,
-  locateAppointmentAt,
+  locateConfirmedAppointmentAt,
+  markLocalCancelled,
   noteForTeam,
   parseConfirmedInstant,
   putHLEvent,
@@ -79,9 +79,11 @@ async function run(args: Args, ctx: ToolContext): Promise<ToolResult> {
     return needsHuman(LOOKUP_FAILED);
   };
 
+  // Confirmed with HighLevel: the local row may be stale, or staff may have
+  // moved or cancelled the appointment there.
   let located;
   try {
-    located = await locateAppointmentAt({
+    located = await locateConfirmedAppointmentAt({
       supabase,
       cfg,
       workspaceId: ctx.workspaceId,
@@ -94,6 +96,9 @@ async function run(args: Args, ctx: ToolContext): Promise<ToolResult> {
   }
 
   if (located.kind === "none") {
+    if (located.cancelledIds.length > 0) {
+      return { ok: true, output: { cancelled: true, already_cancelled: true } };
+    }
     return {
       ok: false,
       output: null,
@@ -112,27 +117,7 @@ async function run(args: Args, ctx: ToolContext): Promise<ToolResult> {
     );
   }
 
-  // HighLevel's word counts before acting: the local row may be stale, or
-  // staff may have moved or cancelled the appointment there.
-  let current;
-  try {
-    current = await fetchHLEvent(cfg, located.hlAppointmentId, hlZone);
-  } catch (err) {
-    return lookupFailed(err);
-  }
-  const markLocalCancelled = async () => {
-    if (!located.localId) return;
-    const { error } = await supabase
-      .from("appointments")
-      .update({ status: "cancelled" })
-      .eq("id", located.localId)
-      .eq("workspace_id", ctx.workspaceId);
-    if (error) console.warn("[cancel_highlevel] failed to update local status:", error);
-  };
-  if (!current || current.state === "cancelled") {
-    await markLocalCancelled();
-    return { ok: true, output: { cancelled: true, already_cancelled: true } };
-  }
+  const { appointment, event: current } = located;
   if (current.state !== "active") {
     return {
       ok: false,
@@ -152,7 +137,7 @@ async function run(args: Args, ctx: ToolContext): Promise<ToolResult> {
     try {
       return await putHLEvent(
         cfg,
-        located.hlAppointmentId,
+        appointment.hlAppointmentId,
         { appointmentStatus: "cancelled" },
         "No pude confirmar si la cita se canceló. No le digas al cliente que quedó cancelada ni que falló: dile que una persona del equipo lo confirmará.",
       );
@@ -179,7 +164,8 @@ async function run(args: Args, ctx: ToolContext): Promise<ToolResult> {
     );
   }
 
-  await markLocalCancelled();
+  // Every local row of that HighLevel appointment, not just the one found.
+  await markLocalCancelled(supabase, ctx.workspaceId, appointment.hlAppointmentId);
   return { ok: true, output: { cancelled: true } };
 }
 

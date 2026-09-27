@@ -27,10 +27,15 @@ export const HL_VERSION_CONTACTS = "2021-07-28";
 // tools' budget, so a call times out here — where its outcome is handled —
 // rather than in the registry, which would leave it running unseen.
 const LOOKUP_TIMEOUT_MS = 7_000;
-const EVENT_TIMEOUT_MS = 6_000;
+const EVENT_TIMEOUT_MS = 5_000;
 const PUT_TIMEOUT_MS = 8_000;
-/** The registry's budget for cancel/reschedule (GET + GET + PUT, and slack). */
-export const APPOINTMENT_TOOL_TIMEOUT_MS = 25_000;
+/**
+ * The registry's budget for cancel/reschedule: the contact's appointments,
+ * up to MAX_EVENT_CHECKS appointment reads, the PUT, and slack.
+ */
+export const APPOINTMENT_TOOL_TIMEOUT_MS = 30_000;
+/** Candidates read from HighLevel, one by one, before a person is asked. */
+const MAX_EVENT_CHECKS = 2;
 
 /** How far a stored start may be from the confirmed one and still match. */
 const MATCH_TOLERANCE_MS = 60_000;
@@ -117,26 +122,23 @@ export function confirmedInstantError(
     : "Esa fecha y hora no es válida (formato ISO 8601, y que exista en el calendario). Confírmala con el cliente o consúltala otra vez.";
 }
 
-/** A HighLevel time's instant: with an offset as written, else read in `timeZone`. */
-function instantOf(value: string, timeZone: string): number | null {
-  const parsed = parseConfirmedInstant(value, timeZone);
-  if ("ms" in parsed) return parsed.ms;
-  // HighLevel's own offset is authoritative for its own times.
-  if (parsed.error === "offset_mismatch") {
-    const ms = Date.parse(value.trim().replace(" ", "T"));
-    return Number.isNaN(ms) ? null : ms;
-  }
-  return null;
-}
+const HAS_OFFSET = /(?:Z|[+-]\d{2}:?\d{2})$/i;
 
 /**
- * A HighLevel time: with an offset (the event endpoint) it's an instant; as a
- * bare wall clock (the contact endpoint, "2026-06-12 10:00:00" or with a 'T')
- * it's read in `timeZone`.
+ * A HighLevel time: with an offset (the event endpoint) it's the instant it
+ * names, as written — HighLevel's own offset is authoritative, whatever the
+ * wall clock reads in any zone; as a bare wall clock (the contact endpoint,
+ * "2026-06-12 10:00:00" or with a 'T') it's read in `timeZone`.
  */
 export function parseHLTime(value: unknown, timeZone: string): number | null {
   if (typeof value !== "string" || !value.trim()) return null;
-  return instantOf(value, timeZone);
+  const text = value.trim();
+  if (HAS_OFFSET.test(text)) {
+    const ms = Date.parse(text.replace(" ", "T"));
+    return Number.isNaN(ms) ? null : ms;
+  }
+  const parsed = parseConfirmedInstant(text, timeZone);
+  return "ms" in parsed ? parsed.ms : null;
 }
 
 /**
@@ -277,47 +279,119 @@ async function hlContactIdOf(
 }
 
 /**
- * The conversation contact's appointment at `instantMs`. A live local row
- * settles it. Otherwise HighLevel is asked too (only with a configured
- * calendar: without one, another calendar's appointment of the same account
- * could match) and merged with what's local, HighLevel's state winning for
- * the same appointment — a cancelled local row must not hide an appointment
- * the customer booked again at that time. Throws when a lookup fails, so the
- * caller reports an error instead of "not found".
+ * The conversation contact's candidates at `instantMs`: the local rows and,
+ * with a configured calendar (without one, another calendar's appointment of
+ * the same account could match), HighLevel's, merged by appointment id with
+ * HighLevel's state winning — nothing syncs HighLevel's changes to the local
+ * rows, so a local state can be stale either way. Throws when a lookup
+ * fails, so the caller reports an error instead of "not found".
  */
-export async function locateAppointmentAt(opts: {
+async function candidatesAt(opts: {
   supabase: SupabaseClient;
   cfg: HLConfig;
   workspaceId: string;
   contactId: string;
   instantMs: number;
   hlZone: string;
-}): Promise<LocateResult> {
+}): Promise<Candidate[]> {
   const local = await localCandidatesAt(
     opts.supabase,
     opts.workspaceId,
     opts.contactId,
     opts.instantMs,
   );
-  if (local.some((c) => c.state === "active")) return pick(local);
-  if (!opts.cfg.calendarId) return pick(local);
-
+  if (!opts.cfg.calendarId) return local;
   const hlContactId = await hlContactIdOf(opts.supabase, opts.workspaceId, opts.contactId);
-  if (!hlContactId) return pick(local);
+  if (!hlContactId) return local;
   const events = await listHLContactEvents(opts.cfg, hlContactId, opts.hlZone);
 
   const merged = new Map<string, Candidate>(local.map((c) => [c.hlAppointmentId, c]));
   for (const e of events) {
-    if (Math.abs(e.startMs - opts.instantMs) > MATCH_TOLERANCE_MS) continue;
     const known = merged.get(e.id);
-    merged.set(
-      e.id,
-      known
-        ? { ...known, state: e.state }
-        : { localId: null, localActive: false, hlAppointmentId: e.id, state: e.state, meta: {} },
-    );
+    if (known) {
+      merged.set(e.id, { ...known, state: e.state });
+      continue;
+    }
+    if (Math.abs(e.startMs - opts.instantMs) > MATCH_TOLERANCE_MS) continue;
+    merged.set(e.id, {
+      localId: null,
+      localActive: false,
+      hlAppointmentId: e.id,
+      state: e.state,
+      meta: {},
+    });
   }
-  return pick([...merged.values()]);
+  return [...merged.values()];
+}
+
+/** The contact's appointment at `instantMs`, from candidatesAt. */
+export async function locateAppointmentAt(
+  opts: Parameters<typeof candidatesAt>[0],
+): Promise<LocateResult> {
+  return pick(await candidatesAt(opts));
+}
+
+/** Marks the local rows of a HighLevel appointment cancelled. Never throws. */
+export async function markLocalCancelled(
+  supabase: SupabaseClient,
+  workspaceId: string,
+  hlAppointmentId: string,
+): Promise<void> {
+  const { error } = await supabase
+    .from("appointments")
+    .update({ status: "cancelled" })
+    .eq("workspace_id", workspaceId)
+    .eq("hl_appointment_id", hlAppointmentId);
+  if (error) console.warn("[HL] failed to mark the local appointment cancelled:", error.message);
+}
+
+export type ConfirmedLocateResult =
+  /** Nothing live at that time; `cancelledIds` are the ones HighLevel has cancelled or gone. */
+  | { kind: "none"; cancelledIds: string[] }
+  | { kind: "ambiguous" }
+  /** HighLevel's current view of it: live, or "other" (attended, no-show). */
+  | { kind: "found"; appointment: LocatedAppointment; event: HLEventDetails };
+
+/**
+ * The appointment at `instantMs`, confirmed with HighLevel before anything
+ * acts on it: each candidate in question (the one picked, or every live one
+ * when two are) is read from HighLevel. One HighLevel has cancelled or no
+ * longer has (404) is synced to its local row and left out, and the rest are
+ * picked from again — a stale row must neither hide the live appointment at
+ * the same time nor make it look ambiguous, nor be reported as "already
+ * cancelled" while that one stays booked. Throws when a lookup fails.
+ */
+export async function locateConfirmedAppointmentAt(
+  opts: Parameters<typeof candidatesAt>[0],
+): Promise<ConfirmedLocateResult> {
+  const candidates = await candidatesAt(opts);
+  const gone = new Set<string>();
+  const confirmed = new Map<string, HLEventDetails>();
+  for (let reads = 0; ; ) {
+    const pool = candidates.filter((c) => !gone.has(c.hlAppointmentId));
+    const found = pick(pool);
+    if (found.kind === "none") return { kind: "none", cancelledIds: [...gone] };
+    const inQuestion =
+      found.kind === "found" ? [found] : pool.filter((c) => c.state === "active");
+    const next = inQuestion.find((c) => !confirmed.has(c.hlAppointmentId));
+    if (!next) {
+      if (found.kind === "ambiguous") return found;
+      const { kind: _kind, ...appointment } = found;
+      return { kind: "found", appointment, event: confirmed.get(found.hlAppointmentId)! };
+    }
+    // Out of reads with something still unconfirmed: a person sorts it out.
+    if (reads++ >= MAX_EVENT_CHECKS) return { kind: "ambiguous" };
+    const event = await fetchHLEvent(opts.cfg, next.hlAppointmentId, opts.hlZone);
+    if (!event || event.state === "cancelled") {
+      await markLocalCancelled(opts.supabase, opts.workspaceId, next.hlAppointmentId);
+      gone.add(next.hlAppointmentId);
+      continue;
+    }
+    confirmed.set(next.hlAppointmentId, event);
+    for (const c of candidates) {
+      if (c.hlAppointmentId === next.hlAppointmentId) c.state = event.state;
+    }
+  }
 }
 
 export interface HLEventDetails {
@@ -428,10 +502,17 @@ export async function noteForTeam(
   }
 }
 
+/** How many appointments only HighLevel knows are read one by one for the list. */
+const MAX_LISTED_HL_ONLY = 10;
+const DAY_MS = 24 * 60 * 60 * 1000;
+
 /**
  * The contact's upcoming live appointments, with the exact instant to copy
  * into cancel/reschedule: local rows and, with a configured calendar,
- * HighLevel's, merged by appointment id (HighLevel's state winning).
+ * HighLevel's, merged by appointment id. HighLevel's state wins, but not its
+ * time from the contact endpoint, which comes without an offset: a local row
+ * keeps its own instant, and one only HighLevel knows is read from the
+ * appointment endpoint, which has the offset.
  */
 export async function listUpcomingAppointments(opts: {
   supabase: SupabaseClient;
@@ -461,10 +542,24 @@ export async function listUpcomingAppointments(opts: {
   if (opts.cfg.calendarId) {
     const hlContactId = await hlContactIdOf(opts.supabase, opts.workspaceId, opts.contactId);
     if (hlContactId) {
+      const hlOnly: Array<{ id: string; roughMs: number }> = [];
       for (const e of await listHLContactEvents(opts.cfg, hlContactId, opts.hlZone)) {
-        // Cancelled (or past) in HighLevel: gone, even if a local row says booked.
-        byId.set(e.id, e.state === "active" && e.startMs >= now ? e.startMs : null);
+        if (byId.has(e.id)) {
+          // Cancelled (or attended) in HighLevel: gone, even if a local row says booked.
+          if (e.state !== "active") byId.set(e.id, null);
+        } else if (e.state === "active" && e.startMs >= now - DAY_MS) {
+          // Upcoming even if its bare time was read a day off.
+          hlOnly.push({ id: e.id, roughMs: e.startMs });
+        }
       }
+      const toRead = hlOnly.sort((x, y) => x.roughMs - y.roughMs).slice(0, MAX_LISTED_HL_ONLY);
+      const events = await Promise.all(
+        toRead.map((e) => fetchHLEvent(opts.cfg, e.id, opts.hlZone)),
+      );
+      toRead.forEach((e, i) => {
+        const event = events[i];
+        byId.set(e.id, event?.state === "active" ? event.startMs : null);
+      });
     }
   }
   return [...byId.values()]

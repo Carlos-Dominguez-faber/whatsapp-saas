@@ -6,11 +6,11 @@ import {
   APPOINTMENT_TOOL_TIMEOUT_MS,
   confirmedInstantError,
   describeInstant,
-  fetchHLEvent,
   hlTimeZone,
   LOCAL_ACTIVE_STATUSES,
   type LocatedAppointment,
   locateAppointmentAt,
+  locateConfirmedAppointmentAt,
   noteForTeam,
   parseConfirmedInstant,
   putHLEvent,
@@ -94,15 +94,13 @@ async function run(args: Args, ctx: ToolContext): Promise<ToolResult> {
     process.env.SUPABASE_SERVICE_ROLE_KEY!,
   );
   const when = describeInstant(currentMs, zone);
-  const locate = (instantMs: number) =>
-    locateAppointmentAt({
-      supabase,
-      cfg,
-      workspaceId: ctx.workspaceId,
-      contactId: ctx.contactId,
-      instantMs,
-      hlZone,
-    });
+  const lookup = {
+    supabase,
+    cfg,
+    workspaceId: ctx.workspaceId,
+    contactId: ctx.contactId,
+    hlZone,
+  };
   const lookupFailed = async (err: unknown) => {
     console.error("[reschedule_highlevel] lookup failed:", err);
     await noteForTeam(
@@ -114,14 +112,16 @@ async function run(args: Args, ctx: ToolContext): Promise<ToolResult> {
     return needsHuman(LOOKUP_FAILED);
   };
 
-  let found;
+  // Confirmed with HighLevel: the local row may be stale, or staff may have
+  // moved or cancelled the appointment there.
+  let located;
   try {
-    found = await locate(currentMs);
+    located = await locateConfirmedAppointmentAt({ ...lookup, instantMs: currentMs });
   } catch (err) {
     return lookupFailed(err);
   }
 
-  if (found.kind === "ambiguous") {
+  if (located.kind === "ambiguous") {
     await noteForTeam(
       supabase,
       ctx,
@@ -133,12 +133,12 @@ async function run(args: Args, ctx: ToolContext): Promise<ToolResult> {
     );
   }
 
-  if (found.kind !== "found" || found.state !== "active") {
+  if (located.kind === "none" || located.event.state !== "active") {
     // A retry of a move that went through: the appointment is now at the new
     // time, and it records the time it was moved from.
     let atNew;
     try {
-      atNew = await locate(newMs);
+      atNew = await locateAppointmentAt({ ...lookup, instantMs: newMs });
     } catch (err) {
       return lookupFailed(err);
     }
@@ -152,11 +152,18 @@ async function run(args: Args, ctx: ToolContext): Promise<ToolResult> {
         output: { rescheduled: true, already_rescheduled: true, new_datetime: formatWithOffset(newMs, zone) },
       };
     }
-    if (found.kind === "found" && found.state === "cancelled") {
+    if (located.kind === "none" && located.cancelledIds.length > 0) {
       return {
         ok: false,
         output: null,
         error: "Esa cita está cancelada, así que no se puede mover. Si el cliente quiere una nueva, agéndala.",
+      };
+    }
+    if (located.kind === "found") {
+      return {
+        ok: false,
+        output: null,
+        error: "Esa cita ya no está activa (por ejemplo, ya se atendió), así que no se puede mover.",
       };
     }
     return {
@@ -166,25 +173,7 @@ async function run(args: Args, ctx: ToolContext): Promise<ToolResult> {
     };
   }
 
-  // Keep the appointment's length: HighLevel's end time doesn't follow the
-  // start on its own.
-  let event;
-  try {
-    event = await fetchHLEvent(cfg, found.hlAppointmentId, hlZone);
-  } catch (err) {
-    return lookupFailed(err);
-  }
-  if (!event || event.state !== "active") {
-    await noteForTeam(
-      supabase,
-      ctx,
-      "hl_appointment_failed",
-      `El cliente pidió mover su cita del ${when}, pero en HighLevel ya no está activa. Revísalo tú.`,
-    );
-    return needsHuman(
-      "Esa cita ya no está activa en el calendario, así que no se movió. Dile al cliente que una persona del equipo lo revisará.",
-    );
-  }
+  const { appointment: found, event } = located;
   if (event.startMs !== null && Math.abs(event.startMs - currentMs) > 60_000) {
     return {
       ok: false,
@@ -192,6 +181,8 @@ async function run(args: Args, ctx: ToolContext): Promise<ToolResult> {
       error: `Esa cita ya no está a esa hora en el calendario (ahora es el ${describeInstant(event.startMs, zone)}). Consulta otra vez list_highlevel_appointments y confirma con el cliente.`,
     };
   }
+  // Keep the appointment's length: HighLevel's end time doesn't follow the
+  // start on its own.
   const durationMs =
     event.startMs !== null && event.endMs !== null && event.endMs > event.startMs
       ? event.endMs - event.startMs
