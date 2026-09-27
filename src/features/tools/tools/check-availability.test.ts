@@ -282,7 +282,7 @@ test("un día con más de 20 horarios los devuelve todos", async () => {
       `2026-09-17T${String(Math.floor(i / 2) + 0).padStart(2, "0")}:${i % 2 ? "30" : "00"}:00Z`,
   );
   const { fn } = mockFetch({
-    timezone: "UTC",
+    businessTimezone: "UTC",
     hlBody: { "2026-09-17": { slots } },
   });
 
@@ -334,6 +334,19 @@ test("sin zona del negocio usa la de HighLevel, y los slots salen con su offset"
   const out = result.output as Record<string, unknown>;
   assert.equal(out.timezone, "America/Cancun");
   assert.deepEqual(out.days, { "2026-06-12": ["2026-06-12T10:00:00-05:00"] });
+});
+
+test("un 'UTC' guardado en HighLevel sin venir de la ubicación cuenta como no configurado", async () => {
+  const { fn } = mockFetch({
+    timezone: "UTC",
+    hlBody: { "2026-06-12": { slots: ["2026-06-12T15:00:00Z"] } },
+  });
+
+  const result = await withFetch(fn as typeof fetch, () =>
+    checkAvailabilityTool.run({ date_from: "2026-06-12", date_to: "2026-06-12" }, ctx),
+  );
+
+  assert.equal((result.output as Record<string, unknown>).timezone, "America/Mexico_City");
 });
 
 test("sin ninguna zona configurada usa la por defecto", async () => {

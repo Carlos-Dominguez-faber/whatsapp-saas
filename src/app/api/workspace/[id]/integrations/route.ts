@@ -16,6 +16,7 @@ import {
   WHATSAPP_PROVIDER_LABELS,
   WORKSPACE_WHATSAPP_SETTINGS,
 } from "@/features/inbox/services/whatsapp-provider";
+import { saveHLLocationTimeZone } from "@/features/inbox/services/highlevel-client";
 
 import {
   isCatalogModel,
@@ -314,6 +315,11 @@ export async function PUT(
       { error: "No se pudo guardar la integración. Intenta de nuevo." },
       { status: 500 },
     );
+  }
+  // HighLevel's bare times are read in the location's zone: store it with
+  // the (possibly new) location. Never throws; a miss leaves the one stored.
+  if (provider === "highlevel" && enabled) {
+    await saveHLLocationTimeZone(workspaceId);
   }
   return NextResponse.json({ ok: true });
 }
