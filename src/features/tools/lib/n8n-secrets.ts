@@ -1,3 +1,4 @@
+import { z } from "zod";
 import { decrypt, encrypt, isEncrypted } from "@/shared/lib/crypto";
 
 /**
@@ -51,3 +52,15 @@ const FORBIDDEN_AUTH_HEADERS = new Set([
 export function isAllowedAuthHeaderName(name: string): boolean {
   return !FORBIDDEN_AUTH_HEADERS.has(name.trim().toLowerCase());
 }
+
+/**
+ * An auth header's value: no line breaks or other control characters, which
+ * would let the value inject extra headers (or break the request) when sent.
+ */
+export const AUTH_HEADER_VALUE = z
+  .string()
+  .max(2000)
+  .regex(
+    /^[^\x00-\x08\x0a-\x1f\x7f]*$/,
+    "El valor del header no puede tener saltos de línea ni caracteres de control",
+  );

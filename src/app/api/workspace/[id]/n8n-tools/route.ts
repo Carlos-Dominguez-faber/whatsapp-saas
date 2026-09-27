@@ -12,6 +12,7 @@ import { validateWebhookUrl } from "@/features/tools/services/ssrf-guard";
 import { HTTPS_URL } from "@/features/tools/lib/tool-config";
 import { N8nParameterSchema } from "@/features/tools/lib/n8n-tool-schema";
 import {
+  AUTH_HEADER_VALUE,
   encryptN8nAuth,
   isAllowedAuthHeaderName,
 } from "@/features/tools/lib/n8n-secrets";
@@ -44,7 +45,7 @@ const CreateSchema = z.object({
     .max(100)
     .regex(/^[A-Za-z0-9-]+$/, "Solo letras, números y guion")
     .optional(),
-  auth_header_value: z.string().max(2000).optional(),
+  auth_header_value: AUTH_HEADER_VALUE.optional(),
   parameters: z.array(N8nParameterSchema).max(20).default([]),
   timeout_ms: z
     .number()
