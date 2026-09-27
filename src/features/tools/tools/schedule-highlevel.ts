@@ -1,15 +1,20 @@
 import { createClient as createSbClient } from "@supabase/supabase-js";
 import { z } from "zod";
-import type { Tool, ToolContext, ToolResult } from "../core/tool";
+import type { Tool, ToolContext, ToolResult, ToolRunOptions } from "../core/tool";
 import { resolveCalendarId } from "../lib/calendar-id.ts";
 import { formatWithOffset } from "@/shared/lib/timezone";
 import {
   APPOINTMENT_TOOL_TIMEOUT_MS,
   confirmedInstantError,
+  hasTimeToWrite,
   HL_API,
   HL_VERSION_EVENTS,
+  hlTimeZone,
+  locateAppointmentAt,
+  noteForTeam,
   parseConfirmedInstant,
   UnknownOutcomeError,
+  WRITE_TIMEOUT_MS,
 } from "../lib/hl-appointment.ts";
 
 const schema = z.object({
@@ -49,15 +54,18 @@ interface HLAppointmentResponse {
   appointment?: { id?: string };
 }
 
-const BOOKING_TIMEOUT_MS = 8_000;
-
-/** HighLevel's wording when the slot was taken (or never free). */
-const SLOT_TAKEN = /slot|no longer available|not available|unavailable|already booked/i;
+/**
+ * HighLevel's wording when the slot is taken ("The slot you have selected is
+ * no longer available"). Unverified against a live account: see the PR.
+ */
+const SLOT_TAKEN = /\bslot\b[^.]{0,60}\b(?:no longer available|not available|unavailable|already booked)\b/i;
 
 const UNKNOWN_BOOKING =
   "No pude confirmar si la cita quedó agendada. No le digas al cliente que se agendó ni que falló: dile que una persona del equipo lo confirmará.";
 
-async function run(args: Args, ctx: ToolContext): Promise<ToolResult> {
+async function run(args: Args, ctx: ToolContext, opts?: ToolRunOptions): Promise<ToolResult> {
+  const startedAt = Date.now();
+  const budgetMs = opts?.timeoutMs ?? APPOINTMENT_TOOL_TIMEOUT_MS;
   const { getHLConfig, upsertHLContactByPhone, linkHLContact } =
     await import("../../inbox/services/highlevel-client.ts");
   const { getBusinessInfo } = await import("../../inbox/services/business-info.ts");
@@ -148,6 +156,64 @@ async function run(args: Args, ctx: ToolContext): Promise<ToolResult> {
     };
   }
 
+  // A taken slot may be the contact's own booking, made by an earlier call
+  // whose answer never arrived: HighLevel says whose it is.
+  const slotTaken = async (): Promise<ToolResult> => {
+    const other: ToolResult = {
+      ok: false,
+      output: null,
+      error: "Ese horario ya no está disponible, así que la cita NO se agendó. Consulta otra vez check_availability y ofrécele al cliente otro horario.",
+    };
+    if (!dbContactId) return other;
+    let located;
+    try {
+      located = await locateAppointmentAt({
+        supabase,
+        cfg: { ...cfg, calendarId },
+        workspaceId: ctx.workspaceId,
+        contactId: dbContactId,
+        instantMs: start.ms,
+        hlZone: hlTimeZone(cfg, zone),
+      });
+    } catch (err) {
+      console.error("[schedule_highlevel] slot owner lookup failed:", err);
+      located = { kind: "unconfirmed" as const };
+    }
+    if (located.kind === "found") {
+      return {
+        ok: true,
+        output: {
+          appointment_id: located.appointment.id,
+          datetime: formatWithOffset(located.appointment.startMs, zone),
+          already_booked: true,
+        },
+      };
+    }
+    if (located.kind === "unconfirmed" || located.kind === "ambiguous") {
+      await noteForTeam(
+        supabase,
+        ctx,
+        "hl_appointment_unconfirmed",
+        `HighLevel dijo que el horario del ${startTime} ya está ocupado y no se pudo confirmar si es la cita del cliente. Revísalo tú.`,
+      );
+      return {
+        ok: false,
+        output: { needs_human: true },
+        error: "No pude confirmar si ese horario quedó a nombre del cliente. No le digas que se agendó ni que falló: dile que una persona del equipo lo confirmará.",
+      };
+    }
+    return other;
+  };
+
+  // Nothing was written yet: saying so is true.
+  if (!hasTimeToWrite(startedAt, budgetMs)) {
+    return {
+      ok: false,
+      output: null,
+      error: "El calendario tardó demasiado, así que la cita NO se agendó. Dile al cliente que lo intentas de nuevo en un momento.",
+    };
+  }
+
   let res: Response;
   try {
     res = await fetch(`${HL_API}/calendars/events/appointments`, {
@@ -165,7 +231,7 @@ async function run(args: Args, ctx: ToolContext): Promise<ToolResult> {
         startTime,
         title: `Cita${args.contact_name ? ` — ${args.contact_name}` : ""}`,
       }),
-      signal: AbortSignal.timeout(BOOKING_TIMEOUT_MS),
+      signal: AbortSignal.timeout(WRITE_TIMEOUT_MS),
     });
   } catch (err) {
     // Sent, and no answer: the booking may exist.
@@ -178,20 +244,19 @@ async function run(args: Args, ctx: ToolContext): Promise<ToolResult> {
     // it, but give the model a plain reason it can relay.
     const detail = (await res.text()).slice(0, 300);
     console.error(`[schedule_highlevel] HighLevel ${res.status}:`, detail);
-    // Only an unknown outcome hands off (the buffer does, for a write that
-    // may have happened); a refusal booked nothing.
     if (res.status >= 500) throw new UnknownOutcomeError(UNKNOWN_BOOKING);
-    if (SLOT_TAKEN.test(detail)) {
-      return {
-        ok: false,
-        output: null,
-        error: "Ese horario ya no está disponible, así que la cita NO se agendó. Consulta otra vez check_availability y ofrécele al cliente otro horario.",
-      };
-    }
+    if (SLOT_TAKEN.test(detail)) return slotTaken();
+    // Credentials, the calendar or the request itself: a person fixes it.
+    await noteForTeam(
+      supabase,
+      ctx,
+      "hl_appointment_failed",
+      `HighLevel rechazó agendar la cita del ${startTime} (error ${res.status}). Revisa la integración.`,
+    );
     return {
       ok: false,
-      output: null,
-      error: `El calendario de HighLevel respondió con un error (${res.status}); no se pudo agendar la cita. Dile al cliente que lo revisarás o pásalo a una persona.`,
+      output: { needs_human: true },
+      error: `El calendario de HighLevel respondió con un error (${res.status}); la cita NO se agendó. Dile al cliente que una persona del equipo lo revisará.`,
     };
   }
 
@@ -210,8 +275,8 @@ async function run(args: Args, ctx: ToolContext): Promise<ToolResult> {
     // The booking already exists in HighLevel and can't be undone by this
     // failure alone — don't error out to the user over a cita that actually
     // did get booked. But do surface it visibly (not just console.warn):
-    // without the local row, cancel_highlevel / reschedule_highlevel have
-    // to fall back to asking HighLevel for this contact's appointment.
+    // without the local row, a workspace with no calendar configured can't
+    // find it to cancel or reschedule (with one, HighLevel is asked).
     console.warn(
       "[schedule_highlevel] failed to persist appointment:",
       insertError,

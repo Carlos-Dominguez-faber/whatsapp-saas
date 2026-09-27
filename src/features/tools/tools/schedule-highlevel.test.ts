@@ -34,6 +34,9 @@ function mockFetch(opts: {
   appointmentInsertBody?: unknown;
   businessTimezone?: string;
   hlTimezone?: string;
+  /** The contact's appointments in HighLevel, and each one's event read. */
+  hlContactEvents?: Array<Record<string, unknown>>;
+  hlEvents?: Record<string, Record<string, unknown>>;
 }) {
   const calls: FetchCall[] = [];
 
@@ -81,11 +84,22 @@ function mockFetch(opts: {
     // Postgrest server to already return a bare object. So this mock must
     // return the object directly, not wrapped in an array.
     if (url.includes("/rest/v1/contacts") && method === "GET") {
-      return jsonResponse(200, {
-        hl_contact_id: "hl_contact_1",
-        phone: "+5215512345678",
-        name: "Juan",
-      });
+      const row = { hl_contact_id: "hl_contact_1", phone: "+5215512345678", name: "Juan" };
+      // .maybeSingle() reads an array; .single() asks for a bare object.
+      const wantsObject = new Headers(init?.headers).get("Accept")?.includes("pgrst.object");
+      return jsonResponse(200, wantsObject ? row : [row]);
+    }
+
+    // HighLevel: the contact's appointments, and one appointment.
+    if (url.includes("leadconnectorhq.com/contacts/hl_contact_1/appointments")) {
+      return jsonResponse(200, { events: opts.hlContactEvents ?? [] });
+    }
+    if (url.includes("leadconnectorhq.com/calendars/events/appointments/") && method === "GET") {
+      const event = opts.hlEvents?.[url.split("/").pop()!];
+      return event ? jsonResponse(200, { event }) : jsonResponse(404, {});
+    }
+    if (url.includes("/rest/v1/messages")) {
+      return method === "GET" ? jsonResponse(200, []) : new Response(null, { status: 201 });
     }
 
     // HighLevel API: create appointment
@@ -96,6 +110,10 @@ function mockFetch(opts: {
       method === "POST"
     ) {
       return jsonResponse(opts.hlStatus, opts.hlBody ?? {});
+    }
+
+    if (url.includes("/rest/v1/appointments") && method === "GET") {
+      return jsonResponse(200, []);
     }
 
     // Supabase appointments table: persist the booking locally
@@ -169,10 +187,10 @@ test("reports the HighLevel error when the API call itself fails", async () => {
       ctx,
     );
     assert.equal(result.ok, false);
-    // A taken slot: nothing was booked, and the model checks availability again.
+    // A slot taken by someone else: nothing was booked, and the model offers another.
     assert.match(result.error ?? "", /check_availability/);
     assert.doesNotMatch(result.error ?? "", /Slot not available/);
-    assert.equal(result.output, null, "no needs_human: only unknown outcomes hand off");
+    assert.equal(result.output, null, "no needs_human: nothing to follow up");
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -271,11 +289,11 @@ test("in a real conversation, a phone passed by the model is ignored: it books t
   }
 });
 
-async function runWith(fn: typeof fetch, args: { datetime_iso: string }) {
+async function runWith(fn: typeof fetch, args: { datetime_iso: string }, timeoutMs?: number) {
   const originalFetch = globalThis.fetch;
   globalThis.fetch = fn;
   try {
-    return await scheduleHighLevelTool.run(args, ctx);
+    return await scheduleHighLevelTool.run(args, ctx, timeoutMs === undefined ? undefined : { timeoutMs });
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -313,12 +331,53 @@ test("business zone unset: the HighLevel zone reads the slot, and the booking ca
   assert.equal((local?.body as { scheduled_at: string }).scheduled_at, "2027-06-12T15:00:00.000Z");
 });
 
-test("another 4xx is a plain failure: nothing was booked, no handoff", async () => {
-  const { fn } = mockFetch({ hlStatus: 401, hlBody: { message: "Invalid JWT" }, appointmentInsertStatus: 201 });
+test("a 401 (or another 4xx that isn't a taken slot) hands off, with a note for the team", async () => {
+  const { fn, calls } = mockFetch({ hlStatus: 401, hlBody: { message: "Invalid JWT" }, appointmentInsertStatus: 201 });
   const result = await runWith(fn as typeof fetch, { datetime_iso: "2027-06-12T10:00:00-06:00" });
   assert.equal(result.ok, false);
   assert.match(result.error ?? "", /\(401\)/);
-  assert.equal(result.output, null);
+  assert.match(result.error ?? "", /NO se agendó/);
+  assert.deepEqual(result.output, { needs_human: true });
+  assert.ok(calls.some((c) => c.method === "POST" && c.url.includes("/rest/v1/messages")), "a note");
+});
+
+test("'slot taken' by the contact's own booking (an earlier call's answer was lost): already booked", async () => {
+  const { fn, calls } = mockFetch({
+    hlStatus: 400,
+    hlBody: { message: "The slot you have selected is no longer available." },
+    appointmentInsertStatus: 201,
+    hlContactEvents: [
+      { id: "hl_mine", calendarId: "cal_1", appointmentStatus: "booked", startTime: "2027-06-12 10:00:00" },
+    ],
+    hlEvents: { hl_mine: { appointmentStatus: "booked", startTime: "2027-06-12T10:00:00-06:00" } },
+  });
+  const result = await runWith(fn as typeof fetch, { datetime_iso: "2027-06-12T10:00:00-06:00" });
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.output, {
+    appointment_id: "hl_mine",
+    datetime: "2027-06-12T10:00:00-06:00",
+    already_booked: true,
+  });
+  // HighLevel's read is the answer, not a second booking.
+  assert.equal(calls.filter((c) => c.method === "POST" && c.url.includes("leadconnectorhq")).length, 1);
+});
+
+test("the slot-taken wording is narrow: a 400 about something else isn't read as a taken slot", async () => {
+  const { fn } = mockFetch({
+    hlStatus: 400,
+    hlBody: { message: "calendarId is not available for this location" },
+    appointmentInsertStatus: 201,
+  });
+  const result = await runWith(fn as typeof fetch, { datetime_iso: "2027-06-12T10:00:00-06:00" });
+  assert.deepEqual(result.output, { needs_human: true });
+});
+
+test("with too little of its budget left for the POST, nothing is booked and it says so", async () => {
+  const { fn, calls } = mockFetch({ hlStatus: 200, hlBody: { id: "hl_evt_1" }, appointmentInsertStatus: 201 });
+  const result = await runWith(fn as typeof fetch, { datetime_iso: "2027-06-12T10:00:00-06:00" }, 9_000);
+  assert.equal(result.ok, false);
+  assert.match(result.error ?? "", /NO se agendó/);
+  assert.equal(bookingOf(calls), undefined);
 });
 
 test("a past slot is refused", async () => {
