@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
 import { createClient } from "@/lib/supabase/server";
@@ -205,11 +206,14 @@ export async function POST(
   });
 
   try {
-    // Enable the workspace's tools in the playground so the agent can actually
-    // check availability / book (e.g. GHL). The playground has no live
-    // conversation, so the tool context carries only the workspace; tools that
-    // need a contact (booking) take an explicit contact_phone arg instead.
-    const tools = await getEnabledTools(workspaceId);
+    // Only the workspace's read-only tools run in the playground (checking
+    // availability, an n8n lookup): a manager tests the agent, and must not
+    // book, cancel or fire the admin's n8n write workflows from here, with a
+    // draft prompt of their own. The seed gives every call of this request
+    // the same idempotency key base, retries included.
+    const tools = (await getEnabledTools(workspaceId)).filter(
+      (t) => t.sensitivity === "read",
+    );
     const reply = await generateChatReply({
       model,
       systemPrompt,
@@ -221,6 +225,7 @@ export async function POST(
         workspaceId,
         conversationId: "",
         contactId: "",
+        batchId: `playground:${randomUUID()}`,
       },
     });
 

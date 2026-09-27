@@ -38,12 +38,18 @@ mock.module("@supabase/supabase-js", {
 });
 
 const generateModels: string[] = [];
+const generateOpts: Array<{ tools?: Array<{ name: string }>; toolContext?: { batchId?: string } }> = [];
 mock.module("@/features/inbox/services/openrouter.ts", {
   exports: {
     getWorkspaceModel: async () => "openai/gpt-4.1",
-    generateChatReply: async (opts: { model: string }) => {
+    generateChatReply: async (opts: {
+      model: string;
+      tools?: Array<{ name: string }>;
+      toolContext?: { batchId?: string };
+    }) => {
       calls.push("generate");
       generateModels.push(opts.model);
+      generateOpts.push(opts);
       return { text: "¡Hola!", promptTokens: 10, completionTokens: 5 };
     },
   },
@@ -70,7 +76,10 @@ mock.module("@/features/inbox/services/business-info.ts", {
     buildNowContext: () => "",
   },
 });
-mock.module("@/features/tools/services/tool-configs.ts", { exports: { getEnabledTools: async () => [] } });
+let enabledTools: Array<{ name: string; sensitivity: string }> = [];
+mock.module("@/features/tools/services/tool-configs.ts", {
+  exports: { getEnabledTools: async () => enabledTools },
+});
 
 let guardResult: { ok: true; reservationId?: string } | { ok: false; response: NextResponse } = {
   ok: true,
@@ -114,6 +123,8 @@ function post(body: Record<string, unknown> = {}) {
 function reset() {
   calls.length = 0;
   generateModels.length = 0;
+  generateOpts.length = 0;
+  enabledTools = [];
   recorded.length = 0;
   guardResult = { ok: true, reservationId: "res_1" };
   policy = (model: string) => model;
@@ -164,4 +175,21 @@ test("the playground calls the model the policy resolved (workspace default incl
   assert.equal(res.status, 200);
   assert.deepEqual(generateModels, ["openai/gpt-4o-mini"]);
   assert.equal(recorded[0].model, "openai/gpt-4o-mini");
+});
+
+test("the playground offers only read-only tools, with a stable idempotency seed", async () => {
+  reset();
+  enabledTools = [
+    { name: "check_availability", sensitivity: "read" },
+    { name: "schedule_highlevel", sensitivity: "write" },
+    { name: "n8n_crm_write", sensitivity: "write" },
+    { name: "n8n_lookup", sensitivity: "read" },
+  ];
+  const res = await post();
+  assert.equal(res.status, 200);
+  assert.deepEqual(
+    generateOpts[0].tools?.map((t) => t.name),
+    ["check_availability", "n8n_lookup"],
+  );
+  assert.match(generateOpts[0].toolContext?.batchId ?? "", /^playground:/);
 });

@@ -19,7 +19,8 @@ async function withTransientRetry<T>(
   {
     retries = 2,
     baseDelayMs = 400,
-  }: { retries?: number; baseDelayMs?: number } = {},
+    canRetry = () => true,
+  }: { retries?: number; baseDelayMs?: number; canRetry?: () => boolean } = {},
 ): Promise<T> {
   let lastErr: unknown;
   for (let attempt = 0; attempt <= retries; attempt++) {
@@ -27,7 +28,7 @@ async function withTransientRetry<T>(
       return await fn();
     } catch (err) {
       lastErr = err;
-      if (attempt === retries || !isTransientError(err)) throw err;
+      if (attempt === retries || !isTransientError(err) || !canRetry()) throw err;
       await new Promise((r) => setTimeout(r, baseDelayMs * (attempt + 1)));
     }
   }
@@ -239,6 +240,9 @@ export async function generateChatReply(params: {
   });
 
   // Bridge Forge tools → AI SDK ToolSet (same shape as generateWithTools).
+  // Once a tool that isn't read-only has run, a failed call is not retried:
+  // the whole turn would run, and repeat, that tool.
+  let wroteSomething = false;
   const aiTools: ToolSet = {};
   if (params.tools && params.toolContext) {
     const ctx = params.toolContext;
@@ -246,21 +250,24 @@ export async function generateChatReply(params: {
       aiTools[forgeTool.name] = tool({
         description: forgeTool.description,
         inputSchema: zodSchema(forgeTool.schema),
-        execute: async (args: unknown): Promise<unknown> =>
-          registry.runTool(
+        execute: async (args: unknown): Promise<unknown> => {
+          if (forgeTool.sensitivity !== "read") wroteSomething = true;
+          return registry.runTool(
             forgeTool,
             args,
             ctx,
             forgeTool.preferredTimeoutMs !== undefined
               ? { timeoutMs: forgeTool.preferredTimeoutMs }
               : undefined,
-          ),
+          );
+        },
       });
     }
   }
   const hasTools = Object.keys(aiTools).length > 0;
 
-  const result = await withTransientRetry(() =>
+  const result = await withTransientRetry(
+    () =>
     generateText({
       model: openrouter.chat(modelId),
       messages: [
@@ -274,6 +281,7 @@ export async function generateChatReply(params: {
         hasTools ? LLM_TOOL_TURN_TIMEOUT_MS : LLM_TIMEOUT_MS,
       ),
     }),
+    { canRetry: () => !wroteSomething },
   );
 
   // totalUsage, not usage: with tools the model runs up to 5 steps, and usage

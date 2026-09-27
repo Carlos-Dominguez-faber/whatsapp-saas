@@ -26,7 +26,10 @@ mock.module("ai", {
     tool: (def: unknown) => def,
     zodSchema: (schema: unknown) => schema,
     stepCountIs: (n: number) => n,
-    APICallError: { isInstance: () => false },
+    // An error carrying a statusCode stands for the SDK's APICallError.
+    APICallError: {
+      isInstance: (e: unknown) => typeof (e as { statusCode?: unknown })?.statusCode === "number",
+    },
   },
 });
 mock.module("@ai-sdk/openai", {
@@ -208,6 +211,57 @@ test("generateWithTools returns every step's tool results with their tool name",
       { toolName: "check_availability", output: { ok: true, output: [] } },
       { toolName: "handoff_human", output: { ok: true, output: { handoff: true, reason: "agent_stuck" } } },
     ]);
+  } finally {
+    generateImpl = null;
+  }
+});
+
+test("generateChatReply retries a transient failure, but never after a write tool ran", async () => {
+  const transient = Object.assign(new Error("upstream 503"), { statusCode: 503 });
+  let attempts = 0;
+  let wrote = false;
+  generateImpl = async (args) => {
+    attempts++;
+    if (!wrote) {
+      wrote = true;
+      await args.tools?.book.execute({});
+    }
+    throw transient;
+  };
+  registryRun = async () => ({ ok: true, output: null });
+  try {
+    await assert.rejects(
+      generateChatReply({
+        systemPrompt: "s",
+        messages: [{ role: "user", content: "u" }],
+        workspaceId: "ws_1",
+        tools: [bookTool],
+        toolContext: { workspaceId: "ws_1", conversationId: "", contactId: "" },
+      } as never),
+    );
+    assert.equal(attempts, 1, "a turn that ran a write tool is not run again");
+  } finally {
+    generateImpl = null;
+    registryRun = async () => null;
+  }
+});
+
+test("generateChatReply does retry a transient failure when no write ran", async () => {
+  const transient = Object.assign(new Error("upstream 503"), { statusCode: 503 });
+  let attempts = 0;
+  generateImpl = async () => {
+    attempts++;
+    if (attempts < 2) throw transient;
+    return { text: "ok", usage: LAST_STEP, totalUsage: ALL_STEPS, steps: [{}] };
+  };
+  try {
+    const r = await generateChatReply({
+      systemPrompt: "s",
+      messages: [{ role: "user", content: "u" }],
+      workspaceId: "ws_1",
+    } as never);
+    assert.equal(r.text, "ok");
+    assert.equal(attempts, 2);
   } finally {
     generateImpl = null;
   }
