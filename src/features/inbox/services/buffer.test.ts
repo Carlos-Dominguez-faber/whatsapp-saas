@@ -143,6 +143,8 @@ const decideArgs: Row[] = [];
 const transitions: Array<{ to: string; trigger: unknown }> = [];
 /** Set to make applyTransition throw this error. */
 let transitionError: Error | null = null;
+/** How many of the next applyTransition calls fail with transitionError. */
+let transitionFailures = Number.POSITIVE_INFINITY;
 mock.module("./decision-engine.ts", {
   exports: {
     decide: async (opts: Row) => {
@@ -153,7 +155,10 @@ mock.module("./decision-engine.ts", {
     },
     applyTransition: async (_conv: string, to: string, opts: Row = {}) => {
       calls.push("transition");
-      if (transitionError) throw transitionError;
+      if (transitionError && transitionFailures > 0) {
+        transitionFailures--;
+        throw transitionError;
+      }
       transitions.push({ to, trigger: opts.trigger });
     },
   },
@@ -223,7 +228,12 @@ mock.module("./model-policy.ts", {
 });
 
 /** ok "running": the tool started and was still running when the turn ended. */
-type Execution = { name: string; sensitivity: string; ok: boolean | null | "running" };
+type Execution = {
+  name: string;
+  sensitivity: string;
+  ok: boolean | null | "running";
+  output?: unknown;
+};
 const generateArgs: Row[] = [];
 /** Tools that actually ran (their start hook let them). */
 const toolsRun: string[] = [];
@@ -253,7 +263,13 @@ mock.module("./openrouter.ts", {
         await opts.onToolStart?.({ callId, name: tool.name, sensitivity: tool.sensitivity });
         toolsRun.push(tool.name);
         if (tool.ok === "running") continue;
-        await opts.onToolExecuted?.({ callId, name: tool.name, sensitivity: tool.sensitivity, ok: tool.ok });
+        await opts.onToolExecuted?.({
+          callId,
+          name: tool.name,
+          sensitivity: tool.sensitivity,
+          ok: tool.ok,
+          ...(tool.output !== undefined ? { output: tool.output } : {}),
+        });
       }
       if (generated.throwAfterTools) throw generated.throwAfterTools;
       return {
@@ -388,6 +404,7 @@ function reset(meta: Row = {}) {
   kbError = null;
   transitions.length = 0;
   transitionError = null;
+  transitionFailures = Number.POSITIVE_INFINITY;
   rpcCalls.length = 0;
   rateAllowed = true;
   failUpdate = () => false;
@@ -1198,7 +1215,7 @@ test("the handoff travels with the saved reply: a retry re-sends it and hands of
   assert.deepEqual(transitions, [{ to: "handoff_pending", trigger: "tool:agent_stuck" }]);
 });
 
-test("a send already made by a dead worker is not repeated, but its handoff is applied", async () => {
+test("a farewell already sent by a dead worker is not repeated; its handoff skips the generic acknowledgement", async () => {
   reset({ retry_count: 1, pending_reply: "Te paso con una persona.", pending_handoff: "customer_request" });
   tables.messages.push({
     id: "out_1",
@@ -1206,6 +1223,21 @@ test("a send already made by a dead worker is not repeated, but its handoff is a
     conversation_id: "conv_1",
     direction: "out",
     status: "sent",
+    meta: { batch_id: "batch_1" },
+  });
+  await processNextBatch();
+  assert.ok(!calls.includes("dispatch"));
+  assert.deepEqual(transitions, [{ to: "handoff_pending", trigger: "tool:customer_request" }]);
+});
+
+test("a farewell left 'queued' by a dead worker may not have arrived: the acknowledgement goes out", async () => {
+  reset({ retry_count: 1, pending_reply: "Te paso con una persona.", pending_handoff: "customer_request" });
+  tables.messages.push({
+    id: "out_1",
+    workspace_id: "ws_1",
+    conversation_id: "conv_1",
+    direction: "out",
+    status: "queued",
     meta: { batch_id: "batch_1" },
   });
   await processNextBatch();
@@ -1268,4 +1300,58 @@ test("a confirmed write followed by a reply leaves no note", async () => {
   };
   await processNextBatch();
   assert.equal(notes().length, 0);
+});
+
+test("handoff_human is checkpointed when it runs: a turn that then fails hands off, not re-queued", async () => {
+  reset();
+  generated = {
+    text: "",
+    tools: [
+      {
+        name: "handoff_human",
+        sensitivity: "read",
+        ok: true,
+        output: { handoff: true, reason: "customer_request" },
+      },
+    ],
+    throwAfterTools: new Error("model timed out"),
+  };
+  const result = await processNextBatch();
+  assert.equal(result.processed, true);
+  assert.deepEqual(transitions, [{ to: "handoff_pending", trigger: "tool_unsent:customer_request" }]);
+  assert.equal(batchRow().status, "processed");
+  assert.ok(
+    batchUpdates().some((u) => (u.meta as Row | undefined)?.pending_handoff === "customer_request"),
+    "the intent was saved on the batch when the tool ran",
+  );
+});
+
+test("a retry that finds only the saved handoff intent hands off without running the turn", async () => {
+  reset({ retry_count: 1, pending_handoff: "agent_stuck" });
+  const result = await processNextBatch();
+  assert.equal(result.processed, true);
+  assert.ok(!calls.includes("generate"));
+  assert.ok(!calls.includes("decide"));
+  assert.deepEqual(transitions, [{ to: "handoff_pending", trigger: "tool_unsent:agent_stuck" }]);
+});
+
+test("a handoff that fails once is retried", async () => {
+  reset();
+  generated = { text: "Te paso con una persona.", toolResults: [HANDOFF_RESULT] };
+  transitionError = new Error("db blip");
+  transitionFailures = 1;
+  await processNextBatch();
+  assert.equal(calls.filter((c) => c === "transition").length, 2);
+  assert.deepEqual(transitions, [{ to: "handoff_pending", trigger: "tool:customer_request" }]);
+  assert.equal(notes().length, 0);
+});
+
+test("a handoff that keeps failing is made visible: event and internal note", async () => {
+  reset();
+  generated = { text: "Te paso con una persona.", toolResults: [HANDOFF_RESULT] };
+  transitionError = new Error("db down");
+  await processNextBatch();
+  assert.equal(calls.filter((c) => c === "transition").length, 2);
+  assert.ok(tables.events.some((e) => e.type === "handoff_failed"));
+  assert.ok(notes().some((n) => (n.meta as Row).reason === "handoff_failed"));
 });

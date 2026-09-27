@@ -493,7 +493,9 @@ export function hasTimeToClaim(
  * - llm_reservation_id: the contact's turn slot, reused, not taken again;
  * - jev_verdict: Jev isn't asked (nor paid) twice;
  * - write_tools_ran: a booking or CRM write already happened — never re-run;
- * - pending_reply: the reply is decided — only sent (again), never regenerated.
+ * - pending_reply: the reply is decided — only sent (again), never regenerated;
+ * - pending_handoff: the agent asked for a person (handoff_human) — honored
+ *   even if the turn fails before its farewell is sent.
  * A batch that carries any of them is `isolated`: it can't absorb new
  * messages, which would never get an answer from a reply already decided.
  */
@@ -502,6 +504,7 @@ const CHECKPOINT_KEYS = [
   "jev_verdict",
   "write_tools_ran",
   "pending_reply",
+  "pending_handoff",
 ] as const;
 
 function hasCheckpoint(meta: Record<string, unknown>): boolean {
@@ -548,6 +551,14 @@ function findHandoffReason(
     }
   }
   return null;
+}
+
+/** The reason in handoff_human's own output, when it asked for a person. */
+function handoffReasonOf(output: unknown): string | null {
+  const o = output as { handoff?: unknown; reason?: unknown } | null;
+  return o?.handoff === true && typeof o.reason === "string" && HANDOFF_REASONS.has(o.reason)
+    ? o.reason
+    : null;
 }
 
 /** The handoff an earlier attempt decided, saved next to its reply. */
@@ -635,16 +646,18 @@ export async function processNextBatch(): Promise<ProcessBatchResult> {
     // Any retry may follow a send whose worker died before closing the batch
     // (a lost checkpoint included): never send twice.
     const pendingHandoff = pendingHandoffOf(batch.meta);
-    if (
-      (retryCount > 0 || pendingReply) &&
-      (await settleEarlierSend(supabase, batch))
-    ) {
+    const earlierSend =
+      retryCount > 0 || pendingReply ? await settleEarlierSend(supabase, batch) : null;
+    if (earlierSend) {
       progress.replySent = true;
       // The worker that sent the reply died before handing off: do it now.
-      // Whether the farewell arrived isn't known, so the contact gets the
-      // generic acknowledgement too.
+      // A farewell known to have gone out needs no generic acknowledgement.
       if (pendingHandoff) {
-        await handOff(supabase, batch, `tool_unsent:${pendingHandoff}`);
+        await handOff(
+          supabase,
+          batch,
+          `${earlierSend.delivered ? "tool" : "tool_unsent"}:${pendingHandoff}`,
+        );
       }
       await markBatchProcessed(batch, mergedText, supabase);
       return done();
@@ -662,6 +675,15 @@ export async function processNextBatch(): Promise<ProcessBatchResult> {
         pendingHandoff,
       );
       await noteUnconfirmedWrites(supabase, batch, writeRuns);
+      return done();
+    }
+
+    // The agent asked for a person and the turn died before its farewell:
+    // hand off now (with the generic acknowledgement) instead of running the
+    // turn again.
+    if (pendingHandoff) {
+      await handOff(supabase, batch, `tool_unsent:${pendingHandoff}`);
+      await markBatchProcessed(batch, mergedText, supabase);
       return done();
     }
 
@@ -921,6 +943,16 @@ export async function processNextBatch(): Promise<ProcessBatchResult> {
       // Then its outcome. A write the tool itself reported as failed changed
       // nothing, so it no longer counts; otherwise it stays counted.
       onToolExecuted: async (execution) => {
+        // handoff_human asked for a person: keep that even if the turn fails
+        // before its farewell goes out.
+        if (execution.name === "handoff_human" && execution.ok === true) {
+          const reason = handoffReasonOf(execution.output);
+          if (reason && batch.meta.pending_handoff === undefined) {
+            batch.meta = { ...batch.meta, pending_handoff: reason };
+            await saveBatchMeta(supabase, batch);
+          }
+          return;
+        }
         if (execution.sensitivity !== "write") return;
         const index = writeRuns.findIndex((w) => w.id === execution.callId);
         if (index < 0) return;
@@ -1087,7 +1119,22 @@ export async function processNextBatch(): Promise<ProcessBatchResult> {
       };
     }
 
-    // ── 10b. A write already went through and there's no reply to send ──────
+    // ── 10b. The agent asked for a person and there's no reply to send ──────
+    // Re-queuing would run the turn again; the contact gets the generic
+    // acknowledgement instead of the farewell that was never written.
+    const handoffAsked = pendingHandoffOf(batch.meta);
+    if (handoffAsked && typeof batch.meta.pending_reply !== "string") {
+      try {
+        await handOff(supabase, batch, `tool_unsent:${handoffAsked}`);
+        await markBatchProcessed(batch, mergedText, supabase);
+        return { ...done(), error: errorMsg };
+      } catch (handoffErr) {
+        console.error("[buffer] hand-off asked by the agent failed:", handoffErr);
+        // Fall through: the re-queued batch keeps pending_handoff.
+      }
+    }
+
+    // ── 10c. A write already went through and there's no reply to send ──────
     // Re-queuing would run the turn — and the write — again.
     if (writeRuns.length > 0 && typeof batch.meta.pending_reply !== "string") {
       try {
@@ -1100,7 +1147,7 @@ export async function processNextBatch(): Promise<ProcessBatchResult> {
       }
     }
 
-    // ── 10c. Dead-letter: out of retries ────────────────────────────────────
+    // ── 10d. Dead-letter: out of retries ────────────────────────────────────
     const newRetryCount = retryCount + 1;
 
     if (newRetryCount > MAX_BATCH_RETRIES) {
@@ -1113,7 +1160,7 @@ export async function processNextBatch(): Promise<ProcessBatchResult> {
       };
     }
 
-    // ── 10d. Re-queue, backing off (retryBackoffMs).
+    // ── 10e. Re-queue, backing off (retryBackoffMs).
     // The meta keeps every checkpoint; a batch that carries one is isolated,
     // so new messages open their own batch (the claim serves this one first).
     const backoffMs = retryBackoffMs(newRetryCount, errorMsg);
@@ -1257,7 +1304,7 @@ async function deliverReply(
 async function settleEarlierSend(
   supabase: ReturnType<typeof svc>,
   batch: MessageBatch,
-): Promise<boolean> {
+): Promise<{ delivered: boolean } | null> {
   const { data, error } = await supabase
     .from("messages")
     .select("id, status, meta")
@@ -1275,7 +1322,7 @@ async function settleEarlierSend(
   const row = (data ?? [])[0] as
     | { id: string; status: string; meta: Record<string, unknown> | null }
     | undefined;
-  if (!row) return false;
+  if (!row) return null;
 
   if (row.status === "queued" && row.meta?.dev_mode !== true) {
     await supabase
@@ -1284,7 +1331,8 @@ async function settleEarlierSend(
       .eq("id", row.id)
       .eq("workspace_id", batch.workspace_id);
   }
-  return true;
+  // Sent, delivered or read: the contact has it.
+  return { delivered: ["sent", "delivered", "read"].includes(row.status) };
 }
 
 /**
@@ -1299,13 +1347,24 @@ async function handOff(
   batch: MessageBatch,
   trigger: string,
 ): Promise<void> {
-  try {
-    await applyTransition(batch.conversation_id, "handoff_pending", {
+  const transition = () =>
+    applyTransition(batch.conversation_id, "handoff_pending", {
       trigger,
       workspaceId: batch.workspace_id,
     });
+  const isSettled = (err: unknown) =>
+    err instanceof Error && err.name === "TransitionError";
+  try {
+    try {
+      await transition();
+    } catch (firstErr) {
+      if (isSettled(firstErr)) throw firstErr;
+      // One more try: a blip must not leave the AI on a conversation that
+      // needs a person.
+      await transition();
+    }
   } catch (transitionErr) {
-    if (transitionErr instanceof Error && transitionErr.name === "TransitionError") {
+    if (isSettled(transitionErr)) {
       return;
     }
     const error =
@@ -1333,6 +1392,18 @@ async function handOff(
       "No se pudo pasar esta conversación a una persona: la IA sigue activa. Revísala tú.",
       "handoff_failed",
     );
+    // And by email, where the workspace turned it on: the inbox shows no
+    // waiting conversation, so the note alone may go unseen.
+    try {
+      const { notifyTeamHandoff } = await import("./team-notifier");
+      await notifyTeamHandoff({
+        workspaceId: batch.workspace_id,
+        conversationId: batch.conversation_id,
+        trigger: "handoff_failed",
+      });
+    } catch (notifyErr) {
+      console.error("[buffer] handoff_failed email failed:", notifyErr);
+    }
   }
 }
 

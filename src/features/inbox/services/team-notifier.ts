@@ -41,6 +41,8 @@ const TRIGGER_LABELS: Record<string, string> = {
   cost_cut: "se alcanzó el tope de costo de IA para esta conversación",
   customer_request: "el cliente pidió hablar con una persona",
   agent_stuck: "el agente de IA no pudo resolver la consulta por su cuenta",
+  handoff_failed:
+    "no se pudo pasar la conversación a una persona automáticamente y la IA sigue activa",
 };
 
 function describeTrigger(trigger: string): string {

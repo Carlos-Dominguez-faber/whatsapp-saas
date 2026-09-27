@@ -172,13 +172,14 @@ class ToolRegistry {
     const start = Date.now();
     let result: ToolResult;
     let lastError: string | undefined;
-    const reportExecution = async (ok: boolean | null) => {
+    const reportExecution = async (ok: boolean | null, output?: unknown) => {
       if (!opts?.onExecuted) return;
       const execution: ToolExecution = {
         callId,
         name: tool.name,
         sensitivity: tool.sensitivity,
         ok,
+        ...(output !== undefined ? { output } : {}),
       };
       try {
         await opts.onExecuted(execution);
@@ -200,7 +201,7 @@ class ToolRegistry {
           ctx,
           tool.sensitiveArgKeys ?? [],
         );
-        await reportExecution(result.ok);
+        await reportExecution(result.ok, result.output);
         return result;
       } catch (err) {
         lastError = err instanceof Error ? err.message : String(err);
