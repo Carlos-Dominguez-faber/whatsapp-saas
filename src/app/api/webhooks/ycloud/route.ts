@@ -24,9 +24,11 @@ import { applyMessageStatus } from "@/features/inbox/services/message-status";
 import { extractWebhookError } from "@/features/inbox/services/whatsapp-errors";
 import {
   checkDestination,
+  internationalDigits,
   phoneString,
   samePhone,
 } from "@/features/inbox/services/phone";
+import { workspaceCountryCode } from "@/features/inbox/services/country-code";
 import { emitEventOncePerDay } from "@/features/inbox/services/daily-events";
 
 // Keep the function alive long enough for the best-effort fast path below
@@ -185,8 +187,18 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
     // accepted, with an event saying so. Without a number, it's accepted.
     if (wsidParam) {
       const configuredPhone = ws.config?.phone_number;
-      const destination = checkDestination(configuredPhone, normalized.workspacePhone);
       const workspaceId = ws.workspace_id;
+      // Bare digits are read with the workspace's country code (only then).
+      const configuredText = phoneString(configuredPhone);
+      const countryCode =
+        configuredText && !internationalDigits(configuredText)
+          ? await workspaceCountryCode(supabase, workspaceId)
+          : undefined;
+      const destination = checkDestination(
+        configuredPhone,
+        normalized.workspacePhone,
+        countryCode,
+      );
       if (destination === "mismatch") {
         console.warn(
           "[webhook] inbound for another number on this workspace's webhook URL — ignored",

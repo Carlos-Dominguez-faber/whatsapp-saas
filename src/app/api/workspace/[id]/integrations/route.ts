@@ -23,6 +23,7 @@ import {
 } from "@/features/agents/lib/model-catalog";
 import { normalizeConfiguredPhone } from "@/features/inbox/services/ycloud-client";
 import { phoneString } from "@/features/inbox/services/phone";
+import { workspaceCountryCode } from "@/features/inbox/services/country-code";
 
 const IntegrationSchema = z.object({
   provider: z.enum(["ycloud", "kapso", "openrouter", "highlevel"]),
@@ -216,6 +217,7 @@ export async function PUT(
     const normalized = await normalizeConfiguredPhone(
       typedPhone,
       await ycloudApiKey(newCreds, existing?.credentials ?? null, workspaceId),
+      await workspaceCountryCode(svc, workspaceId),
     );
     config = { ...config, phone_number: normalized.value };
     phoneWarning = normalized.warning;

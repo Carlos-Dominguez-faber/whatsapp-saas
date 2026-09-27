@@ -1,5 +1,5 @@
 import type { MetaTemplateComponent } from "@/features/settings/lib/template-form";
-import { internationalDigits, matchesOwnNumber, normalizePhone } from "./phone";
+import { matchesOwnNumber, normalizePhone, placePhone } from "./phone";
 
 const YCLOUD_BASE_URL = "https://api.ycloud.com/v2";
 const YCLOUD_MESSAGES_URL = `${YCLOUD_BASE_URL}/whatsapp/messages`;
@@ -379,8 +379,12 @@ export async function listYCloudPhoneNumbers(
 export async function normalizeConfiguredPhone(
   typed: string,
   apiKey: string | null,
+  defaultCountryCode?: string,
 ): Promise<{ value: string; warning?: string }> {
-  const international = internationalDigits(typed);
+  // With its country code (+, 00, or bare digits starting with the
+  // workspace's own code); a national reading is not enough to save it so.
+  const placed = placePhone(typed, defaultCountryCode);
+  const international = placed?.international ? placed.e164 : null;
   let listed: YCloudPhoneNumber[] | null = null;
   if (apiKey) {
     try {
@@ -392,11 +396,13 @@ export async function normalizeConfiguredPhone(
       );
     }
   }
-  const own = listed?.find((n) => matchesOwnNumber(typed, n.phoneNumber));
+  const own = listed?.find((n) =>
+    matchesOwnNumber(typed, n.phoneNumber, defaultCountryCode),
+  );
   if (own) return { value: normalizePhone(own.phoneNumber) };
 
   if (international) {
-    const value = `+${international}`;
+    const value = international;
     return listed
       ? {
           value,

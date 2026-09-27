@@ -71,6 +71,15 @@ mock.module("@/features/inbox/services/daily-events.ts", {
     },
   },
 });
+const countryCodeCalls: string[] = [];
+mock.module("@/features/inbox/services/country-code.ts", {
+  exports: {
+    workspaceCountryCode: async (_db: unknown, workspaceId: string) => {
+      countryCodeCalls.push(workspaceId);
+      return "52";
+    },
+  },
+});
 // after() needs a request scope; here it just runs the callback.
 const afterTasks: Array<Promise<unknown>> = [];
 mock.module("next/server", {
@@ -213,4 +222,34 @@ test("the workspace's own number matches even written another way", async () => 
   assert.equal(inboundCalls, 1);
   assert.equal((await res.json()).reaction, true);
   assert.equal(batchCalls, 0, "a reaction is stored but starts no paid turn");
+});
+
+test("a configured 1 998 123 4567 is read as a Mexican mobile: filed, unverified, never enforced as +1", async () => {
+  const original = ROW.config;
+  ROW.config = { phone_number: "1 998 123 4567" };
+  inboundCalls = 0;
+  events.length = 0;
+  countryCodeCalls.length = 0;
+  const res = await inbound("+5219981234567", { type: "reaction", reaction: { emoji: "👍" } });
+  assert.equal(res.status, 200);
+  assert.equal(inboundCalls, 1);
+  await settled();
+  assert.equal(events[0]?.type, "inbound_destination_unchecked");
+  assert.deepEqual(countryCodeCalls, ["ws_1"], "read with the workspace's code");
+  ROW.config = original;
+});
+
+test("bare digits with the workspace's code are enforced; a + number never needs the code", async () => {
+  const original = ROW.config;
+  ROW.config = { phone_number: "5219981234567" };
+  inboundCalls = 0;
+  const res = await inbound("+5219980000000", { type: "text", text: { body: "hola" } });
+  assert.equal((await res.json()).ignored, "destination_mismatch");
+  assert.equal(inboundCalls, 0);
+
+  ROW.config = original; // "+15550000000"
+  countryCodeCalls.length = 0;
+  await inbound("+15550000000", { type: "reaction", reaction: { emoji: "👍" } });
+  assert.deepEqual(countryCodeCalls, [], "no business_info read on the common path");
+  await settled();
 });

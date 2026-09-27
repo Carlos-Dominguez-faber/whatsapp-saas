@@ -35,6 +35,10 @@ mock.module("@/shared/lib/integration-secrets.ts", {
   },
 });
 
+mock.module("@/features/inbox/services/country-code.ts", {
+  exports: { workspaceCountryCode: async () => "52" },
+});
+
 type Stored = { credentials: Record<string, unknown>; config: Record<string, unknown> };
 let stored: Record<string, Stored> = {};
 let rpcCalls: Array<{ fn: string; args: Record<string, unknown> }> = [];
@@ -276,6 +280,46 @@ test("a national number YCloud can't confirm is kept as typed, with how to fix i
     assert.equal(status, 200);
     assert.equal(saved.phone_number, "998 123 4567", "no guessed country code");
     assert.match(json.warning, /lada internacional/);
+  } finally {
+    console.warn = original;
+    restore();
+  }
+});
+
+test("a typed 1 998 123 4567 never becomes +1…: YCloud's line if listed, else kept as typed", async () => {
+  reset();
+  const listed = ycloudLists(["+5219981234567"]);
+  try {
+    const { saved, json } = await saveYCloudPhone("1 998 123 4567");
+    assert.equal(saved.phone_number, "+5219981234567");
+    assert.equal(json.warning, undefined);
+  } finally {
+    listed.restore();
+  }
+
+  reset();
+  const unreachable = ycloudLists(null);
+  const original = console.warn;
+  console.warn = () => {};
+  try {
+    const { saved, json } = await saveYCloudPhone("1 998 123 4567");
+    assert.equal(saved.phone_number, "1 998 123 4567");
+    assert.match(json.warning, /lada internacional/);
+  } finally {
+    console.warn = original;
+    unreachable.restore();
+  }
+});
+
+test("bare digits with the workspace's code are saved in E.164 even without YCloud to confirm", async () => {
+  reset();
+  const { restore } = ycloudLists(null);
+  const original = console.warn;
+  console.warn = () => {};
+  try {
+    const { saved, json } = await saveYCloudPhone("5219981234567");
+    assert.equal(saved.phone_number, "+5219981234567");
+    assert.equal(json.warning, undefined);
   } finally {
     console.warn = original;
     restore();
