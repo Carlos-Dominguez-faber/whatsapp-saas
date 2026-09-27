@@ -43,6 +43,19 @@ test("impossible dates and skipped hours have no instant", () => {
   assert.equal(wallClockToInstant(wall("2026-03-08T02:30"), "America/New_York"), null);
 });
 
+test("the repeated hour when clocks go back gives the earlier instant, east or west of UTC", () => {
+  // New York, 2026-11-01: 01:30 happens at 05:30Z (EDT) and again at 06:30Z (EST).
+  assert.equal(
+    new Date(wallClockToInstant(wall("2026-11-01T01:30"), "America/New_York")!).toISOString(),
+    "2026-11-01T05:30:00.000Z",
+  );
+  // Madrid, 2026-10-25: 02:30 happens at 00:30Z (CEST) and again at 01:30Z (CET).
+  assert.equal(
+    new Date(wallClockToInstant(wall("2026-10-25T02:30"), "Europe/Madrid")!).toISOString(),
+    "2026-10-25T00:30:00.000Z",
+  );
+});
+
 test("formatWithOffset uses the zone's offset at that instant", () => {
   assert.equal(formatWithOffset(Date.parse("2026-07-15T14:00:00Z"), "America/New_York"), "2026-07-15T10:00:00-04:00");
   assert.equal(formatWithOffset(Date.parse("2026-01-15T15:00:00Z"), "America/New_York"), "2026-01-15T10:00:00-05:00");

@@ -1,11 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import {
-  buildNowContext,
-  buildUpcomingDaysTable,
-  businessTimeZone,
-} from "./business-info.ts";
-import type { BusinessInfo } from "./business-info.ts";
+import { buildNowContext, buildUpcomingDaysTable } from "./business-info.ts";
 
 test("advances by calendar days in the target timezone across a DST transition (no skipped/duplicate dates)", () => {
   // America/New_York springs forward on 2026-03-08 at 02:00 local (EST -05:00 -> EDT -04:00).
@@ -136,29 +131,4 @@ test("falls back to the default timezone instead of throwing on an invalid IANA 
   } finally {
     console.warn = originalWarn;
   }
-});
-
-test("businessTimeZone returns the configured timezone when it's a valid IANA zone", () => {
-  const info: BusinessInfo = {
-    structured: { timezone: "America/Santiago" },
-    free_text: null,
-  };
-  assert.equal(businessTimeZone(info), "America/Santiago");
-});
-
-test("businessTimeZone falls back to the default when info is null", () => {
-  assert.equal(businessTimeZone(null), "America/Mexico_City");
-});
-
-test("businessTimeZone falls back to the default when structured.timezone is missing", () => {
-  const info: BusinessInfo = { structured: {}, free_text: null };
-  assert.equal(businessTimeZone(info), "America/Mexico_City");
-});
-
-test("businessTimeZone falls back to the default when structured.timezone is not a valid IANA zone", () => {
-  const info: BusinessInfo = {
-    structured: { timezone: "not-a-real-timezone" },
-    free_text: null,
-  };
-  assert.equal(businessTimeZone(info), "America/Mexico_City");
 });

@@ -21,14 +21,16 @@ function jsonResponse(status: number, body: unknown): Response {
 
 function mockFetch(opts: {
   connected?: boolean;
-  timezone?: string;
+  /** The HighLevel integration's zone; null leaves it unset. */
+  timezone?: string | null;
   businessTimezone?: string;
   hlStatus?: number;
   hlBody?: unknown;
 }) {
   const calls: string[] = [];
+  const versions: string[] = [];
 
-  const fn = async (input: string | URL | Request): Promise<Response> => {
+  const fn = async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
     const url = String(input);
     calls.push(url);
 
@@ -43,7 +45,9 @@ function mockFetch(opts: {
                 config: {
                   location_id: "loc_1",
                   calendar_id: "cal_1",
-                  timezone: opts.timezone ?? "America/Santiago",
+                  ...(opts.timezone === null
+                    ? {}
+                    : { timezone: opts.timezone ?? "America/Santiago" }),
                 },
                 enabled: true,
               },
@@ -61,13 +65,14 @@ function mockFetch(opts: {
     }
 
     if (url.includes("/free-slots")) {
+      versions.push(new Headers(init?.headers).get("Version") ?? "");
       return jsonResponse(opts.hlStatus ?? 200, opts.hlBody ?? {});
     }
 
     throw new Error(`unexpected fetch call: ${url}`);
   };
 
-  return { fn, calls };
+  return { fn, calls, versions };
 }
 
 async function withFetch<T>(
@@ -94,8 +99,8 @@ function daysWithOneSlot(start: string, n: number): Record<string, unknown> {
   return out;
 }
 
-test("devuelve los ISO originales agrupados por día local", async () => {
-  const { fn } = mockFetch({
+test("devuelve los horarios agrupados por día local, con el offset de la zona", async () => {
+  const { fn, versions } = mockFetch({
     hlBody: {
       "2026-06-12": {
         slots: ["2026-06-12T15:00:00-04:00", "2026-06-12T16:00:00-04:00"],
@@ -121,9 +126,11 @@ test("devuelve los ISO originales agrupados por día local", async () => {
   assert.equal(out.covered_until, "2026-06-12");
   assert.equal(out.omitted_days, 0);
   assert.equal(out.unreadable, 0);
+  // GET /calendars/{id}/free-slots in HighLevel's OpenAPI spec.
+  assert.deepEqual(versions, ["2021-04-15"]);
 });
 
-test("una zona horaria inválida del LLM cae a la del workspace y lo declara", async () => {
+test("una zona que pida el modelo se ignora: los horarios van en la zona de agenda", async () => {
   const { fn, calls } = mockFetch({
     hlBody: { "2026-06-12": { slots: ["2026-06-12T15:00:00-04:00"] } },
   });
@@ -133,8 +140,8 @@ test("una zona horaria inválida del LLM cae a la del workspace y lo declara", a
       {
         date_from: "2026-06-12",
         date_to: "2026-06-12",
-        timezone: "America/Santiagoo",
-      },
+        timezone: "America/Bogota",
+      } as never,
       ctx,
     ),
   );
@@ -142,9 +149,9 @@ test("una zona horaria inválida del LLM cae a la del workspace y lo declara", a
   assert.equal(result.ok, true);
   const out = result.output as Record<string, unknown>;
   assert.equal(out.timezone, "America/Santiago");
-  assert.match(out.message as string, /America\/Santiagoo/);
+  assert.deepEqual(out.days, { "2026-06-12": ["2026-06-12T15:00:00-04:00"] });
 
-  // La zona que se le manda a HighLevel también tiene que ser la resuelta.
+  // La zona que se le manda a HighLevel también es la de agenda.
   const slotsCall = calls.find((u) => u.includes("/free-slots"));
   assert.ok(slotsCall);
   assert.match(slotsCall!, /timezone=America%2FSantiago(&|$)/);
@@ -295,11 +302,11 @@ test("un día con más de 20 horarios los devuelve todos", async () => {
   );
 });
 
-test("sin zona del LLM usa la del negocio antes que la de HighLevel (que vale UTC por defecto)", async () => {
+test("la zona del negocio va antes que la de HighLevel", async () => {
   const { fn, calls } = mockFetch({
     timezone: "UTC",
     businessTimezone: "America/Mexico_City",
-    hlBody: { "2026-06-12": { slots: ["2026-06-12T15:00:00-06:00"] } },
+    hlBody: { "2026-06-12": { slots: ["2026-06-12T15:00:00Z"] } },
   });
 
   const result = await withFetch(fn as typeof fetch, () =>
@@ -307,21 +314,39 @@ test("sin zona del LLM usa la del negocio antes que la de HighLevel (que vale UT
   );
 
   assert.equal(result.ok, true);
-  assert.equal((result.output as Record<string, unknown>).timezone, "America/Mexico_City");
+  const out = result.output as Record<string, unknown>;
+  assert.equal(out.timezone, "America/Mexico_City");
+  assert.deepEqual(out.days, { "2026-06-12": ["2026-06-12T09:00:00-06:00"] });
   const hl = calls.find((u) => u.includes("/free-slots"))!;
   assert.equal(new URL(hl).searchParams.get("timezone"), "America/Mexico_City");
 });
 
-test("la zona del LLM, si es válida, gana sobre la del negocio", async () => {
+test("sin zona del negocio usa la de HighLevel, y los slots salen con su offset", async () => {
   const { fn } = mockFetch({
-    businessTimezone: "America/Mexico_City",
-    hlBody: { "2026-06-12": { slots: [] } },
+    timezone: "America/Cancun",
+    hlBody: { "2026-06-12": { slots: ["2026-06-12T15:00:00Z"] } },
   });
+
   const result = await withFetch(fn as typeof fetch, () =>
-    checkAvailabilityTool.run(
-      { date_from: "2026-06-12", date_to: "2026-06-12", timezone: "America/Bogota" },
-      ctx,
-    ),
+    checkAvailabilityTool.run({ date_from: "2026-06-12", date_to: "2026-06-12" }, ctx),
   );
-  assert.equal((result.output as Record<string, unknown>).timezone, "America/Bogota");
+
+  const out = result.output as Record<string, unknown>;
+  assert.equal(out.timezone, "America/Cancun");
+  assert.deepEqual(out.days, { "2026-06-12": ["2026-06-12T10:00:00-05:00"] });
+});
+
+test("sin ninguna zona configurada usa la por defecto", async () => {
+  const { fn } = mockFetch({
+    timezone: null,
+    hlBody: { "2026-06-12": { slots: ["2026-06-12T15:00:00Z"] } },
+  });
+
+  const result = await withFetch(fn as typeof fetch, () =>
+    checkAvailabilityTool.run({ date_from: "2026-06-12", date_to: "2026-06-12" }, ctx),
+  );
+
+  const out = result.output as Record<string, unknown>;
+  assert.equal(out.timezone, "America/Mexico_City");
+  assert.deepEqual(out.days, { "2026-06-12": ["2026-06-12T09:00:00-06:00"] });
 });

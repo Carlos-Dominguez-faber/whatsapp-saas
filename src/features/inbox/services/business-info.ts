@@ -97,8 +97,9 @@ export function buildUpcomingDaysTable(timeZone: string, now: Date): string {
  * A workspace admin can save an arbitrary string as the business timezone
  * (business_info.structured.timezone has no server-side IANA validation).
  * An invalid one used to throw uncaught here, dead-lettering every message
- * in the workspace after 3 retries — fall back to the default instead. The
- * same resolver picks check_availability's zone, so both agree.
+ * in the workspace after 3 retries — fall back to the default instead.
+ * Callers pass the scheduling zone (scheduling-timezone.ts), the one every
+ * scheduling tool reads and writes, so the prompt and the tools agree.
  */
 export function buildNowContext(timeZone?: string | null): string {
   const tz = resolveTimeZone(timeZone);
@@ -115,17 +116,7 @@ export function buildNowContext(timeZone?: string | null): string {
   });
   const offset = offsetFor(tz, now);
   const upcoming = buildUpcomingDaysTable(tz, now);
-  return `## Fecha actual\nHoy es ${human} (zona horaria ${tz}, offset ${offset}).\n\n${upcoming}\n\nUsa esta tabla para resolver referencias como "el martes", "mañana", "en 3 días", etc. — copia la fecha exacta de la tabla, no la calcules tú. Cuando agendes, construye las horas en ISO con el offset que aparece junto a esa fecha en la tabla (no siempre es el mismo que el de "Hoy es...", puede cambiar por horario de verano), y pasa la zona horaria ${tz} a la herramienta de disponibilidad.`;
-}
-
-/**
- * The workspace's configured timezone from its business info, through the
- * same resolver as buildNowContext and check_availability, so every place
- * that reasons about "now" agrees on the zone.
- */
-export function businessTimeZone(info: BusinessInfo | null): string {
-  const tz = (info?.structured as { timezone?: string } | undefined)?.timezone;
-  return resolveTimeZone(tz);
+  return `## Fecha actual\nHoy es ${human} (zona horaria ${tz}, offset ${offset}).\n\n${upcoming}\n\nUsa esta tabla para resolver referencias como "el martes", "mañana", "en 3 días", etc. — copia la fecha exacta de la tabla, no la calcules tú. Cuando agendes, construye las horas en ISO con el offset que aparece junto a esa fecha en la tabla (no siempre es el mismo que el de "Hoy es...", puede cambiar por horario de verano). Los horarios y citas que dan las herramientas de agenda ya vienen en esta zona: cópialos tal cual, sin cambiarles el offset.`;
 }
 
 /**

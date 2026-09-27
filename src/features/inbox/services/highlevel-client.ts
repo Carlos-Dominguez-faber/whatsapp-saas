@@ -9,6 +9,7 @@
  */
 
 import { createClient as createSbClient } from "@supabase/supabase-js";
+import { isIanaTimeZone } from "@/shared/lib/timezone";
 import { decryptCredentials } from "@/shared/lib/integration-secrets";
 import { phoneVariants, phoneWithCountryCode } from "./phone";
 import { workspaceCountryCode } from "./country-code";
@@ -39,10 +40,10 @@ export interface HLConfig {
   /** Stage within the pipeline for new opportunities; null when not configured. */
   pipelineStageId: string | null;
   /**
-   * IANA timezone for availability queries when the model does not pass a
-   * valid one. Defaults to "UTC".
+   * The HighLevel location's IANA zone, when the integration has one
+   * configured (null otherwise). See scheduling-timezone.ts for how it's used.
    */
-  timezone: string;
+  timezone: string | null;
 }
 
 export interface HLPipeline {
@@ -133,8 +134,24 @@ export async function getHLConfig(
     calendarId: str(calendarId),
     pipelineId: str(pipelineId),
     pipelineStageId: str(pipelineStageId),
-    timezone: str(config.timezone) ?? "UTC",
+    timezone: isIanaTimeZone(config.timezone) ? config.timezone.trim() : null,
   };
+}
+
+/**
+ * The HighLevel integration's configured zone, without loading (or
+ * decrypting) the rest of the integration. Null when there's none.
+ */
+export async function hlConfiguredTimeZone(workspaceId: string): Promise<string | null> {
+  const { data } = await svc()
+    .from("integrations")
+    .select("config")
+    .eq("workspace_id", workspaceId)
+    .eq("provider", "highlevel")
+    .eq("enabled", true)
+    .maybeSingle();
+  const tz = (data?.config as { timezone?: unknown } | null)?.timezone;
+  return isIanaTimeZone(tz) ? tz.trim() : null;
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

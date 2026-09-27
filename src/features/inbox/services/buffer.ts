@@ -36,6 +36,7 @@ import {
 } from "./conversation-history";
 import { getSetterConfig, evaluateLead } from "./setter";
 import { syncContactToHL, createHLOpportunity } from "./highlevel-client";
+import { workspaceSchedulingTimeZone } from "./scheduling-timezone";
 import {
   loadWhatsAppSettings,
   WHATSAPP_NOT_CONNECTED,
@@ -862,13 +863,12 @@ export async function processNextBatch(): Promise<ProcessBatchResult> {
       .filter(Boolean)
       .join("\n\n");
     const bizContext = buildBusinessInfoContext(businessInfo);
+    // The scheduling tools' zone, so "today" and their dates agree.
+    const timeZone = await workspaceSchedulingTimeZone(batch.workspace_id, businessInfo);
     const promptBase =
       resolvedPrompt?.body ??
       "Eres un asistente de WhatsApp. Responde de forma concisa y útil en español.";
-    const structured = businessInfo?.structured as {
-      timezone?: string;
-      name?: string;
-    } | null;
+    const structured = businessInfo?.structured as { name?: string } | null;
     // WS1: surface the rolling conversation summary so the model keeps long-term
     // context beyond the recent-message window.
     const summary =
@@ -878,7 +878,7 @@ export async function processNextBatch(): Promise<ProcessBatchResult> {
     // Canonical assembly (shared with the test-chat playground) — includes the
     // response style, KB and the strict rules/restrictions guardrails.
     const fullSystemPrompt = buildSystemPrompt({
-      nowContext: buildNowContext(structured?.timezone),
+      nowContext: buildNowContext(timeZone),
       bizContext,
       promptBase,
       summary,

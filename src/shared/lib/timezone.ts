@@ -8,6 +8,8 @@
 
 export const DEFAULT_TIMEZONE = "America/Mexico_City";
 
+const DAY_MS = 24 * 60 * 60 * 1000;
+
 /**
  * An IANA zone name ("America/Mexico_City", "Etc/GMT+5", "UTC") the runtime
  * knows. Offsets ("-05:00") and abbreviations ("EST", "CST") are refused even
@@ -84,23 +86,23 @@ function sameWallClock(a: WallClock, b: WallClock): boolean {
 /**
  * The instant at which the clock in `tz` reads `wall`, or null when it never
  * does: an impossible date (February 30) or a time skipped by a DST change.
- * An ambiguous time (the repeated hour when clocks go back) gives the first.
+ * An ambiguous time (the hour repeated when clocks go back) gives the EARLIER
+ * instant, the first time the clock reads it, in every zone.
  */
 export function wallClockToInstant(wall: WallClock, tz: string): number | null {
   const asUtc = Date.UTC(wall.year, wall.month - 1, wall.day, wall.hour, wall.minute, wall.second);
   if (Number.isNaN(asUtc)) return null;
-  // The offset measured at the naive instant may belong to the other side of
-  // a DST change; measuring again at the first guess settles it.
   const offsetAt = (ms: number) => {
     const w = wallClockOf(ms, tz);
     return Date.UTC(w.year, w.month - 1, w.day, w.hour, w.minute, w.second) - ms;
   };
-  const first = asUtc - offsetAt(asUtc);
-  const second = asUtc - offsetAt(first);
-  for (const candidate of [Math.min(first, second), Math.max(first, second)]) {
-    if (sameWallClock(wallClockOf(candidate, tz), wall)) return candidate;
-  }
-  return null;
+  // A day either side of the naive instant lies on either side of any DST
+  // change near it, so between them they hold every offset the wall clock
+  // can have; each candidate that reads back as `wall` is a real occurrence.
+  const matches = [offsetAt(asUtc - DAY_MS), offsetAt(asUtc), offsetAt(asUtc + DAY_MS)]
+    .map((offset) => asUtc - offset)
+    .filter((candidate) => sameWallClock(wallClockOf(candidate, tz), wall));
+  return matches.length > 0 ? Math.min(...matches) : null;
 }
 
 /** `YYYY-MM-DDTHH:mm:ss±HH:MM` for instant `ms`, with `tz`'s offset then. */

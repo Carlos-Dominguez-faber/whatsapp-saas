@@ -334,7 +334,11 @@ mock.module("./conversation-history.ts", {
 });
 mock.module("./setter.ts", { exports: { getSetterConfig: async () => null, evaluateLead: async () => null } });
 mock.module("./highlevel-client.ts", {
-  exports: { syncContactToHL: async () => undefined, createHLOpportunity: async () => undefined },
+  exports: {
+    syncContactToHL: async () => undefined,
+    createHLOpportunity: async () => undefined,
+    hlConfiguredTimeZone: async () => null,
+  },
 });
 
 const { processNextBatch, upsertBatch, reconcileOrphanedMessages, hasTimeToClaim } = await import(

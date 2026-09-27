@@ -2,13 +2,15 @@
  * Helpers de la tool de disponibilidad (check_availability, HighLevel).
  */
 
+import { formatWithOffset, isIanaTimeZone } from "@/shared/lib/timezone";
+
 const DAY_MS = 24 * 60 * 60 * 1000;
 
 /** Un ISO solo es interpretable sin adivinar si trae offset explícito. */
 const HAS_OFFSET = /(?:Z|[+-]\d{2}:?\d{2})$/i;
 
 export interface GroupedSlots {
-  /** `{ "YYYY-MM-DD": ["<ISO original del proveedor>", ...] }` */
+  /** `{ "YYYY-MM-DD": ["<instante en ISO con el offset de tz>", ...] }` */
   days: Record<string, string[]>;
   /** Días completos del rango que quedaron fuera por `maxDays` o `maxSlots`. */
   omittedDays: number;
@@ -22,8 +24,8 @@ export interface GroupedSlots {
 }
 
 /**
- * Agrupa slots por día LOCAL en `tz`, conservando **el ISO original del
- * proveedor** como valor.
+ * Agrupa slots por día LOCAL en `tz`, y escribe cada uno como su instante con
+ * el offset de `tz` en ese momento (`formatWithOffset`).
  *
  * Reemplaza el recorte ciego a los primeros 20 slots: cortaba el rango a mitad
  * de camino y el bot negaba horarios que sí existían. Un recorte por muestra
@@ -33,12 +35,17 @@ export interface GroupedSlots {
  * SIEMPRE completo; si el rango excede `maxDays` se descartan DÍAS ENTEROS
  * (los últimos), nunca horarios sueltos dentro de un día presente.
  *
- * El valor es el ISO y no una etiqueta `"HH:MM"` por tres razones:
+ * El valor es un ISO completo y no una etiqueta `"HH:MM"` por tres razones:
  *  1. `"HH:MM"` colapsa los dos cupos distintos que el retroceso de horario
  *    deja a la misma hora local — rompía el invariante de "día completo".
  *  2. Pierde los segundos, con el mismo efecto.
  *  3. El modelo agenda copiando un `datetime_iso`; con la etiqueta tenía que
  *    reconstruirlo haciendo aritmética de fechas, que es lo que peor hace.
+ *
+ * Y va reescrito en `tz`, no tal como lo mandó el proveedor: `tz` es la zona
+ * con la que schedule, cancel y reschedule leen y validan la fecha que el
+ * modelo copia (ver scheduling-timezone.ts). Un slot con el offset de otra
+ * zona se rechazaría allá.
  */
 export function groupByDay(
   slots: readonly unknown[],
@@ -49,8 +56,10 @@ export function groupByDay(
   // (el primero siempre entra completo), nunca horarios sueltos de un día.
   maxSlots = 60,
 ): GroupedSlots {
-  // day -> (ISO original -> instante), para ordenar por instante y deduplicar.
-  const byDay = new Map<string, Map<string, number>>();
+  // Una zona inválida degrada a UTC, igual que localDay.
+  const zone = isIanaTimeZone(tz) ? tz.trim() : "UTC";
+  // day -> instantes, para ordenar y deduplicar.
+  const byDay = new Map<string, Set<number>>();
   let unreadable = 0;
 
   for (const raw of slots) {
@@ -60,9 +69,9 @@ export function groupByDay(
       unreadable++;
       continue;
     }
-    const day = localDay(instant, tz);
-    if (!byDay.has(day)) byDay.set(day, new Map());
-    byDay.get(day)!.set(iso, instant);
+    const day = localDay(instant, zone);
+    if (!byDay.has(day)) byDay.set(day, new Set());
+    byDay.get(day)!.add(instant);
   }
 
   const sortedDays = [...byDay.keys()].sort();
@@ -73,9 +82,9 @@ export function groupByDay(
   for (const day of sortedDays.slice(0, maxDays)) {
     const size = byDay.get(day)!.size;
     if (kept > 0 && total + size > maxSlots) break;
-    const isos = [...byDay.get(day)!.entries()]
-      .sort((a, b) => a[1] - b[1] || a[0].localeCompare(b[0]))
-      .map(([iso]) => iso);
+    const isos = [...byDay.get(day)!]
+      .sort((a, b) => a - b)
+      .map((instant) => formatWithOffset(instant, zone));
     // A calendar so dense that its first day alone exceeds the cap: show the
     // earliest slots of that day and say the rest exist.
     if (size > maxSlots) {
@@ -135,14 +144,11 @@ export interface AvailabilityOutput {
  * Regla dura: **un dato ilegible nunca se convierte en "no hay horarios"**.
  * Si hubo descartes, el mensaje no puede afirmar ausencia de cupos — esa es la
  * misma clase de mentira que este cambio vino a arreglar, pero total.
- *
- * `requestedTz` es la zona que pidió el LLM (si pidió alguna); si no coincide
- * con la que se usó de verdad, el output lo dice.
+
  */
 export function buildAvailabilityOutput(
   grouped: GroupedSlots,
   timezone: string,
-  requestedTz?: string,
 ): AvailabilityOutput {
   const dayKeys = Object.keys(grouped.days);
   const count = Object.values(grouped.days).reduce(
@@ -154,7 +160,7 @@ export function buildAvailabilityOutput(
   const parts: string[] = [];
   if (count > 0) {
     parts.push(
-      `Hay ${count} horarios disponibles. Cada uno es el instante exacto en ISO: cópialo tal cual para agendar.`,
+      `Hay ${count} horarios disponibles, en la zona horaria del negocio (${timezone}). Cada uno es el instante exacto en ISO: cópialo tal cual para agendar o reagendar, sin cambiarle el offset.`,
     );
   } else if (grouped.unreadable > 0) {
     parts.push(
@@ -181,12 +187,6 @@ export function buildAvailabilityOutput(
   if (grouped.omittedDays > 0 && coveredUntil) {
     parts.push(
       `Esta lista solo cubre hasta el ${coveredUntil}; hay ${grouped.omittedDays} días más con horarios que no entran acá.`,
-    );
-  }
-
-  if (requestedTz && requestedTz !== timezone) {
-    parts.push(
-      `La zona horaria pedida ("${requestedTz}") no es válida; los horarios están en ${timezone}.`,
     );
   }
 

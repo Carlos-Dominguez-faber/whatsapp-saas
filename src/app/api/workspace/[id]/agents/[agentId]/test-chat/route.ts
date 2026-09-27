@@ -23,6 +23,7 @@ import {
   buildBusinessInfoContext,
   buildNowContext,
 } from "@/features/inbox/services/business-info";
+import { workspaceSchedulingTimeZone } from "@/features/inbox/services/scheduling-timezone";
 import { getEnabledTools } from "@/features/tools/services/tool-configs";
 import type { AgentConfig } from "@/features/agents/types";
 import { isCatalogModel } from "@/features/agents/lib/model-catalog";
@@ -171,9 +172,7 @@ export async function POST(
     ((info?.structured as { name?: string } | null)?.name as string) ??
     "tu negocio";
   const bizContext = buildBusinessInfoContext(info);
-  const timeZone =
-    ((info?.structured as { timezone?: string } | null)?.timezone as string) ??
-    "America/Mexico_City";
+  const timeZone = await workspaceSchedulingTimeZone(workspaceId, info);
 
   // KB: search with the latest user message, just like buffer.ts.
   const lastUserMessage =
