@@ -37,7 +37,15 @@ import { createClient as svcClient } from "@supabase/supabase-js";
 import type {
   Tool as ForgeTool,
   ToolContext,
+  ToolExecution,
+  ToolStart,
 } from "@/features/tools/core/tool";
+
+// Upper bounds for one model call, so a hung provider can't eat the whole
+// function (the buffer needs time left to send and to close the batch). A
+// tool turn runs up to 5 steps, each with its own tool calls.
+const LLM_TIMEOUT_MS = 60_000;
+const LLM_TOOL_TURN_TIMEOUT_MS = 120_000;
 import { registry } from "@/features/tools/index";
 import { getActiveAgent } from "@/features/agents/services/active-agent";
 import { decryptCredentials } from "@/shared/lib/integration-secrets";
@@ -180,6 +188,7 @@ export async function generateReply(
       { role: "user", content: userMessage },
     ],
     maxOutputTokens: 1024,
+    abortSignal: AbortSignal.timeout(LLM_TIMEOUT_MS),
   });
 
   // AI SDK v6 exposes inputTokens / outputTokens; map to stable naming.
@@ -254,6 +263,9 @@ export async function generateChatReply(params: {
       tools: hasTools ? aiTools : undefined,
       stopWhen: hasTools ? stepCountIs(5) : undefined,
       maxOutputTokens: params.maxOutputTokens ?? 512,
+      abortSignal: AbortSignal.timeout(
+        hasTools ? LLM_TOOL_TURN_TIMEOUT_MS : LLM_TIMEOUT_MS,
+      ),
     }),
   );
 
@@ -279,6 +291,16 @@ export interface GenerateWithToolsParams {
   toolContext: ToolContext;
   /** Prior conversation turns (oldest→newest), injected between system and the current batch. */
   history?: Array<{ role: "user" | "assistant"; content: string }>;
+  /**
+   * Called right before each tool runs. If it throws, that tool doesn't run
+   * and the whole turn is aborted with its error.
+   */
+  onToolStart?: (start: ToolStart) => void | Promise<void>;
+  /**
+   * Called once per tool that actually ran — also when the turn later fails,
+   * which is when the caller most needs to know a write already happened.
+   */
+  onToolExecuted?: (execution: ToolExecution) => void | Promise<void>;
 }
 
 export interface GenerateWithToolsResult {
@@ -319,6 +341,13 @@ export async function generateWithTools(
   // Each entry uses inputSchema (zodSchema wrapper) + execute — the correct v6 shape.
   // execute returns Promise<unknown> to satisfy ToolSet's output constraint.
   const aiTools: ToolSet = {};
+  // A start hook that fails (the caller couldn't record a write) aborts the
+  // turn: the model must not carry on as if the tool had run.
+  const aborter = new AbortController();
+  let startFailure: unknown = null;
+  // Tools still running when the turn ends early (a timeout, a provider
+  // error): waited for, so the caller's hooks see how each one ended.
+  const inFlight = new Set<Promise<unknown>>();
 
   for (const forgeTool of params.availableTools ?? []) {
     const ctx = params.toolContext;
@@ -326,24 +355,55 @@ export async function generateWithTools(
       description: forgeTool.description,
       inputSchema: zodSchema(forgeTool.schema),
       execute: async (args: unknown): Promise<unknown> => {
-        return registry.run(forgeTool.name, args, ctx);
+        const run = registry.run(forgeTool.name, args, ctx, {
+          onStart: async (start) => {
+            try {
+              await params.onToolStart?.(start);
+            } catch (err) {
+              startFailure ??= err;
+              aborter.abort(err);
+              throw err;
+            }
+          },
+          onExecuted: params.onToolExecuted,
+        });
+        inFlight.add(run);
+        try {
+          return await run;
+        } finally {
+          inFlight.delete(run);
+        }
       },
     });
   }
 
   const hasTools = Object.keys(aiTools).length > 0;
 
-  const result = await generateText({
-    model: openrouter.chat(modelId),
-    messages: [
-      { role: "system", content: params.systemPrompt },
-      ...(params.history ?? []),
-      { role: "user", content: params.userMessage },
-    ],
-    tools: hasTools ? aiTools : undefined,
-    stopWhen: hasTools ? stepCountIs(5) : undefined,
-    maxOutputTokens: 1024,
-  });
+  let result: Awaited<ReturnType<typeof generateText>>;
+  try {
+    result = await generateText({
+      model: openrouter.chat(modelId),
+      messages: [
+        { role: "system", content: params.systemPrompt },
+        ...(params.history ?? []),
+        { role: "user", content: params.userMessage },
+      ],
+      tools: hasTools ? aiTools : undefined,
+      stopWhen: hasTools ? stepCountIs(5) : undefined,
+      maxOutputTokens: 1024,
+      abortSignal: AbortSignal.any([
+        aborter.signal,
+        AbortSignal.timeout(hasTools ? LLM_TOOL_TURN_TIMEOUT_MS : LLM_TIMEOUT_MS),
+      ]),
+    });
+  } catch (err) {
+    // Bounded by the registry's per-tool timeout.
+    await Promise.allSettled([...inFlight]);
+    throw startFailure ?? err;
+  }
+  // On the last step the SDK may finish without noticing the abort: a reply
+  // written as if the unrecorded tool had run must not go out.
+  if (startFailure) throw startFailure;
 
   // totalUsage, not usage: a tool turn runs up to 5 steps, and usage only
   // reports the last one — the budget would see a fraction of the real spend.
@@ -351,6 +411,10 @@ export async function generateWithTools(
     text: result.text,
     inputTokens: result.totalUsage?.inputTokens ?? 0,
     outputTokens: result.totalUsage?.outputTokens ?? 0,
-    toolCallsExecuted: result.steps?.length ?? 0,
+    // Tool calls across every step (a plain reply is one step, zero calls).
+    toolCallsExecuted: (result.steps ?? []).reduce(
+      (n, step) => n + (step.toolCalls?.length ?? 0),
+      0,
+    ),
   };
 }

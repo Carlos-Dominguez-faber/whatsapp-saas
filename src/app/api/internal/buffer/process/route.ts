@@ -16,6 +16,10 @@ import { processNextBatch } from "@/features/inbox/services/buffer";
 // workspace_id is NEVER trusted from the request body — always read server-side.
 // ──────────────────────────────────────────────────────────────────────────────
 
+// Same budget as the cron drain: one LLM turn plus tool calls. Must stay below
+// claim_next_batch()'s 7-minute stale lease.
+export const maxDuration = 300;
+
 function svc() {
   return createSbClient(
     process.env.NEXT_PUBLIC_SUPABASE_URL!,
@@ -74,13 +78,14 @@ export async function POST(request: Request): Promise<NextResponse> {
   if (batchId) {
     const supabase = svc();
 
-    // Validate batch exists and is in a processable state
+    // Only a batch still buffering can be primed: one in 'processing' belongs
+    // to a live worker, and reviving it would hand it to a second one.
     // workspace_id is read from DB — never from request body
     const { data: batch, error: batchError } = await supabase
       .from("message_batches")
       .select("id, workspace_id, status")
       .eq("id", batchId)
-      .in("status", ["buffering", "processing"])
+      .eq("status", "buffering")
       .maybeSingle();
 
     if (batchError) {
@@ -101,26 +106,52 @@ export async function POST(request: Request): Promise<NextResponse> {
       );
     }
 
-    // Force the batch into 'buffering' with flush_at = now so processNextBatch
-    // can claim it immediately via the RPC
-    await supabase
+    // Set flush_at = now so processNextBatch can claim it immediately via the
+    // RPC. The UPDATE repeats the status guard: between the SELECT above and
+    // this write the cron may have claimed the batch, and re-arming it then
+    // would hand it to a second worker → double reply.
+    const { data: rearmed, error: rearmError } = await supabase
       .from("message_batches")
       .update({
-        status: "buffering",
         flush_at: new Date().toISOString(),
         updated_at: new Date().toISOString(),
       })
       .eq("id", batchId)
-      .eq("workspace_id", batch.workspace_id); // explicit workspace guard
+      .eq("workspace_id", batch.workspace_id) // explicit workspace guard
+      .eq("status", "buffering")
+      .select("id");
+
+    if (rearmError) {
+      console.error("[internal/buffer/process] batch re-arm error:", rearmError);
+      return NextResponse.json(
+        { error: "No se pudo preparar el lote" },
+        { status: 500 },
+      );
+    }
+
+    if (!rearmed || rearmed.length === 0) {
+      return NextResponse.json(
+        { error: "El lote ya está siendo procesado" },
+        { status: 409 },
+      );
+    }
   }
 
-  // ── 3b. Process next ready batch (or the one we just primed above) ────────
+  // ── 3b. Process the next ready batch ──────────────────────────────────────
+  // claim_next_batch() serves each conversation's oldest unfinished batch
+  // first, so the primed batch may wait behind an older one — or another
+  // conversation's may come first. The response says which one ran.
   const result = await processNextBatch();
+
+  if (result.error) {
+    console.error("[internal/buffer/process] processing error:", result.error);
+  }
 
   return NextResponse.json({
     ok: true,
     processed: result.processed,
-    batchId: batchId ?? undefined,
-    ...(result.error ? { error: result.error } : {}),
+    requestedBatchId: batchId ?? undefined,
+    processedBatchId: result.batchId,
+    ...(result.error ? { error: "No se pudo procesar el lote" } : {}),
   });
 }

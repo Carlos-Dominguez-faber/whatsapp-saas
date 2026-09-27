@@ -2,6 +2,7 @@ import { createClient as createSbClient } from "@supabase/supabase-js";
 import type { OutboundEcho } from "./kapso-webhook-handler";
 import type { ContactRow, ConversationRow, MessageRow } from "../types/index";
 import type { ConversationState } from "./state-machine";
+import { DEFAULT_COUNTRY_CODE, normalizePhone } from "./phone";
 
 /**
  * The fields every provider's webhook parser produces (YCloud's and Kapso's
@@ -13,6 +14,8 @@ export interface InboundMessage {
   text: string | null;
   wamid: string;
   customerName: string | null;
+  /** The provider's own type, before clamping (e.g. "reaction"). */
+  rawType?: string;
 }
 
 function svc() {
@@ -22,27 +25,8 @@ function svc() {
   );
 }
 
-/** Default country code when a workspace hasn't configured one (Mexico). */
-export const DEFAULT_COUNTRY_CODE = "52";
-
-/**
- * Normalises a phone string to E.164 format.
- * - Trims whitespace and separators, prepends '+' if missing.
- * - When the number arrives WITHOUT a country code (no '+', national length
- *   ≤ 10 digits), prepends the workspace's `defaultCountryCode`.
- */
-export function normalizePhone(
-  phone: string,
-  defaultCountryCode?: string,
-): string {
-  const trimmed = phone.trim().replace(/[\s\-()]/g, "");
-  if (trimmed.startsWith("+")) return trimmed;
-  const digits = trimmed.replace(/\D/g, "");
-  if (defaultCountryCode && digits.length > 0 && digits.length <= 10) {
-    return `+${defaultCountryCode}${digits}`;
-  }
-  return `+${digits}`;
-}
+// Kept here too: callers import them from the normalizer.
+export { DEFAULT_COUNTRY_CODE, normalizePhone };
 
 export interface ProcessInboundResult {
   contact: ContactRow;
@@ -152,7 +136,12 @@ export async function processInbound(
         body: normalized.text,
         wamid: normalized.wamid,
         status: "delivered",
-        meta: { from_name: normalized.customerName },
+        meta: {
+          from_name: normalized.customerName,
+          // Kept in the thread, never answered: the webhook doesn't batch it,
+          // and this keeps the orphan reconciler from batching it either.
+          ...(normalized.rawType === "reaction" ? { no_reply: true } : {}),
+        },
       },
       {
         onConflict: "workspace_id,wamid",

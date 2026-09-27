@@ -4,8 +4,13 @@
  */
 
 import { createClient as createSbClient } from "@supabase/supabase-js";
-import { fetchYCloudTemplates } from "./ycloud-client";
+import {
+  fetchYCloudTemplates,
+  resolveWabaId,
+  templateOfficialId,
+} from "./ycloud-client";
 import { fetchKapsoTemplates } from "./kapso-client";
+import { phoneString } from "./phone";
 import {
   decryptWhatsAppCredentials,
   loadWhatsAppIntegration,
@@ -13,6 +18,7 @@ import {
   WHATSAPP_NOT_CONNECTED,
   type WhatsAppProvider,
 } from "./whatsapp-provider";
+import { extractRejectionReason, templateStatusPatch } from "./template-sync";
 
 function svc() {
   return createSbClient(
@@ -65,6 +71,10 @@ interface MetaTemplate {
   language?: string;
   category?: string;
   status?: string;
+  // Why Meta rejected it: Graph (Kapso) reports `rejected_reason`, YCloud
+  // `reason`; Meta sends "NONE" when there is none.
+  rejected_reason?: string;
+  reason?: string;
   components?: MetaTemplateComponent[];
   [key: string]: unknown;
 }
@@ -133,7 +143,7 @@ async function fetchProviderTemplates(
   provider: WhatsAppProvider,
   apiKey: string,
   config: Record<string, unknown>,
-): Promise<unknown[]> {
+): Promise<{ items: unknown[]; truncated: boolean }> {
   if (provider === "kapso") {
     // Kapso's template endpoints are Meta's, scoped to a WABA id in the path.
     // It is configured per workspace — the API can't discover it without it.
@@ -143,14 +153,22 @@ async function fetchProviderTemplates(
         "[templates] falta waba_id en la configuración de Kapso del workspace",
       );
     }
-    return fetchKapsoTemplates(apiKey, wabaId);
+    return { items: await fetchKapsoTemplates(apiKey, wabaId), truncated: false };
   }
-  return fetchYCloudTemplates(apiKey);
+  // YCloud's key reaches every WABA of the account: only this number's.
+  const phoneNumber = phoneString(config.phone_number) ?? "";
+  if (!phoneNumber) {
+    throw new Error(
+      "[templates] falta el número de WhatsApp en la configuración de YCloud del workspace",
+    );
+  }
+  const wabaId = await resolveWabaId(apiKey, phoneNumber);
+  return fetchYCloudTemplates(apiKey, wabaId);
 }
 
 export async function syncTemplates(
   workspaceId: string,
-): Promise<{ synced: number; errors: number }> {
+): Promise<{ synced: number; errors: number; truncated: boolean }> {
   const supabase = svc();
 
   // 1. Load the workspace's WhatsApp integration
@@ -163,14 +181,21 @@ export async function syncTemplates(
   const apiKey = whatsappApiKey(whatsapp.provider, credentials);
 
   if (!apiKey || apiKey === "placeholder") {
-    return { synced: 0, errors: 0 };
+    return { synced: 0, errors: 0, truncated: false };
   }
 
   // 2. Fetch templates from the provider
-  const records = await fetchProviderTemplates(
+  const { items: records, truncated } = await fetchProviderTemplates(
     whatsapp.provider,
     apiKey,
     whatsapp.config,
+  );
+
+  // What we already stored, by the template's identity (name + language):
+  // keeps a rejection reason Meta stops reporting, and `approved_at` on the
+  // first approval instead of every sync.
+  const previous = new Map(
+    (await listTemplates(workspaceId)).map((t) => [`${t.name}|${t.language}`, t]),
   );
 
   let synced = 0;
@@ -189,6 +214,7 @@ export async function syncTemplates(
       const components = Array.isArray(t.components) ? t.components : [];
       const bodyTemplate = extractBodyText(components);
       const variables = extractTemplateVariables(bodyTemplate);
+      const now = new Date().toISOString();
 
       const { error: upsertError } = await supabase.from("templates").upsert(
         {
@@ -200,9 +226,14 @@ export async function syncTemplates(
           body_template: bodyTemplate,
           components: t.components ?? {},
           variables,
-          provider_template_id: typeof t.id === "string" ? t.id : null,
-          rejection_reason: null,
-          updated_at: new Date().toISOString(),
+          provider_template_id: templateOfficialId(t),
+          ...templateStatusPatch(
+            status,
+            extractRejectionReason(t.rejected_reason ?? t.reason),
+            previous.get(`${name}|${language}`),
+            now,
+          ),
+          updated_at: now,
         },
         {
           onConflict: "workspace_id,name,language",
@@ -224,7 +255,7 @@ export async function syncTemplates(
     }
   }
 
-  return { synced, errors };
+  return { synced, errors, truncated };
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

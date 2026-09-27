@@ -9,13 +9,27 @@
  * public.fn(a, b)"); that is a code bug, not a pending migration, so it does
  * not count. 42883 is Postgres' own undefined_function.
  */
-export function isMissingFunctionError(error: unknown, fnName: string): boolean {
+export function isMissingFunctionError(
+  error: unknown,
+  fnName: string,
+  opts: {
+    /**
+     * Also count a PGRST202 whose hint names `fnName` with other parameters:
+     * an older version of the function is installed and the migration that
+     * replaces it hasn't run yet. Only for functions known to have shipped
+     * with another signature (e.g. #9's 4-parameter
+     * upsert_batch_and_link_message).
+     */
+    acceptOtherSignature?: boolean;
+  } = {},
+): boolean {
   const e = error as { code?: unknown; message?: unknown; hint?: unknown } | null;
   if (!e) return false;
   if (e.code === "42883") {
     return typeof e.message === "string" && e.message.includes(fnName);
   }
   if (e.code !== "PGRST202") return false;
+  if (opts.acceptOtherSignature) return true;
   const hint = typeof e.hint === "string" ? e.hint : "";
   return !hint.includes(`.${fnName}(`);
 }

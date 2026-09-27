@@ -36,6 +36,7 @@ export const WORKSPACE_WHATSAPP_SETTINGS = [
   "message_history_window",
   "handoff_ack_enabled",
   "handoff_ack_message",
+  "cost_cut_handoff",
   "jev_enabled",
   "jev_stage",
   "jev_reply",

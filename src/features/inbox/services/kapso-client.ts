@@ -46,6 +46,10 @@ function extractKapsoErrorMessage(body: unknown): string | null {
 }
 
 /** Single place where every Kapso call parses its response and raises. */
+// A call that hangs must not eat the function's time budget. For a send, past
+// this the message may or may not have left: dispatch treats it as final.
+const KAPSO_TIMEOUT_MS = 20_000;
+
 async function kapsoFetch(
   url: string,
   apiKey: string,
@@ -53,6 +57,7 @@ async function kapsoFetch(
   context: string,
 ): Promise<Record<string, unknown>> {
   const response = await fetch(url, {
+    signal: AbortSignal.timeout(KAPSO_TIMEOUT_MS),
     ...init,
     headers: {
       ...(init.body ? { "Content-Type": "application/json" } : {}),
@@ -218,8 +223,13 @@ export async function fetchKapsoTemplates(
   apiKey: string,
   wabaId: string,
 ): Promise<unknown[]> {
+  // `rejected_reason` is NOT in Graph's default field set for this edge, so it
+  // has to be asked for — and asking for fields means listing every field the
+  // sync reads (see syncTemplates). VERIFICAR EN PROD: that Kapso forwards
+  // `fields` to Graph and still returns every template with it.
+  const fields = "id,name,language,category,status,components,rejected_reason";
   const data = await kapsoFetch(
-    `${KAPSO_WA_BASE}/${encodeURIComponent(wabaId)}/message_templates?limit=100`,
+    `${KAPSO_WA_BASE}/${encodeURIComponent(wabaId)}/message_templates?limit=100&fields=${fields}`,
     apiKey,
     { method: "GET" },
     "fetchTemplates",

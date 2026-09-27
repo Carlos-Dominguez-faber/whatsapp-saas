@@ -64,6 +64,18 @@ export async function POST(
 
   const { description, category, useCase } = parsed.data;
 
+  // Meta only takes authentication templates from its own library (a one-time
+  // password button, no free text), so drafting one would be rejected anyway.
+  if (category === "authentication") {
+    return NextResponse.json(
+      {
+        error:
+          "Las plantillas de autenticación (códigos de verificación) las tiene que crear WhatsApp desde su biblioteca oficial; no se pueden redactar con IA. Elige Utilidad o Marketing.",
+      },
+      { status: 400 },
+    );
+  }
+
   const userMessage = `Crea una plantilla de WhatsApp para: ${description}. Categoría: ${category}. Caso de uso: ${useCase}. Devuelve SOLO el texto de la plantilla, sin explicaciones.`;
 
   const guard = await guardWorkspaceLlmCall(workspaceId, "template_generate");

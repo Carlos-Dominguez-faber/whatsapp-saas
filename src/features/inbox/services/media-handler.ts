@@ -226,9 +226,32 @@ export async function patchMessageMedia(
   mediaMeta: MediaMeta,
 ): Promise<void> {
   const supabase = svc();
+
+  // Merge, don't replace: `meta` also holds what the normalizer wrote
+  // (from_name, origin…). Read-modify-write without a lock — only this job
+  // touches a message's media meta; if that changes, move the merge into SQL
+  // (`meta || jsonb`).
+  const { data: existing, error: readError } = await supabase
+    .from("messages")
+    .select("meta")
+    .eq("id", messageId)
+    .eq("workspace_id", workspaceId)
+    .maybeSingle();
+
+  // Without the current meta, writing now would erase it: better to lose the
+  // media patch than the normalizer's fields.
+  if (readError) {
+    console.error(
+      "[media-handler] patchMessageMedia could not read the current meta:",
+      readError.message,
+      messageId,
+    );
+    return;
+  }
+
   const { error } = await supabase
     .from("messages")
-    .update({ meta: mediaMeta })
+    .update({ meta: { ...((existing?.meta as object) ?? {}), ...mediaMeta } })
     .eq("id", messageId)
     .eq("workspace_id", workspaceId);
 

@@ -23,6 +23,12 @@ const insertedRows: unknown[] = [];
 let insertErrorToReturn: unknown = null;
 let rpcResponse: QueueEntry = { data: null, error: null };
 let rpcCalls: Array<{ fn: string; args: unknown }> = [];
+let updateResponseQueue: Array<{ error: unknown }> = [];
+function nextUpdateResponse(): { error: unknown } {
+  return updateResponseQueue.length > 0
+    ? updateResponseQueue.shift()!
+    : { error: insertErrorToReturn };
+}
 const updateCalls: Array<{ row: unknown; eqArgs: unknown[][] }> = [];
 
 function nextResponse(): QueueEntry {
@@ -71,7 +77,7 @@ const fakeClient = {
             return chain;
           },
           then(resolve: (v: { error: unknown }) => void) {
-            resolve({ error: insertErrorToReturn });
+            resolve(nextUpdateResponse());
           },
         };
         return chain;
@@ -382,4 +388,65 @@ test("recordLlmUsage updates the reservation row in place when a reservationId i
     total_tokens: 150,
     contact_id: "contact_1",
   });
+});
+
+test("recordLlmUsage throws after exhausting retries when the reservation UPDATE keeps failing — an untracked reservation must not look like a success", async () => {
+  updateCalls.length = 0;
+  insertErrorToReturn = { message: "update boom" };
+  const errorLogs: unknown[][] = [];
+  const originalError = console.error;
+  console.error = (...args: unknown[]) => {
+    errorLogs.push(args);
+  };
+  try {
+    await assert.rejects(
+      () =>
+        recordLlmUsage(
+          {
+            reservationId: "res_1",
+            workspaceId: "ws_1",
+            conversationId: "conv_1",
+            contactId: "contact_1",
+            model: "openai/gpt-4o",
+            promptTokens: 100,
+            completionTokens: 50,
+          },
+          { delayMs: 0, sleep: async () => {} },
+        ),
+      /Failed to update llm_usage reservation res_1/,
+    );
+  } finally {
+    console.error = originalError;
+    insertErrorToReturn = null;
+  }
+  assert.equal(updateCalls.length, 3);
+  assert.ok(
+    errorLogs.some((args) =>
+      String(args[0]).includes(
+        "failed to update llm_usage reservation after retries",
+      ),
+    ),
+  );
+});
+
+test("recordLlmUsage retries the reservation UPDATE and succeeds on a later attempt — a transient blip must not re-trigger the already-paid-for LLM call", async () => {
+  updateCalls.length = 0;
+  updateResponseQueue = [
+    { error: { message: "transient blip" } },
+    { error: null },
+  ];
+  await recordLlmUsage(
+    {
+      reservationId: "res_1",
+      workspaceId: "ws_1",
+      conversationId: "conv_1",
+      contactId: "contact_1",
+      model: "openai/gpt-4o",
+      promptTokens: 100,
+      completionTokens: 50,
+    },
+    { delayMs: 0, sleep: async () => {} },
+  );
+  assert.equal(updateCalls.length, 2);
+  updateResponseQueue = [];
 });

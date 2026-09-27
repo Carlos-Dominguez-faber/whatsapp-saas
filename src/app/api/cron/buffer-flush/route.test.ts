@@ -2,16 +2,25 @@ import assert from "node:assert/strict";
 import { test, mock } from "node:test";
 
 const processCalls: number[] = [];
+let reconcileCalls = 0;
+// Results processNextBatch returns in order; empty → nothing left to claim.
+let queue: Array<{ processed: boolean; error?: string }> = [];
+let timeLeft = true;
 mock.module("@/features/inbox/services/buffer.ts", {
   exports: {
     processNextBatch: async () => {
       processCalls.push(1);
-      return { processed: false };
+      return queue.shift() ?? { processed: false };
     },
+    reconcileOrphanedMessages: async () => {
+      reconcileCalls++;
+      return 2;
+    },
+    hasTimeToClaim: () => timeLeft,
   },
 });
 
-const { GET } = await import("./route.ts");
+const { GET, maxDuration } = await import("./route.ts");
 
 function req(auth?: string) {
   return new Request("http://localhost/api/cron/buffer-flush", {
@@ -40,6 +49,40 @@ test("runs the drain with the right bearer", async () => {
   processCalls.length = 0;
   const res = await GET(req("Bearer s3cret"));
   assert.equal(res.status, 200);
-  assert.deepEqual(await res.json(), { ok: true, processed: 0 });
+  assert.deepEqual(await res.json(), { ok: true, processed: 0, recovered: 2 });
   assert.equal(processCalls.length, 1);
+});
+
+test("orphans are reconciled only for an authorized tick", async () => {
+  delete process.env.CRON_SECRET;
+  reconcileCalls = 0;
+  await GET(req("Bearer undefined"));
+  assert.equal(reconcileCalls, 0);
+  process.env.CRON_SECRET = "s3cret";
+  await GET(req("Bearer s3cret"));
+  assert.equal(reconcileCalls, 1);
+});
+
+test("declares maxDuration below claim_next_batch's 7-minute lease", () => {
+  assert.equal(maxDuration, 300);
+});
+
+test("a failed batch doesn't stop the drain; nothing left does", async () => {
+  process.env.CRON_SECRET = "s3cret";
+  processCalls.length = 0;
+  timeLeft = true;
+  queue = [{ processed: true }, { processed: false, error: "boom" }, { processed: true }];
+  const res = await GET(req("Bearer s3cret"));
+  assert.equal(processCalls.length, 4, "3 results, then an empty claim ends it");
+  assert.equal((await res.json()).processed, 2);
+});
+
+test("no batch is claimed without time left to finish it", async () => {
+  process.env.CRON_SECRET = "s3cret";
+  processCalls.length = 0;
+  timeLeft = false;
+  queue = [{ processed: true }];
+  await GET(req("Bearer s3cret"));
+  assert.equal(processCalls.length, 0);
+  timeLeft = true;
 });

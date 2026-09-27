@@ -13,8 +13,10 @@ import { createClient as createSbClient } from "@supabase/supabase-js";
 import {
   createYCloudTemplate,
   resolveWabaId,
+  WabaNotFoundError,
   YCloudError,
 } from "@/features/inbox/services/ycloud-client";
+import { phoneString } from "@/features/inbox/services/phone";
 import {
   createKapsoTemplate,
   KapsoError,
@@ -25,6 +27,10 @@ import {
   whatsappApiKey,
   WHATSAPP_PROVIDER_LABELS,
 } from "@/features/inbox/services/whatsapp-provider";
+import {
+  formatErrorForLog,
+  parseTemplateError,
+} from "@/features/inbox/services/whatsapp-errors";
 import {
   buildTemplatePayload,
   createTemplateSchema,
@@ -122,8 +128,20 @@ export async function POST(
   const buttons = (
     Array.isArray(row.buttons) ? row.buttons : []
   ) as TemplateButton[];
-  const category =
-    (row.category as string) === "marketing" ? "marketing" : "utility";
+  // Meta only takes authentication templates from its own library: sending
+  // one as UTILITY with free text is rejected every time. Rows synced before
+  // the category was normalized may carry it uppercase.
+  const rowCategory = String(row.category ?? "").trim().toLowerCase();
+  if (rowCategory === "authentication") {
+    return NextResponse.json(
+      {
+        error:
+          "Las plantillas de autenticación no se pueden enviar desde aquí: WhatsApp exige crearlas desde su biblioteca oficial. Cambia la categoría a Utilidad o Marketing.",
+      },
+      { status: 400 },
+    );
+  }
+  const category = rowCategory === "marketing" ? "marketing" : "utility";
 
   const input: CreateTemplateInput = {
     name: row.name as string,
@@ -184,8 +202,7 @@ export async function POST(
       }
       result = await createKapsoTemplate(apiKey, wabaId, payload);
     } else {
-      const phoneNumber =
-        (whatsapp.config.phone_number as string | undefined) ?? "";
+      const phoneNumber = phoneString(whatsapp.config.phone_number) ?? "";
       if (!phoneNumber) {
         return NextResponse.json(
           { error: "Falta el número de WhatsApp en la configuración de YCloud" },
@@ -221,12 +238,19 @@ export async function POST(
 
     return NextResponse.json({ data: updated });
   } catch (err) {
+    if (err instanceof WabaNotFoundError) {
+      return NextResponse.json({ error: err.message }, { status: 422 });
+    }
     if (err instanceof YCloudError || err instanceof KapsoError) {
-      console.error(`[templates/submit] ${label} error:`, err.status, err.body);
-      return NextResponse.json(
-        { error: `${label} rechazó la plantilla: ${err.message}` },
-        { status: 502 },
+      // `err.message` carries Meta's raw text: server log only. The team gets
+      // the catalog's Spanish reason.
+      const waError = parseTemplateError(err.body, err.status);
+      console.error(
+        `[templates/submit] ${label} error:`,
+        formatErrorForLog(waError),
+        err.message,
       );
+      return NextResponse.json({ error: waError.message }, { status: 502 });
     }
     console.error("[templates/submit] error:", err);
     return NextResponse.json(

@@ -1,4 +1,6 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
+import { extractWebhookError, type WhatsAppError } from "./whatsapp-errors";
+import { inboundContentText } from "./inbound-content";
 
 /**
  * Verifies a Kapso webhook signature.
@@ -48,6 +50,8 @@ export interface NormalizedInbound {
   from: string;
   /** Message type as reported by Kapso */
   type: string;
+  /** The provider's own message type, before clamping (e.g. "reaction"). */
+  rawType: string;
   /** Text content, the media caption, or "[Multimedia]" when neither exists */
   text: string | null;
   /** WhatsApp message ID */
@@ -233,7 +237,8 @@ export function parseInbound(
 
       if (text === null) text = "[Multimedia]";
     } else {
-      text = "[Multimedia]";
+      // Button taps, list/interactive replies, orders, locations…
+      text = inboundContentText(message, msgType);
     }
 
     // Kapso transcribes voice notes for us; media-understanding can skip the
@@ -246,6 +251,7 @@ export function parseInbound(
       phoneNumberId,
       from,
       type: toMessageType(msgType),
+      rawType: msgType,
       text,
       wamid,
       customerName,
@@ -349,6 +355,8 @@ const STATUS_EVENTS: Record<string, string> = {
 export interface ParsedStatus {
   wamid: string;
   status: string;
+  /** Only on 'failed': why, already translated for the team. */
+  error: WhatsAppError | null;
 }
 
 /**
@@ -372,7 +380,13 @@ export function parseStatusUpdate(
     const wamid = asString(message?.id) ?? asString(event.message_id);
     if (!wamid) return null;
 
-    return { wamid, status };
+    // A 'failed' without a reason is the silent red icon: the extractor
+    // walks the envelope's candidates and falls back to a generic text.
+    return {
+      wamid,
+      status,
+      error: status === "failed" ? extractWebhookError(event) : null,
+    };
   } catch {
     return null;
   }
