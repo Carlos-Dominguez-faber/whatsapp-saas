@@ -932,7 +932,11 @@ test("an empty reply after a write that timed out hands off too (it may have hap
   generated = { text: "", tools: [{ name: "schedule_highlevel", sensitivity: "write", ok: null }] };
   const result = await processNextBatch();
   assert.equal(result.processed, true);
-  assert.equal(transitions[0]?.trigger, "empty_reply");
+  // Nothing was sent: the contact gets the generic acknowledgement.
+  assert.equal(transitions[0]?.trigger, "tool_unsent:tool_failed");
+  const note = notes().find((n) => (n.meta as Row).reason === "write_tool_unfinished");
+  assert.match(String(note?.body), /schedule_highlevel/);
+  assert.equal(batchRow().status, "processed");
 });
 
 test("the budget cut hands off to a person only when the workspace opted in", async () => {
@@ -1294,6 +1298,9 @@ test("a write whose outcome is unknown, followed by a reply, leaves a note for t
   const note = notes().find((n) => (n.meta as Row).reason === "write_tool_unfinished");
   assert.ok(note, "a person is told to check");
   assert.match(String(note!.body), /cancel_highlevel/);
+  // The reply promised a person: one gets the conversation, after it.
+  assert.deepEqual(transitions, [{ to: "handoff_pending", trigger: "tool:tool_failed" }]);
+  assert.ok(calls.indexOf("dispatch") < calls.indexOf("transition"), calls.join(" → "));
 });
 
 test("a confirmed write followed by a reply leaves no note", async () => {
@@ -1350,12 +1357,142 @@ test("a handoff that fails once is retried", async () => {
   assert.equal(notes().length, 0);
 });
 
-test("a handoff that keeps failing is made visible: event and internal note", async () => {
+/** The reply this batch sent, as dispatchText would have stored it. */
+function sentReply() {
+  tables.messages.push({
+    id: "out_1",
+    workspace_id: "ws_1",
+    conversation_id: "conv_1",
+    direction: "out",
+    status: "sent",
+    meta: { batch_id: "batch_1" },
+  });
+}
+
+test("a handoff that keeps failing is re-queued with backoff; the retry hands off without sending twice", async () => {
   reset();
   generated = { text: "Te paso con una persona.", toolResults: [HANDOFF_RESULT] };
+  transitionError = new Error("db down");
+  const before = Date.now();
+  const result = await processNextBatch();
+  assert.equal(result.processed, false);
+  assert.equal(dispatchArgs.length, 1);
+  const row = batchRow();
+  const meta = row.meta as Row;
+  assert.equal(row.status, "buffering");
+  assert.equal(meta.pending_handoff, "customer_request");
+  assert.equal(meta.pending_reply, "Te paso con una persona.");
+  assert.equal(meta.handoff_attempts, 1);
+  assert.equal(meta.isolated, true);
+  assert.equal(Math.round((Date.parse(String(row.flush_at)) - before) / 60_000), 1);
+  // Not reported yet: it will be tried again.
+  assert.ok(!tables.events.some((e) => e.type === "handoff_failed"));
+  assert.equal(notes().length, 0);
+
+  // The next attempt: the reply is found sent, and only the handoff runs.
+  sentReply();
+  row.status = "processing";
+  transitionError = null;
+  const retry = await processNextBatch();
+  assert.equal(retry.processed, true);
+  assert.equal(dispatchArgs.length, 1, "never sent twice");
+  assert.deepEqual(transitions, [{ to: "handoff_pending", trigger: "tool:customer_request" }]);
+  assert.equal(batchRow().status, "processed");
+});
+
+test("a handoff still failing on its last attempt is made visible: event and internal note", async () => {
+  reset({
+    retry_count: 1,
+    pending_reply: "Te paso con una persona.",
+    pending_handoff: "customer_request",
+    handoff_attempts: 3,
+  });
+  sentReply();
   transitionError = new Error("db down");
   await processNextBatch();
   assert.equal(calls.filter((c) => c === "transition").length, 2);
   assert.ok(tables.events.some((e) => e.type === "handoff_failed"));
   assert.ok(notes().some((n) => (n.meta as Row).reason === "handoff_failed"));
+  assert.equal(batchRow().status, "processed");
+});
+
+test("a handoff refused because the conversation left the AI is settled, not re-queued", async () => {
+  reset();
+  generated = { text: "Te paso con una persona.", toolResults: [HANDOFF_RESULT] };
+  transitionError = Object.assign(new Error("already with a person"), { name: "TransitionError" });
+  const result = await processNextBatch();
+  assert.equal(result.processed, true);
+  assert.equal(batchRow().status, "processed");
+  assert.equal(calls.filter((c) => c === "transition").length, 1);
+});
+
+test("an owed handoff with no reply is re-queued too when it fails, and the next attempt hands off", async () => {
+  reset({ retry_count: 1, pending_handoff: "agent_stuck" });
+  transitionError = new Error("db down");
+  const result = await processNextBatch();
+  assert.equal(result.processed, false);
+  assert.equal(batchRow().status, "buffering");
+  assert.equal((batchRow().meta as Row).handoff_attempts, 1);
+  assert.ok(!calls.includes("generate"));
+
+  batchRow().status = "processing";
+  transitionError = null;
+  await processNextBatch();
+  assert.deepEqual(transitions, [{ to: "handoff_pending", trigger: "tool_unsent:agent_stuck" }]);
+  assert.ok(!calls.includes("generate"));
+});
+
+// ── a scheduling tool that promised a person ─────────────────────────────────
+
+test("a scheduling tool answering needs_human hands off after the reply, without the generic acknowledgement", async () => {
+  reset();
+  generated = {
+    text: "El calendario dio un error y tu cita no se canceló; una persona del equipo lo revisará.",
+    tools: [
+      { name: "cancel_highlevel", sensitivity: "write", ok: false, output: { needs_human: true } },
+    ],
+  };
+  const result = await processNextBatch();
+  assert.equal(result.processed, true);
+  assert.deepEqual(transitions, [{ to: "handoff_pending", trigger: "tool:tool_failed" }]);
+  assert.ok(calls.indexOf("dispatch") < calls.indexOf("transition"), calls.join(" → "));
+  assert.ok(
+    batchUpdates().some((u) => (u.meta as Row | undefined)?.pending_handoff === "tool_failed"),
+    "saved when the tool answered, so a failed turn still hands off",
+  );
+  // It changed nothing: no write left to check.
+  assert.equal(notes().length, 0);
+});
+
+test("needs_human from a tool that isn't a scheduling tool moves nothing", async () => {
+  reset();
+  generated = {
+    text: "Listo.",
+    tools: [{ name: "n8n_lookup", sensitivity: "read", ok: false, output: { needs_human: true } }],
+  };
+  await processNextBatch();
+  assert.equal(transitions.length, 0);
+});
+
+test("handoff_human's reason wins over tool_failed in the same turn", async () => {
+  reset();
+  generated = {
+    text: "Te paso con una persona.",
+    tools: [{ name: "reschedule_highlevel", sensitivity: "write", ok: false, output: { needs_human: true } }],
+    toolResults: [HANDOFF_RESULT],
+  };
+  await processNextBatch();
+  assert.deepEqual(transitions, [{ to: "handoff_pending", trigger: "tool:customer_request" }]);
+});
+
+test("a retry owing a handoff after a write still tells the team to check the write", async () => {
+  reset({
+    retry_count: 1,
+    pending_handoff: "agent_stuck",
+    write_tools_ran: [{ id: "call_1", name: "schedule_highlevel", ok: true }],
+  });
+  await processNextBatch();
+  assert.deepEqual(transitions, [{ to: "handoff_pending", trigger: "tool_unsent:agent_stuck" }]);
+  const note = notes().find((n) => (n.meta as Row).reason === "write_tool_unfinished");
+  assert.match(String(note?.body), /schedule_highlevel/);
 });

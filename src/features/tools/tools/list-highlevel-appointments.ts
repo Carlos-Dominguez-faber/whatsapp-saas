@@ -50,7 +50,7 @@ async function run(_args: Args, ctx: ToolContext): Promise<ToolResult> {
     return {
       ok: false,
       output: null,
-      error: "No pude consultar la agenda en este momento. Dile al cliente que una persona del equipo lo revisará.",
+      error: "No pude consultar la agenda en este momento. Dile al cliente que lo revisarás, o pásalo a una persona.",
     };
   }
 }

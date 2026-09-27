@@ -43,6 +43,8 @@ const TRIGGER_LABELS: Record<string, string> = {
   agent_stuck: "el agente de IA no pudo resolver la consulta por su cuenta",
   handoff_failed:
     "no se pudo pasar la conversación a una persona automáticamente y la IA sigue activa",
+  tool_failed:
+    "una acción de agenda falló o no se pudo confirmar, y se le dijo al cliente que una persona lo revisará",
 };
 
 function describeTrigger(trigger: string): string {
