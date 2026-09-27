@@ -8,7 +8,7 @@ BEGIN;
 CREATE EXTENSION IF NOT EXISTS pgtap WITH SCHEMA extensions;
 SET search_path = public, extensions;
 
-SELECT plan(122);
+SELECT plan(127);
 
 -- ── public.users: read-only for sessions ────────────────────────────────────
 SELECT ok(NOT has_table_privilege('authenticated', 'public.users', 'UPDATE'),
@@ -566,6 +566,30 @@ SELECT is((SELECT sensitivity::text FROM public.tools WHERE key = 'list_highleve
   'list_highlevel_appointments is a read tool');
 SELECT ok(NOT has_table_privilege('authenticated', 'public.events', 'INSERT'),
   'sessions have no INSERT on events');
+
+-- ── one local appointment per HighLevel appointment ─────────────────────────
+INSERT INTO public.appointments (workspace_id, scheduled_at, hl_appointment_id)
+  VALUES ('b0000000-0000-4000-8000-000000000001', now() + interval '1 day', 'hl_dup_test');
+SELECT throws_ok(
+  $$INSERT INTO public.appointments (workspace_id, scheduled_at, hl_appointment_id)
+    VALUES ('b0000000-0000-4000-8000-000000000001', now() + interval '2 days', 'hl_dup_test')$$,
+  '23505', NULL, 'a second local row cannot hold the same HighLevel appointment');
+SELECT lives_ok(
+  $$INSERT INTO public.appointments (workspace_id, scheduled_at, hl_appointment_id)
+    VALUES ('a0000000-0000-4000-8000-000000000001', now() + interval '2 days', 'hl_dup_test')$$,
+  'another workspace keeps its own row for that id');
+SELECT lives_ok(
+  $$INSERT INTO public.appointments (workspace_id, scheduled_at) VALUES
+    ('b0000000-0000-4000-8000-000000000001', now() + interval '3 days'),
+    ('b0000000-0000-4000-8000-000000000001', now() + interval '3 days')$$,
+  'rows booked without HighLevel carry no id and never collide');
+SELECT ok(
+  (SELECT indexdef LIKE '%WHERE (hl_appointment_id IS NOT NULL)%'
+     FROM pg_indexes WHERE indexname = 'uq_appointments_workspace_hl_appointment_id'),
+  'the unique index covers only rows with a HighLevel id');
+SELECT ok(
+  (SELECT schema #> '{properties,timezone}' IS NULL FROM public.tools WHERE key = 'check_availability'),
+  'check_availability no longer takes a time zone from the model');
 
 -- ── password-reset audit: append-only, server-only ──────────────────────────
 SELECT ok(NOT has_table_privilege('authenticated', 'public.member_password_resets', 'SELECT'),
