@@ -6,6 +6,7 @@ import {
   APPOINTMENT_TOOL_TIMEOUT_MS,
   confirmedInstantError,
   describeInstant,
+  hasTimeToLookUp,
   hasTimeToWrite,
   hlTimeZone,
   localMetaOf,
@@ -137,6 +138,9 @@ async function run(args: Args, ctx: ToolContext, opts?: ToolRunOptions): Promise
   }
 
   if (located.kind !== "found") {
+    // Without the time to check whether this is a retry of a move that went
+    // through, nothing was changed: that much is true.
+    if (!hasTimeToLookUp(startedAt, budgetMs)) return unconfirmed();
     // A retry of a move this tool made: HighLevel has the appointment live at
     // the new time, and its local row records the time it was moved from.
     let atNew;

@@ -42,7 +42,7 @@ async function run(_args: Args, ctx: ToolContext): Promise<ToolResult> {
     const notes: string[] = [];
     if (appointments.length > 0) {
       notes.push("Para cancelar o reagendar, copia datetime_iso exactamente como aparece.");
-    } else if (unreadable === 0) {
+    } else if (unreadable === 0 && !more) {
       notes.push("El cliente no tiene citas próximas registradas.");
     }
     // A read that failed is not "no appointment": the model must not say so.
@@ -51,7 +51,11 @@ async function run(_args: Args, ctx: ToolContext): Promise<ToolResult> {
         `No pude leer ${unreadable === 1 ? "una de sus citas" : `${unreadable} de sus citas`} en el calendario: puede tener más de las que aparecen.`,
       );
     }
-    if (more) notes.push("Tiene más citas próximas que no aparecen aquí.");
+    if (more) {
+      notes.push(
+        "Tiene más citas en el calendario que no aparecen aquí: no le digas que no tiene otras; pregúntale la fecha de la que busca.",
+      );
+    }
     return { ok: true, output: { appointments, note: notes.join(" ") } };
   } catch (err) {
     console.error("[list_highlevel_appointments] lookup failed:", err);

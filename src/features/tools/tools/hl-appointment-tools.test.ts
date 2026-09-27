@@ -75,6 +75,8 @@ function hlFetch(opts: {
   putThrows?: boolean;
   /** HTTP status of GET /contacts/{id}/appointments (200 by default). */
   contactListStatus?: number;
+  /** Local writes (write-backs) fail with a database error. */
+  localWritesFail?: boolean;
 }) {
   const calls: FetchCall[] = [];
   const fn = async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
@@ -109,6 +111,7 @@ function hlFetch(opts: {
     }
     if (url.includes("/rest/v1/appointments")) {
       if (method === "GET") return json(200, filterRows(url, opts.local ?? []));
+      if (opts.localWritesFail) return json(500, { message: "db down", code: "XX000" });
       return new Response(null, { status: 201 });
     }
     if (url.includes("/rest/v1/contacts")) {
@@ -280,9 +283,12 @@ test("cancel: HighLevel's status decides, not the local row's", async () => {
   assert.deepEqual((await cancelAt(stale)).output, { cancelled: true });
   assert.deepEqual(putIds(stale.calls), ["hl_a1"]);
 
-  // HighLevel no longer has it (404): already cancelled there.
+  // HighLevel answers 404 for it: unknown, never "already cancelled".
   const gone = hlFetch({ local: [active("a1", CONFIRMED_UTC)], hlEvents: { hl_a1: null } });
-  assert.deepEqual((await cancelAt(gone)).output, { cancelled: true, already_cancelled: true });
+  const unknown = await cancelAt(gone);
+  assert.deepEqual(unknown.output, { needs_human: true });
+  assert.match(unknown.error ?? "", /No pude confirmar/);
+  assert.equal(puts(gone.calls).length, 0);
 });
 
 test("cancel: two live appointments at the same time are ambiguous: none is cancelled, a person is told", async () => {
@@ -756,4 +762,197 @@ test("parseHLTime: an explicit offset is the instant it names, even at a wall cl
     new Date(parseHLTime("2026-06-12 10:00:00", "Europe/Madrid")!).toISOString(),
     "2026-06-12T08:00:00.000Z",
   );
+});
+
+// ── every candidate near the time is read; what isn't read is unknown ──────
+
+/** `n` appointments the contact endpoint lists at the confirmed time. */
+const listedAt = (prefix: string, n: number, status: string) =>
+  Array.from({ length: n }, (_, i) => listed(`${prefix}${i}`, "2030-06-12 10:00:00", status));
+
+test("more than 5 candidates: cancelled ones listed first don't hide the live one at that time", async () => {
+  const fake = hlFetch({
+    ...withCalendar,
+    hlContactEvents: [...listedAt("c", 5, "cancelled"), listed("hl_live", "2030-06-12 10:00:00")],
+    hlEvents: {
+      ...Object.fromEntries(
+        Array.from({ length: 5 }, (_, i) => [`c${i}`, { appointmentStatus: "cancelled", startTime: CONFIRMED }]),
+      ),
+      hl_live: { appointmentStatus: "confirmed", startTime: CONFIRMED },
+    },
+  });
+  const result = await cancelAt(fake);
+  assert.deepEqual(result.output, { cancelled: true });
+  assert.deepEqual(putIds(fake.calls), ["hl_live"]);
+});
+
+test("a wrong zone for the bare times plus earlier appointments still reads the one at that time", async () => {
+  // Read in Madrid, the bare times are 7-8 h off; four earlier appointments
+  // are nearer by that reading. Within the day of margin, all are read.
+  const fake = hlFetch({
+    ...withCalendar,
+    hlTimezone: "Europe/Madrid",
+    hlContactEvents: [
+      listed("e1", "2030-06-12 08:00:00"),
+      listed("e2", "2030-06-12 07:00:00"),
+      listed("e3", "2030-06-12 06:00:00"),
+      listed("e4", "2030-06-12 05:00:00"),
+      listed("hl_live", "2030-06-12 10:00:00"),
+    ],
+    hlEvents: {
+      e1: { appointmentStatus: "confirmed", startTime: "2030-06-12T08:00:00-06:00" },
+      e2: { appointmentStatus: "confirmed", startTime: "2030-06-12T07:00:00-06:00" },
+      e3: { appointmentStatus: "confirmed", startTime: "2030-06-12T06:00:00-06:00" },
+      e4: { appointmentStatus: "confirmed", startTime: "2030-06-12T05:00:00-06:00" },
+      hl_live: { appointmentStatus: "confirmed", startTime: CONFIRMED },
+    },
+  });
+  assert.deepEqual((await cancelAt(fake)).output, { cancelled: true });
+  assert.deepEqual(putIds(fake.calls), ["hl_live"]);
+});
+
+test("past the read bound with no live match: 'no pude confirmar', never 'already cancelled'", async () => {
+  const fake = hlFetch({
+    ...withCalendar,
+    hlContactEvents: listedAt("c", 21, "cancelled"),
+    hlEvents: Object.fromEntries(
+      Array.from({ length: 21 }, (_, i) => [`c${i}`, { appointmentStatus: "cancelled", startTime: CONFIRMED }]),
+    ),
+  });
+  const result = await cancelAt(fake);
+  assert.deepEqual(result.output, { needs_human: true });
+  assert.match(result.error ?? "", /No pude confirmar/);
+  const reads = fake.calls.filter((c) => c.method === "GET" && c.url.includes("/calendars/events/appointments/"));
+  assert.equal(reads.length, 20, "bounded");
+});
+
+test("ties go live-first: the live one listed after 21 cancelled ones is still read and found", async () => {
+  const fake = hlFetch({
+    ...withCalendar,
+    hlContactEvents: [...listedAt("c", 21, "cancelled"), listed("hl_live", "2030-06-12 10:00:00")],
+    hlEvents: {
+      ...Object.fromEntries(
+        Array.from({ length: 21 }, (_, i) => [`c${i}`, { appointmentStatus: "cancelled", startTime: CONFIRMED }]),
+      ),
+      hl_live: { appointmentStatus: "confirmed", startTime: CONFIRMED },
+    },
+  });
+  assert.deepEqual((await cancelAt(fake)).output, { cancelled: true });
+  assert.deepEqual(putIds(fake.calls), ["hl_live"]);
+});
+
+test("calendar: a 404 for an id the contact endpoint just listed is unknown, not cancelled", async () => {
+  const fake = hlFetch({
+    ...withCalendar,
+    hlContactEvents: [listed("hl_a1", "2030-06-12 10:00:00")],
+    hlEvents: { hl_a1: null },
+  });
+  const result = await cancelAt(fake);
+  assert.deepEqual(result.output, { needs_human: true });
+  assert.equal(puts(fake.calls).length, 0);
+});
+
+// ── without a calendar, HighLevel still decides ─────────────────────────────
+
+test("no calendar: HighLevel moved the appointment the cache has at 10:00 — the list and cancel follow HighLevel", async () => {
+  const setup = {
+    local: [active("a1", CONFIRMED_UTC)],
+    hlEvents: { hl_a1: { appointmentStatus: "confirmed", startTime: "2030-06-12T12:00:00-06:00" } },
+  };
+  const out = await listOf(hlFetch(setup));
+  assert.deepEqual(out.appointments.map((a) => a.datetime_iso), ["2030-06-12T12:00:00-06:00"]);
+
+  const cancel = hlFetch(setup);
+  assert.deepEqual((await cancelAt(cancel, "2030-06-12T12:00:00-06:00")).output, { cancelled: true });
+  assert.deepEqual(putIds(cancel.calls), ["hl_a1"]);
+
+  // At the stale time there's nothing to cancel.
+  const stale = hlFetch(setup);
+  assert.equal((await cancelAt(stale)).ok, false);
+  assert.equal(puts(stale.calls).length, 0);
+});
+
+test("no calendar: a row the cache calls booked but HighLevel cancelled is not listed", async () => {
+  const out = await listOf(
+    hlFetch({
+      local: [active("a1", CONFIRMED_UTC)],
+      hlEvents: { hl_a1: { appointmentStatus: "cancelled", startTime: CONFIRMED } },
+    }),
+  );
+  assert.deepEqual(out.appointments, []);
+});
+
+// ── the list: future first, and never "none" when more exist ────────────────
+
+test("list: past-but-'confirmed' appointments don't fill it, and more than it shows is said", async () => {
+  const past = Array.from({ length: 6 }, (_, i) => listed(`p${i}`, `2020-06-1${i} 10:00:00`));
+  const future = Array.from({ length: 11 }, (_, i) =>
+    listed(`f${i}`, `2030-07-${String(i + 10).padStart(2, "0")} 10:00:00`),
+  );
+  const fake = hlFetch({
+    ...withCalendar,
+    hlContactEvents: [...past, ...future],
+    hlEvents: Object.fromEntries(
+      future.map((e, i) => [
+        e.id,
+        { appointmentStatus: "confirmed", startTime: `2030-07-${String(i + 10).padStart(2, "0")}T10:00:00-06:00` },
+      ]),
+    ),
+  });
+  const out = await listOf(fake);
+  assert.equal(out.appointments.length, 10);
+  assert.equal(out.appointments[0].datetime_iso, "2030-07-10T10:00:00-06:00");
+  assert.match(out.note, /Tiene más citas/);
+  assert.doesNotMatch(out.note, /no tiene citas próximas/);
+  // The past ones are never read.
+  assert.ok(!fake.calls.some((c) => /\/appointments\/p\d$/.test(c.url)));
+});
+
+// ── budget on reschedule ─────────────────────────────────────────────────────
+
+test("reschedule: with too little budget for the PUT, nothing is moved and it says so", async () => {
+  const fake = hlFetch({ local: [active("a1", CONFIRMED_UTC)] });
+  const result = await withFetch(fake, () =>
+    rescheduleHighLevelTool.run(
+      { appointment_datetime_iso: CONFIRMED, new_datetime_iso: NEW_TIME },
+      ctx,
+      { timeoutMs: 9_000 },
+    ),
+  );
+  assert.equal(result.ok, false);
+  assert.match(result.error ?? "", /NO se movió/);
+  assert.equal(puts(fake.calls).length, 0);
+});
+
+test("reschedule: not found, and no budget for the retry lookup: a person checks, nothing changed", async () => {
+  // 13 s: enough for a write (10 s), not for another lookup (14 s).
+  const fake = hlFetch({ ...withCalendar, hlContactEvents: [] });
+  const result = await withFetch(fake, () =>
+    rescheduleHighLevelTool.run(
+      { appointment_datetime_iso: CONFIRMED, new_datetime_iso: NEW_TIME },
+      ctx,
+      { timeoutMs: 13_000 },
+    ),
+  );
+  assert.deepEqual(result.output, { needs_human: true });
+  assert.match(result.error ?? "", /NO se movió/);
+  const lookups = fake.calls.filter((c) => c.url.includes("leadconnectorhq.com/contacts/"));
+  assert.equal(lookups.length, 1, "the retry lookup is skipped");
+});
+
+// ── the cache failing never fails the tool ──────────────────────────────────
+
+test("a failing write-back doesn't change the answer: cancel and list still work", async () => {
+  const cancel = hlFetch({ local: [active("a1", CONFIRMED_UTC)], localWritesFail: true });
+  assert.deepEqual((await cancelAt(cancel)).output, { cancelled: true });
+
+  const out = await listOf(
+    hlFetch({
+      ...withCalendar,
+      localWritesFail: true,
+      hlContactEvents: [listed("hl_a1", "2030-06-12 10:00:00")],
+      hlEvents: { hl_a1: { appointmentStatus: "confirmed", startTime: CONFIRMED } },
+    }),
+  );
+  assert.deepEqual(out.appointments.map((a) => a.datetime_iso), [CONFIRMED]);
 });
