@@ -334,6 +334,24 @@ test("'tool:tool_failed' dice que falló una acción de agenda", async () => {
   assert.match(bodies[0], /acción de agenda falló o no se pudo confirmar/);
 });
 
+test("'tool:write_unconfirmed' no habla de agenda", async () => {
+  reset();
+  const bodies: string[] = [];
+  globalThis.fetch = (async (_url: unknown, init?: RequestInit) => {
+    bodies.push(String(init?.body ?? ""));
+    return { ok: true } as Response;
+  }) as typeof fetch;
+
+  await notifyTeamHandoff({
+    workspaceId: "ws_1",
+    conversationId: "conv_1",
+    trigger: "tool:write_unconfirmed",
+  });
+
+  assert.match(bodies[0], /una acción de la IA no se pudo confirmar/);
+  assert.doesNotMatch(bodies[0], /agenda/);
+});
+
 // ── aislamiento de tenant en el contacto ──
 
 test("conversationId que no pertenece al workspace: NO manda correo", async () => {

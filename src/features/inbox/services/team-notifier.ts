@@ -45,6 +45,7 @@ const TRIGGER_LABELS: Record<string, string> = {
     "no se pudo pasar la conversación a una persona automáticamente y la IA sigue activa",
   tool_failed:
     "una acción de agenda falló o no se pudo confirmar, y se le dijo al cliente que una persona lo revisará",
+  write_unconfirmed: "una acción de la IA no se pudo confirmar; revisa qué quedó hecho",
 };
 
 function describeTrigger(trigger: string): string {

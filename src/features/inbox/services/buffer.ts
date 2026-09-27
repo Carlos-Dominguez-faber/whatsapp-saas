@@ -498,7 +498,9 @@ export function hasTimeToClaim(
  * - pending_handoff: the agent asked for a person (handoff_human), or a
  *   scheduling tool left something a person must settle (tool_failed) —
  *   honored even if the turn fails before its reply is sent, and retried
- *   (handoff_attempts) when the handoff itself fails.
+ *   (handoff_attempts) when the handoff itself fails; reply_settled then
+ *   says the reply already went out or never will, so it isn't dispatched
+ *   again.
  * A batch that carries any of them is `isolated`: it can't absorb new
  * messages, which would never get an answer from a reply already decided.
  */
@@ -540,6 +542,8 @@ const HANDOFF_REASONS = new Set(["customer_request", "agent_stuck"]);
  * reply promises a person, so one is handed the conversation after it.
  */
 const TOOL_FAILED = "tool_failed";
+/** The same for a write outside scheduling (an n8n tool): a generic label. */
+const WRITE_UNCONFIRMED = "write_unconfirmed";
 const NEEDS_HUMAN_TOOLS = new Set(["schedule_highlevel", "cancel_highlevel", "reschedule_highlevel"]);
 
 function needsHuman(execution: { name: string; ok: boolean | null; output?: unknown }): boolean {
@@ -580,7 +584,8 @@ function handoffReasonOf(output: unknown): string | null {
 /** The handoff an earlier attempt (or this turn's tools) decided. */
 function pendingHandoffOf(meta: Record<string, unknown>): string | null {
   const reason = meta.pending_handoff;
-  return typeof reason === "string" && (HANDOFF_REASONS.has(reason) || reason === TOOL_FAILED)
+  return typeof reason === "string" &&
+    (HANDOFF_REASONS.has(reason) || reason === TOOL_FAILED || reason === WRITE_UNCONFIRMED)
     ? reason
     : null;
 }
@@ -688,9 +693,28 @@ export async function processNextBatch(): Promise<ProcessBatchResult> {
           batch,
           `${earlierSend.delivered ? "tool" : "tool_unsent"}:${pendingHandoff}`,
           pendingHandoff,
+          earlierSend.delivered ? "sent" : "unsent",
         );
         if (outcome === "requeued") return requeued();
       }
+      await markBatchProcessed(batch, mergedText, supabase);
+      return done();
+    }
+
+    // The reply was settled — sent, or blocked or failed for good — by an
+    // attempt whose handoff then failed and was re-queued: only the handoff
+    // is left. A blocked reply is never dispatched again.
+    const replySettled = batch.meta.reply_settled;
+    if (pendingHandoff && (replySettled === "sent" || replySettled === "unsent")) {
+      progress.replySent = true;
+      const outcome = await handOffOrRequeue(
+        supabase,
+        batch,
+        `${replySettled === "sent" ? "tool" : "tool_unsent"}:${pendingHandoff}`,
+        pendingHandoff,
+        replySettled,
+      );
+      if (outcome === "requeued") return requeued();
       await markBatchProcessed(batch, mergedText, supabase);
       return done();
     }
@@ -1049,11 +1073,14 @@ export async function processNextBatch(): Promise<ProcessBatchResult> {
     // deliverReply doesn't send once the conversation left ai_active.
     // A write whose outcome is unknown (it threw, timed out, or never
     // reported back) was answered with "a person will confirm": one does.
-    if (
-      batch.meta.pending_handoff === undefined &&
-      writeRuns.some((w) => w.ok === null)
-    ) {
-      batch.meta = { ...batch.meta, pending_handoff: TOOL_FAILED };
+    const unconfirmed = writeRuns.filter((w) => w.ok === null);
+    if (batch.meta.pending_handoff === undefined && unconfirmed.length > 0) {
+      batch.meta = {
+        ...batch.meta,
+        pending_handoff: unconfirmed.some((w) => NEEDS_HUMAN_TOOLS.has(w.name))
+          ? TOOL_FAILED
+          : WRITE_UNCONFIRMED,
+      };
     }
     const handoffReason =
       findHandoffReason(reply.toolResults) ?? pendingHandoffOf(batch.meta);
@@ -1354,6 +1381,7 @@ async function deliverReply(
       batch,
       dispatchResult.ok ? `tool:${handoffReason}` : `tool_unsent:${handoffReason}`,
       handoffReason,
+      dispatchResult.ok ? "sent" : "unsent",
     );
     if (outcome === "requeued") return "requeued";
   }
@@ -1484,14 +1512,17 @@ async function handOff(
 /**
  * A handoff the batch owes (pending_handoff), with retries: when it fails
  * and attempts remain, the batch is re-queued with backoff, keeping
- * pending_handoff (and its reply, which settleEarlierSend won't send twice),
- * and the failure is reported only on the last attempt.
+ * pending_handoff, and the failure is reported only on the last attempt.
+ * `replySettled` records that this attempt's reply went out ("sent") or
+ * never will ("unsent": blocked, or failed for good), so the retry only
+ * hands off and never dispatches it again.
  */
 async function handOffOrRequeue(
   supabase: ReturnType<typeof svc>,
   batch: MessageBatch,
   trigger: string,
   reason: string,
+  replySettled?: "sent" | "unsent",
 ): Promise<"done" | "requeued"> {
   const attempt = handoffAttemptsOf(batch.meta) + 1;
   const canRetry = attempt <= MAX_BATCH_RETRIES;
@@ -1508,6 +1539,7 @@ async function handOffOrRequeue(
         ...batch.meta,
         pending_handoff: reason,
         handoff_attempts: attempt,
+        ...(replySettled ? { reply_settled: replySettled } : {}),
         isolated: true,
         last_error: `handoff failed (${trigger})`,
       },

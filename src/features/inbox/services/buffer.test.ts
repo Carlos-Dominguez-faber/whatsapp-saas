@@ -1442,6 +1442,26 @@ test("an owed handoff with no reply is re-queued too when it fails, and the next
   assert.ok(!calls.includes("generate"));
 });
 
+test("a blocked reply whose handoff is re-queued is never dispatched again", async () => {
+  reset();
+  generated = { text: "Te paso con una persona.", toolResults: [HANDOFF_RESULT] };
+  dispatchResult = { ok: false, retryable: false, errorCode: "WINDOW_EXPIRED" };
+  transitionError = new Error("db down");
+  await processNextBatch();
+  assert.equal(dispatchArgs.length, 1);
+  assert.equal((batchRow().meta as Row).reply_settled, "unsent");
+  assert.equal(batchRow().status, "buffering");
+
+  // The retry: no send row exists (it was blocked), yet nothing is sent.
+  batchRow().status = "processing";
+  transitionError = null;
+  dispatchResult = { ok: true };
+  await processNextBatch();
+  assert.equal(dispatchArgs.length, 1, "not dispatched again");
+  assert.deepEqual(transitions, [{ to: "handoff_pending", trigger: "tool_unsent:customer_request" }]);
+  assert.equal(batchRow().status, "processed");
+});
+
 // ── a scheduling tool that promised a person ─────────────────────────────────
 
 test("a scheduling tool answering needs_human hands off after the reply, without the generic acknowledgement", async () => {
@@ -1462,6 +1482,16 @@ test("a scheduling tool answering needs_human hands off after the reply, without
   );
   // It changed nothing: no write left to check.
   assert.equal(notes().length, 0);
+});
+
+test("an unconfirmed write outside scheduling hands off with a generic reason", async () => {
+  reset();
+  generated = {
+    text: "Listo, lo registré.",
+    tools: [{ name: "n8n_crear_pedido", sensitivity: "write", ok: null }],
+  };
+  await processNextBatch();
+  assert.deepEqual(transitions, [{ to: "handoff_pending", trigger: "tool:write_unconfirmed" }]);
 });
 
 test("needs_human from a tool that isn't a scheduling tool moves nothing", async () => {
