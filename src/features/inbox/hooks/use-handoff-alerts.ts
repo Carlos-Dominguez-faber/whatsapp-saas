@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { RealtimePostgresChangesPayload } from "@supabase/supabase-js";
 import { shouldNotifyHandoff } from "./handoff-alert";
+import { createClient } from "@/lib/supabase/client";
 import type { ConversationRow, ConversationWithContact } from "@/features/inbox/types";
 
 type NotificationSupport = "unsupported" | NotificationPermission;
@@ -36,7 +37,10 @@ export function getBaseTitle(): string {
  * navegador (si dio permiso). Degrada en silencio sin la Notification API o
  * sin permiso — el contador sigue funcionando igual.
  */
-export function useHandoffAlerts(conversations: ConversationWithContact[]) {
+export function useHandoffAlerts(
+  conversations: ConversationWithContact[],
+  workspaceId?: string,
+) {
   // Solo cuenta las conversaciones YA CARGADAS en el listado
   // (paginado a 50 en el inbox), así que puede quedar en 0 habiendo
   // handoff_pending más antiguos fuera de esa página. El mecanismo
@@ -81,6 +85,28 @@ export function useHandoffAlerts(conversations: ConversationWithContact[]) {
       conversations.filter((c) => c.state === "handoff_pending").map((c) => c.id),
     );
   }
+
+  // El listado trae solo la primera página: las que esperan más atrás se
+  // suman desde la base, para que un UPDATE suyo no parezca una entrada nueva.
+  useEffect(() => {
+    if (!workspaceId) return;
+    let cancelled = false;
+    createClient()
+      .from("conversations")
+      .select("id")
+      .eq("workspace_id", workspaceId)
+      .eq("state", "handoff_pending")
+      .limit(1000)
+      .then(({ data }) => {
+        if (cancelled) return;
+        for (const row of (data as { id: string }[] | null) ?? []) {
+          notifiedRef.current!.add(row.id);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [workspaceId]);
 
   const handleConversationChange = useCallback(
     (payload: RealtimePostgresChangesPayload<ConversationRow>) => {

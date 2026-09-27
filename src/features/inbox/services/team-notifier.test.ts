@@ -53,7 +53,7 @@ const fakeClient = {
         select: () => ({
           eq: () => ({
             eq: () => ({
-              in: () => ({ limit: async () => membershipsRow }),
+              in: async () => membershipsRow,
             }),
           }),
         }),
@@ -639,4 +639,35 @@ test("un usuario desactivado no recibe el aviso aunque su membresía siga activa
   }
   const emails = JSON.parse(fetchCalls[0].init.body) as Array<{ to: string[] }>;
   assert.deepEqual(emails.map((e) => e.to), [["a@ws.com"]]);
+});
+
+test("el tope de destinatarios se aplica después de filtrar, con los admins primero", async () => {
+  reset();
+  const agents = Array.from({ length: 25 }, (_, i) => ({
+    role: "agent",
+    users: { email: `agente${i}@ws.com`, is_active: true },
+  }));
+  membershipsRow = {
+    data: [
+      ...agents,
+      { role: "agent", users: { email: "baja@ws.com", is_active: false } },
+      { role: "admin", users: { email: "jefa@ws.com", is_active: true } },
+    ],
+    error: null,
+  };
+  const fetchCalls: Array<{ init: { body: string } }> = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async (_url: string, init: { body: string }) => {
+    fetchCalls.push({ init });
+    return { ok: true } as Response;
+  }) as typeof fetch;
+  try {
+    await notifyTeamHandoff({ workspaceId: "ws_1", conversationId: "conv_1", trigger: "keyword" });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  const emails = JSON.parse(fetchCalls[0].init.body) as Array<{ to: string[] }>;
+  assert.equal(emails.length, 20);
+  assert.deepEqual(emails[0].to, ["jefa@ws.com"], "the admin is never crowded out");
+  assert.ok(!emails.some((e) => e.to[0] === "baja@ws.com"));
 });

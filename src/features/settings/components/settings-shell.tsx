@@ -32,6 +32,8 @@ interface Props {
   initialTemplates?: unknown[];
   initialAgents?: AgentDto[];
   jev: JevSettings;
+  /** The server can send the team's handoff emails (Resend configured). */
+  teamEmailReady?: boolean;
 }
 
 export function SettingsShell({
@@ -43,6 +45,7 @@ export function SettingsShell({
   initialTemplates = [],
   initialAgents = [],
   jev,
+  teamEmailReady = false,
 }: Props) {
   const biForForm = initialBusinessInfo as {
     structured: Record<string, unknown>;
@@ -89,6 +92,7 @@ export function SettingsShell({
               workspaceId={workspaceId}
               role={role}
               initialIntegrations={initialIntegrations}
+              teamEmailReady={teamEmailReady}
             />
           </div>
         </TabsContent>

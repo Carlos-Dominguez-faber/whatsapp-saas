@@ -42,7 +42,7 @@ export function InboxLayout({
   // Contador en el título de la pestaña + notificación nativa cuando una
   // conversación entra a handoff_pending (ver use-handoff-alerts.ts).
   const { permission, requestPermission, handleConversationChange } =
-    useHandoffAlerts(conversations);
+    useHandoffAlerts(conversations, workspaceId ?? undefined);
 
   // Live-update the list when chats arrive/change (new conversation, new
   // message, state/handoff change) — re-runs the server component.

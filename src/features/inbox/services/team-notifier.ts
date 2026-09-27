@@ -62,8 +62,11 @@ export interface TeamHandoffParams {
 }
 
 interface MembershipEmailRow {
+  role: string;
   users: { email: string; is_active: boolean | null } | null;
 }
+
+const ROLE_ORDER: Record<string, number> = { admin: 0, manager: 1, agent: 2 };
 
 interface ConversationContactIdRow {
   contact_id: string;
@@ -166,11 +169,10 @@ export async function notifyTeamHandoff(
 
     const { data: memberships, error: membershipsError } = await supabase
       .from("memberships")
-      .select("users(email, is_active)")
+      .select("role, users(email, is_active)")
       .eq("workspace_id", workspaceId)
       .eq("is_active", true)
-      .in("role", NOTIFIABLE_ROLES)
-      .limit(MAX_RECIPIENTS);
+      .in("role", NOTIFIABLE_ROLES);
 
     if (membershipsError) {
       // Una consulta caída NO es "workspace sin operadores": si se cuenta
@@ -190,8 +192,11 @@ export async function notifyTeamHandoff(
       return;
     }
 
+    // The cap applies after dropping deactivated users and bad addresses,
+    // admins first: a large team must not crowd out the people in charge.
     const rawEmails = ((memberships ?? []) as unknown as MembershipEmailRow[])
       .filter((m) => m.users?.is_active !== false)
+      .sort((a, b) => (ROLE_ORDER[a.role] ?? 9) - (ROLE_ORDER[b.role] ?? 9))
       .map((m) => m.users?.email)
       .filter((email): email is string => Boolean(email));
 
