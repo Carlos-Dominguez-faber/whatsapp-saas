@@ -2,29 +2,39 @@ import assert from "node:assert/strict";
 import { test, mock } from "node:test";
 import type { ToolContext } from "../core/tool";
 
+type RequestOpts = {
+  resolvedIp?: string;
+  method: string;
+  headers: Record<string, string>;
+  body?: string;
+  timeoutMs: number;
+  maxResponseBytes?: number;
+};
+
 let validateImpl: (url: string) => Promise<{ error: string | null; resolvedIp?: string }>;
-let fetchPinnedCalls: Array<{
-  url: string;
-  resolvedIp: string;
-  opts: { method: string; headers: Record<string, string>; body?: string; timeoutMs: number; maxResponseBytes?: number };
-}>;
+let fetchPinnedCalls: Array<{ url: string; resolvedIp: string; opts: RequestOpts }>;
 let fetchPinnedImpl: () => Promise<{ status: number; bodyText: string; truncated: boolean }>;
+
+class RedirectRefusedError extends Error {}
 
 mock.module("../services/ssrf-guard.ts", {
   exports: {
     validateWebhookUrl: (url: string) => validateImpl(url),
-    fetchPinned: (
-      url: string,
-      resolvedIp: string,
-      opts: { method: string; headers: Record<string, string>; body?: string; timeoutMs: number; maxResponseBytes?: number },
-    ) => {
-      fetchPinnedCalls.push({ url, resolvedIp, opts });
+    fetchPinnedFollowingRedirects: (url: string, opts: RequestOpts) => {
+      fetchPinnedCalls.push({ url, resolvedIp: opts.resolvedIp ?? "", opts });
       return fetchPinnedImpl();
     },
+    firstStatusOf: (err: unknown) => {
+      const status = (err as { firstStatus?: unknown } | null)?.firstStatus;
+      return typeof status === "number" ? status : undefined;
+    },
+    RedirectRefusedError,
   },
 });
 
-const { buildN8nToolRun } = await import("./n8n-tool-runner.ts");
+const { buildN8nToolRun, MAX_LLM_OUTPUT_CHARS, n8nIdempotencyKey } = await import(
+  "./n8n-tool-runner.ts"
+);
 
 const ctx: ToolContext = {
   workspaceId: "ws_1",
@@ -83,7 +93,10 @@ test("sync mode parses a JSON body and returns it as output", async () => {
 
   const call = fetchPinnedCalls[0];
   assert.equal(call.opts.method, "POST");
-  assert.deepEqual(JSON.parse(call.opts.body!), {
+  const sent = JSON.parse(call.opts.body!);
+  assert.equal(typeof sent.idempotency_key, "string");
+  delete sent.idempotency_key;
+  assert.deepEqual(sent, {
     workspace_id: "ws_1",
     conversation_id: "conv_1",
     contact_id: "contact_1",
@@ -127,13 +140,68 @@ test("treats a non-2xx status as an error", async () => {
   assert.equal(result.error, "HTTP 500");
 });
 
-test("treats a redirect (3xx) as an error, never following it", async () => {
+test("a POST answered with a redirect it couldn't follow counts as received, not failed", async () => {
   reset();
-  fetchPinnedImpl = async () => ({ status: 302, bodyText: "", truncated: false });
+  fetchPinnedImpl = async () => {
+    const err = new RedirectRefusedError("Redirect to a blocked address") as Error & {
+      firstStatus?: number;
+    };
+    err.firstStatus = 302;
+    throw err;
+  };
+  const run = buildN8nToolRun({ ...baseRow, mode: "sync", sensitivity: "write" });
+  const result = await run({}, ctx);
+  assert.equal(result.ok, true);
+  assert.equal((result.output as { redirect_followed: boolean }).redirect_followed, false);
+});
+
+test("a refused redirect before any response is an error", async () => {
+  reset();
+  fetchPinnedImpl = async () => {
+    throw new RedirectRefusedError("Too many redirects");
+  };
   const run = buildN8nToolRun({ ...baseRow, mode: "sync", sensitivity: "read" });
   const result = await run({}, ctx);
   assert.equal(result.ok, false);
-  assert.match(result.error ?? "", /302/);
+  assert.equal(result.error, "Too many redirects");
+});
+
+test("the model sees at most MAX_LLM_OUTPUT_CHARS of a sync response", async () => {
+  reset();
+  const big = { rows: "x".repeat(MAX_LLM_OUTPUT_CHARS * 2) };
+  fetchPinnedImpl = async () => ({ status: 200, bodyText: JSON.stringify(big), truncated: false });
+  const run = buildN8nToolRun({ ...baseRow, mode: "sync", sensitivity: "read" });
+  const result = await run({}, ctx);
+  assert.equal(result.ok, true);
+  assert.equal(typeof result.output, "string");
+  const text = result.output as string;
+  assert.ok(text.length <= MAX_LLM_OUTPUT_CHARS + 40, `got ${text.length} chars`);
+  assert.match(text, /\[respuesta truncada\]$/);
+});
+
+test("the idempotency key is stable for the same batch, tool and args, and differs otherwise", () => {
+  const row = { id: "tool_1" };
+  const inBatch = { ...ctx, batchId: "batch_1" };
+  const a = n8nIdempotencyKey(row, { b: 2, a: 1 }, inBatch);
+  assert.equal(a, n8nIdempotencyKey(row, { a: 1, b: 2 }, inBatch), "key order doesn't matter");
+  assert.notEqual(a, n8nIdempotencyKey(row, { a: 1, b: 3 }, inBatch));
+  assert.notEqual(a, n8nIdempotencyKey(row, { a: 1, b: 2 }, { ...ctx, batchId: "batch_2" }));
+  assert.notEqual(
+    n8nIdempotencyKey(row, {}, ctx),
+    n8nIdempotencyKey(row, {}, ctx),
+    "outside a batch (playground) every call gets its own key",
+  );
+});
+
+test("a tool whose auth header can't be decrypted never calls the workflow", async () => {
+  reset();
+  const run = buildN8nToolRun(
+    { ...baseRow, mode: "sync", sensitivity: "read", auth_header_name: "Authorization" },
+    { authError: "No se pudo leer el header de autenticación" },
+  );
+  const result = await run({}, ctx);
+  assert.equal(result.ok, false);
+  assert.equal(fetchPinnedCalls.length, 0);
 });
 
 test("adds the configured auth header when present", async () => {

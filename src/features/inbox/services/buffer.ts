@@ -745,6 +745,7 @@ export async function processNextBatch(): Promise<ProcessBatchResult> {
       workspaceId: batch.workspace_id,
       conversationId: batch.conversation_id,
       contactId: conversation.contact_id as string,
+      batchId: batch.id,
     };
 
     // ── 8b. Resolve conversational memory window (WS2: configurable) ─────────

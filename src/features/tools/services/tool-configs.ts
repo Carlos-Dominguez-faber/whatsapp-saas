@@ -1,8 +1,10 @@
 import { createClient as createSbClient } from "@supabase/supabase-js";
 import { registry } from "../registry";
 import type { Tool } from "../core/tool";
+import { emitEventOncePerDay } from "@/features/inbox/services/daily-events";
 import { buildZodSchema, sensitiveArgKeys } from "../lib/n8n-params-schema";
 import { buildN8nToolRun, type N8nToolRow } from "../lib/n8n-tool-runner";
+import { decryptN8nAuth } from "../lib/n8n-secrets";
 
 function svc() {
   return createSbClient(
@@ -44,25 +46,67 @@ async function getStaticEnabledTools(workspaceId: string): Promise<Tool[]> {
 // racing the timeout and retrying on top of a webhook call still in flight.
 const EXTERNAL_TIMEOUT_MARGIN_MS = 500;
 
+const N8N_TOOL_COLUMNS =
+  "id, workspace_id, name, description, mode, sensitivity, webhook_url, auth_header_name, auth_header_value, parameters, timeout_ms, enabled";
+
 async function getDynamicN8nTools(workspaceId: string): Promise<Tool[]> {
   const supabase = svc();
 
-  const { data } = await supabase
+  const { data, error } = await supabase
     .from("n8n_tools")
-    .select("*")
+    .select(N8N_TOOL_COLUMNS)
     .eq("workspace_id", workspaceId)
     .eq("enabled", true);
+  if (error) {
+    // Static tools still work without the dynamic ones.
+    console.error("[tools] n8n_tools lookup failed:", error);
+    return [];
+  }
 
-  return ((data as N8nToolRow[] | null) ?? []).map((row) => ({
-    name: row.name,
-    description: row.description,
-    sensitivity: row.sensitivity,
-    schema: buildZodSchema(row.parameters),
-    enabledFor: () => true,
-    run: buildN8nToolRun(row),
-    preferredTimeoutMs: row.timeout_ms + EXTERNAL_TIMEOUT_MARGIN_MS,
-    sensitiveArgKeys: sensitiveArgKeys(row.parameters),
-  }));
+  const staticNames = new Set(registry.list().map((t) => t.name));
+  const tools: Tool[] = [];
+  for (const row of (data as N8nToolRow[] | null) ?? []) {
+    // A row named like a built-in tool (e.g. handoff_human) would shadow it
+    // for the model. The API refuses such names; a row that has one anyway
+    // (written directly, or before that tool existed) is left out.
+    if (staticNames.has(row.name)) {
+      await emitEventOncePerDay(
+        supabase,
+        workspaceId,
+        "n8n_tool_name_collision",
+        "warn",
+        { tool_id: row.id, name: row.name },
+        { tool_id: row.id },
+      );
+      continue;
+    }
+
+    let authError: string | undefined;
+    let authValue = row.auth_header_value;
+    if (authValue) {
+      try {
+        authValue = await decryptN8nAuth(workspaceId, authValue);
+      } catch (err) {
+        console.error(`[tools] n8n tool ${row.id}: auth header won't decrypt:`, err);
+        authValue = null;
+        authError =
+          "No se pudo leer el header de autenticación de esta herramienta; vuelve a guardarlo en Configuración.";
+      }
+    }
+
+    const clearRow: N8nToolRow = { ...row, auth_header_value: authValue };
+    tools.push({
+      name: row.name,
+      description: row.description,
+      sensitivity: row.sensitivity,
+      schema: buildZodSchema(row.parameters),
+      enabledFor: () => true,
+      run: buildN8nToolRun(clearRow, { authError }),
+      preferredTimeoutMs: row.timeout_ms + EXTERNAL_TIMEOUT_MARGIN_MS,
+      sensitiveArgKeys: sensitiveArgKeys(row.parameters),
+    });
+  }
+  return tools;
 }
 
 /**

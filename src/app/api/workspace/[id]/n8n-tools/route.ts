@@ -11,6 +11,10 @@ import { registry } from "@/features/tools/index";
 import { validateWebhookUrl } from "@/features/tools/services/ssrf-guard";
 import { HTTPS_URL } from "@/features/tools/lib/tool-config";
 import { N8nParameterSchema } from "@/features/tools/lib/n8n-tool-schema";
+import {
+  encryptN8nAuth,
+  isAllowedAuthHeaderName,
+} from "@/features/tools/lib/n8n-secrets";
 
 function svc() {
   return createSbClient(
@@ -30,7 +34,9 @@ const CreateSchema = z.object({
     .regex(/^[a-zA-Z0-9_-]+$/, "Solo letras, números, guion y guion bajo"),
   description: z.string().trim().min(1).max(500),
   mode: z.enum(["sync", "async"]),
-  sensitivity: z.enum(["read", "write"]),
+  // A workflow is assumed to change something unless the admin says it only
+  // reads: write tools are never retried.
+  sensitivity: z.enum(["read", "write"]).default("write"),
   webhook_url: HTTPS_URL,
   auth_header_name: z
     .string()
@@ -117,6 +123,21 @@ export async function POST(
     );
   }
 
+  const authName = parsed.data.auth_header_name || null;
+  const authValue = parsed.data.auth_header_value || null;
+  if (authValue && !authName) {
+    return NextResponse.json(
+      { error: "Falta el nombre del header de autenticación" },
+      { status: 400 },
+    );
+  }
+  if (authName && !isAllowedAuthHeaderName(authName)) {
+    return NextResponse.json(
+      { error: `"${authName}" no se puede usar como header de autenticación` },
+      { status: 400 },
+    );
+  }
+
   const { error: urlError } = await validateWebhookUrl(parsed.data.webhook_url);
   if (urlError) {
     return NextResponse.json({ error: urlError }, { status: 400 });
@@ -137,7 +158,15 @@ export async function POST(
 
   const { data, error } = await db
     .from("n8n_tools")
-    .insert({ workspace_id: workspaceId, ...parsed.data })
+    .insert({
+      workspace_id: workspaceId,
+      ...parsed.data,
+      auth_header_name: authName,
+      // Encrypted at rest, bound to this workspace.
+      auth_header_value: authValue
+        ? await encryptN8nAuth(workspaceId, authValue)
+        : null,
+    })
     .select(
       "id, name, description, mode, sensitivity, webhook_url, auth_header_name, parameters, timeout_ms, enabled, created_at, updated_at",
     )

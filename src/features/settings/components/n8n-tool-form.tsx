@@ -71,12 +71,15 @@ export function N8nToolForm({ workspaceId, tool, open, onOpenChange, onSaved }: 
   const [name, setName] = useState(tool?.name ?? "");
   const [description, setDescription] = useState(tool?.description ?? "");
   const [mode, setMode] = useState<"sync" | "async">(tool?.mode ?? "sync");
+  // "Escritura" by default: write tools are never retried, so a workflow
+  // that changes something can't run twice by mistake.
   const [sensitivity, setSensitivity] = useState<"read" | "write">(
-    tool?.sensitivity ?? "read",
+    tool?.sensitivity ?? "write",
   );
   const [webhookUrl, setWebhookUrl] = useState(tool?.webhook_url ?? "");
   const [authHeaderName, setAuthHeaderName] = useState(tool?.auth_header_name ?? "");
   const [authHeaderValue, setAuthHeaderValue] = useState("");
+  const [removeAuth, setRemoveAuth] = useState(false);
   const [parameters, setParameters] = useState<N8nToolParamForm[]>(
     tool?.parameters ?? [],
   );
@@ -91,10 +94,11 @@ export function N8nToolForm({ workspaceId, tool, open, onOpenChange, onSaved }: 
       setName(tool?.name ?? "");
       setDescription(tool?.description ?? "");
       setMode(tool?.mode ?? "sync");
-      setSensitivity(tool?.sensitivity ?? "read");
+      setSensitivity(tool?.sensitivity ?? "write");
       setWebhookUrl(tool?.webhook_url ?? "");
       setAuthHeaderName(tool?.auth_header_name ?? "");
       setAuthHeaderValue("");
+      setRemoveAuth(false);
       setParameters(tool?.parameters ?? []);
       setTimeoutMs(String(tool?.timeout_ms ?? DEFAULT_TIMEOUT_MS));
     }
@@ -156,8 +160,13 @@ export function N8nToolForm({ workspaceId, tool, open, onOpenChange, onSaved }: 
         ...(p.sensitive ? { sensitive: true } : {}),
       })),
     };
-    if (authHeaderName.trim()) body.auth_header_name = authHeaderName.trim();
-    if (authHeaderValue.trim()) body.auth_header_value = authHeaderValue.trim();
+    if (removeAuth) {
+      body.auth_header_name = null;
+      body.auth_header_value = null;
+    } else {
+      if (authHeaderName.trim()) body.auth_header_name = authHeaderName.trim();
+      if (authHeaderValue.trim()) body.auth_header_value = authHeaderValue.trim();
+    }
 
     const url = isEdit
       ? `/api/workspace/${workspaceId}/n8n-tools/${tool!.id}`
@@ -302,9 +311,28 @@ export function N8nToolForm({ workspaceId, tool, open, onOpenChange, onSaved }: 
                 value={authHeaderValue}
                 onChange={(e) => setAuthHeaderValue(e.target.value)}
                 placeholder={isEdit && tool?.has_auth ? "••••••••" : "Bearer ..."}
+                disabled={removeAuth}
               />
             </div>
           </div>
+          {isEdit && tool?.has_auth && (
+            <div className="flex items-center gap-2 text-xs text-muted-foreground">
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                className="h-7 px-2 text-xs"
+                aria-pressed={removeAuth}
+                onClick={() => setRemoveAuth((v) => !v)}
+              >
+                {removeAuth ? "Conservar autenticación" : "Quitar autenticación"}
+              </Button>
+              {removeAuth && <span>Se quitará el header al guardar.</span>}
+            </div>
+          )}
+          <p className="text-xs text-muted-foreground">
+            El valor se guarda cifrado y nunca se vuelve a mostrar.
+          </p>
 
           <div className="space-y-2">
             <div className="flex items-center justify-between">

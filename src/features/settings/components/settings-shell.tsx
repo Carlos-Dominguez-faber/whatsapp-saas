@@ -64,7 +64,7 @@ export function SettingsShell({
             <TabsTrigger value="integraciones">Integraciones</TabsTrigger>
             <TabsTrigger value="negocio">Negocio</TabsTrigger>
             <TabsTrigger value="tools">Tools</TabsTrigger>
-            <TabsTrigger value="n8n">n8n</TabsTrigger>
+            {role === "admin" && <TabsTrigger value="n8n">n8n</TabsTrigger>}
             <TabsTrigger value="templates">Templates</TabsTrigger>
             <TabsTrigger value="knowledge-base">Knowledge Base</TabsTrigger>
             <TabsTrigger value="equipo">Equipo</TabsTrigger>
@@ -109,11 +109,14 @@ export function SettingsShell({
           </div>
         </TabsContent>
 
-        <TabsContent value="n8n">
-          <div className="p-6 space-y-6 rounded-lg border border-border/60 bg-card">
-            <N8nToolsTab workspaceId={workspaceId} />
-          </div>
-        </TabsContent>
+        {/* n8n tools hold a webhook secret: admins only, like the API. */}
+        {role === "admin" && (
+          <TabsContent value="n8n">
+            <div className="p-6 space-y-6 rounded-lg border border-border/60 bg-card">
+              <N8nToolsTab workspaceId={workspaceId} />
+            </div>
+          </TabsContent>
+        )}
 
         <TabsContent value="templates">
           <div className="p-6 rounded-lg border border-border/60 bg-card">

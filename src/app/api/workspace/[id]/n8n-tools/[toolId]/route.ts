@@ -11,6 +11,10 @@ import { registry } from "@/features/tools/index";
 import { validateWebhookUrl } from "@/features/tools/services/ssrf-guard";
 import { HTTPS_URL } from "@/features/tools/lib/tool-config";
 import { N8nParameterSchema } from "@/features/tools/lib/n8n-tool-schema";
+import {
+  encryptN8nAuth,
+  isAllowedAuthHeaderName,
+} from "@/features/tools/lib/n8n-secrets";
 
 function svc() {
   return createSbClient(
@@ -82,6 +86,18 @@ export async function PATCH(
     );
   }
 
+  if (
+    parsed.data.auth_header_name &&
+    !isAllowedAuthHeaderName(parsed.data.auth_header_name)
+  ) {
+    return NextResponse.json(
+      {
+        error: `"${parsed.data.auth_header_name}" no se puede usar como header de autenticación`,
+      },
+      { status: 400 },
+    );
+  }
+
   if (parsed.data.webhook_url) {
     const { error: urlError } = await validateWebhookUrl(parsed.data.webhook_url);
     if (urlError) {
@@ -89,10 +105,27 @@ export async function PATCH(
     }
   }
 
+  // auth_header_value: a string replaces the secret (encrypted), null removes
+  // it together with the header name ("Quitar auth"), absent keeps it.
+  const update: Record<string, unknown> = { ...parsed.data };
+  if (parsed.data.auth_header_value === null) {
+    update.auth_header_name = null;
+    update.auth_header_value = null;
+  } else if (typeof parsed.data.auth_header_value === "string") {
+    if (parsed.data.auth_header_value === "") {
+      delete update.auth_header_value;
+    } else {
+      update.auth_header_value = await encryptN8nAuth(
+        workspaceId,
+        parsed.data.auth_header_value,
+      );
+    }
+  }
+
   const db = svc();
   const { data, error } = await db
     .from("n8n_tools")
-    .update({ ...parsed.data, updated_at: new Date().toISOString() })
+    .update({ ...update, updated_at: new Date().toISOString() })
     .eq("id", toolId)
     .eq("workspace_id", workspaceId)
     .select(

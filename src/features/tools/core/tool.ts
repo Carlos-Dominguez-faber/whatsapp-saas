@@ -7,6 +7,12 @@ export interface ToolContext {
   conversationId: string;
   contactId: string;
   // SEC-01: identity anchored server-side — LLM cannot override these
+  /**
+   * The inbound batch this turn answers, when there is one (not in the
+   * playground). Stable across retries of the batch, so a tool can derive an
+   * idempotency key from it.
+   */
+  batchId?: string;
 }
 
 export interface ToolResult {

@@ -1,11 +1,13 @@
 #!/usr/bin/env node
 // ============================================================================
 // scripts/encrypt-credentials.mjs — encrypt existing integrations.credentials
+// and n8n_tools.auth_header_value
 //
 // Installations created before credential encryption store API keys and signing
-// secrets as plaintext in integrations.credentials. This walks every row and
-// encrypts the plaintext values in place, using the same AES-256-GCM helper the
-// app uses (src/shared/lib/crypto.ts — imported, not reimplemented).
+// secrets as plaintext in integrations.credentials, and n8n tools created before
+// it store their auth header in the clear. This walks every row and encrypts the
+// plaintext values in place, using the same AES-256-GCM helper the app uses
+// (src/shared/lib/crypto.ts — imported, not reimplemented).
 //
 // Idempotent: already-encrypted values are skipped, so re-running is a no-op.
 // The app reads plaintext and ciphertext alike, so running this is safe at any
@@ -116,11 +118,6 @@ const rows = await call(
   "integrations?select=id,workspace_id,provider,credentials",
 );
 
-if (!rows.length) {
-  ok("No hay integraciones. Nada que hacer.");
-  process.exit(0);
-}
-
 let changed = 0;
 let alreadyDone = 0;
 
@@ -153,15 +150,49 @@ for (const row of rows) {
   changed++;
 }
 
+// n8n tools: one secret per row, bound to its workspace.
+// Before db-push the table doesn't exist yet (PGRST205): nothing to encrypt.
+const n8nRes = await fetch(
+  `${SUPABASE_URL}/rest/v1/n8n_tools?select=id,workspace_id,name,auth_header_value&auth_header_value=not.is.null`,
+  { headers: baseHeaders },
+);
+let n8nRows = [];
+if (n8nRes.ok) {
+  n8nRows = await n8nRes.json();
+} else if (n8nRes.status === 404) {
+  log("  (sin tabla n8n_tools todavía: corre db-push y vuelve a correr este script)");
+} else {
+  fail(`GET n8n_tools → ${n8nRes.status} ${await n8nRes.text()}`);
+}
+for (const row of n8nRows) {
+  const value = row.auth_header_value;
+  if (typeof value !== "string" || value === "" || isEncrypted(value)) {
+    alreadyDone++;
+    continue;
+  }
+  log(`  n8n "${row.name}" (workspace ${row.workspace_id})`);
+  log("    cifra: auth_header_value");
+  if (!DRY_RUN) {
+    await call("PATCH", `n8n_tools?id=eq.${row.id}`, {
+      auth_header_value: await encrypt(value, `${row.workspace_id}:n8n_tool`),
+    });
+  }
+  changed++;
+}
+
 log("");
+if (!rows.length && !n8nRows.length) {
+  ok("No hay integraciones ni herramientas de n8n. Nada que hacer.");
+  process.exit(0);
+}
 if (DRY_RUN) {
   ok(
-    `${changed} integración(es) se cifrarían, ${alreadyDone} ya está(n) al día.`,
+    `${changed} registro(s) se cifrarían, ${alreadyDone} ya está(n) al día.`,
   );
   log("Corre el script sin --dry-run para aplicarlo.");
 } else {
   ok(
-    `${changed} integración(es) cifradas, ${alreadyDone} ya estaba(n) al día.`,
+    `${changed} registro(s) cifrados, ${alreadyDone} ya estaba(n) al día.`,
   );
   if (changed)
     log(

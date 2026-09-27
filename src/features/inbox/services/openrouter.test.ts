@@ -46,7 +46,13 @@ type RunOpts = {
 };
 let registryRun: (name: string, args: unknown, ctx: unknown, opts: RunOpts) => Promise<unknown> = async () => null;
 mock.module("@/features/tools/index.ts", {
-  exports: { registry: { run: (n: string, a: unknown, c: unknown, o: RunOpts) => registryRun(n, a, c, o) } },
+  exports: {
+    registry: {
+      run: (n: string, a: unknown, c: unknown, o: RunOpts) => registryRun(n, a, c, o),
+      runTool: (t: { name: string }, a: unknown, c: unknown, o: RunOpts) =>
+        registryRun(t.name, a, c, o),
+    },
+  },
 });
 mock.module("@/features/agents/services/active-agent.ts", { exports: { getActiveAgent: async () => null } });
 mock.module("@/shared/lib/integration-secrets.ts", { exports: { decryptCredentials: async () => ({}) } });

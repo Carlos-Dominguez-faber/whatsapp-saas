@@ -8,6 +8,9 @@ interface QueueEntry {
 
 let toolConfigsQueue: QueueEntry[] = [];
 let n8nToolsQueue: QueueEntry[] = [];
+let eventInserts: Array<Record<string, unknown>> = [];
+
+process.env.ENCRYPTION_KEY = Buffer.alloc(32, 7).toString("base64");
 
 const fakeClient = {
   from(table: string) {
@@ -29,6 +32,20 @@ const fakeClient = {
         }),
       };
     }
+    if (table === "events") {
+      const chain = {
+        select: () => chain,
+        eq: () => chain,
+        gte: () => chain,
+        contains: () => chain,
+        limit: () => Promise.resolve({ data: [], error: null }),
+        insert: (row: Record<string, unknown>) => {
+          eventInserts.push(row);
+          return Promise.resolve({ error: null });
+        },
+      };
+      return chain;
+    }
     throw new Error(`unexpected table: ${table}`);
   },
 };
@@ -44,10 +61,28 @@ mock.module("@supabase/supabase-js", {
 await import("../index.ts");
 const { getEnabledTools } = await import("./tool-configs.ts");
 
+const { encrypt } = await import("@/shared/lib/crypto");
+
 function reset() {
   toolConfigsQueue = [{ data: [] }];
   n8nToolsQueue = [{ data: [] }];
+  eventInserts = [];
 }
+
+const n8nRow = {
+  id: "row_1",
+  workspace_id: "ws_1",
+  name: "n8n_catalog",
+  description: "Consulta el catálogo",
+  mode: "sync",
+  sensitivity: "read",
+  webhook_url: "https://hooks.example/catalog",
+  auth_header_name: null,
+  auth_header_value: null,
+  parameters: [],
+  timeout_ms: 8000,
+  enabled: true,
+};
 
 test("returns an empty list when nothing is enabled", async () => {
   reset();
@@ -123,4 +158,48 @@ test("a static tool and a dynamic n8n tool coexist in the same list", async () =
   const tools = await getEnabledTools("ws_1");
   const names = tools.map((t) => t.name).sort();
   assert.deepEqual(names, ["echo", "n8n_ticket"]);
+});
+
+test("leaves out an n8n tool named like a built-in tool, and records it once a day", async () => {
+  reset();
+  n8nToolsQueue = [{ data: [{ ...n8nRow, id: "row_x", name: "schedule_highlevel" }] }];
+  const tools = await getEnabledTools("ws_1");
+  assert.deepEqual(tools.map((t) => t.name), []);
+  assert.equal(eventInserts.length, 1);
+  assert.equal(eventInserts[0].type, "n8n_tool_name_collision");
+});
+
+test("an encrypted auth header reaches the runner in clear", async () => {
+  reset();
+  const stored = await encrypt("Bearer s3cret", "ws_1:n8n_tool");
+  n8nToolsQueue = [
+    { data: [{ ...n8nRow, auth_header_name: "Authorization", auth_header_value: stored }] },
+  ];
+  const tools = await getEnabledTools("ws_1");
+  assert.equal(tools.length, 1);
+  // The row's workspace mismatch check runs before any network call, so a
+  // foreign ctx proves the tool was built without an auth error.
+  const result = await tools[0].run({}, {
+    workspaceId: "ws_other",
+    conversationId: "c",
+    contactId: "k",
+  });
+  assert.match(result.error ?? "", /workspace/);
+});
+
+test("an auth header encrypted for another workspace makes the tool refuse to run", async () => {
+  reset();
+  const stored = await encrypt("Bearer s3cret", "ws_OTHER:n8n_tool");
+  n8nToolsQueue = [
+    { data: [{ ...n8nRow, auth_header_name: "Authorization", auth_header_value: stored }] },
+  ];
+  const tools = await getEnabledTools("ws_1");
+  assert.equal(tools.length, 1);
+  const result = await tools[0].run({}, {
+    workspaceId: "ws_1",
+    conversationId: "c",
+    contactId: "k",
+  });
+  assert.equal(result.ok, false);
+  assert.match(result.error ?? "", /header de autenticación/);
 });
