@@ -3,6 +3,7 @@ import { z } from "zod";
 import type { Tool, ToolContext, ToolResult } from "../core/tool";
 import {
   APPOINTMENT_TOOL_TIMEOUT_MS,
+  confirmedInstantError,
   describeInstant,
   fetchHLEvent,
   hlTimeZone,
@@ -16,20 +17,27 @@ const schema = z.object({
   appointment_datetime_iso: z
     .string()
     .describe(
-      "Fecha y hora de la cita que el cliente confirmó cancelar, en ISO 8601 (ej: 2026-06-12T10:00:00-06:00). Cópiala de list_highlevel_appointments; si no está claro cuál cita es, pregúntale al cliente.",
+      "Fecha y hora de la cita que el cliente confirmó cancelar, copiada exactamente de list_highlevel_appointments (ISO 8601 con su offset). Si no está claro cuál cita es, pregúntale al cliente.",
     ),
 });
 
 type Args = z.infer<typeof schema>;
 
+/** A tool answer that a person has to follow up: the buffer hands off after the reply. */
+function needsHuman(error: string): ToolResult {
+  return { ok: false, output: { needs_human: true }, error };
+}
+
 const LOOKUP_FAILED =
   "No pude consultar la agenda en este momento, así que la cita NO se canceló. Dile al cliente que una persona del equipo lo revisará.";
 
+/** Same instant, within a minute. */
+const MATCH_MS = 60_000;
+
 async function run(args: Args, ctx: ToolContext): Promise<ToolResult> {
   const { getHLConfig } = await import("../../inbox/services/highlevel-client.ts");
-  const { getBusinessInfo, businessTimeZone } = await import(
-    "../../inbox/services/business-info.ts"
-  );
+  const { getBusinessInfo } = await import("../../inbox/services/business-info.ts");
+  const { schedulingTimeZone } = await import("../../inbox/services/scheduling-timezone.ts");
 
   const cfg = await getHLConfig(ctx.workspaceId);
   if (!cfg) {
@@ -44,30 +52,32 @@ async function run(args: Args, ctx: ToolContext): Promise<ToolResult> {
     };
   }
 
-  const zone = businessTimeZone(await getBusinessInfo(ctx.workspaceId));
+  const zone = schedulingTimeZone(await getBusinessInfo(ctx.workspaceId), cfg.timezone);
   const hlZone = hlTimeZone(cfg, zone);
-  const instantMs = parseConfirmedInstant(args.appointment_datetime_iso, zone);
-  if (instantMs === null) {
-    return {
-      ok: false,
-      output: null,
-      error:
-        "Esa fecha y hora no es válida (formato ISO 8601, y que exista en el calendario). Confírmala con el cliente o consúltala con list_highlevel_appointments.",
-    };
+  const parsed = parseConfirmedInstant(args.appointment_datetime_iso, zone);
+  if ("error" in parsed) {
+    return { ok: false, output: null, error: confirmedInstantError(parsed.error, zone) };
   }
+  const instantMs = parsed.ms;
+  const when = describeInstant(instantMs, zone);
   if (instantMs < Date.now()) {
-    return {
-      ok: false,
-      output: null,
-      error: `La cita del ${describeInstant(instantMs, zone)} ya pasó; no se puede cancelar.`,
-    };
+    return { ok: false, output: null, error: `La cita del ${when} ya pasó; no se puede cancelar.` };
   }
 
   const supabase = createSbClient(
     process.env.NEXT_PUBLIC_SUPABASE_URL!,
     process.env.SUPABASE_SERVICE_ROLE_KEY!,
   );
-  const when = describeInstant(instantMs, zone);
+  const lookupFailed = async (err: unknown) => {
+    console.error("[cancel_highlevel] lookup failed:", err);
+    await noteForTeam(
+      supabase,
+      ctx,
+      "hl_appointment_failed",
+      `El cliente pidió cancelar su cita del ${when} y no se pudo consultar la agenda. Revísalo tú.`,
+    );
+    return needsHuman(LOOKUP_FAILED);
+  };
 
   let located;
   try {
@@ -80,21 +90,14 @@ async function run(args: Args, ctx: ToolContext): Promise<ToolResult> {
       hlZone,
     });
   } catch (err) {
-    console.error("[cancel_highlevel] lookup failed:", err);
-    await noteForTeam(
-      supabase,
-      ctx,
-      "hl_appointment_failed",
-      `El cliente pidió cancelar su cita del ${when} y no se pudo consultar la agenda. Revísalo tú.`,
-    );
-    return { ok: false, output: null, error: LOOKUP_FAILED };
+    return lookupFailed(err);
   }
 
   if (located.kind === "none") {
     return {
       ok: false,
       output: null,
-      error: `No encontré una cita del cliente el ${when}. Confirma con el cliente la fecha y hora exactas (list_highlevel_appointments te da las suyas); no le digas que se canceló.`,
+      error: `No encontré una cita del cliente el ${when}. Confirma con el cliente cuál es (list_highlevel_appointments te da las suyas); no le digas que se canceló.`,
     };
   }
   if (located.kind === "ambiguous") {
@@ -104,40 +107,45 @@ async function run(args: Args, ctx: ToolContext): Promise<ToolResult> {
       "hl_appointment_failed",
       `El cliente pidió cancelar su cita del ${when}, pero tiene más de una a esa hora. No se canceló ninguna: revísalo tú.`,
     );
+    return needsHuman(
+      "El cliente tiene más de una cita a esa hora, así que no se canceló ninguna. Dile que una persona del equipo lo revisará.",
+    );
+  }
+
+  // HighLevel's word counts before acting: the local row may be stale, or
+  // staff may have moved or cancelled the appointment there.
+  let current;
+  try {
+    current = await fetchHLEvent(cfg, located.hlAppointmentId, hlZone);
+  } catch (err) {
+    return lookupFailed(err);
+  }
+  const markLocalCancelled = async () => {
+    if (!located.localId) return;
+    const { error } = await supabase
+      .from("appointments")
+      .update({ status: "cancelled" })
+      .eq("id", located.localId)
+      .eq("workspace_id", ctx.workspaceId);
+    if (error) console.warn("[cancel_highlevel] failed to update local status:", error);
+  };
+  if (!current || current.state === "cancelled") {
+    await markLocalCancelled();
+    return { ok: true, output: { cancelled: true, already_cancelled: true } };
+  }
+  if (current.state !== "active") {
     return {
       ok: false,
       output: null,
-      error:
-        "El cliente tiene más de una cita a esa hora, así que no se canceló ninguna. Dile que una persona del equipo lo revisará.",
+      error: "Esa cita ya no está activa (por ejemplo, ya se atendió), así que no se puede cancelar.",
     };
   }
-
-  // Not active here: before saying "already cancelled", ask HighLevel, whose
-  // word counts (the local row may be stale).
-  if (located.state !== "active") {
-    let current;
-    try {
-      current = await fetchHLEvent(cfg, located.hlAppointmentId, hlZone);
-    } catch (err) {
-      console.error("[cancel_highlevel] confirm lookup failed:", err);
-      await noteForTeam(
-        supabase,
-        ctx,
-        "hl_appointment_failed",
-        `El cliente pidió cancelar su cita del ${when}; no se pudo confirmar su estado en HighLevel. Revísalo tú.`,
-      );
-      return { ok: false, output: null, error: LOOKUP_FAILED };
-    }
-    if (!current || current.state === "cancelled") {
-      return { ok: true, output: { cancelled: true, already_cancelled: true } };
-    }
-    if (current.state !== "active") {
-      return {
-        ok: false,
-        output: null,
-        error: "Esa cita ya no está activa (por ejemplo, ya se atendió), así que no se puede cancelar.",
-      };
-    }
+  if (current.startMs !== null && Math.abs(current.startMs - instantMs) > MATCH_MS) {
+    return {
+      ok: false,
+      output: null,
+      error: `Esa cita ya no está a esa hora en el calendario (ahora es el ${describeInstant(current.startMs, zone)}). Consulta otra vez list_highlevel_appointments y confirma con el cliente.`,
+    };
   }
 
   const put = await (async () => {
@@ -166,31 +174,19 @@ async function run(args: Args, ctx: ToolContext): Promise<ToolResult> {
       "hl_appointment_failed",
       `HighLevel rechazó cancelar la cita del ${when} (error ${put.status}). Revísalo tú.`,
     );
-    return {
-      ok: false,
-      output: null,
-      error: `El calendario respondió con un error (${put.status}); la cita NO se canceló. Dile al cliente que una persona del equipo lo revisará.`,
-    };
+    return needsHuman(
+      `El calendario respondió con un error (${put.status}); la cita NO se canceló. Dile al cliente que una persona del equipo lo revisará.`,
+    );
   }
 
-  if (located.localId) {
-    const { error: updateError } = await supabase
-      .from("appointments")
-      .update({ status: "cancelled" })
-      .eq("id", located.localId)
-      .eq("workspace_id", ctx.workspaceId);
-    if (updateError) {
-      console.warn("[cancel_highlevel] cancelled in HighLevel but failed to update local status:", updateError);
-    }
-  }
-
+  await markLocalCancelled();
   return { ok: true, output: { cancelled: true } };
 }
 
 export const cancelHighLevelTool: Tool<Args> = {
   name: "cancel_highlevel",
   description:
-    "Cancela en HighLevel la cita del cliente que empieza en la fecha y hora indicadas. Úsala solo cuando el cliente haya confirmado explícitamente cuál cita quiere cancelar (consulta sus citas con list_highlevel_appointments). Solo confirma la cancelación si esta herramienta responde con éxito; si no encuentra la cita, falla o no pudo confirmar, dile la verdad.",
+    "Cancela en HighLevel la cita del cliente que empieza en la fecha y hora indicadas. Úsala solo cuando el cliente haya confirmado explícitamente cuál cita quiere cancelar (consulta sus citas con list_highlevel_appointments y copia su datetime_iso). Solo confirma la cancelación si esta herramienta responde con éxito; si no encuentra la cita, falla o no pudo confirmar, dile la verdad.",
   sensitivity: "write",
   schema,
   enabledFor: () => true,

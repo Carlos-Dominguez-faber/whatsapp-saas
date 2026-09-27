@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { scheduleHighLevelTool } from "./schedule-highlevel.ts";
+import { UnknownOutcomeError } from "../lib/hl-appointment.ts";
 import type { ToolContext } from "../core/tool";
 
 process.env.NEXT_PUBLIC_SUPABASE_URL = "https://fake.supabase.co";
@@ -23,6 +24,7 @@ interface FetchCall {
   url: string;
   method: string;
   body: unknown;
+  version: string | null;
 }
 
 function mockFetch(opts: {
@@ -30,6 +32,8 @@ function mockFetch(opts: {
   hlBody?: unknown;
   appointmentInsertStatus: number;
   appointmentInsertBody?: unknown;
+  businessTimezone?: string;
+  hlTimezone?: string;
 }) {
   const calls: FetchCall[] = [];
 
@@ -43,6 +47,7 @@ function mockFetch(opts: {
       url,
       method,
       body: init?.body ? JSON.parse(String(init.body)) : null,
+      version: new Headers(init?.headers).get("Version"),
     });
 
     // Supabase integrations table (get workspace HighLevel config)
@@ -50,10 +55,23 @@ function mockFetch(opts: {
       return jsonResponse(200, [
         {
           credentials: { highlevel_pit: "tok_123" },
-          config: { location_id: "loc_1", calendar_id: "cal_1" },
+          config: {
+            location_id: "loc_1",
+            calendar_id: "cal_1",
+            ...(opts.hlTimezone ? { timezone: opts.hlTimezone } : {}),
+          },
           enabled: true,
         },
       ]);
+    }
+
+    if (url.includes("/rest/v1/business_info")) {
+      return jsonResponse(
+        200,
+        opts.businessTimezone
+          ? [{ structured: { timezone: opts.businessTimezone }, free_text: null }]
+          : [],
+      );
     }
 
     // Supabase contacts table (get contact phone for scheduling).
@@ -110,14 +128,14 @@ test("books the appointment and persists it locally on the happy path", async ()
 
   try {
     const result = await scheduleHighLevelTool.run(
-      { datetime_iso: "2026-06-12T10:00:00-06:00" },
+      { datetime_iso: "2027-06-12T10:00:00-06:00" },
       ctx,
     );
 
     assert.equal(result.ok, true);
     assert.deepEqual(result.output, {
       appointment_id: "hl_evt_1",
-      datetime: "2026-06-12T10:00:00-06:00",
+      datetime: "2027-06-12T10:00:00-06:00",
     });
 
     const eventCall = calls.find(
@@ -128,6 +146,9 @@ test("books the appointment and persists it locally on the happy path", async ()
       undefined,
       "should not log a persist-failed event when the insert succeeds",
     );
+    // POST /calendars/events/appointments in HighLevel's OpenAPI spec.
+    const booking = calls.find((c) => c.method === "POST" && c.url.includes("leadconnectorhq"));
+    assert.equal(booking?.version, "2021-04-15");
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -144,12 +165,14 @@ test("reports the HighLevel error when the API call itself fails", async () => {
 
   try {
     const result = await scheduleHighLevelTool.run(
-      { datetime_iso: "2026-06-12T10:00:00-06:00" },
+      { datetime_iso: "2027-06-12T10:00:00-06:00" },
       ctx,
     );
     assert.equal(result.ok, false);
     assert.match(result.error ?? "", /\(400\)/);
     assert.doesNotMatch(result.error ?? "", /Slot not available/);
+    // A person follows up: the buffer hands off after the reply.
+    assert.deepEqual(result.output, { needs_human: true });
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -167,13 +190,13 @@ test("still reports success to the caller when the local insert fails (the HL bo
 
   try {
     const result = await scheduleHighLevelTool.run(
-      { datetime_iso: "2026-06-12T10:00:00-06:00" },
+      { datetime_iso: "2027-06-12T10:00:00-06:00" },
       ctx,
     );
     assert.equal(result.ok, true);
     assert.deepEqual(result.output, {
       appointment_id: "hl_evt_1",
-      datetime: "2026-06-12T10:00:00-06:00",
+      datetime: "2027-06-12T10:00:00-06:00",
     });
   } finally {
     globalThis.fetch = originalFetch;
@@ -192,7 +215,7 @@ test("logs a visible error event to the events table when the local insert fails
 
   try {
     await scheduleHighLevelTool.run(
-      { datetime_iso: "2026-06-12T10:00:00-06:00" },
+      { datetime_iso: "2027-06-12T10:00:00-06:00" },
       ctx,
     );
 
@@ -229,7 +252,7 @@ test("in a real conversation, a phone passed by the model is ignored: it books t
 
   try {
     const result = await scheduleHighLevelTool.run(
-      { datetime_iso: "2026-06-12T10:00:00-06:00", contact_phone: "+15550009999" },
+      { datetime_iso: "2027-06-12T10:00:00-06:00", contact_phone: "+15550009999" },
       ctx,
     );
     assert.equal(result.ok, true);
@@ -246,4 +269,70 @@ test("in a real conversation, a phone passed by the model is ignored: it books t
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+async function runWith(fn: typeof fetch, args: { datetime_iso: string }) {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = fn;
+  try {
+    return await scheduleHighLevelTool.run(args, ctx);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+}
+
+const bookingOf = (calls: FetchCall[]) =>
+  calls.find((c) => c.method === "POST" && c.url.includes("leadconnectorhq"));
+
+test("a slot with another zone's offset is refused, never booked", async () => {
+  // Business in Cancún (-05:00): "10:00-06:00" is 11:00 there — a slot copied
+  // from somewhere else, so nothing is guessed.
+  const { fn, calls } = mockFetch({
+    hlStatus: 200,
+    hlBody: { id: "hl_evt_1" },
+    appointmentInsertStatus: 201,
+    businessTimezone: "America/Cancun",
+  });
+  const result = await runWith(fn as typeof fetch, { datetime_iso: "2027-06-12T10:00:00-06:00" });
+  assert.equal(result.ok, false);
+  assert.match(result.error ?? "", /America\/Cancun/);
+  assert.equal(bookingOf(calls), undefined);
+});
+
+test("business zone unset: the HighLevel zone reads the slot, and the booking carries its offset", async () => {
+  const { fn, calls } = mockFetch({
+    hlStatus: 200,
+    hlBody: { id: "hl_evt_1" },
+    appointmentInsertStatus: 201,
+    hlTimezone: "America/Cancun",
+  });
+  const result = await runWith(fn as typeof fetch, { datetime_iso: "2027-06-12T10:00:00" });
+  assert.equal(result.ok, true);
+  assert.equal((bookingOf(calls)?.body as { startTime: string }).startTime, "2027-06-12T10:00:00-05:00");
+  const local = calls.find((c) => c.url.includes("/rest/v1/appointments") && c.method === "POST");
+  assert.equal((local?.body as { scheduled_at: string }).scheduled_at, "2027-06-12T15:00:00.000Z");
+});
+
+test("a past slot is refused", async () => {
+  const { fn, calls } = mockFetch({ hlStatus: 200, appointmentInsertStatus: 201 });
+  const result = await runWith(fn as typeof fetch, { datetime_iso: "2020-06-12T10:00:00-06:00" });
+  assert.equal(result.ok, false);
+  assert.equal(bookingOf(calls), undefined);
+});
+
+test("a 5xx or no answer from HighLevel is an unknown outcome, not a failure", async () => {
+  const { fn } = mockFetch({ hlStatus: 502, appointmentInsertStatus: 201 });
+  await assert.rejects(
+    runWith(fn as typeof fetch, { datetime_iso: "2027-06-12T10:00:00-06:00" }),
+    (err: unknown) => err instanceof UnknownOutcomeError && /No pude confirmar/.test(err.message),
+  );
+
+  const dropped = (async (input: string | URL | Request, init?: RequestInit) => {
+    if (String(input).includes("leadconnectorhq")) throw new TypeError("fetch failed");
+    return fn(input, init);
+  }) as typeof fetch;
+  await assert.rejects(
+    runWith(dropped, { datetime_iso: "2027-06-12T10:00:00-06:00" }),
+    (err: unknown) => err instanceof UnknownOutcomeError,
+  );
 });

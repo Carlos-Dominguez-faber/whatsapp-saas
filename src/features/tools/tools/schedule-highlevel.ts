@@ -2,12 +2,21 @@ import { createClient as createSbClient } from "@supabase/supabase-js";
 import { z } from "zod";
 import type { Tool, ToolContext, ToolResult } from "../core/tool";
 import { resolveCalendarId } from "../lib/calendar-id.ts";
+import { formatWithOffset } from "@/shared/lib/timezone";
+import {
+  APPOINTMENT_TOOL_TIMEOUT_MS,
+  confirmedInstantError,
+  HL_API,
+  HL_VERSION_EVENTS,
+  parseConfirmedInstant,
+  UnknownOutcomeError,
+} from "../lib/hl-appointment.ts";
 
 const schema = z.object({
   datetime_iso: z
     .string()
     .describe(
-      "Inicio de la cita en ISO 8601 con zona horaria, ej: 2026-06-12T10:00:00-06:00",
+      "Inicio de la cita, copiado exactamente de check_availability (ISO 8601 con su offset, ej: 2026-06-12T10:00:00-06:00).",
     ),
   calendar_id: z
     .string()
@@ -40,9 +49,16 @@ interface HLAppointmentResponse {
   appointment?: { id?: string };
 }
 
+const BOOKING_TIMEOUT_MS = 8_000;
+
+const UNKNOWN_BOOKING =
+  "No pude confirmar si la cita quedó agendada. No le digas al cliente que se agendó ni que falló: dile que una persona del equipo lo confirmará.";
+
 async function run(args: Args, ctx: ToolContext): Promise<ToolResult> {
   const { getHLConfig, upsertHLContactByPhone, linkHLContact } =
     await import("../../inbox/services/highlevel-client.ts");
+  const { getBusinessInfo } = await import("../../inbox/services/business-info.ts");
+  const { schedulingTimeZone } = await import("../../inbox/services/scheduling-timezone.ts");
 
   const cfg = await getHLConfig(ctx.workspaceId);
   if (!cfg) {
@@ -61,6 +77,18 @@ async function run(args: Args, ctx: ToolContext): Promise<ToolResult> {
       error: "No hay un calendario de HighLevel configurado",
     };
   }
+
+  // The slot as check_availability wrote it, in the same zone: a time copied
+  // from another zone is refused, not guessed.
+  const zone = schedulingTimeZone(await getBusinessInfo(ctx.workspaceId), cfg.timezone);
+  const start = parseConfirmedInstant(args.datetime_iso, zone);
+  if ("error" in start) {
+    return { ok: false, output: null, error: confirmedInstantError(start.error, zone) };
+  }
+  if (start.ms < Date.now()) {
+    return { ok: false, output: null, error: "Ese horario ya pasó; ofrécele uno futuro." };
+  }
+  const startTime = formatWithOffset(start.ms, zone);
 
   const supabase = createSbClient(
     process.env.NEXT_PUBLIC_SUPABASE_URL!,
@@ -117,24 +145,30 @@ async function run(args: Args, ctx: ToolContext): Promise<ToolResult> {
     };
   }
 
-  const res = await fetch(
-    "https://services.leadconnectorhq.com/calendars/events/appointments",
-    {
+  let res: Response;
+  try {
+    res = await fetch(`${HL_API}/calendars/events/appointments`, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${cfg.token}`,
-        Version: "2021-07-28",
+        // POST /calendars/events/appointments, HighLevel's OpenAPI spec.
+        Version: HL_VERSION_EVENTS,
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
         calendarId,
         locationId: cfg.locationId,
         contactId: hlContactId,
-        startTime: args.datetime_iso,
+        startTime,
         title: `Cita${args.contact_name ? ` — ${args.contact_name}` : ""}`,
       }),
-    },
-  );
+      signal: AbortSignal.timeout(BOOKING_TIMEOUT_MS),
+    });
+  } catch (err) {
+    // Sent, and no answer: the booking may exist.
+    console.error("[schedule_highlevel] booking got no answer:", err);
+    throw new UnknownOutcomeError(UNKNOWN_BOOKING);
+  }
 
   if (!res.ok) {
     // The raw body is HighLevel's own wording (English, internal ids): log
@@ -143,10 +177,12 @@ async function run(args: Args, ctx: ToolContext): Promise<ToolResult> {
       `[schedule_highlevel] HighLevel ${res.status}:`,
       (await res.text()).slice(0, 300),
     );
+    if (res.status >= 500) throw new UnknownOutcomeError(UNKNOWN_BOOKING);
     return {
       ok: false,
-      output: null,
-      error: `El calendario de HighLevel respondió con un error (${res.status}); no se pudo agendar la cita. Dile al cliente que lo revisarás o pásalo a una persona.`,
+      // A person follows up: the buffer hands the conversation off after the reply.
+      output: { needs_human: true },
+      error: `El calendario de HighLevel respondió con un error (${res.status}); no se pudo agendar la cita. Dile al cliente que una persona del equipo lo revisará.`,
     };
   }
 
@@ -157,7 +193,7 @@ async function run(args: Args, ctx: ToolContext): Promise<ToolResult> {
     workspace_id: ctx.workspaceId,
     contact_id: dbContactId,
     conversation_id: ctx.conversationId,
-    scheduled_at: args.datetime_iso,
+    scheduled_at: new Date(start.ms).toISOString(),
     status: "booked",
     hl_appointment_id: appointmentId,
   });
@@ -180,7 +216,7 @@ async function run(args: Args, ctx: ToolContext): Promise<ToolResult> {
         provider: "highlevel",
         hl_appointment_id: appointmentId,
         contact_id: dbContactId,
-        scheduled_at: args.datetime_iso,
+        scheduled_at: new Date(start.ms).toISOString(),
         error: insertError.message,
       },
     });
@@ -190,7 +226,7 @@ async function run(args: Args, ctx: ToolContext): Promise<ToolResult> {
     ok: true,
     output: {
       appointment_id: appointmentId,
-      datetime: args.datetime_iso,
+      datetime: startTime,
     },
   };
 }
@@ -203,4 +239,6 @@ export const scheduleHighLevelTool: Tool<Args> = {
   schema,
   enabledFor: () => true,
   run,
+  // Contact upsert + booking, each bounded, inside the registry's budget.
+  preferredTimeoutMs: APPOINTMENT_TOOL_TIMEOUT_MS,
 };

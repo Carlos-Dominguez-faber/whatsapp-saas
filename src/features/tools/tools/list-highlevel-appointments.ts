@@ -9,9 +9,8 @@ type Args = z.infer<typeof schema>;
 
 async function run(_args: Args, ctx: ToolContext): Promise<ToolResult> {
   const { getHLConfig } = await import("../../inbox/services/highlevel-client.ts");
-  const { getBusinessInfo, businessTimeZone } = await import(
-    "../../inbox/services/business-info.ts"
-  );
+  const { getBusinessInfo } = await import("../../inbox/services/business-info.ts");
+  const { schedulingTimeZone } = await import("../../inbox/services/scheduling-timezone.ts");
 
   const cfg = await getHLConfig(ctx.workspaceId);
   if (!cfg) {
@@ -22,7 +21,7 @@ async function run(_args: Args, ctx: ToolContext): Promise<ToolResult> {
     return { ok: true, output: { appointments: [], note: "No hay un contacto real en esta conversación." } };
   }
 
-  const zone = businessTimeZone(await getBusinessInfo(ctx.workspaceId));
+  const zone = schedulingTimeZone(await getBusinessInfo(ctx.workspaceId), cfg.timezone);
   const supabase = createSbClient(
     process.env.NEXT_PUBLIC_SUPABASE_URL!,
     process.env.SUPABASE_SERVICE_ROLE_KEY!,
@@ -33,7 +32,7 @@ async function run(_args: Args, ctx: ToolContext): Promise<ToolResult> {
       cfg,
       workspaceId: ctx.workspaceId,
       contactId: ctx.contactId,
-      businessZone: zone,
+      zone,
       hlZone: hlTimeZone(cfg, zone),
     });
     return {

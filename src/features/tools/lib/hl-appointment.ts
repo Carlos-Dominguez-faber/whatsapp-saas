@@ -3,7 +3,7 @@ import type { HLConfig } from "../../inbox/services/highlevel-client.ts";
 import type { ToolContext } from "../core/tool";
 import {
   formatWithOffset,
-  isIanaTimeZone,
+  wallClockOf,
   wallClockToInstant,
 } from "@/shared/lib/timezone";
 
@@ -59,32 +59,74 @@ export class UnknownOutcomeError extends Error {
   }
 }
 
+export type ConfirmedInstant =
+  | { ms: number }
+  /** The text isn't a date and time, or that time never exists in the zone. */
+  | { error: "invalid" }
+  /** Its offset isn't the zone's at that moment: copied from another zone. */
+  | { error: "offset_mismatch" };
+
 /**
- * The instant a customer confirmed. The date and time are read as a wall
- * clock in the business's zone — the offset the model wrote is not trusted,
- * since it may be the one from today and not from that date (DST). Null when
- * the text isn't a date and time, or that time never exists there (February
- * 30, a time skipped by a DST change).
+ * The instant of a date and time the model passed, read in `timeZone` (the
+ * scheduling zone, see scheduling-timezone.ts). With an explicit offset, the
+ * instant it names must read, in that zone, as the same wall clock that was
+ * written — slots and appointment lists carry that zone's offset, so a
+ * mismatch means the text came from somewhere else, and nothing is guessed.
+ * Without one, the wall clock is read in the zone (the first of a repeated
+ * DST hour). February 30 and times skipped by a DST change never exist.
  */
-export function parseConfirmedInstant(iso: string, timeZone: string): number | null {
-  const m = iso
-    .trim()
-    .match(
-      /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::(\d{2}))?(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?$/i,
-    );
-  if (!m) return null;
-  const [, y, mo, d, h, mi, s] = m;
-  return wallClockToInstant(
-    {
-      year: Number(y),
-      month: Number(mo),
-      day: Number(d),
-      hour: Number(h),
-      minute: Number(mi),
-      second: Number(s ?? 0),
-    },
-    timeZone,
+export function parseConfirmedInstant(iso: string, timeZone: string): ConfirmedInstant {
+  const text = iso.trim();
+  const m = text.match(
+    /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::(\d{2}))?(?:\.\d+)?(Z|[+-]\d{2}:?\d{2})?$/i,
   );
+  if (!m) return { error: "invalid" };
+  const [, y, mo, d, h, mi, s, offset] = m;
+  const wall = {
+    year: Number(y),
+    month: Number(mo),
+    day: Number(d),
+    hour: Number(h),
+    minute: Number(mi),
+    second: Number(s ?? 0),
+  };
+  const local = wallClockToInstant(wall, timeZone);
+  if (local === null) return { error: "invalid" };
+  if (!offset) return { ms: local };
+
+  const explicit = Date.parse(text.replace(" ", "T"));
+  if (Number.isNaN(explicit)) return { error: "invalid" };
+  const read = wallClockOf(explicit, timeZone);
+  const same =
+    read.year === wall.year &&
+    read.month === wall.month &&
+    read.day === wall.day &&
+    read.hour === wall.hour &&
+    read.minute === wall.minute &&
+    read.second === wall.second;
+  return same ? { ms: explicit } : { error: "offset_mismatch" };
+}
+
+/** What to tell the model when parseConfirmedInstant refuses a date. */
+export function confirmedInstantError(
+  error: "invalid" | "offset_mismatch",
+  timeZone: string,
+): string {
+  return error === "offset_mismatch"
+    ? `La fecha no está en la zona horaria del negocio (${timeZone}). No la ajustes a mano: vuelve a consultar la disponibilidad o la lista de citas y copia la fecha exactamente como aparece.`
+    : "Esa fecha y hora no es válida (formato ISO 8601, y que exista en el calendario). Confírmala con el cliente o consúltala otra vez.";
+}
+
+/** A HighLevel time's instant: with an offset as written, else read in `timeZone`. */
+function instantOf(value: string, timeZone: string): number | null {
+  const parsed = parseConfirmedInstant(value, timeZone);
+  if ("ms" in parsed) return parsed.ms;
+  // HighLevel's own offset is authoritative for its own times.
+  if (parsed.error === "offset_mismatch") {
+    const ms = Date.parse(value.trim().replace(" ", "T"));
+    return Number.isNaN(ms) ? null : ms;
+  }
+  return null;
 }
 
 /**
@@ -94,21 +136,16 @@ export function parseConfirmedInstant(iso: string, timeZone: string): number | n
  */
 export function parseHLTime(value: unknown, timeZone: string): number | null {
   if (typeof value !== "string" || !value.trim()) return null;
-  if (/(Z|[+-]\d{2}:?\d{2})$/i.test(value.trim())) {
-    const ms = Date.parse(value.trim());
-    return Number.isNaN(ms) ? null : ms;
-  }
-  return parseConfirmedInstant(value, timeZone);
+  return instantOf(value, timeZone);
 }
 
 /**
- * The zone HighLevel's bare times are in: the location's, when the
- * integration has a real one configured, else the business's.
+ * The zone HighLevel's bare times (no offset) are read in: the location's,
+ * when the integration has one configured, else the scheduling zone.
+ * HighLevel doesn't document it; see the PR's manual checks.
  */
-export function hlTimeZone(cfg: HLConfig, businessTimeZone: string): string {
-  return isIanaTimeZone(cfg.timezone) && cfg.timezone !== "UTC"
-    ? cfg.timezone
-    : businessTimeZone;
+export function hlTimeZone(cfg: HLConfig, schedulingZone: string): string {
+  return cfg.timezone ?? schedulingZone;
 }
 
 /** A date the model can read back to the customer, in the business's zone. */
@@ -123,6 +160,8 @@ export function describeInstant(ms: number, timeZone: string): string {
 export interface LocatedAppointment {
   /** The local `appointments` row, when there is one. */
   localId: string | null;
+  /** Whether that local row is live (it may be cancelled while HighLevel's isn't). */
+  localActive: boolean;
   hlAppointmentId: string;
   state: AppointmentState;
   meta: Record<string, unknown>;
@@ -152,12 +191,17 @@ function pick(
   return chosen ? { kind: "found", ...chosen } : { kind: "none" };
 }
 
-async function findLocalAt(
+/** Local appointment statuses that are still live (see the CHECK on appointments). */
+export const LOCAL_ACTIVE_STATUSES = ["booked", "confirmed"];
+
+type Candidate = { state: AppointmentState } & LocatedAppointment;
+
+async function localCandidatesAt(
   supabase: SupabaseClient,
   workspaceId: string,
   contactId: string,
   instantMs: number,
-): Promise<LocateResult> {
+): Promise<Candidate[]> {
   const { data, error } = await supabase
     .from("appointments")
     .select("id, hl_appointment_id, status, scheduled_at, meta")
@@ -169,16 +213,15 @@ async function findLocalAt(
     .order("created_at", { ascending: false })
     .limit(10);
   if (error) throw new Error(`appointments lookup failed: ${error.message}`);
-  return pick(
-    ((data as LocalRow[] | null) ?? [])
-      .filter((r) => r.hl_appointment_id)
-      .map((r) => ({
-        localId: r.id,
-        hlAppointmentId: r.hl_appointment_id!,
-        state: stateOf(r.status),
-        meta: r.meta ?? {},
-      })),
-  );
+  return ((data as LocalRow[] | null) ?? [])
+    .filter((r) => r.hl_appointment_id)
+    .map((r) => ({
+      localId: r.id,
+      localActive: stateOf(r.status) === "active",
+      hlAppointmentId: r.hl_appointment_id!,
+      state: stateOf(r.status),
+      meta: r.meta ?? {},
+    }));
 }
 
 interface HLContactEvent {
@@ -234,11 +277,13 @@ async function hlContactIdOf(
 }
 
 /**
- * The conversation contact's appointment at `instantMs`: the local table
- * first, then HighLevel — only with a configured calendar, since without one
- * another calendar's appointment of the same account could be the match.
- * Throws when a lookup itself fails, so the caller reports an error instead of
- * "not found".
+ * The conversation contact's appointment at `instantMs`. A live local row
+ * settles it. Otherwise HighLevel is asked too (only with a configured
+ * calendar: without one, another calendar's appointment of the same account
+ * could match) and merged with what's local, HighLevel's state winning for
+ * the same appointment — a cancelled local row must not hide an appointment
+ * the customer booked again at that time. Throws when a lookup fails, so the
+ * caller reports an error instead of "not found".
  */
 export async function locateAppointmentAt(opts: {
   supabase: SupabaseClient;
@@ -248,19 +293,31 @@ export async function locateAppointmentAt(opts: {
   instantMs: number;
   hlZone: string;
 }): Promise<LocateResult> {
-  const local = await findLocalAt(opts.supabase, opts.workspaceId, opts.contactId, opts.instantMs);
-  if (local.kind !== "none") return local;
-
-  if (!opts.cfg.calendarId) return { kind: "none" };
-  const hlContactId = await hlContactIdOf(opts.supabase, opts.workspaceId, opts.contactId);
-  if (!hlContactId) return { kind: "none" };
-
-  const events = await listHLContactEvents(opts.cfg, hlContactId, opts.hlZone);
-  return pick(
-    events
-      .filter((e) => Math.abs(e.startMs - opts.instantMs) <= MATCH_TOLERANCE_MS)
-      .map((e) => ({ localId: null, hlAppointmentId: e.id, state: e.state, meta: {} })),
+  const local = await localCandidatesAt(
+    opts.supabase,
+    opts.workspaceId,
+    opts.contactId,
+    opts.instantMs,
   );
+  if (local.some((c) => c.state === "active")) return pick(local);
+  if (!opts.cfg.calendarId) return pick(local);
+
+  const hlContactId = await hlContactIdOf(opts.supabase, opts.workspaceId, opts.contactId);
+  if (!hlContactId) return pick(local);
+  const events = await listHLContactEvents(opts.cfg, hlContactId, opts.hlZone);
+
+  const merged = new Map<string, Candidate>(local.map((c) => [c.hlAppointmentId, c]));
+  for (const e of events) {
+    if (Math.abs(e.startMs - opts.instantMs) > MATCH_TOLERANCE_MS) continue;
+    const known = merged.get(e.id);
+    merged.set(
+      e.id,
+      known
+        ? { ...known, state: e.state }
+        : { localId: null, localActive: false, hlAppointmentId: e.id, state: e.state, meta: {} },
+    );
+  }
+  return pick([...merged.values()]);
 }
 
 export interface HLEventDetails {
@@ -372,48 +429,50 @@ export async function noteForTeam(
 }
 
 /**
- * The contact's upcoming active appointments, with the exact instant to copy
- * into cancel/reschedule. Local rows first; HighLevel when there are none and
- * a calendar is configured.
+ * The contact's upcoming live appointments, with the exact instant to copy
+ * into cancel/reschedule: local rows and, with a configured calendar,
+ * HighLevel's, merged by appointment id (HighLevel's state winning).
  */
 export async function listUpcomingAppointments(opts: {
   supabase: SupabaseClient;
   cfg: HLConfig;
   workspaceId: string;
   contactId: string;
-  businessZone: string;
+  zone: string;
   hlZone: string;
 }): Promise<Array<{ datetime_iso: string; cuando: string }>> {
   const now = Date.now();
   const { data, error } = await opts.supabase
     .from("appointments")
-    .select("scheduled_at, status")
+    .select("hl_appointment_id, scheduled_at")
     .eq("workspace_id", opts.workspaceId)
     .eq("contact_id", opts.contactId)
-    .in("status", ["booked", "confirmed"])
+    .in("status", LOCAL_ACTIVE_STATUSES)
     .not("hl_appointment_id", "is", null)
     .gte("scheduled_at", new Date(now).toISOString())
     .order("scheduled_at", { ascending: true })
-    .limit(10);
+    .limit(20);
   if (error) throw new Error(`appointments lookup failed: ${error.message}`);
-  let instants = ((data as Array<{ scheduled_at: string }> | null) ?? []).map((r) =>
-    Date.parse(r.scheduled_at),
-  );
 
-  if (instants.length === 0 && opts.cfg.calendarId) {
+  const byId = new Map<string, number | null>();
+  for (const r of (data as Array<{ hl_appointment_id: string; scheduled_at: string }> | null) ?? []) {
+    byId.set(r.hl_appointment_id, Date.parse(r.scheduled_at));
+  }
+  if (opts.cfg.calendarId) {
     const hlContactId = await hlContactIdOf(opts.supabase, opts.workspaceId, opts.contactId);
     if (hlContactId) {
-      instants = (await listHLContactEvents(opts.cfg, hlContactId, opts.hlZone))
-        .filter((e) => e.state === "active" && e.startMs >= now)
-        .map((e) => e.startMs)
-        .sort((a, b) => a - b)
-        .slice(0, 10);
+      for (const e of await listHLContactEvents(opts.cfg, hlContactId, opts.hlZone)) {
+        // Cancelled (or past) in HighLevel: gone, even if a local row says booked.
+        byId.set(e.id, e.state === "active" && e.startMs >= now ? e.startMs : null);
+      }
     }
   }
-  return instants
-    .filter((ms) => !Number.isNaN(ms))
+  return [...byId.values()]
+    .filter((ms): ms is number => ms !== null && !Number.isNaN(ms) && ms >= now)
+    .sort((x, y) => x - y)
+    .slice(0, 10)
     .map((ms) => ({
-      datetime_iso: formatWithOffset(ms, opts.businessZone),
-      cuando: describeInstant(ms, opts.businessZone),
+      datetime_iso: formatWithOffset(ms, opts.zone),
+      cuando: describeInstant(ms, opts.zone),
     }));
 }
