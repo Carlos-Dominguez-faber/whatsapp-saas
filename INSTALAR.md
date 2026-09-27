@@ -454,33 +454,57 @@ las migraciones, así que las migraciones van **antes** de `vercel --prod`.
 - **Agencia → Miembros:** el super admin ve quién tiene acceso a cada workspace y
   puede generar una clave nueva para un miembro activo, que se muestra una sola vez.
   - No resetea la de otro super admin ni la tuya.
-  - La clave es de la persona, no del workspace: la nueva aplica en todos sus
-    workspaces, y la hoja te dice en cuántos está.
-  - Cada reseteo queda en `events` (`member_password_reset`, con quién lo hizo);
-    si ese registro no se puede escribir, la clave no cambia.
-  - Las sesiones que esa persona ya tenga abiertas pueden seguir activas hasta
-    que expiren.
+  - La clave es de la persona, no del workspace. Si también está activa en otros
+    workspaces, la hoja los nombra y pide una segunda confirmación: la clave nueva
+    aplica en todos.
+  - Al cambiar la clave, Supabase cierra sus sesiones y tokens de refresco. Un
+    token de acceso que ya tenía puede seguir funcionando hasta que expire (a lo
+    más una hora).
+  - Cada reseteo queda en una tabla de auditoría que nadie puede editar ni borrar
+    (`member_password_resets`, ni siquiera desde el service role) y como evento en
+    cada workspace donde la persona está. Si el registro no se puede escribir, la
+    clave no cambia.
   - Al dar de alta un cliente con un email que ya tiene cuenta, la app pide
     confirmar antes de usar esa cuenta (conserva su contraseña).
-- **Cancelar y reagendar en HighLevel** (`cancel_highlevel`, `reschedule_highlevel`;
-  apagadas hasta que las actives en Configuración → Tools):
-  - El agente tiene que pasar la fecha y hora de la cita que el cliente confirmó, y
-    la tool solo actúa sobre la cita del contacto a esa hora. Si la cita ya estaba
-    cancelada o ya está en el horario nuevo, lo dice y no cambia nada (un
-    reintento nunca cancela ni mueve otra cita).
-  - Busca primero en tu base; si ahí no está, le pregunta a HighLevel, **solo si
-    el workspace tiene un calendario configurado** (en otro calendario de la misma
-    cuenta podría estar la cita de otro servicio).
-  - `schedule_highlevel` agenda siempre al contacto de la conversación; un teléfono
-    que pase el modelo solo se usa en el chat de prueba.
+- **Equipo:** invitar un correo que **ya tiene cuenta** responde "Ese correo ya tiene
+  cuenta; pídele a la agencia que lo agregue", salvo que esa persona ya esté en
+  este workspace. Solo el super admin agrega cuentas existentes.
+- **Citas en HighLevel** (apagadas hasta que las actives en Configuración → Tools):
+  - `list_highlevel_appointments` (lectura): las próximas citas del contacto, con la
+    fecha y hora exactas que el agente debe copiar.
+  - `cancel_highlevel` y `reschedule_highlevel`: el agente pasa la fecha y hora de
+    la cita que el cliente confirmó, y la tool solo actúa sobre la cita del
+    contacto a esa hora. La hora se lee en la zona del negocio (Configuración →
+    Negocio), así que una fecha del otro lado de un cambio de horario sigue
+    empatando; una fecha que no existe se rechaza.
+  - Si la cita ya estaba cancelada, o ya está en el horario nuevo por un cambio
+    anterior, lo dice y no cambia nada: un reintento nunca cancela ni mueve otra
+    cita. Tampoco actúa sobre citas pasadas ni cuando hay dos citas a la misma hora.
+  - Reagendar conserva la duración de la cita.
+  - Si HighLevel no confirma el cambio (error 5xx, tiempo agotado), el agente no le
+    dice al cliente que se hizo ni que falló: dice que una persona lo confirmará.
+    Cada vez que la consulta o el cambio fallan, queda una **nota interna** en la
+    conversación para el equipo.
+  - Busca primero en tu base; si ahí no está, le pregunta a HighLevel **solo si el
+    workspace tiene un calendario configurado**.
+  - Usan los encabezados `Version` que documenta HighLevel (`2021-04-15` para las
+    citas, `2021-07-28` para las citas de un contacto).
+  - `schedule_highlevel` agenda siempre al contacto de la conversación.
+- **Chat de prueba de agentes:** solo corre las tools de **lectura** (consultar
+  disponibilidad, una tool de n8n de lectura). No agenda, no cancela ni dispara
+  workflows de escritura.
 - **Tools de n8n por workspace** (Configuración → n8n, solo admins): cada fila es una
   tool que llama a un webhook de n8n.
   - El header de autenticación se guarda **cifrado** y nunca se vuelve a mostrar;
-    ninguna sesión puede leerlo (ni un admin). Si venías de la rama del PR #11,
-    corre `node scripts/encrypt-credentials.mjs` para cifrar los que tengas en
-    texto plano.
-  - Cada llamada manda un `idempotency_key` estable para el mismo mensaje, tool y
-    argumentos: si tu workflow escribe algo, úsalo para no hacerlo dos veces.
+    ninguna sesión puede leerlo (ni un admin). No acepta saltos de línea ni
+    caracteres de control. Si venías de la rama del PR #11, corre
+    `node scripts/encrypt-credentials.mjs` para cifrar los que tengas en texto plano.
+  - Cada llamada manda un `idempotency_key`: el mismo para la misma tool con los
+    mismos argumentos al contestar el mismo mensaje del cliente, también si ese
+    mensaje se reintenta. Úsalo en tu workflow para no escribir dos veces. Ojo: si
+    el agente llama la tool **dos veces con los mismos argumentos** en un mismo
+    turno, las dos llamadas llevan la misma clave (tu workflow las tratará como
+    una).
   - Las llamadas siguen redirecciones como `custom_webhook` (máximo 3, cada salto
     validado, solo HTTPS, sin mandar el header a otro dominio).
   - El agente ve a lo más 16 KB de la respuesta: haz que el workflow devuelva solo
@@ -491,17 +515,21 @@ las migraciones, así que las migraciones van **antes** de `vercel --prod`.
 - **`handoff_human`** (apagada hasta que la actives en Configuración → Tools): el
   agente puede pasar la conversación a una persona cuando el cliente lo pide o
   cuando no tiene cómo resolver. Primero manda su despedida y luego pasa la
-  conversación; si no escribió despedida, pasa de inmediato y el contacto recibe
-  el aviso de siempre.
+  conversación; si no escribió despedida, o el turno falla después de pedirlo, pasa
+  de inmediato y el contacto recibe el aviso de siempre. Si el traspaso falla, se
+  reintenta; si vuelve a fallar, queda un evento `handoff_failed`, una nota interna
+  y, si el aviso por correo está activo, un correo al equipo.
 - **Aviso al equipo por correo** (apagado por defecto: Configuración →
   Integraciones → WhatsApp → "Avisar al equipo por correo…"): cuando una
   conversación pasa a una persona, cada admin, manager y agente activo recibe su
-  propio correo, con un tope de 10 avisos por hora por workspace. Requiere una
-  cuenta de [Resend](https://resend.com) y dos variables en Vercel:
-  `RESEND_API_KEY` y `HANDOFF_NOTIFY_FROM` (una dirección de un dominio verificado
-  en Resend). Sin ellas no se manda nada.
+  propio correo (hasta 20, los admins primero), con un tope de 10 avisos por hora
+  por workspace. Requiere una cuenta de [Resend](https://resend.com) y dos
+  variables en Vercel: `RESEND_API_KEY` y `HANDOFF_NOTIFY_FROM` (una dirección de un
+  dominio verificado en Resend). Sin ellas no se manda nada, y la pantalla lo avisa.
 - En el inbox, la pestaña muestra cuántas conversaciones esperan a una persona y,
-  si das permiso, el navegador avisa cuando entra una nueva.
+  si das permiso, el navegador avisa una sola vez por cada conversación que entra.
+- **Eventos:** las sesiones ya no pueden insertar filas en `events` (solo el
+  servidor), así nadie puede falsear un registro ni silenciar un aviso.
 
 **Si instalaste desde la antigua rama `provider/kapso`** (Kapso), cámbiate a `main`,
 donde ahora viven los dos proveedores. Cada workspace sigue con el proveedor que

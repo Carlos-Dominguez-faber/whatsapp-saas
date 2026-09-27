@@ -8,7 +8,7 @@ BEGIN;
 CREATE EXTENSION IF NOT EXISTS pgtap WITH SCHEMA extensions;
 SET search_path = public, extensions;
 
-SELECT plan(112);
+SELECT plan(122);
 
 -- ── public.users: read-only for sessions ────────────────────────────────────
 SELECT ok(NOT has_table_privilege('authenticated', 'public.users', 'UPDATE'),
@@ -326,10 +326,10 @@ SELECT throws_ok(
   $$INSERT INTO public.events (workspace_id, type, payload)
     VALUES ('b0000000-0000-4000-8000-000000000001', 'model_outside_catalog', '{}')$$,
   '42501', NULL, 'a session cannot pre-empt the daily model_outside_catalog event');
-SELECT lives_ok(
+SELECT throws_ok(
   $$INSERT INTO public.events (workspace_id, type, payload)
     VALUES ('b0000000-0000-4000-8000-000000000001', 'note_viewed', '{}')$$,
-  'a session still inserts other event types in its workspace');
+  '42501', NULL, 'a session inserts no event at all: only the server writes events');
 RESET ROLE;
 
 -- ── the buffer: one batch per conversation, stale leases counted ───────────
@@ -539,6 +539,10 @@ SELECT throws_ok(
   '42501', NULL, 'a session cannot fake a password-reset audit entry');
 SELECT throws_ok(
   $$INSERT INTO public.events (workspace_id, type, payload)
+    VALUES ('b0000000-0000-4000-8000-000000000001', 'Member_Password_Reset', '{}')$$,
+  '42501', NULL, 'nor a variant spelling of it');
+SELECT throws_ok(
+  $$INSERT INTO public.events (workspace_id, type, payload)
     VALUES ('b0000000-0000-4000-8000-000000000001', 'handoff_ack_sent', '{}')$$,
   '42501', NULL, 'a session cannot silence the contact''s handoff acknowledgement');
 SELECT throws_ok(
@@ -558,6 +562,29 @@ SELECT is((SELECT sensitivity::text FROM public.tools WHERE key = 'cancel_highle
   'cancel_highlevel is a write tool');
 SELECT ok((SELECT schema::text FROM public.tools WHERE key = 'reschedule_highlevel') LIKE '%appointment_datetime_iso%',
   'reschedule_highlevel asks for the appointment''s confirmed date');
+SELECT is((SELECT sensitivity::text FROM public.tools WHERE key = 'list_highlevel_appointments'), 'read',
+  'list_highlevel_appointments is a read tool');
+SELECT ok(NOT has_table_privilege('authenticated', 'public.events', 'INSERT'),
+  'sessions have no INSERT on events');
+
+-- ── password-reset audit: append-only, server-only ──────────────────────────
+SELECT ok(NOT has_table_privilege('authenticated', 'public.member_password_resets', 'SELECT'),
+  'sessions cannot read the password-reset audit');
+SELECT ok(NOT has_table_privilege('service_role', 'public.member_password_resets', 'UPDATE'),
+  'not even the service role may UPDATE the audit');
+SELECT ok(NOT has_table_privilege('service_role', 'public.member_password_resets', 'DELETE'),
+  'not even the service role may DELETE the audit');
+INSERT INTO public.member_password_resets (actor_user_id, target_user_id, workspace_id, affected_workspace_ids, outcome)
+  VALUES ('a0000000-0000-4000-8000-0000000000e1', 'b0000000-0000-4000-8000-0000000000e1',
+          'b0000000-0000-4000-8000-000000000001', ARRAY['b0000000-0000-4000-8000-000000000001']::uuid[], 'done');
+SELECT throws_ok($$UPDATE public.member_password_resets SET outcome = 'failed'$$, '42501', NULL,
+  'an audit row cannot be changed, even by the owner');
+SELECT throws_ok($$DELETE FROM public.member_password_resets$$, '42501', NULL,
+  'an audit row cannot be deleted, even by the owner');
+SELECT lives_ok($$DELETE FROM public.workspaces WHERE id = 'a0000000-0000-4000-8000-000000000001'$$,
+  'a workspace can still be deleted: the audit has no foreign keys');
+SELECT is((SELECT count(*)::int FROM public.member_password_resets), 1,
+  'the audit outlives the workspaces it mentions');
 
 SELECT * FROM finish();
 ROLLBACK;
