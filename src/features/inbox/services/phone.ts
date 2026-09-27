@@ -237,3 +237,16 @@ export function checkDestination(
   if (!placed?.international || !destinationPhone) return "unenforced";
   return samePhone(placed.e164, destinationPhone) ? "match" : "mismatch";
 }
+
+/**
+ * The forms the same line can be stored in: E.164 plus, for Mexican and
+ * Argentinian mobiles, the variant with (or without) the extra mobile digit.
+ * For looking a number up where it was stored as written.
+ */
+export function phoneVariants(phone: string, defaultCountryCode?: string): string[] {
+  const key = phoneKey(phone, defaultCountryCode);
+  const variants = new Set([`+${key}`, normalizePhone(phone, defaultCountryCode)]);
+  if (key.length === 12 && key.startsWith("52")) variants.add(`+521${key.slice(2)}`);
+  if (key.length === 12 && key.startsWith("54")) variants.add(`+549${key.slice(2)}`);
+  return [...variants];
+}

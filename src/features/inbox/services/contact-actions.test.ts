@@ -27,11 +27,12 @@ mock.module("@/lib/supabase/server.ts", {
 
 // ── ./highlevel-client ──────────────────────────────────────────────────────
 let syncCalls: Array<[string, string]> = [];
+let syncResult: Record<string, unknown> | null = { hl_id: "hl_1" };
 mock.module("./highlevel-client.ts", {
   exports: {
     syncContactToHL: async (workspaceId: string, contactId: string) => {
       syncCalls.push([workspaceId, contactId]);
-      return { hl_id: "hl_1" };
+      return syncResult;
     },
   },
 });
@@ -42,6 +43,7 @@ beforeEach(() => {
   accessResult = { ok: true, userId: "user_1", role: "agent" };
   checkCalls = [];
   syncCalls = [];
+  syncResult = { hl_id: "hl_1" };
 });
 
 test("syncContactHL syncs when the caller is an agent of the workspace", async () => {
@@ -59,4 +61,11 @@ test("syncContactHL rejects a signed-in user who is not a member, without syncin
 
   assert.equal(result.ok, false);
   assert.deepEqual(syncCalls, [], "a non-member must not trigger a sync");
+});
+
+test("syncContactHL doesn't report success when another contact already holds the HighLevel contact", async () => {
+  syncResult = { hl_id: "hl_1", linkConflict: { heldBy: "ct_2" } };
+  const result = await syncContactHL("ct_1", "ws_1");
+  assert.equal(result.ok, false);
+  assert.match(String((result as { error?: string }).error), /misma persona/);
 });

@@ -40,7 +40,7 @@ interface HLAppointmentResponse {
 }
 
 async function run(args: Args, ctx: ToolContext): Promise<ToolResult> {
-  const { getHLConfig, upsertHLContactByPhone } =
+  const { getHLConfig, upsertHLContactByPhone, linkHLContact } =
     await import("../../inbox/services/highlevel-client");
 
   const cfg = await getHLConfig(ctx.workspaceId);
@@ -78,6 +78,7 @@ async function run(args: Args, ctx: ToolContext): Promise<ToolResult> {
       .from("contacts")
       .select("hl_contact_id, phone, name")
       .eq("id", ctx.contactId)
+      .eq("workspace_id", ctx.workspaceId)
       .single();
     const contactRow = contact as ContactRow | null;
     if (contactRow?.phone) {
@@ -100,10 +101,9 @@ async function run(args: Args, ctx: ToolContext): Promise<ToolResult> {
   if (!hlContactId) {
     hlContactId = await upsertHLContactByPhone(cfg, { name, phone });
     if (hlContactId && dbContactId) {
-      await supabase
-        .from("contacts")
-        .update({ hl_contact_id: hlContactId })
-        .eq("id", dbContactId);
+      // A conflict (another local contact already holds this HighLevel id) is
+      // logged and evented by linkHLContact; the booking still goes ahead.
+      await linkHLContact(supabase, ctx.workspaceId, dbContactId, hlContactId);
     }
   }
 

@@ -7,6 +7,7 @@ import {
   normalizePhone,
   phoneKey,
   phoneString,
+  phoneVariants,
   phoneWithCountryCode,
   placePhone,
   samePhone,
@@ -143,4 +144,10 @@ test("bare digits count as international only with the workspace's own country c
   assert.equal(phoneWithCountryCode("447911123456", "52"), null);
   assert.equal(phoneWithCountryCode("998 123 4567 ext 12", "52"), null);
   assert.equal(phoneWithCountryCode("998 123 4567 x 123", "52"), null);
+});
+
+test("phoneVariants finds a Mexican mobile stored either way", () => {
+  assert.deepEqual(phoneVariants("5512345678", "52").sort(), ["+525512345678", "+5215512345678"].sort());
+  assert.ok(phoneVariants("+5215512345678").includes("+525512345678"));
+  assert.deepEqual(phoneVariants("+15550001111"), ["+15550001111"]);
 });

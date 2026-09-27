@@ -401,6 +401,33 @@ las migraciones, así que las migraciones van **antes** de `vercel --prod`.
   llegado a su tope por hora. Pasados 15 minutos ya no se contesta solo.
 - **Nuevo ajuste, apagado por defecto:** Configuración → Integraciones → WhatsApp →
   "Pasar a una persona si se acaba el presupuesto diario de IA".
+- El webhook de contactos de **HighLevel** ahora sí sincroniza (antes fallaba
+  siempre sin avisar). **Es la primera vez que corre**: si tu HighLevel manda
+  webhooks de contactos, cada alta o cambio allá llega ahora a tu base, y cada uno
+  hace una lectura a la API de HighLevel (cuenta para sus límites de uso). Si no
+  quieres esa sincronización, quita el webhook de contactos en HighLevel.
+  - Enlaza el contacto de HighLevel con el de WhatsApp que tenga el mismo
+    teléfono, aunque esté escrito distinto (`+52 1…` y `+52…` cuentan como el
+    mismo número). Un número de HighLevel sin `+` usa el código de país del
+    negocio solo si tiene el largo de un número de ese país (10 dígitos en
+    México), contando los prefijos de siempre (`044`/`045` o `1` en México, `9` o
+    `15` en Argentina, el `0`); o si ya empieza con ese código. Si no, ese
+    contacto no se enlaza por teléfono. Si no existe, lo crea.
+  - No sobrescribe nada tuyo: **suma** sus etiquetas a las locales y solo llena
+    el nombre y el correo si estaban vacíos.
+  - Al revés, al guardar un contacto aquí sus etiquetas se **agregan** en
+    HighLevel, nunca reemplazan las de allá (las de tus flujos de HighLevel se
+    quedan). Por eso quitar una etiqueta aquí no la quita en HighLevel, y la
+    siguiente sincronización desde HighLevel puede volver a traerla: quítala en
+    los dos lados.
+  - Si dos contactos tuyos resultan ser la misma persona en HighLevel, no se
+    fusionan ni se le pasa nada al duplicado: queda un evento
+    `hl_contact_link_conflict` (uno al día por contacto) que dice cuál tiene el
+    enlace, y el botón de sincronizar del contacto lo avisa en vez de decir que
+    salió bien.
+  - Si al actualizar dos contactos de un workspace ya compartían el mismo id de
+    HighLevel, `db-push` deja el enlace solo en el que se tocó más recientemente
+    y lo avisa con un `WARNING` que lista cuáles se desenlazaron.
 - Los horarios de HighLevel se consultan en la zona horaria del negocio
   (Configuración → Negocio) si el agente no pide otra.
 - La sincronización de plantillas de **YCloud** ahora sí trae tus plantillas (antes

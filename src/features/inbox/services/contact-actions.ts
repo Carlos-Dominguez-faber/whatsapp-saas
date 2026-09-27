@@ -131,6 +131,13 @@ export async function syncContactHL(
   if (!result) {
     return { ok: false, error: "Error al sincronizar con HighLevel" };
   }
+  if (result.linkConflict) {
+    return {
+      ok: false,
+      error:
+        "Este contacto ya está en HighLevel, enlazado a otro contacto de aquí: son la misma persona registrada dos veces. Revisa los dos y quédate con uno.",
+    };
+  }
 
   return { ok: true, data: { hl_id: result.hl_id } };
 }
