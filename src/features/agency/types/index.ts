@@ -63,6 +63,12 @@ export interface WorkspaceMember {
   fullName: string | null;
   role: string;
   isActive: boolean;
+  /** Super admins' passwords are never reset from the agency sheet. */
+  isSuperAdmin: boolean;
+  /** The caller — nobody resets their own password from here. */
+  isSelf: boolean;
+  /** Workspaces where this person is an active member: the password is global. */
+  activeWorkspaceCount: number;
 }
 
 export type GetWorkspaceMembersResult =

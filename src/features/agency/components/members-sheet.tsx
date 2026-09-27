@@ -103,8 +103,9 @@ export function MembersSheet({ workspaceId, onClose }: Props) {
             Miembros
           </SheetTitle>
           <SheetDescription className="text-muted-foreground">
-            Miembros con acceso a este workspace. Puedes resetear la clave de
-            cualquiera de ellos.
+            Miembros con acceso a este workspace. Puedes generar una clave nueva
+            para los miembros activos; la de un super admin y la tuya no se
+            cambian desde aquí.
           </SheetDescription>
         </SheetHeader>
 
@@ -191,26 +192,43 @@ export function MembersSheet({ workspaceId, onClose }: Props) {
                     Inactivo
                   </Badge>
                 )}
-                {confirmUserId === member.userId ? (
-                  <div className="flex items-center gap-2">
-                    <Button
-                      size="sm"
-                      variant="destructive"
-                      className="text-xs"
-                      disabled={resetting}
-                      onClick={() => handleReset(member.userId)}
-                    >
-                      Confirmar reset
-                    </Button>
-                    <Button
-                      size="sm"
-                      variant="ghost"
-                      className="text-xs text-muted-foreground"
-                      disabled={resetting}
-                      onClick={() => setConfirmUserId(null)}
-                    >
-                      Cancelar
-                    </Button>
+                {!member.isActive ? null : member.isSuperAdmin ? (
+                  <p className="text-xs text-muted-foreground">
+                    Super admin: su clave no se resetea desde aquí.
+                  </p>
+                ) : member.isSelf ? (
+                  <p className="text-xs text-muted-foreground">
+                    Eres tú: cambia tu clave desde tu cuenta.
+                  </p>
+                ) : confirmUserId === member.userId ? (
+                  <div className="space-y-2">
+                    <p className="text-xs text-muted-foreground">
+                      La clave es de la persona, no del workspace:
+                      {member.activeWorkspaceCount > 1
+                        ? ` la nueva aplica en sus ${member.activeWorkspaceCount} workspaces.`
+                        : " la nueva aplica en todos sus accesos."}{" "}
+                      La anterior deja de funcionar.
+                    </p>
+                    <div className="flex items-center gap-2">
+                      <Button
+                        size="sm"
+                        variant="destructive"
+                        className="text-xs"
+                        disabled={resetting}
+                        onClick={() => handleReset(member.userId)}
+                      >
+                        Confirmar reset
+                      </Button>
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        className="text-xs text-muted-foreground"
+                        disabled={resetting}
+                        onClick={() => setConfirmUserId(null)}
+                      >
+                        Cancelar
+                      </Button>
+                    </div>
                   </div>
                 ) : (
                   <Button

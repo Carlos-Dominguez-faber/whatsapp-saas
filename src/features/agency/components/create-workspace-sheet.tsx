@@ -361,6 +361,11 @@ export function CreateWorkspaceSheet({ open, onClose, onCreated }: Props) {
                   </span>
                   . ¿Usar esta misma cuenta para el workspace nuevo?
                 </p>
+                <p className="text-xs text-muted-foreground">
+                  La cuenta conserva su contraseña actual (la que escribiste aquí
+                  no se aplica). Si el cliente no la recuerda, usa Miembros →
+                  Resetear clave.
+                </p>
                 <div className="flex gap-2">
                   <Button
                     type="button"

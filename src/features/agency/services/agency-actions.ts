@@ -172,17 +172,20 @@ export async function createWorkspaceForClient(
 
   if (wsError || !workspace) {
     console.error("[agency] workspace insert error:", wsError);
-    if (provisioned) {
-      // The client account was already resolved/created above (possibly a
-      // brand-new auth user with a generated password) but the workspace
-      // insert that was going to use it just failed. Leave a trace: the
-      // account isn't lost — the precheck will find it and offer
-      // confirmReuseExistingEmail on the next attempt — but its password
-      // (if newly generated) is now unrecoverable except via a manual reset.
-      console.error(
-        "[agency] client account left without a workspace after insert failure:",
+    if (provisioned?.created) {
+      // The account was created just now for this workspace and its password
+      // was never shown: remove it, so the next attempt starts clean instead
+      // of offering to reuse an account nobody can log into.
+      const { error: deleteError } = await service.auth.admin.deleteUser(
         provisioned.userId,
       );
+      if (deleteError) {
+        console.error(
+          "[agency] client account left without a workspace after insert failure:",
+          provisioned.userId,
+          deleteError,
+        );
+      }
     }
     return { error: "Error al crear el workspace" };
   }
@@ -484,7 +487,7 @@ export async function getWorkspaceMembers(
   const service = svc();
   const { data, error } = await service
     .from("memberships")
-    .select("user_id, role, is_active, users(email, full_name)")
+    .select("user_id, role, is_active, users(email, full_name, is_super_admin)")
     .eq("workspace_id", workspaceId);
 
   if (error) {
@@ -492,19 +495,46 @@ export async function getWorkspaceMembers(
     return { error: "No se pudieron cargar los miembros" };
   }
 
-  const members: WorkspaceMember[] = (
+  const rows =
     (data as unknown as {
       user_id: string;
       role: string;
       is_active: boolean;
-      users: { email: string; full_name: string | null } | null;
-    }[]) ?? []
-  ).map((row) => ({
+      users: {
+        email: string;
+        full_name: string | null;
+        is_super_admin: boolean | null;
+      } | null;
+    }[]) ?? [];
+
+  // A password is global to the person, not to this workspace: count where
+  // else each member is active so the sheet can say so before a reset.
+  const workspaceCounts = new Map<string, number>();
+  const userIds = rows.map((row) => row.user_id);
+  if (userIds.length > 0) {
+    const { data: activeRows, error: countError } = await service
+      .from("memberships")
+      .select("user_id")
+      .in("user_id", userIds)
+      .eq("is_active", true);
+    if (countError) {
+      console.error("[agency] count member workspaces error:", countError);
+      return { error: "No se pudieron cargar los miembros" };
+    }
+    for (const row of (activeRows as { user_id: string }[]) ?? []) {
+      workspaceCounts.set(row.user_id, (workspaceCounts.get(row.user_id) ?? 0) + 1);
+    }
+  }
+
+  const members: WorkspaceMember[] = rows.map((row) => ({
     userId: row.user_id,
     email: row.users?.email ?? "",
     fullName: row.users?.full_name ?? null,
     role: row.role,
     isActive: row.is_active,
+    isSuperAdmin: row.users?.is_super_admin === true,
+    isSelf: row.user_id === userId,
+    activeWorkspaceCount: workspaceCounts.get(row.user_id) ?? 0,
   }));
 
   return { members };
@@ -517,27 +547,33 @@ export async function resetMemberPassword(
   const adminId = await assertSuperAdmin();
   if (!adminId) return { error: "No autorizado" };
 
+  if (userId === adminId) {
+    return { error: "No puedes resetear tu propia clave desde aquí" };
+  }
+
   const service = svc();
 
   const { data: membership, error: membershipError } = await service
     .from("memberships")
-    .select("user_id")
+    .select("user_id, is_active")
     .eq("workspace_id", workspaceId)
     .eq("user_id", userId)
-    .eq("is_active", true)
     .maybeSingle();
 
   if (membershipError || !membership) {
     console.error(
-      "[agency] reset target is not an active member of the workspace:",
+      "[agency] reset target is not a member of the workspace:",
       membershipError,
     );
     return { error: "No se pudo resetear la clave" };
   }
+  if (!(membership as { is_active: boolean }).is_active) {
+    return { error: "Ese miembro está inactivo en este workspace" };
+  }
 
   const { data: userRow, error: userError } = await service
     .from("users")
-    .select("email")
+    .select("email, is_super_admin")
     .eq("id", userId)
     .single();
 
@@ -545,6 +581,32 @@ export async function resetMemberPassword(
     console.error("[agency] resolve user for reset error:", userError);
     return { error: "No se pudo resetear la clave" };
   }
+  const target = userRow as { email: string; is_super_admin: boolean | null };
+  if (target.is_super_admin === true) {
+    return { error: "La clave de un super admin no se resetea desde aquí" };
+  }
+
+  // Audit before acting: if the trail can't be written, the reset doesn't run.
+  const { data: auditRow, error: auditError } = await service
+    .from("events")
+    .insert({
+      workspace_id: workspaceId,
+      type: "member_password_reset",
+      level: "warn",
+      payload: {
+        actor_user_id: adminId,
+        target_user_id: userId,
+        outcome: "attempted",
+      },
+    })
+    .select("id")
+    .single();
+
+  if (auditError || !auditRow) {
+    console.error("[agency] password reset audit error:", auditError);
+    return { error: "No se pudo registrar el reseteo; la clave no cambió" };
+  }
+  const auditId = (auditRow as { id: string }).id;
 
   const password = generatePassword();
   const { error: updateError } = await service.auth.admin.updateUserById(
@@ -552,10 +614,22 @@ export async function resetMemberPassword(
     { password },
   );
 
+  const outcome = updateError ? "failed" : "done";
+  const { error: auditUpdateError } = await service
+    .from("events")
+    .update({
+      payload: { actor_user_id: adminId, target_user_id: userId, outcome },
+    })
+    .eq("id", auditId)
+    .eq("workspace_id", workspaceId);
+  if (auditUpdateError) {
+    console.error("[agency] password reset audit update error:", auditUpdateError);
+  }
+
   if (updateError) {
     console.error("[agency] password reset error:", updateError);
     return { error: "No se pudo resetear la clave" };
   }
 
-  return { email: (userRow as { email: string }).email, password };
+  return { email: target.email, password };
 }

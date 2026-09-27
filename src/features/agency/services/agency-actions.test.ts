@@ -45,15 +45,25 @@ function fakeService(opts: {
     user_id: string;
     role: string;
     is_active: boolean;
-    users: { email: string; full_name: string | null } | null;
+    users: {
+      email: string;
+      full_name: string | null;
+      is_super_admin?: boolean | null;
+    } | null;
   }>;
   membersError?: { message: string } | null;
-  membershipExists?: boolean;
+  /** Active-membership rows across all workspaces (for the global-password count). */
+  activeMembershipRows?: Array<{ user_id: string }>;
+  membership?: { user_id: string; is_active: boolean } | null;
   membershipError?: { message: string } | null;
   userEmail?: string | null;
+  userIsSuperAdmin?: boolean;
   updateError?: { message: string } | null;
+  auditInsertError?: { message: string } | null;
 }) {
   const updateCalls: Array<{ userId: string; password: string }> = [];
+  const auditInserts: Array<Record<string, unknown>> = [];
+  const auditUpdates: Array<Record<string, unknown>> = [];
   const client = {
     auth: {
       admin: {
@@ -70,19 +80,28 @@ function fakeService(opts: {
       if (table === "memberships") {
         return {
           select() {
+            let usedIn = false;
             const chain: any = {
               eq() {
                 return chain;
               },
+              in() {
+                usedIn = true;
+                return chain;
+              },
               maybeSingle: async () => ({
-                data: opts.membershipExists ? { user_id: "target1" } : null,
+                data: opts.membership ?? null,
                 error: opts.membershipError ?? null,
               }),
               then(resolve: (v: unknown) => void) {
-                resolve({
-                  data: opts.membersRows ?? [],
-                  error: opts.membersError ?? null,
-                });
+                resolve(
+                  usedIn
+                    ? { data: opts.activeMembershipRows ?? [], error: null }
+                    : {
+                        data: opts.membersRows ?? [],
+                        error: opts.membersError ?? null,
+                      },
+                );
               },
             };
             return chain;
@@ -97,7 +116,13 @@ function fakeService(opts: {
                 return {
                   single: async () =>
                     opts.userEmail
-                      ? { data: { email: opts.userEmail }, error: null }
+                      ? {
+                          data: {
+                            email: opts.userEmail,
+                            is_super_admin: opts.userIsSuperAdmin ?? false,
+                          },
+                          error: null,
+                        }
                       : { data: null, error: { message: "not found" } },
                 };
               },
@@ -105,10 +130,33 @@ function fakeService(opts: {
           },
         };
       }
+      if (table === "events") {
+        return {
+          insert(row: Record<string, unknown>) {
+            auditInserts.push(row);
+            return {
+              select: () => ({
+                single: async () =>
+                  opts.auditInsertError
+                    ? { data: null, error: opts.auditInsertError }
+                    : { data: { id: "audit_1" }, error: null },
+              }),
+            };
+          },
+          update(row: Record<string, unknown>) {
+            auditUpdates.push(row);
+            const c: any = {
+              eq: () => c,
+              then: (resolve: (v: unknown) => void) => resolve({ error: null }),
+            };
+            return c;
+          },
+        };
+      }
       throw new Error(`unexpected table: ${table}`);
     },
   };
-  return { client, updateCalls };
+  return { client, updateCalls, auditInserts, auditUpdates };
 }
 
 function fakeCreateWorkspaceService(opts: {
@@ -124,8 +172,11 @@ function fakeCreateWorkspaceService(opts: {
    * between our precheck and our own createUser call.
    */
   raceUser?: { id: string; email: string };
+  /** Makes the workspaces insert fail (after the client account was resolved). */
+  workspaceInsertError?: { message: string };
 }) {
   const inserts: Array<{ table: string; row: unknown }> = [];
+  const deletedUsers: string[] = [];
   let promptCounter = 0;
   let createUserAttempted = false;
 
@@ -164,6 +215,10 @@ function fakeCreateWorkspaceService(opts: {
           if (opts.raceUser && createUserAttempted) users.push(opts.raceUser);
           return { data: { users }, error: null };
         },
+        deleteUser: async (id: string) => {
+          deletedUsers.push(id);
+          return { data: {}, error: null };
+        },
         createUser: async () => {
           createUserAttempted = true;
           if (opts.createUserError) {
@@ -178,7 +233,12 @@ function fakeCreateWorkspaceService(opts: {
     },
     from(table: string) {
       if (table === "workspaces") {
-        return chain({ data: { id: "ws_new" }, error: null }, table);
+        return chain(
+          opts.workspaceInsertError
+            ? { data: null, error: opts.workspaceInsertError }
+            : { data: { id: "ws_new" }, error: null },
+          table,
+        );
       }
       if (table === "memberships") {
         return chain({ data: null, error: null }, table);
@@ -209,7 +269,7 @@ function fakeCreateWorkspaceService(opts: {
     },
   };
 
-  return { client, inserts };
+  return { client, inserts, deletedUsers };
 }
 
 const { getWorkspaceMembers, resetMemberPassword, createWorkspaceForClient } = await import(
@@ -223,7 +283,7 @@ test("getWorkspaceMembers returns 'No autorizado' when the caller isn't super ad
   assert.deepEqual(result, { error: "No autorizado" });
 });
 
-test("getWorkspaceMembers maps membership + user rows for a super admin", async () => {
+test("getWorkspaceMembers maps rows and flags self, super admins and the global-password count", async () => {
   currentAuthClient = fakeAuthClient({ user: { id: "admin1" }, isSuperAdmin: true });
   currentServiceClient = fakeService({
     membersRows: [
@@ -231,14 +291,19 @@ test("getWorkspaceMembers maps membership + user rows for a super admin", async 
         user_id: "u1",
         role: "admin",
         is_active: true,
-        users: { email: "cliente@empresa.com", full_name: "Cliente Uno" },
+        users: { email: "cliente@empresa.com", full_name: "Cliente Uno", is_super_admin: false },
       },
       {
         user_id: "admin1",
         role: "admin",
         is_active: true,
-        users: { email: "agencia@example.com", full_name: null },
+        users: { email: "agencia@example.com", full_name: null, is_super_admin: true },
       },
+    ],
+    activeMembershipRows: [
+      { user_id: "u1" },
+      { user_id: "u1" },
+      { user_id: "admin1" },
     ],
   }).client;
 
@@ -251,6 +316,9 @@ test("getWorkspaceMembers maps membership + user rows for a super admin", async 
         fullName: "Cliente Uno",
         role: "admin",
         isActive: true,
+        isSuperAdmin: false,
+        isSelf: false,
+        activeWorkspaceCount: 2,
       },
       {
         userId: "admin1",
@@ -258,6 +326,9 @@ test("getWorkspaceMembers maps membership + user rows for a super admin", async 
         fullName: null,
         role: "admin",
         isActive: true,
+        isSuperAdmin: true,
+        isSelf: true,
+        activeWorkspaceCount: 1,
       },
     ],
   });
@@ -279,10 +350,10 @@ test("resetMemberPassword returns 'No autorizado' when the caller isn't super ad
   assert.deepEqual(result, { error: "No autorizado" });
 });
 
-test("resetMemberPassword generates a new password and returns it with the email", async () => {
+test("resetMemberPassword generates a new password, audits it and returns it with the email", async () => {
   currentAuthClient = fakeAuthClient({ user: { id: "admin1" }, isSuperAdmin: true });
   const service = fakeService({
-    membershipExists: true,
+    membership: { user_id: "target1", is_active: true },
     userEmail: "cliente@empresa.com",
   });
   currentServiceClient = service.client;
@@ -294,12 +365,69 @@ test("resetMemberPassword generates a new password and returns it with the email
   assert.equal(service.updateCalls.length, 1);
   assert.equal(service.updateCalls[0].userId, "target1");
   assert.equal(service.updateCalls[0].password, result.password);
+
+  assert.equal(service.auditInserts.length, 1);
+  assert.deepEqual(service.auditInserts[0], {
+    workspace_id: "ws_1",
+    type: "member_password_reset",
+    level: "warn",
+    payload: { actor_user_id: "admin1", target_user_id: "target1", outcome: "attempted" },
+  });
+  assert.deepEqual(service.auditUpdates, [
+    { payload: { actor_user_id: "admin1", target_user_id: "target1", outcome: "done" } },
+  ]);
+  assert.ok(
+    !JSON.stringify(service.auditInserts).includes(result.password!),
+    "the new password never reaches the audit trail",
+  );
 });
 
-test("resetMemberPassword returns a controlled error when the userId is not an active member of the given workspace", async () => {
+test("resetMemberPassword refuses the caller's own account without touching auth", async () => {
   currentAuthClient = fakeAuthClient({ user: { id: "admin1" }, isSuperAdmin: true });
   const service = fakeService({
-    membershipExists: false,
+    membership: { user_id: "admin1", is_active: true },
+    userEmail: "agencia@example.com",
+  });
+  currentServiceClient = service.client;
+
+  const result = await resetMemberPassword("ws_1", "admin1");
+  assert.deepEqual(result, { error: "No puedes resetear tu propia clave desde aquí" });
+  assert.equal(service.updateCalls.length, 0);
+  assert.equal(service.auditInserts.length, 0);
+});
+
+test("resetMemberPassword refuses a super admin's account", async () => {
+  currentAuthClient = fakeAuthClient({ user: { id: "admin1" }, isSuperAdmin: true });
+  const service = fakeService({
+    membership: { user_id: "owner2", is_active: true },
+    userEmail: "otro-dueno@example.com",
+    userIsSuperAdmin: true,
+  });
+  currentServiceClient = service.client;
+
+  const result = await resetMemberPassword("ws_1", "owner2");
+  assert.deepEqual(result, { error: "La clave de un super admin no se resetea desde aquí" });
+  assert.equal(service.updateCalls.length, 0);
+  assert.equal(service.auditInserts.length, 0);
+});
+
+test("resetMemberPassword refuses an inactive member with a specific message", async () => {
+  currentAuthClient = fakeAuthClient({ user: { id: "admin1" }, isSuperAdmin: true });
+  const service = fakeService({
+    membership: { user_id: "target1", is_active: false },
+    userEmail: "cliente@empresa.com",
+  });
+  currentServiceClient = service.client;
+
+  const result = await resetMemberPassword("ws_1", "target1");
+  assert.deepEqual(result, { error: "Ese miembro está inactivo en este workspace" });
+  assert.equal(service.updateCalls.length, 0);
+});
+
+test("resetMemberPassword returns a controlled error when the userId is not a member of the given workspace", async () => {
+  currentAuthClient = fakeAuthClient({ user: { id: "admin1" }, isSuperAdmin: true });
+  const service = fakeService({
+    membership: null,
     userEmail: "cliente@empresa.com",
   });
   currentServiceClient = service.client;
@@ -316,22 +444,40 @@ test("resetMemberPassword returns a controlled error when the userId is not an a
 test("resetMemberPassword returns a controlled error for a non-existent userId", async () => {
   currentAuthClient = fakeAuthClient({ user: { id: "admin1" }, isSuperAdmin: true });
   currentServiceClient = fakeService({
-    membershipExists: true,
+    membership: { user_id: "ghost", is_active: true },
     userEmail: null,
   }).client;
   const result = await resetMemberPassword("ws_1", "ghost");
   assert.deepEqual(result, { error: "No se pudo resetear la clave" });
 });
 
-test("resetMemberPassword returns a generic error when updateUserById fails", async () => {
+test("resetMemberPassword does not reset when the audit trail can't be written", async () => {
   currentAuthClient = fakeAuthClient({ user: { id: "admin1" }, isSuperAdmin: true });
-  currentServiceClient = fakeService({
-    membershipExists: true,
+  const service = fakeService({
+    membership: { user_id: "target1", is_active: true },
+    userEmail: "cliente@empresa.com",
+    auditInsertError: { message: "db down" },
+  });
+  currentServiceClient = service.client;
+
+  const result = await resetMemberPassword("ws_1", "target1");
+  assert.deepEqual(result, { error: "No se pudo registrar el reseteo; la clave no cambió" });
+  assert.equal(service.updateCalls.length, 0);
+});
+
+test("resetMemberPassword returns a generic error when updateUserById fails, and audits the failure", async () => {
+  currentAuthClient = fakeAuthClient({ user: { id: "admin1" }, isSuperAdmin: true });
+  const service = fakeService({
+    membership: { user_id: "target1", is_active: true },
     userEmail: "cliente@empresa.com",
     updateError: { message: "boom" },
-  }).client;
+  });
+  currentServiceClient = service.client;
   const result = await resetMemberPassword("ws_1", "target1");
   assert.deepEqual(result, { error: "No se pudo resetear la clave" });
+  assert.deepEqual(service.auditUpdates, [
+    { payload: { actor_user_id: "admin1", target_user_id: "target1", outcome: "failed" } },
+  ]);
 });
 
 test("createWorkspaceForClient creates workspace + user + membership when the email is new", async () => {
@@ -351,10 +497,10 @@ test("createWorkspaceForClient creates workspace + user + membership when the em
 
   assert.equal(result.error, undefined);
   assert.equal(result.needsConfirmation, undefined);
-  assert.equal(
-    result.webhookUrl,
-    "https://app.example.com/api/webhooks/kapso?wsid=ws_new",
-  );
+  assert.deepEqual(result.webhookUrls, {
+    ycloud: "https://app.example.com/api/webhooks/ycloud?wsid=ws_new",
+    kapso: "https://app.example.com/api/webhooks/kapso?wsid=ws_new",
+  });
   assert.ok(result.clientCredentials);
   assert.equal(result.clientCredentials?.email, "nuevo@cliente.com");
   assert.ok(
@@ -412,10 +558,10 @@ test("createWorkspaceForClient proceeds and reuses the existing account when con
 
   assert.equal(result.error, undefined);
   assert.equal(result.needsConfirmation, undefined);
-  assert.equal(
-    result.webhookUrl,
-    "https://app.example.com/api/webhooks/kapso?wsid=ws_new",
-  );
+  assert.deepEqual(result.webhookUrls, {
+    ycloud: "https://app.example.com/api/webhooks/ycloud?wsid=ws_new",
+    kapso: "https://app.example.com/api/webhooks/kapso?wsid=ws_new",
+  });
   assert.equal(
     result.clientCredentials,
     null,
@@ -508,4 +654,44 @@ test("createWorkspaceForClient creates nothing and returns a controlled error wh
     false,
     "must not create a workspace at all — resolved before anything is created",
   );
+});
+
+test("createWorkspaceForClient deletes the account it just created when the workspace insert fails", async () => {
+  currentAuthClient = fakeAuthClient({ user: { id: "admin1" }, isSuperAdmin: true });
+  const service = fakeCreateWorkspaceService({
+    createUserId: "new_user",
+    workspaceInsertError: { message: "insert failed" },
+  });
+  currentServiceClient = service.client;
+
+  const result = await createWorkspaceForClient({
+    name: "Clínica Test",
+    useCase: "general",
+    clientEmail: "nuevo@cliente.com",
+    clientPassword: "",
+  });
+
+  assert.deepEqual(result, { error: "Error al crear el workspace" });
+  assert.deepEqual(service.deletedUsers, ["new_user"]);
+});
+
+test("createWorkspaceForClient never deletes a reused account when the workspace insert fails", async () => {
+  currentAuthClient = fakeAuthClient({ user: { id: "admin1" }, isSuperAdmin: true });
+  const service = fakeCreateWorkspaceService({
+    existingAuthUsers: [{ id: "existing_user", email: "duplicado@cliente.com" }],
+    existingUserFullName: "Cliente Existente",
+    workspaceInsertError: { message: "insert failed" },
+  });
+  currentServiceClient = service.client;
+
+  const result = await createWorkspaceForClient({
+    name: "Clínica Test",
+    useCase: "general",
+    clientEmail: "duplicado@cliente.com",
+    clientPassword: "",
+    confirmReuseExistingEmail: true,
+  });
+
+  assert.deepEqual(result, { error: "Error al crear el workspace" });
+  assert.deepEqual(service.deletedUsers, []);
 });
