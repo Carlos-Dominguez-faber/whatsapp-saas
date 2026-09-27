@@ -65,10 +65,27 @@ function membershipsTable() {
   return q;
 }
 
+/** Existing auth accounts, by email. */
+let accounts: Record<string, string> = {};
+let actorIsSuperAdmin = false;
+let provisionCalls: Array<{ email: string; allowExisting?: boolean }> = [];
+
 mock.module("@supabase/supabase-js", {
   exports: {
     createClient: () => ({
-      from: () => ({
+      from: (table: string) =>
+        table === "users"
+          ? {
+              select: () => ({
+                eq: () => ({
+                  maybeSingle: async () => ({
+                    data: { is_super_admin: actorIsSuperAdmin },
+                    error: null,
+                  }),
+                }),
+              }),
+            }
+          : ({
         select: (cols: string, opts?: { count?: string }) =>
           membershipsTable().select(cols, opts),
         update: (row: unknown) => {
@@ -92,13 +109,27 @@ mock.module("@supabase/supabase-js", {
   },
 });
 
+class ExistingAccountError extends Error {}
 mock.module("@/lib/auth/provision-user.ts", {
   exports: {
-    provisionWorkspaceUser: async (_db: unknown, email: string) => ({
-      userId: email === "boss@x.com" ? "u_admin" : "u_new",
-      password: null,
-      created: false,
-    }),
+    ExistingAccountError,
+    findAuthUserByEmail: async (_db: unknown, email: string) =>
+      accounts[email] ? { id: accounts[email], email } : null,
+    provisionWorkspaceUser: async (
+      _db: unknown,
+      email: string,
+      opts?: { allowExisting?: boolean },
+    ) => {
+      provisionCalls.push({ email, allowExisting: opts?.allowExisting });
+      if (accounts[email] && opts?.allowExisting === false) {
+        throw new ExistingAccountError();
+      }
+      return {
+        userId: accounts[email] ?? "u_new",
+        password: accounts[email] ? null : "gen-pass",
+        created: !accounts[email],
+      };
+    },
   },
 });
 
@@ -119,6 +150,9 @@ const U_AGENT = "00000000-0000-4000-8000-00000000000c";
 function reset(role: typeof actorRole) {
   actorRole = role;
   writes = [];
+  accounts = { "boss@x.com": "u_admin", "other-admin@y.com": "u_other_admin" };
+  actorIsSuperAdmin = false;
+  provisionCalls = [];
   memberships = [
     { workspace_id: "ws_1", user_id: U_ADMIN, role: "admin", is_active: true },
     { workspace_id: "ws_1", user_id: U_MANAGER, role: "manager", is_active: true },
@@ -219,4 +253,42 @@ test("the ceiling uses the target's role in THIS workspace, not in another one",
   // U_AGENT is admin in ws_2 but an agent in ws_1: a ws_1 manager may manage them.
   const res = await PATCH(req("PATCH", { userId: U_AGENT, role: "viewer" }), params);
   assert.equal(res.status, 200);
+});
+
+test("a workspace admin cannot attach another client's existing account (409, no write)", async () => {
+  reset("admin");
+  const res = await POST(req("POST", { email: "other-admin@y.com", role: "agent" }), params);
+  assert.equal(res.status, 409);
+  assert.match((await res.json()).error, /ya tiene cuenta/);
+  assert.equal(writes.length, 0);
+  assert.equal(provisionCalls.length, 0);
+});
+
+test("re-inviting someone already in this workspace still works", async () => {
+  reset("admin");
+  const res = await POST(req("POST", { email: "boss@x.com", role: "admin" }), params);
+  assert.equal(res.status, 200);
+  assert.deepEqual(provisionCalls, [{ email: "boss@x.com", allowExisting: true }]);
+});
+
+test("a super admin may attach an existing account", async () => {
+  reset("admin");
+  actorIsSuperAdmin = true;
+  const res = await POST(req("POST", { email: "other-admin@y.com", role: "agent" }), params);
+  assert.equal(res.status, 200);
+  assert.deepEqual(provisionCalls, [{ email: "other-admin@y.com", allowExisting: true }]);
+});
+
+test("an account created between the check and the insert is refused, not attached", async () => {
+  reset("admin");
+  // The check sees no account; provisioning finds one (a concurrent signup).
+  const res = await POST(req("POST", { email: "race@z.com", role: "agent" }), params);
+  assert.equal(res.status, 200, "no account: created normally");
+  reset("admin");
+  const originalFind = accounts;
+  accounts = {};
+  const racing = POST(req("POST", { email: "race@z.com", role: "agent" }), params);
+  accounts = { ...originalFind, "race@z.com": "u_race" };
+  const raced = await racing;
+  assert.equal(raced.status, 409);
 });

@@ -67,8 +67,11 @@ export interface WorkspaceMember {
   isSuperAdmin: boolean;
   /** The caller — nobody resets their own password from here. */
   isSelf: boolean;
-  /** Workspaces where this person is an active member: the password is global. */
-  activeWorkspaceCount: number;
+  /**
+   * Names of the OTHER workspaces where this person is active: the password
+   * is global, so a reset changes it there too.
+   */
+  otherWorkspaces: string[];
 }
 
 export type GetWorkspaceMembersResult =
@@ -76,5 +79,11 @@ export type GetWorkspaceMembersResult =
   | { members?: never; error: string };
 
 export type ResetMemberPasswordResult =
-  | { email: string; password: string; error?: never }
-  | { email?: never; password?: never; error: string };
+  | { email: string; password: string; error?: never; otherWorkspaces?: never }
+  | {
+      email?: never;
+      password?: never;
+      error: string;
+      /** Set when the reset needs confirming for these other workspaces. */
+      otherWorkspaces?: string[];
+    };

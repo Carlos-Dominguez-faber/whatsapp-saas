@@ -478,6 +478,25 @@ export async function getAllWorkspacesWithStats(): Promise<GetWorkspacesResult> 
   return { workspaces: result };
 }
 
+interface ActiveMembershipRow {
+  user_id: string;
+  workspace_id: string;
+  workspaces: { name: string } | null;
+}
+
+async function loadActiveMemberships(
+  service: ReturnType<typeof svc>,
+  userIds: string[],
+): Promise<ActiveMembershipRow[]> {
+  const { data, error } = await service
+    .from("memberships")
+    .select("user_id, workspace_id, workspaces(name)")
+    .in("user_id", userIds)
+    .eq("is_active", true);
+  if (error) throw new Error(error.message);
+  return (data as unknown as ActiveMembershipRow[] | null) ?? [];
+}
+
 export async function getWorkspaceMembers(
   workspaceId: string,
 ): Promise<GetWorkspaceMembersResult> {
@@ -507,22 +526,24 @@ export async function getWorkspaceMembers(
       } | null;
     }[]) ?? [];
 
-  // A password is global to the person, not to this workspace: count where
-  // else each member is active so the sheet can say so before a reset.
-  const workspaceCounts = new Map<string, number>();
+  // A password is global to the person, not to this workspace: list where
+  // else each member is active so the sheet can name those workspaces before
+  // a reset.
+  const otherWorkspaces = new Map<string, string[]>();
   const userIds = rows.map((row) => row.user_id);
   if (userIds.length > 0) {
-    const { data: activeRows, error: countError } = await service
-      .from("memberships")
-      .select("user_id")
-      .in("user_id", userIds)
-      .eq("is_active", true);
-    if (countError) {
-      console.error("[agency] count member workspaces error:", countError);
+    let active: ActiveMembershipRow[];
+    try {
+      active = await loadActiveMemberships(service, userIds);
+    } catch (err) {
+      console.error("[agency] member workspaces error:", err);
       return { error: "No se pudieron cargar los miembros" };
     }
-    for (const row of (activeRows as { user_id: string }[]) ?? []) {
-      workspaceCounts.set(row.user_id, (workspaceCounts.get(row.user_id) ?? 0) + 1);
+    for (const row of active) {
+      if (row.workspace_id === workspaceId) continue;
+      const names = otherWorkspaces.get(row.user_id) ?? [];
+      names.push(row.workspaces?.name ?? row.workspace_id);
+      otherWorkspaces.set(row.user_id, names);
     }
   }
 
@@ -534,7 +555,7 @@ export async function getWorkspaceMembers(
     isActive: row.is_active,
     isSuperAdmin: row.users?.is_super_admin === true,
     isSelf: row.user_id === userId,
-    activeWorkspaceCount: workspaceCounts.get(row.user_id) ?? 0,
+    otherWorkspaces: otherWorkspaces.get(row.user_id) ?? [],
   }));
 
   return { members };
@@ -543,6 +564,7 @@ export async function getWorkspaceMembers(
 export async function resetMemberPassword(
   workspaceId: string,
   userId: string,
+  opts: { confirmOtherWorkspaces?: boolean } = {},
 ): Promise<ResetMemberPasswordResult> {
   const adminId = await assertSuperAdmin();
   if (!adminId) return { error: "No autorizado" };
@@ -586,44 +608,71 @@ export async function resetMemberPassword(
     return { error: "La clave de un super admin no se resetea desde aquí" };
   }
 
-  // Audit before acting: if the trail can't be written, the reset doesn't run.
-  const { data: auditRow, error: auditError } = await service
-    .from("events")
-    .insert({
-      workspace_id: workspaceId,
-      type: "member_password_reset",
-      level: "warn",
-      payload: {
-        actor_user_id: adminId,
-        target_user_id: userId,
-        outcome: "attempted",
-      },
-    })
-    .select("id")
-    .single();
+  // The new password applies wherever this person is active. Resetting it
+  // from one client's workspace changes it in the others too, so that needs
+  // its own confirmation, naming them.
+  let active: ActiveMembershipRow[];
+  try {
+    active = await loadActiveMemberships(service, [userId]);
+  } catch (err) {
+    console.error("[agency] reset target workspaces error:", err);
+    return { error: "No se pudo resetear la clave" };
+  }
+  const others = active.filter((row) => row.workspace_id !== workspaceId);
+  if (others.length > 0 && opts.confirmOtherWorkspaces !== true) {
+    return {
+      error:
+        "Esta persona también está en otros workspaces y su clave nueva aplicará en todos. Confírmalo para continuar.",
+      otherWorkspaces: others.map((row) => row.workspaces?.name ?? row.workspace_id),
+    };
+  }
+  const affected = [...new Set([workspaceId, ...active.map((row) => row.workspace_id)])];
 
-  if (auditError || !auditRow) {
+  // Audit before acting, in the append-only table: if the trail can't be
+  // written, the reset doesn't run.
+  const auditRow = {
+    actor_user_id: adminId,
+    target_user_id: userId,
+    workspace_id: workspaceId,
+    affected_workspace_ids: affected,
+  };
+  const { error: auditError } = await service
+    .from("member_password_resets")
+    .insert({ ...auditRow, outcome: "attempted" });
+  if (auditError) {
     console.error("[agency] password reset audit error:", auditError);
     return { error: "No se pudo registrar el reseteo; la clave no cambió" };
   }
-  const auditId = (auditRow as { id: string }).id;
 
   const password = generatePassword();
   const { error: updateError } = await service.auth.admin.updateUserById(
     userId,
     { password },
   );
-
   const outcome = updateError ? "failed" : "done";
-  const { error: auditUpdateError } = await service
-    .from("events")
-    .update({
-      payload: { actor_user_id: adminId, target_user_id: userId, outcome },
-    })
-    .eq("id", auditId)
-    .eq("workspace_id", workspaceId);
-  if (auditUpdateError) {
-    console.error("[agency] password reset audit update error:", auditUpdateError);
+
+  const { error: outcomeError } = await service
+    .from("member_password_resets")
+    .insert({ ...auditRow, outcome });
+  if (outcomeError) {
+    console.error("[agency] password reset outcome audit error:", outcomeError);
+  }
+  // Also visible in each affected workspace's own event log.
+  const { error: eventsError } = await service.from("events").insert(
+    affected.map((ws) => ({
+      workspace_id: ws,
+      type: "member_password_reset",
+      level: "warn",
+      payload: {
+        actor_user_id: adminId,
+        target_user_id: userId,
+        performed_in: workspaceId,
+        outcome,
+      },
+    })),
+  );
+  if (eventsError) {
+    console.error("[agency] password reset events error:", eventsError);
   }
 
   if (updateError) {

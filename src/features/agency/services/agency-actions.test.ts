@@ -52,8 +52,12 @@ function fakeService(opts: {
     } | null;
   }>;
   membersError?: { message: string } | null;
-  /** Active-membership rows across all workspaces (for the global-password count). */
-  activeMembershipRows?: Array<{ user_id: string }>;
+  /** Active memberships across all workspaces (with the workspace name). */
+  activeMembershipRows?: Array<{
+    user_id: string;
+    workspace_id: string;
+    workspaces: { name: string } | null;
+  }>;
   membership?: { user_id: string; is_active: boolean } | null;
   membershipError?: { message: string } | null;
   userEmail?: string | null;
@@ -62,8 +66,8 @@ function fakeService(opts: {
   auditInsertError?: { message: string } | null;
 }) {
   const updateCalls: Array<{ userId: string; password: string }> = [];
-  const auditInserts: Array<Record<string, unknown>> = [];
-  const auditUpdates: Array<Record<string, unknown>> = [];
+  const auditRows: Array<Record<string, unknown>> = [];
+  const eventRows: Array<Record<string, unknown>> = [];
   const client = {
     auth: {
       admin: {
@@ -130,33 +134,27 @@ function fakeService(opts: {
           },
         };
       }
+      if (table === "member_password_resets") {
+        return {
+          insert: async (row: Record<string, unknown>) => {
+            if (opts.auditInsertError) return { error: opts.auditInsertError };
+            auditRows.push(row);
+            return { error: null };
+          },
+        };
+      }
       if (table === "events") {
         return {
-          insert(row: Record<string, unknown>) {
-            auditInserts.push(row);
-            return {
-              select: () => ({
-                single: async () =>
-                  opts.auditInsertError
-                    ? { data: null, error: opts.auditInsertError }
-                    : { data: { id: "audit_1" }, error: null },
-              }),
-            };
-          },
-          update(row: Record<string, unknown>) {
-            auditUpdates.push(row);
-            const c: any = {
-              eq: () => c,
-              then: (resolve: (v: unknown) => void) => resolve({ error: null }),
-            };
-            return c;
+          insert: async (rows: Array<Record<string, unknown>>) => {
+            eventRows.push(...rows);
+            return { error: null };
           },
         };
       }
       throw new Error(`unexpected table: ${table}`);
     },
   };
-  return { client, updateCalls, auditInserts, auditUpdates };
+  return { client, updateCalls, auditRows, eventRows };
 }
 
 function fakeCreateWorkspaceService(opts: {
@@ -283,7 +281,7 @@ test("getWorkspaceMembers returns 'No autorizado' when the caller isn't super ad
   assert.deepEqual(result, { error: "No autorizado" });
 });
 
-test("getWorkspaceMembers maps rows and flags self, super admins and the global-password count", async () => {
+test("getWorkspaceMembers maps rows and names each member's other workspaces", async () => {
   currentAuthClient = fakeAuthClient({ user: { id: "admin1" }, isSuperAdmin: true });
   currentServiceClient = fakeService({
     membersRows: [
@@ -301,9 +299,9 @@ test("getWorkspaceMembers maps rows and flags self, super admins and the global-
       },
     ],
     activeMembershipRows: [
-      { user_id: "u1" },
-      { user_id: "u1" },
-      { user_id: "admin1" },
+      { user_id: "u1", workspace_id: "ws_1", workspaces: { name: "Este" } },
+      { user_id: "u1", workspace_id: "ws_2", workspaces: { name: "Tienda Dos" } },
+      { user_id: "admin1", workspace_id: "ws_1", workspaces: { name: "Este" } },
     ],
   }).client;
 
@@ -318,7 +316,7 @@ test("getWorkspaceMembers maps rows and flags self, super admins and the global-
         isActive: true,
         isSuperAdmin: false,
         isSelf: false,
-        activeWorkspaceCount: 2,
+        otherWorkspaces: ["Tienda Dos"],
       },
       {
         userId: "admin1",
@@ -328,7 +326,7 @@ test("getWorkspaceMembers maps rows and flags self, super admins and the global-
         isActive: true,
         isSuperAdmin: true,
         isSelf: true,
-        activeWorkspaceCount: 1,
+        otherWorkspaces: [],
       },
     ],
   });
@@ -350,11 +348,14 @@ test("resetMemberPassword returns 'No autorizado' when the caller isn't super ad
   assert.deepEqual(result, { error: "No autorizado" });
 });
 
-test("resetMemberPassword generates a new password, audits it and returns it with the email", async () => {
+const ONLY_HERE = [{ user_id: "target1", workspace_id: "ws_1", workspaces: { name: "Este" } }];
+
+test("resetMemberPassword generates a new password, audits it append-only and returns it", async () => {
   currentAuthClient = fakeAuthClient({ user: { id: "admin1" }, isSuperAdmin: true });
   const service = fakeService({
     membership: { user_id: "target1", is_active: true },
     userEmail: "cliente@empresa.com",
+    activeMembershipRows: ONLY_HERE,
   });
   currentServiceClient = service.client;
 
@@ -362,23 +363,56 @@ test("resetMemberPassword generates a new password, audits it and returns it wit
   assert.equal(result.error, undefined);
   assert.equal(result.email, "cliente@empresa.com");
   assert.ok(result.password && result.password.length > 0);
-  assert.equal(service.updateCalls.length, 1);
-  assert.equal(service.updateCalls[0].userId, "target1");
-  assert.equal(service.updateCalls[0].password, result.password);
+  assert.deepEqual(service.updateCalls, [{ userId: "target1", password: result.password }]);
 
-  assert.equal(service.auditInserts.length, 1);
-  assert.deepEqual(service.auditInserts[0], {
+  const base = {
+    actor_user_id: "admin1",
+    target_user_id: "target1",
     workspace_id: "ws_1",
-    type: "member_password_reset",
-    level: "warn",
-    payload: { actor_user_id: "admin1", target_user_id: "target1", outcome: "attempted" },
-  });
-  assert.deepEqual(service.auditUpdates, [
-    { payload: { actor_user_id: "admin1", target_user_id: "target1", outcome: "done" } },
+    affected_workspace_ids: ["ws_1"],
+  };
+  assert.deepEqual(service.auditRows, [
+    { ...base, outcome: "attempted" },
+    { ...base, outcome: "done" },
   ]);
+  assert.equal(service.eventRows.length, 1);
   assert.ok(
-    !JSON.stringify(service.auditInserts).includes(result.password!),
+    !JSON.stringify([service.auditRows, service.eventRows]).includes(result.password!),
     "the new password never reaches the audit trail",
+  );
+});
+
+test("resetMemberPassword refuses someone active elsewhere unless confirmed, naming those workspaces", async () => {
+  currentAuthClient = fakeAuthClient({ user: { id: "admin1" }, isSuperAdmin: true });
+  const rows = [
+    ...ONLY_HERE,
+    { user_id: "target1", workspace_id: "ws_2", workspaces: { name: "Tienda Dos" } },
+  ];
+  const refused = fakeService({
+    membership: { user_id: "target1", is_active: true },
+    userEmail: "cliente@empresa.com",
+    activeMembershipRows: rows,
+  });
+  currentServiceClient = refused.client;
+  const first = await resetMemberPassword("ws_1", "target1");
+  assert.deepEqual(first.otherWorkspaces, ["Tienda Dos"]);
+  assert.ok(first.error);
+  assert.equal(refused.updateCalls.length, 0);
+  assert.equal(refused.auditRows.length, 0);
+
+  const confirmed = fakeService({
+    membership: { user_id: "target1", is_active: true },
+    userEmail: "cliente@empresa.com",
+    activeMembershipRows: rows,
+  });
+  currentServiceClient = confirmed.client;
+  const second = await resetMemberPassword("ws_1", "target1", { confirmOtherWorkspaces: true });
+  assert.equal(second.error, undefined);
+  assert.deepEqual(confirmed.auditRows[0].affected_workspace_ids, ["ws_1", "ws_2"]);
+  // The reset is recorded in every workspace where the person is active.
+  assert.deepEqual(
+    confirmed.eventRows.map((e) => e.workspace_id),
+    ["ws_1", "ws_2"],
   );
 });
 
@@ -393,7 +427,7 @@ test("resetMemberPassword refuses the caller's own account without touching auth
   const result = await resetMemberPassword("ws_1", "admin1");
   assert.deepEqual(result, { error: "No puedes resetear tu propia clave desde aquí" });
   assert.equal(service.updateCalls.length, 0);
-  assert.equal(service.auditInserts.length, 0);
+  assert.equal(service.auditRows.length, 0);
 });
 
 test("resetMemberPassword refuses a super admin's account", async () => {
@@ -408,7 +442,7 @@ test("resetMemberPassword refuses a super admin's account", async () => {
   const result = await resetMemberPassword("ws_1", "owner2");
   assert.deepEqual(result, { error: "La clave de un super admin no se resetea desde aquí" });
   assert.equal(service.updateCalls.length, 0);
-  assert.equal(service.auditInserts.length, 0);
+  assert.equal(service.auditRows.length, 0);
 });
 
 test("resetMemberPassword refuses an inactive member with a specific message", async () => {
@@ -426,19 +460,12 @@ test("resetMemberPassword refuses an inactive member with a specific message", a
 
 test("resetMemberPassword returns a controlled error when the userId is not a member of the given workspace", async () => {
   currentAuthClient = fakeAuthClient({ user: { id: "admin1" }, isSuperAdmin: true });
-  const service = fakeService({
-    membership: null,
-    userEmail: "cliente@empresa.com",
-  });
+  const service = fakeService({ membership: null, userEmail: "cliente@empresa.com" });
   currentServiceClient = service.client;
 
   const result = await resetMemberPassword("ws_1", "target1");
   assert.deepEqual(result, { error: "No se pudo resetear la clave" });
-  assert.equal(
-    service.updateCalls.length,
-    0,
-    "must never call updateUserById when the membership check fails",
-  );
+  assert.equal(service.updateCalls.length, 0);
 });
 
 test("resetMemberPassword returns a controlled error for a non-existent userId", async () => {
@@ -456,6 +483,7 @@ test("resetMemberPassword does not reset when the audit trail can't be written",
   const service = fakeService({
     membership: { user_id: "target1", is_active: true },
     userEmail: "cliente@empresa.com",
+    activeMembershipRows: ONLY_HERE,
     auditInsertError: { message: "db down" },
   });
   currentServiceClient = service.client;
@@ -470,14 +498,16 @@ test("resetMemberPassword returns a generic error when updateUserById fails, and
   const service = fakeService({
     membership: { user_id: "target1", is_active: true },
     userEmail: "cliente@empresa.com",
+    activeMembershipRows: ONLY_HERE,
     updateError: { message: "boom" },
   });
   currentServiceClient = service.client;
   const result = await resetMemberPassword("ws_1", "target1");
   assert.deepEqual(result, { error: "No se pudo resetear la clave" });
-  assert.deepEqual(service.auditUpdates, [
-    { payload: { actor_user_id: "admin1", target_user_id: "target1", outcome: "failed" } },
-  ]);
+  assert.deepEqual(
+    service.auditRows.map((r) => r.outcome),
+    ["attempted", "failed"],
+  );
 });
 
 test("createWorkspaceForClient creates workspace + user + membership when the email is new", async () => {

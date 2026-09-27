@@ -28,6 +28,8 @@ export function MembersSheet({ workspaceId, onClose }: Props) {
   const [members, setMembers] = useState<WorkspaceMember[] | null>(null);
   const [loading, setLoading] = useState(false);
   const [confirmUserId, setConfirmUserId] = useState<string | null>(null);
+  // Second confirmation, for someone who is also active in other workspaces.
+  const [confirmOthers, setConfirmOthers] = useState(false);
   const [credentials, setCredentials] = useState<{
     email: string;
     password: string;
@@ -67,11 +69,20 @@ export function MembersSheet({ workspaceId, onClose }: Props) {
     onClose();
   }
 
+  function askReset(userId: string) {
+    setConfirmOthers(false);
+    setConfirmUserId(userId);
+  }
+
   function handleReset(userId: string) {
     if (!workspaceId) return;
+    const confirmOtherWorkspaces = confirmOthers;
     setConfirmUserId(null);
+    setConfirmOthers(false);
     startReset(async () => {
-      const result = await resetMemberPassword(workspaceId, userId);
+      const result = await resetMemberPassword(workspaceId, userId, {
+        confirmOtherWorkspaces,
+      });
       if (result.error) {
         toast.error(result.error);
         return;
@@ -203,18 +214,40 @@ export function MembersSheet({ workspaceId, onClose }: Props) {
                 ) : confirmUserId === member.userId ? (
                   <div className="space-y-2">
                     <p className="text-xs text-muted-foreground">
-                      La clave es de la persona, no del workspace:
-                      {member.activeWorkspaceCount > 1
-                        ? ` la nueva aplica en sus ${member.activeWorkspaceCount} workspaces.`
-                        : " la nueva aplica en todos sus accesos."}{" "}
-                      La anterior deja de funcionar.
+                      La clave es de la persona, no del workspace: la anterior deja
+                      de funcionar y se cierran sus sesiones.
                     </p>
+                    {member.otherWorkspaces.length > 0 && (
+                      <div className="rounded-md border border-warning/30 bg-warning/5 p-2 space-y-1.5">
+                        <p className="text-xs text-foreground">
+                          También está activo en:
+                        </p>
+                        <ul className="list-disc pl-4 text-xs text-foreground">
+                          {member.otherWorkspaces.map((name) => (
+                            <li key={name}>{name}</li>
+                          ))}
+                        </ul>
+                        <label className="flex items-start gap-2 text-xs text-foreground">
+                          <input
+                            type="checkbox"
+                            className="mt-0.5"
+                            checked={confirmOthers}
+                            onChange={(e) => setConfirmOthers(e.target.checked)}
+                          />
+                          Entiendo que la clave nueva también aplica en esos
+                          workspaces.
+                        </label>
+                      </div>
+                    )}
                     <div className="flex items-center gap-2">
                       <Button
                         size="sm"
                         variant="destructive"
                         className="text-xs"
-                        disabled={resetting}
+                        disabled={
+                          resetting ||
+                          (member.otherWorkspaces.length > 0 && !confirmOthers)
+                        }
                         onClick={() => handleReset(member.userId)}
                       >
                         Confirmar reset
@@ -236,7 +269,7 @@ export function MembersSheet({ workspaceId, onClose }: Props) {
                     variant="outline"
                     className="gap-1.5 text-xs"
                     disabled={resetting}
-                    onClick={() => setConfirmUserId(member.userId)}
+                    onClick={() => askReset(member.userId)}
                   >
                     <KeyRound className="h-3.5 w-3.5" aria-hidden="true" />
                     Resetear clave

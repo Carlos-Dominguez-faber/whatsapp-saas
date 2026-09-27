@@ -41,6 +41,14 @@ export async function findAuthUserByEmail(
   }
 }
 
+/** The email already has an account and the caller may not attach it. */
+export class ExistingAccountError extends Error {
+  constructor() {
+    super("An account with this email already exists");
+    this.name = "ExistingAccountError";
+  }
+}
+
 export interface ProvisionResult {
   userId: string;
   /** Password to share with the user — only set when a NEW account was created. */
@@ -56,11 +64,13 @@ export interface ProvisionResult {
  * @param service  A service-role Supabase client (admin API access).
  * @param email    The user's email (also their login).
  * @param opts.password  Optional explicit password; a strong one is generated if omitted.
+ * @param opts.allowExisting  false: an email that already has an account throws
+ *   ExistingAccountError instead of resolving it (default true).
  */
 export async function provisionWorkspaceUser(
   service: SupabaseClient,
   email: string,
-  opts?: { password?: string; fullName?: string },
+  opts?: { password?: string; fullName?: string; allowExisting?: boolean },
 ): Promise<ProvisionResult> {
   const password = opts?.password?.trim() || generatePassword();
 
@@ -81,6 +91,7 @@ export async function provisionWorkspaceUser(
     if (!userId) {
       throw new Error(error?.message ?? "No se pudo crear el usuario");
     }
+    if (opts?.allowExisting === false) throw new ExistingAccountError();
   }
 
   // Ensure the public.users profile row exists (the auth trigger may lag).
