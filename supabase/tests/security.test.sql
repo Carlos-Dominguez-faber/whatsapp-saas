@@ -8,7 +8,7 @@ BEGIN;
 CREATE EXTENSION IF NOT EXISTS pgtap WITH SCHEMA extensions;
 SET search_path = public, extensions;
 
-SELECT plan(95);
+SELECT plan(112);
 
 -- ── public.users: read-only for sessions ────────────────────────────────────
 SELECT ok(NOT has_table_privilege('authenticated', 'public.users', 'UPDATE'),
@@ -498,6 +498,66 @@ SELECT lives_ok(
   $$UPDATE public.contacts SET hl_contact_id = 'hl-sec-1'
      WHERE id = 'a0000000-0000-4000-8000-0000000000c1'$$,
   'another workspace may link its own contact to the same HighLevel id');
+
+-- ── n8n tools: admins only, and never the auth header ──────────────────────
+SELECT ok(NOT has_column_privilege('authenticated', 'public.n8n_tools', 'auth_header_value', 'SELECT'),
+  'sessions cannot read an n8n tool''s auth header');
+SELECT ok(has_column_privilege('authenticated', 'public.n8n_tools', 'webhook_url', 'SELECT'),
+  'a session may read the rest of an n8n tool (RLS limits it to admins)');
+SELECT ok(NOT has_table_privilege('authenticated', 'public.n8n_tools', 'INSERT'),
+  'sessions cannot insert n8n tools (the admin-only API does)');
+SELECT ok(NOT has_table_privilege('authenticated', 'public.n8n_tools', 'UPDATE'),
+  'sessions cannot update n8n tools');
+SELECT ok(NOT has_table_privilege('authenticated', 'public.n8n_tools', 'DELETE'),
+  'sessions cannot delete n8n tools');
+SELECT ok(NOT has_table_privilege('anon', 'public.n8n_tools', 'SELECT'),
+  'anon cannot read n8n tools');
+INSERT INTO public.n8n_tools (id, workspace_id, name, description, mode, webhook_url, auth_header_name, auth_header_value) VALUES
+  ('a0000000-0000-4000-8000-0000000000a8', 'a0000000-0000-4000-8000-000000000001', 'n8n_a', 'A tool', 'sync',
+   'https://hooks.example/a', 'Authorization', 'enc:v1:iv:ct'),
+  ('b0000000-0000-4000-8000-0000000000a8', 'b0000000-0000-4000-8000-000000000001', 'n8n_b', 'B tool', 'sync',
+   'https://hooks.example/b', NULL, NULL);
+SELECT is((SELECT sensitivity FROM public.n8n_tools WHERE name = 'n8n_b'), 'write',
+  'an n8n tool is a write tool unless marked read');
+
+SET LOCAL ROLE authenticated;
+SELECT set_config('request.jwt.claims',
+  '{"sub":"a0000000-0000-4000-8000-0000000000e1","role":"authenticated"}', true);
+SELECT is_empty($$SELECT id FROM public.n8n_tools$$,
+  'a viewer does not see their workspace''s n8n tools');
+SELECT set_config('request.jwt.claims',
+  '{"sub":"b0000000-0000-4000-8000-0000000000e1","role":"authenticated"}', true);
+SELECT results_eq($$SELECT name FROM public.n8n_tools$$, $$VALUES ('n8n_b'::text)$$,
+  'an admin sees only their own workspace''s n8n tools');
+SELECT throws_ok($$SELECT auth_header_value FROM public.n8n_tools$$, '42501', NULL,
+  'not even an admin session reads the auth header');
+
+-- ── sessions cannot write the events the server audits, dedupes or caps on ──
+SELECT throws_ok(
+  $$INSERT INTO public.events (workspace_id, type, payload)
+    VALUES ('b0000000-0000-4000-8000-000000000001', 'member_password_reset', '{}')$$,
+  '42501', NULL, 'a session cannot fake a password-reset audit entry');
+SELECT throws_ok(
+  $$INSERT INTO public.events (workspace_id, type, payload)
+    VALUES ('b0000000-0000-4000-8000-000000000001', 'handoff_ack_sent', '{}')$$,
+  '42501', NULL, 'a session cannot silence the contact''s handoff acknowledgement');
+SELECT throws_ok(
+  $$INSERT INTO public.events (workspace_id, type, payload)
+    VALUES ('b0000000-0000-4000-8000-000000000001', 'handoff_team_notified', '{}')$$,
+  '42501', NULL, 'a session cannot use up the team email cap');
+SELECT throws_ok(
+  $$INSERT INTO public.events (workspace_id, type, payload)
+    VALUES ('b0000000-0000-4000-8000-000000000001', 'jev_judgment', '{}')$$,
+  '42501', NULL, 'a session cannot use up the daily JEV quota');
+RESET ROLE;
+
+-- ── Phase 3 tools are in the catalog ────────────────────────────────────────
+SELECT is((SELECT sensitivity::text FROM public.tools WHERE key = 'handoff_human'), 'read',
+  'handoff_human is read: running it changes nothing, the buffer hands off');
+SELECT is((SELECT sensitivity::text FROM public.tools WHERE key = 'cancel_highlevel'), 'write',
+  'cancel_highlevel is a write tool');
+SELECT ok((SELECT schema::text FROM public.tools WHERE key = 'reschedule_highlevel') LIKE '%appointment_datetime_iso%',
+  'reschedule_highlevel asks for the appointment''s confirmed date');
 
 SELECT * FROM finish();
 ROLLBACK;
