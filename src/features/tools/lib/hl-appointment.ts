@@ -9,7 +9,16 @@ import {
 
 /**
  * Finding and changing the ONE appointment a customer confirmed, for
- * cancel_highlevel, reschedule_highlevel and list_highlevel_appointments.
+ * cancel_highlevel, reschedule_highlevel, list_highlevel_appointments and
+ * schedule_highlevel's "slot taken" check.
+ *
+ * HighLevel is the only source of truth. With a calendar configured, the
+ * contact's appointments come from GET /contacts/{id}/appointments (ids and
+ * status; its times have no offset, so they only prefilter) and each one is
+ * read from GET /calendars/events/appointments/{id}, whose instant, end and
+ * status decide what matches, what is shown and how long it lasts. Every read
+ * is written back to the local `appointments` row, which is only a cache.
+ * Without a calendar, the local rows say which appointments to read.
  *
  * The cancel/reschedule tools take the appointment's date and time as the
  * customer confirmed it and act only on the contact's appointment at that
@@ -21,30 +30,44 @@ export const HL_API = "https://services.leadconnectorhq.com";
 /** GET/PUT /calendars/events/appointments/{id} (HighLevel's OpenAPI spec). */
 export const HL_VERSION_EVENTS = "2021-04-15";
 /** GET /contacts/{id}/appointments (HighLevel's OpenAPI spec). */
-export const HL_VERSION_CONTACTS = "2021-07-28";
+const HL_VERSION_CONTACTS = "2021-07-28";
 
 // Each HighLevel call has its own bound, and together they stay under the
 // tools' budget, so a call times out here — where its outcome is handled —
 // rather than in the registry, which would leave it running unseen.
 const LOOKUP_TIMEOUT_MS = 7_000;
 const EVENT_TIMEOUT_MS = 5_000;
-const PUT_TIMEOUT_MS = 8_000;
+/** The bound of one write (PUT here, POST in schedule_highlevel). */
+export const WRITE_TIMEOUT_MS = 8_000;
 /**
- * The registry's budget for cancel/reschedule: the contact's appointments,
- * up to MAX_EVENT_CHECKS appointment reads, the PUT, and slack.
+ * The registry's budget for schedule/cancel/reschedule: the contact's
+ * appointments, their reads (in parallel), a second lookup when reschedule
+ * checks for a retry, the write, and slack.
  */
 export const APPOINTMENT_TOOL_TIMEOUT_MS = 30_000;
-/** Candidates read from HighLevel, one by one, before a person is asked. */
-const MAX_EVENT_CHECKS = 2;
+/** The list's budget: the contact's appointments and their reads. */
+export const LIST_TOOL_TIMEOUT_MS = 15_000;
+/** Appointments read from HighLevel per lookup, nearest first. */
+const MAX_CANDIDATES = 5;
+const DAY_MS = 24 * 60 * 60 * 1000;
 
-/** How far a stored start may be from the confirmed one and still match. */
+/** How far an appointment's start may be from the confirmed one and still match. */
 const MATCH_TOLERANCE_MS = 60_000;
+
+/**
+ * Whether a write still fits the tool's budget (`budgetMs` from its start),
+ * with ~2 s of slack. When it doesn't, the tool writes nothing and says so:
+ * a write the registry cut off would leave its outcome unknown.
+ */
+export function hasTimeToWrite(startedAtMs: number, budgetMs: number): boolean {
+  return startedAtMs + budgetMs - Date.now() >= WRITE_TIMEOUT_MS + 2_000;
+}
 
 const ACTIVE_STATUSES = new Set(["booked", "confirmed", "new", "active"]);
 
 export type AppointmentState = "active" | "cancelled" | "other";
 
-export function stateOf(status: string | null | undefined): AppointmentState {
+function stateOf(status: string | null | undefined): AppointmentState {
   const s = (status ?? "").toLowerCase();
   if (ACTIVE_STATUSES.has(s)) return "active";
   if (s === "cancelled" || s === "canceled") return "cancelled";
@@ -159,109 +182,39 @@ export function describeInstant(ms: number, timeZone: string): string {
   });
 }
 
-export interface LocatedAppointment {
-  /** The local `appointments` row, when there is one. */
-  localId: string | null;
-  /** Whether that local row is live (it may be cancelled while HighLevel's isn't). */
-  localActive: boolean;
-  hlAppointmentId: string;
-  state: AppointmentState;
-  meta: Record<string, unknown>;
-}
-
-export type LocateResult =
-  | { kind: "none" }
-  | { kind: "ambiguous" }
-  | ({ kind: "found" } & LocatedAppointment);
-
-interface LocalRow {
+/** One of the contact's appointments, as HighLevel's event endpoint has it. */
+export interface HLAppointment {
   id: string;
-  hl_appointment_id: string | null;
-  status: string | null;
-  scheduled_at: string;
-  meta: Record<string, unknown> | null;
+  startMs: number;
+  endMs: number | null;
+  status: string;
+  state: AppointmentState;
 }
 
-function pick(
-  candidates: Array<{ state: AppointmentState } & LocatedAppointment>,
-): LocateResult {
-  const active = candidates.filter((c) => c.state === "active");
-  // Two live appointments at the same instant: acting on one of them could
-  // be the wrong one, so nothing is changed.
-  if (active.length > 1) return { kind: "ambiguous" };
-  const chosen = active[0] ?? candidates.find((c) => c.state === "cancelled") ?? candidates[0];
-  return chosen ? { kind: "found", ...chosen } : { kind: "none" };
+export interface AppointmentLookup {
+  supabase: SupabaseClient;
+  cfg: HLConfig;
+  workspaceId: string;
+  contactId: string;
+  /** The zone of the contact endpoint's bare times: only for the prefilter. */
+  hlZone: string;
 }
 
 /** Local appointment statuses that are still live (see the CHECK on appointments). */
-export const LOCAL_ACTIVE_STATUSES = ["booked", "confirmed"];
+const LOCAL_ACTIVE_STATUSES = ["booked", "confirmed"];
 
-type Candidate = { state: AppointmentState } & LocatedAppointment;
-
-async function localCandidatesAt(
-  supabase: SupabaseClient,
-  workspaceId: string,
-  contactId: string,
-  instantMs: number,
-): Promise<Candidate[]> {
-  const { data, error } = await supabase
-    .from("appointments")
-    .select("id, hl_appointment_id, status, scheduled_at, meta")
-    .eq("workspace_id", workspaceId)
-    .eq("contact_id", contactId)
-    .not("hl_appointment_id", "is", null)
-    .gte("scheduled_at", new Date(instantMs - MATCH_TOLERANCE_MS).toISOString())
-    .lte("scheduled_at", new Date(instantMs + MATCH_TOLERANCE_MS).toISOString())
-    .order("created_at", { ascending: false })
-    .limit(10);
-  if (error) throw new Error(`appointments lookup failed: ${error.message}`);
-  return ((data as LocalRow[] | null) ?? [])
-    .filter((r) => r.hl_appointment_id)
-    .map((r) => ({
-      localId: r.id,
-      localActive: stateOf(r.status) === "active",
-      hlAppointmentId: r.hl_appointment_id!,
-      state: stateOf(r.status),
-      meta: r.meta ?? {},
-    }));
-}
-
-interface HLContactEvent {
-  id?: string;
-  calendarId?: string | null;
-  status?: string | null;
-  appointmentStatus?: string | null;
-  startTime?: string | null;
-}
-
-/** The contact's appointments on the workspace's calendar, from HighLevel. */
-async function listHLContactEvents(
-  cfg: HLConfig,
-  hlContactId: string,
-  timeZone: string,
-): Promise<Array<{ id: string; startMs: number; state: AppointmentState }>> {
-  const res = await fetch(`${HL_API}/contacts/${hlContactId}/appointments`, {
-    headers: { Authorization: `Bearer ${cfg.token}`, Version: HL_VERSION_CONTACTS },
-    signal: AbortSignal.timeout(LOOKUP_TIMEOUT_MS),
-  });
-  if (!res.ok) {
-    console.error(
-      "[HL] contact appointments lookup failed:",
-      res.status,
-      (await res.text()).slice(0, 200),
-    );
-    throw new Error(`HighLevel respondió ${res.status}`);
-  }
-  const json = (await res.json()) as { events?: HLContactEvent[] };
-  const out: Array<{ id: string; startMs: number; state: AppointmentState }> = [];
-  for (const e of json.events ?? []) {
-    if (!e.id || e.calendarId !== cfg.calendarId) continue;
-    const startMs = parseHLTime(e.startTime, timeZone);
-    if (startMs === null) continue;
-    out.push({ id: e.id, startMs, state: stateOf(e.appointmentStatus ?? e.status) });
-  }
-  return out;
-}
+/** HighLevel's status → the local row's (CHECK on appointments). */
+const LOCAL_STATUS: Record<string, string> = {
+  new: "booked",
+  booked: "booked",
+  active: "booked",
+  confirmed: "confirmed",
+  cancelled: "cancelled",
+  canceled: "cancelled",
+  invalid: "cancelled",
+  showed: "completed",
+  noshow: "no_show",
+};
 
 async function hlContactIdOf(
   supabase: SupabaseClient,
@@ -278,125 +231,289 @@ async function hlContactIdOf(
   return (data as { hl_contact_id: string | null } | null)?.hl_contact_id ?? null;
 }
 
-/**
- * The conversation contact's candidates at `instantMs`: the local rows and,
- * with a configured calendar (without one, another calendar's appointment of
- * the same account could match), HighLevel's, merged by appointment id with
- * HighLevel's state winning — nothing syncs HighLevel's changes to the local
- * rows, so a local state can be stale either way. Throws when a lookup
- * fails, so the caller reports an error instead of "not found".
- */
-async function candidatesAt(opts: {
-  supabase: SupabaseClient;
-  cfg: HLConfig;
-  workspaceId: string;
-  contactId: string;
-  instantMs: number;
-  hlZone: string;
-}): Promise<Candidate[]> {
-  const local = await localCandidatesAt(
-    opts.supabase,
-    opts.workspaceId,
-    opts.contactId,
-    opts.instantMs,
-  );
-  if (!opts.cfg.calendarId) return local;
-  const hlContactId = await hlContactIdOf(opts.supabase, opts.workspaceId, opts.contactId);
-  if (!hlContactId) return local;
-  const events = await listHLContactEvents(opts.cfg, hlContactId, opts.hlZone);
+interface HLContactEvent {
+  id?: string;
+  calendarId?: string | null;
+  status?: string | null;
+  appointmentStatus?: string | null;
+  startTime?: string | null;
+}
 
-  const merged = new Map<string, Candidate>(local.map((c) => [c.hlAppointmentId, c]));
-  for (const e of events) {
-    const known = merged.get(e.id);
-    if (known) {
-      merged.set(e.id, { ...known, state: e.state });
-      continue;
-    }
-    if (Math.abs(e.startMs - opts.instantMs) > MATCH_TOLERANCE_MS) continue;
-    merged.set(e.id, {
-      localId: null,
-      localActive: false,
-      hlAppointmentId: e.id,
-      state: e.state,
-      meta: {},
+/**
+ * The ids of the contact's appointments on the calendar to read, nearest to
+ * `pivotMs` first, up to MAX_CANDIDATES: upcoming ones only, with a day of
+ * margin because the endpoint's times have no offset and are read in
+ * `hlZone` just to prefilter. `liveOnly` keeps the ones it lists as live.
+ */
+async function contactCandidates(
+  opts: AppointmentLookup,
+  pivotMs: number,
+  liveOnly: boolean,
+): Promise<{ ids: string[]; capped: number }> {
+  const hlContactId = await hlContactIdOf(opts.supabase, opts.workspaceId, opts.contactId);
+  if (!hlContactId) return { ids: [], capped: 0 };
+  const res = await fetch(`${HL_API}/contacts/${hlContactId}/appointments`, {
+    headers: { Authorization: `Bearer ${opts.cfg.token}`, Version: HL_VERSION_CONTACTS },
+    signal: AbortSignal.timeout(LOOKUP_TIMEOUT_MS),
+  });
+  if (!res.ok) {
+    console.error(
+      "[HL] contact appointments lookup failed:",
+      res.status,
+      (await res.text()).slice(0, 200),
+    );
+    throw new Error(`HighLevel respondió ${res.status}`);
+  }
+  const json = (await res.json()) as { events?: HLContactEvent[] };
+  const earliest = Date.now() - DAY_MS;
+  const candidates: Array<{ id: string; distance: number }> = [];
+  for (const e of json.events ?? []) {
+    if (!e.id || e.calendarId !== opts.cfg.calendarId) continue;
+    if (liveOnly && stateOf(e.appointmentStatus ?? e.status) !== "active") continue;
+    const roughMs = parseHLTime(e.startTime, opts.hlZone);
+    if (roughMs !== null && roughMs < earliest) continue;
+    candidates.push({
+      id: e.id,
+      distance: roughMs === null ? Number.POSITIVE_INFINITY : Math.abs(roughMs - pivotMs),
     });
   }
-  return [...merged.values()];
+  candidates.sort((a, b) => a.distance - b.distance);
+  return {
+    ids: candidates.slice(0, MAX_CANDIDATES).map((c) => c.id),
+    capped: Math.max(0, candidates.length - MAX_CANDIDATES),
+  };
 }
 
-/** The contact's appointment at `instantMs`, from candidatesAt. */
-export async function locateAppointmentAt(
-  opts: Parameters<typeof candidatesAt>[0],
-): Promise<LocateResult> {
-  return pick(await candidatesAt(opts));
+/** Without a calendar: the local rows' HighLevel ids at `instantMs`. */
+async function localIdsAt(opts: AppointmentLookup, instantMs: number): Promise<string[]> {
+  const { data, error } = await opts.supabase
+    .from("appointments")
+    .select("hl_appointment_id")
+    .eq("workspace_id", opts.workspaceId)
+    .eq("contact_id", opts.contactId)
+    .not("hl_appointment_id", "is", null)
+    .gte("scheduled_at", new Date(instantMs - MATCH_TOLERANCE_MS).toISOString())
+    .lte("scheduled_at", new Date(instantMs + MATCH_TOLERANCE_MS).toISOString())
+    .limit(MAX_CANDIDATES);
+  if (error) throw new Error(`appointments lookup failed: ${error.message}`);
+  const ids = ((data as Array<{ hl_appointment_id: string }> | null) ?? []).map(
+    (r) => r.hl_appointment_id,
+  );
+  return [...new Set(ids)];
 }
 
-/** Marks the local rows of a HighLevel appointment cancelled. Never throws. */
-export async function markLocalCancelled(
+/**
+ * Writes what HighLevel said about an appointment to its local row (one per
+ * workspace and HighLevel id), creating it when there is none. `meta` is
+ * merged into the row's. Never throws: the local row is only a cache.
+ */
+export async function recordLocally(
+  opts: Pick<AppointmentLookup, "supabase" | "workspaceId" | "contactId">,
+  hlAppointmentId: string,
+  fields: { scheduled_at?: string; status?: string; meta?: Record<string, unknown> },
+): Promise<void> {
+  try {
+    const { meta, ...rest } = fields;
+    const row: Record<string, unknown> = {
+      workspace_id: opts.workspaceId,
+      hl_appointment_id: hlAppointmentId,
+      contact_id: opts.contactId,
+      ...rest,
+    };
+    if (meta) {
+      const { data } = await opts.supabase
+        .from("appointments")
+        .select("meta")
+        .eq("workspace_id", opts.workspaceId)
+        .eq("hl_appointment_id", hlAppointmentId)
+        .maybeSingle();
+      row.meta = { ...((data as { meta: Record<string, unknown> | null } | null)?.meta ?? {}), ...meta };
+    }
+    // A new row needs a time; without one only an existing row is updated.
+    const { error } = rest.scheduled_at
+      ? await opts.supabase
+          .from("appointments")
+          .upsert(row, { onConflict: "workspace_id,hl_appointment_id" })
+      : await opts.supabase
+          .from("appointments")
+          .update(row)
+          .eq("workspace_id", opts.workspaceId)
+          .eq("hl_appointment_id", hlAppointmentId);
+    if (error) console.warn("[HL] local appointment write-back failed:", error.message);
+  } catch (err) {
+    console.warn("[HL] local appointment write-back failed:", err);
+  }
+}
+
+/** The local record of a move this tool made (reschedule's retry check). */
+export async function localMetaOf(
   supabase: SupabaseClient,
   workspaceId: string,
   hlAppointmentId: string,
-): Promise<void> {
-  const { error } = await supabase
+): Promise<Record<string, unknown>> {
+  const { data } = await supabase
     .from("appointments")
-    .update({ status: "cancelled" })
+    .select("meta")
     .eq("workspace_id", workspaceId)
-    .eq("hl_appointment_id", hlAppointmentId);
-  if (error) console.warn("[HL] failed to mark the local appointment cancelled:", error.message);
+    .eq("hl_appointment_id", hlAppointmentId)
+    .maybeSingle();
+  return (data as { meta: Record<string, unknown> | null } | null)?.meta ?? {};
 }
-
-export type ConfirmedLocateResult =
-  /** Nothing live at that time; `cancelledIds` are the ones HighLevel has cancelled or gone. */
-  | { kind: "none"; cancelledIds: string[] }
-  | { kind: "ambiguous" }
-  /** HighLevel's current view of it: live, or "other" (attended, no-show). */
-  | { kind: "found"; appointment: LocatedAppointment; event: HLEventDetails };
 
 /**
- * The appointment at `instantMs`, confirmed with HighLevel before anything
- * acts on it: each candidate in question (the one picked, or every live one
- * when two are) is read from HighLevel. One HighLevel has cancelled or no
- * longer has (404) is synced to its local row and left out, and the rest are
- * picked from again — a stale row must neither hide the live appointment at
- * the same time nor make it look ambiguous, nor be reported as "already
- * cancelled" while that one stays booked. Throws when a lookup fails.
+ * Reads each appointment from the event endpoint, in parallel, and writes
+ * each answer back to its local row. `gone`: HighLevel no longer has it
+ * (404). `unreadable`: the read failed, or came without a usable time.
  */
-export async function locateConfirmedAppointmentAt(
-  opts: Parameters<typeof candidatesAt>[0],
-): Promise<ConfirmedLocateResult> {
-  const candidates = await candidatesAt(opts);
-  const gone = new Set<string>();
-  const confirmed = new Map<string, HLEventDetails>();
-  for (let reads = 0; ; ) {
-    const pool = candidates.filter((c) => !gone.has(c.hlAppointmentId));
-    const found = pick(pool);
-    if (found.kind === "none") return { kind: "none", cancelledIds: [...gone] };
-    const inQuestion =
-      found.kind === "found" ? [found] : pool.filter((c) => c.state === "active");
-    const next = inQuestion.find((c) => !confirmed.has(c.hlAppointmentId));
-    if (!next) {
-      if (found.kind === "ambiguous") return found;
-      const { kind: _kind, ...appointment } = found;
-      return { kind: "found", appointment, event: confirmed.get(found.hlAppointmentId)! };
+async function readAppointments(
+  opts: AppointmentLookup,
+  ids: string[],
+): Promise<{ appointments: HLAppointment[]; gone: string[]; unreadable: number }> {
+  const settled = await Promise.allSettled(
+    ids.map((id) => fetchHLEvent(opts.cfg, id, opts.hlZone)),
+  );
+  const appointments: HLAppointment[] = [];
+  const gone: string[] = [];
+  let unreadable = 0;
+  settled.forEach((result, i) => {
+    if (result.status === "rejected") {
+      unreadable++;
+    } else if (result.value === null) {
+      gone.push(ids[i]);
+    } else if (result.value.startMs === null) {
+      unreadable++;
+    } else {
+      appointments.push({ id: ids[i], ...result.value, startMs: result.value.startMs });
     }
-    // Out of reads with something still unconfirmed: a person sorts it out.
-    if (reads++ >= MAX_EVENT_CHECKS) return { kind: "ambiguous" };
-    const event = await fetchHLEvent(opts.cfg, next.hlAppointmentId, opts.hlZone);
-    if (!event || event.state === "cancelled") {
-      await markLocalCancelled(opts.supabase, opts.workspaceId, next.hlAppointmentId);
-      gone.add(next.hlAppointmentId);
-      continue;
-    }
-    confirmed.set(next.hlAppointmentId, event);
-    for (const c of candidates) {
-      if (c.hlAppointmentId === next.hlAppointmentId) c.state = event.state;
-    }
-  }
+  });
+  await Promise.all([
+    ...appointments.map((a) => {
+      const status = LOCAL_STATUS[a.status];
+      return recordLocally(opts, a.id, {
+        scheduled_at: new Date(a.startMs).toISOString(),
+        ...(status ? { status } : {}),
+      });
+    }),
+    ...gone.map((id) => recordLocally(opts, id, { status: "cancelled" })),
+  ]);
+  return { appointments, gone, unreadable };
 }
 
-export interface HLEventDetails {
+export type LocateResult =
+  | { kind: "found"; appointment: HLAppointment }
+  /** More than one live appointment at that time. */
+  | { kind: "ambiguous" }
+  /** Only a cancelled one at that time. */
+  | { kind: "already_cancelled" }
+  /** At that time, but no longer live (attended, no-show). */
+  | { kind: "not_active"; appointment: HLAppointment }
+  /** Some read failed and none of the rest is live at that time: unknown. */
+  | { kind: "unconfirmed" }
+  /** Nothing at that time; `onlyUpcoming` when the contact has exactly one. */
+  | { kind: "not_found"; onlyUpcoming: HLAppointment | null };
+
+/**
+ * The contact's appointment at `instantMs`, as HighLevel has it now. Throws
+ * when the contact's appointments can't be listed.
+ */
+export async function locateAppointmentAt(
+  opts: AppointmentLookup & { instantMs: number },
+): Promise<LocateResult> {
+  const withCalendar = Boolean(opts.cfg.calendarId);
+  const { ids, capped } = withCalendar
+    ? await contactCandidates(opts, opts.instantMs, false)
+    : { ids: await localIdsAt(opts, opts.instantMs), capped: 0 };
+  const { appointments, gone, unreadable } = await readAppointments(opts, ids);
+
+  const atTime = appointments.filter(
+    (a) => Math.abs(a.startMs - opts.instantMs) <= MATCH_TOLERANCE_MS,
+  );
+  const live = atTime.filter((a) => a.state === "active");
+  if (live.length === 1) return { kind: "found", appointment: live[0] };
+  if (live.length > 1) return { kind: "ambiguous" };
+  if (unreadable > 0) return { kind: "unconfirmed" };
+  // Without a calendar the ids came from rows at that time: one HighLevel no
+  // longer has was cancelled (deleted) there.
+  if (atTime.some((a) => a.state === "cancelled") || (!withCalendar && gone.length > 0)) {
+    return { kind: "already_cancelled" };
+  }
+  const other = atTime.find((a) => a.state === "other");
+  if (other) return { kind: "not_active", appointment: other };
+  const upcoming = appointments.filter((a) => a.state === "active" && a.startMs >= Date.now());
+  return {
+    kind: "not_found",
+    onlyUpcoming: withCalendar && capped === 0 && upcoming.length === 1 ? upcoming[0] : null,
+  };
+}
+
+/**
+ * For a "not found": the contact's only upcoming appointment, so the model
+ * can ask whether that's the one; else where to look.
+ */
+export function onlyUpcomingHint(only: HLAppointment | null, zone: string): string {
+  return only
+    ? `Su única cita próxima es el ${describeInstant(only.startMs, zone)} (datetime_iso: ${formatWithOffset(only.startMs, zone)}): pregúntale si se refiere a esa. `
+    : "Confirma con el cliente cuál es (list_highlevel_appointments te da las suyas). ";
+}
+
+/**
+ * The contact's upcoming live appointments, with the exact instant to copy
+ * into cancel/reschedule, written in `zone`. With a calendar they are read
+ * from HighLevel (a failed read is counted, not fatal); without one, the
+ * local rows are listed.
+ */
+export async function listUpcomingAppointments(
+  opts: AppointmentLookup & { zone: string },
+): Promise<{
+  appointments: Array<{ datetime_iso: string; cuando: string }>;
+  unreadable: number;
+  more: boolean;
+}> {
+  const now = Date.now();
+  let instants: number[];
+  let unreadable = 0;
+  let more = false;
+  if (opts.cfg.calendarId) {
+    const { ids, capped } = await contactCandidates(opts, now, true);
+    const read = await readAppointments(opts, ids);
+    instants = read.appointments
+      .filter((a) => a.state === "active" && a.startMs >= now)
+      .map((a) => a.startMs);
+    unreadable = read.unreadable;
+    more = capped > 0;
+  } else {
+    const { data, error } = await opts.supabase
+      .from("appointments")
+      .select("scheduled_at")
+      .eq("workspace_id", opts.workspaceId)
+      .eq("contact_id", opts.contactId)
+      .in("status", LOCAL_ACTIVE_STATUSES)
+      .not("hl_appointment_id", "is", null)
+      .gte("scheduled_at", new Date(now).toISOString())
+      .order("scheduled_at", { ascending: true })
+      .limit(MAX_CANDIDATES + 1);
+    if (error) throw new Error(`appointments lookup failed: ${error.message}`);
+    const rows = (data as Array<{ scheduled_at: string }> | null) ?? [];
+    instants = rows.slice(0, MAX_CANDIDATES).map((r) => Date.parse(r.scheduled_at));
+    more = rows.length > MAX_CANDIDATES;
+  }
+  return {
+    appointments: instants
+      .sort((x, y) => x - y)
+      .map((ms) => ({
+        datetime_iso: formatWithOffset(ms, opts.zone),
+        cuando: describeInstant(ms, opts.zone),
+      })),
+    unreadable,
+    more,
+  };
+}
+
+interface HLEventDetails {
   startMs: number | null;
   endMs: number | null;
+  /** HighLevel's own status ("confirmed", "showed"...). */
+  status: string;
   state: AppointmentState;
 }
 
@@ -404,7 +521,7 @@ export interface HLEventDetails {
  * One appointment as HighLevel has it now, or null when HighLevel no longer
  * has it (404). Throws when that can't be known.
  */
-export async function fetchHLEvent(
+async function fetchHLEvent(
   cfg: HLConfig,
   hlAppointmentId: string,
   hlZone: string,
@@ -422,10 +539,12 @@ export async function fetchHLEvent(
     event?: { startTime?: unknown; endTime?: unknown; appointmentStatus?: string; status?: string };
   };
   const e = json.event ?? {};
+  const status = (e.appointmentStatus ?? e.status ?? "").toLowerCase();
   return {
     startMs: parseHLTime(e.startTime, hlZone),
     endMs: parseHLTime(e.endTime, hlZone),
-    state: stateOf(e.appointmentStatus ?? e.status),
+    status,
+    state: stateOf(status),
   };
 }
 
@@ -450,7 +569,7 @@ export async function putHLEvent(
         "Content-Type": "application/json",
       },
       body: JSON.stringify(body),
-      signal: AbortSignal.timeout(PUT_TIMEOUT_MS),
+      signal: AbortSignal.timeout(WRITE_TIMEOUT_MS),
     });
   } catch (err) {
     console.error("[HL] appointment update got no answer:", err);
@@ -500,74 +619,4 @@ export async function noteForTeam(
   } catch (err) {
     console.error("[HL] internal note failed:", err);
   }
-}
-
-/** How many appointments only HighLevel knows are read one by one for the list. */
-const MAX_LISTED_HL_ONLY = 10;
-const DAY_MS = 24 * 60 * 60 * 1000;
-
-/**
- * The contact's upcoming live appointments, with the exact instant to copy
- * into cancel/reschedule: local rows and, with a configured calendar,
- * HighLevel's, merged by appointment id. HighLevel's state wins, but not its
- * time from the contact endpoint, which comes without an offset: a local row
- * keeps its own instant, and one only HighLevel knows is read from the
- * appointment endpoint, which has the offset.
- */
-export async function listUpcomingAppointments(opts: {
-  supabase: SupabaseClient;
-  cfg: HLConfig;
-  workspaceId: string;
-  contactId: string;
-  zone: string;
-  hlZone: string;
-}): Promise<Array<{ datetime_iso: string; cuando: string }>> {
-  const now = Date.now();
-  const { data, error } = await opts.supabase
-    .from("appointments")
-    .select("hl_appointment_id, scheduled_at")
-    .eq("workspace_id", opts.workspaceId)
-    .eq("contact_id", opts.contactId)
-    .in("status", LOCAL_ACTIVE_STATUSES)
-    .not("hl_appointment_id", "is", null)
-    .gte("scheduled_at", new Date(now).toISOString())
-    .order("scheduled_at", { ascending: true })
-    .limit(20);
-  if (error) throw new Error(`appointments lookup failed: ${error.message}`);
-
-  const byId = new Map<string, number | null>();
-  for (const r of (data as Array<{ hl_appointment_id: string; scheduled_at: string }> | null) ?? []) {
-    byId.set(r.hl_appointment_id, Date.parse(r.scheduled_at));
-  }
-  if (opts.cfg.calendarId) {
-    const hlContactId = await hlContactIdOf(opts.supabase, opts.workspaceId, opts.contactId);
-    if (hlContactId) {
-      const hlOnly: Array<{ id: string; roughMs: number }> = [];
-      for (const e of await listHLContactEvents(opts.cfg, hlContactId, opts.hlZone)) {
-        if (byId.has(e.id)) {
-          // Cancelled (or attended) in HighLevel: gone, even if a local row says booked.
-          if (e.state !== "active") byId.set(e.id, null);
-        } else if (e.state === "active" && e.startMs >= now - DAY_MS) {
-          // Upcoming even if its bare time was read a day off.
-          hlOnly.push({ id: e.id, roughMs: e.startMs });
-        }
-      }
-      const toRead = hlOnly.sort((x, y) => x.roughMs - y.roughMs).slice(0, MAX_LISTED_HL_ONLY);
-      const events = await Promise.all(
-        toRead.map((e) => fetchHLEvent(opts.cfg, e.id, opts.hlZone)),
-      );
-      toRead.forEach((e, i) => {
-        const event = events[i];
-        byId.set(e.id, event?.state === "active" ? event.startMs : null);
-      });
-    }
-  }
-  return [...byId.values()]
-    .filter((ms): ms is number => ms !== null && !Number.isNaN(ms) && ms >= now)
-    .sort((x, y) => x - y)
-    .slice(0, 10)
-    .map((ms) => ({
-      datetime_iso: formatWithOffset(ms, opts.zone),
-      cuando: describeInstant(ms, opts.zone),
-    }));
 }

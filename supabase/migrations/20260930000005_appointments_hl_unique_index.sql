@@ -2,11 +2,10 @@
 -- Migration: 20260930000005_appointments_hl_unique_index
 -- One local appointment per HighLevel appointment, per workspace.
 --
--- reschedule_highlevel records a move on the local row of the HighLevel
--- appointment it moved, and creates that row when the appointment was only
--- known to HighLevel (booked through its link, or by staff). Nothing kept two
--- rows from holding the same HighLevel id, and each would then answer for the
--- same appointment with a different time or status.
+-- The local rows are a cache of HighLevel's appointments: every read of an
+-- appointment from HighLevel is written back to its row (an upsert on this
+-- pair), creating it for one only HighLevel knew (booked through its link, or
+-- by staff). Nothing kept two rows from holding the same HighLevel id.
 --
 -- Existing duplicates would make CREATE UNIQUE INDEX fail and stop db push.
 -- Instead, in each duplicated (workspace_id, hl_appointment_id) group one row
@@ -18,9 +17,9 @@
 -- (the CLI doesn't wrap a migration in a transaction), so the table is locked
 -- against writes until the index exists and no new duplicate slips in.
 --
--- Partial (WHERE NOT NULL): rows booked without HighLevel carry no id. No
--- ON CONFLICT relies on it; the tool updates, else inserts, else updates on a
--- unique violation.
+-- Total, not partial: NULLs never collide in a unique index (rows booked
+-- without HighLevel carry no id), and a partial one could not back the
+-- write-back's ON CONFLICT from PostgREST.
 -- Without CONCURRENTLY: it can't run inside the DO block's transaction.
 -- ============================================================================
 
@@ -55,8 +54,7 @@ BEGIN
   END IF;
 
   CREATE UNIQUE INDEX IF NOT EXISTS uq_appointments_workspace_hl_appointment_id
-    ON public.appointments (workspace_id, hl_appointment_id)
-    WHERE hl_appointment_id IS NOT NULL;
+    ON public.appointments (workspace_id, hl_appointment_id);
 END
 $$;
 

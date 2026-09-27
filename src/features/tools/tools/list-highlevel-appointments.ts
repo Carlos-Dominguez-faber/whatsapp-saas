@@ -1,7 +1,11 @@
 import { createClient as createSbClient } from "@supabase/supabase-js";
 import { z } from "zod";
 import type { Tool, ToolContext, ToolResult } from "../core/tool";
-import { hlTimeZone, listUpcomingAppointments } from "../lib/hl-appointment.ts";
+import {
+  hlTimeZone,
+  LIST_TOOL_TIMEOUT_MS,
+  listUpcomingAppointments,
+} from "../lib/hl-appointment.ts";
 
 const schema = z.object({});
 
@@ -27,7 +31,7 @@ async function run(_args: Args, ctx: ToolContext): Promise<ToolResult> {
     process.env.SUPABASE_SERVICE_ROLE_KEY!,
   );
   try {
-    const appointments = await listUpcomingAppointments({
+    const { appointments, unreadable, more } = await listUpcomingAppointments({
       supabase,
       cfg,
       workspaceId: ctx.workspaceId,
@@ -35,16 +39,20 @@ async function run(_args: Args, ctx: ToolContext): Promise<ToolResult> {
       zone,
       hlZone: hlTimeZone(cfg, zone),
     });
-    return {
-      ok: true,
-      output: {
-        appointments,
-        note:
-          appointments.length > 0
-            ? "Para cancelar o reagendar, copia datetime_iso exactamente como aparece."
-            : "El cliente no tiene citas próximas registradas.",
-      },
-    };
+    const notes: string[] = [];
+    if (appointments.length > 0) {
+      notes.push("Para cancelar o reagendar, copia datetime_iso exactamente como aparece.");
+    } else if (unreadable === 0) {
+      notes.push("El cliente no tiene citas próximas registradas.");
+    }
+    // A read that failed is not "no appointment": the model must not say so.
+    if (unreadable > 0) {
+      notes.push(
+        `No pude leer ${unreadable === 1 ? "una de sus citas" : `${unreadable} de sus citas`} en el calendario: puede tener más de las que aparecen.`,
+      );
+    }
+    if (more) notes.push("Tiene más citas próximas que no aparecen aquí.");
+    return { ok: true, output: { appointments, note: notes.join(" ") } };
   } catch (err) {
     console.error("[list_highlevel_appointments] lookup failed:", err);
     return {
@@ -63,4 +71,6 @@ export const listHighLevelAppointmentsTool: Tool<Args> = {
   schema,
   enabledFor: () => true,
   run,
+  // The contact's appointments, then their reads in parallel.
+  preferredTimeoutMs: LIST_TOOL_TIMEOUT_MS,
 };

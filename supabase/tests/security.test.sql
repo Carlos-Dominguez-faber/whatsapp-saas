@@ -583,10 +583,12 @@ SELECT lives_ok(
     ('b0000000-0000-4000-8000-000000000001', now() + interval '3 days'),
     ('b0000000-0000-4000-8000-000000000001', now() + interval '3 days')$$,
   'rows booked without HighLevel carry no id and never collide');
-SELECT ok(
-  (SELECT indexdef LIKE '%WHERE (hl_appointment_id IS NOT NULL)%'
-     FROM pg_indexes WHERE indexname = 'uq_appointments_workspace_hl_appointment_id'),
-  'the unique index covers only rows with a HighLevel id');
+SELECT lives_ok(
+  $$INSERT INTO public.appointments (workspace_id, scheduled_at, hl_appointment_id, status)
+    VALUES ('b0000000-0000-4000-8000-000000000001', now() + interval '4 days', 'hl_dup_test', 'cancelled')
+    ON CONFLICT (workspace_id, hl_appointment_id)
+    DO UPDATE SET scheduled_at = EXCLUDED.scheduled_at, status = EXCLUDED.status$$,
+  'the index backs the write-back''s upsert on (workspace_id, hl_appointment_id)');
 SELECT ok(
   (SELECT schema #> '{properties,timezone}' IS NULL FROM public.tools WHERE key = 'check_availability'),
   'check_availability no longer takes a time zone from the model');

@@ -1,19 +1,20 @@
-import { createClient as createSbClient, type SupabaseClient } from "@supabase/supabase-js";
+import { createClient as createSbClient } from "@supabase/supabase-js";
 import { z } from "zod";
-import type { Tool, ToolContext, ToolResult } from "../core/tool";
+import type { Tool, ToolContext, ToolResult, ToolRunOptions } from "../core/tool";
 import { formatWithOffset } from "@/shared/lib/timezone";
 import {
   APPOINTMENT_TOOL_TIMEOUT_MS,
   confirmedInstantError,
   describeInstant,
+  hasTimeToWrite,
   hlTimeZone,
-  LOCAL_ACTIVE_STATUSES,
-  type LocatedAppointment,
+  localMetaOf,
   locateAppointmentAt,
-  locateConfirmedAppointmentAt,
   noteForTeam,
+  onlyUpcomingHint,
   parseConfirmedInstant,
   putHLEvent,
+  recordLocally,
 } from "../lib/hl-appointment.ts";
 
 const schema = z.object({
@@ -36,8 +37,8 @@ function needsHuman(error: string): ToolResult {
   return { ok: false, output: { needs_human: true }, error };
 }
 
-const LOOKUP_FAILED =
-  "No pude consultar la agenda en este momento, así que la cita NO se movió. Dile al cliente que una persona del equipo lo revisará.";
+const UNCONFIRMED =
+  "No pude confirmar la cita en el calendario en este momento, así que NO se movió. Dile al cliente que una persona del equipo lo revisará.";
 
 /** Same instant, within a minute. */
 function sameInstant(a: unknown, ms: number): boolean {
@@ -45,7 +46,9 @@ function sameInstant(a: unknown, ms: number): boolean {
   return !Number.isNaN(parsed) && Math.abs(parsed - ms) <= 60_000;
 }
 
-async function run(args: Args, ctx: ToolContext): Promise<ToolResult> {
+async function run(args: Args, ctx: ToolContext, opts?: ToolRunOptions): Promise<ToolResult> {
+  const startedAt = Date.now();
+  const budgetMs = opts?.timeoutMs ?? APPOINTMENT_TOOL_TIMEOUT_MS;
   const { getHLConfig } = await import("../../inbox/services/highlevel-client.ts");
   const { getBusinessInfo } = await import("../../inbox/services/business-info.ts");
   const { schedulingTimeZone } = await import("../../inbox/services/scheduling-timezone.ts");
@@ -101,26 +104,26 @@ async function run(args: Args, ctx: ToolContext): Promise<ToolResult> {
     contactId: ctx.contactId,
     hlZone,
   };
-  const lookupFailed = async (err: unknown) => {
-    console.error("[reschedule_highlevel] lookup failed:", err);
+  const unconfirmed = async (err?: unknown) => {
+    if (err) console.error("[reschedule_highlevel] lookup failed:", err);
     await noteForTeam(
       supabase,
       ctx,
       "hl_appointment_failed",
-      `El cliente pidió mover su cita del ${when} y no se pudo consultar la agenda. Revísalo tú.`,
+      `El cliente pidió mover su cita del ${when} y no se pudo confirmar en la agenda. Revísalo tú.`,
     );
-    return needsHuman(LOOKUP_FAILED);
+    return needsHuman(UNCONFIRMED);
   };
 
-  // Confirmed with HighLevel: the local row may be stale, or staff may have
-  // moved or cancelled the appointment there.
+  // HighLevel's current view: the local rows are only a cache.
   let located;
   try {
-    located = await locateConfirmedAppointmentAt({ ...lookup, instantMs: currentMs });
+    located = await locateAppointmentAt({ ...lookup, instantMs: currentMs });
   } catch (err) {
-    return lookupFailed(err);
+    return unconfirmed(err);
   }
 
+  if (located.kind === "unconfirmed") return unconfirmed();
   if (located.kind === "ambiguous") {
     await noteForTeam(
       supabase,
@@ -133,33 +136,35 @@ async function run(args: Args, ctx: ToolContext): Promise<ToolResult> {
     );
   }
 
-  if (located.kind === "none" || located.event.state !== "active") {
-    // A retry of a move that went through: the appointment is now at the new
-    // time, and it records the time it was moved from.
+  if (located.kind !== "found") {
+    // A retry of a move this tool made: HighLevel has the appointment live at
+    // the new time, and its local row records the time it was moved from.
     let atNew;
     try {
       atNew = await locateAppointmentAt({ ...lookup, instantMs: newMs });
     } catch (err) {
-      return lookupFailed(err);
+      return unconfirmed(err);
     }
     if (
       atNew.kind === "found" &&
-      atNew.state === "active" &&
-      sameInstant(atNew.meta.rescheduled_from, currentMs)
+      sameInstant(
+        (await localMetaOf(supabase, ctx.workspaceId, atNew.appointment.id)).rescheduled_from,
+        currentMs,
+      )
     ) {
       return {
         ok: true,
         output: { rescheduled: true, already_rescheduled: true, new_datetime: formatWithOffset(newMs, zone) },
       };
     }
-    if (located.kind === "none" && located.cancelledIds.length > 0) {
+    if (located.kind === "already_cancelled") {
       return {
         ok: false,
         output: null,
         error: "Esa cita está cancelada, así que no se puede mover. Si el cliente quiere una nueva, agéndala.",
       };
     }
-    if (located.kind === "found") {
+    if (located.kind === "not_active") {
       return {
         ok: false,
         output: null,
@@ -169,32 +174,34 @@ async function run(args: Args, ctx: ToolContext): Promise<ToolResult> {
     return {
       ok: false,
       output: null,
-      error: `No encontré una cita activa del cliente el ${when}. Confirma con el cliente cuál es (list_highlevel_appointments te da las suyas); no le digas que se reagendó.`,
+      error: `No encontré una cita activa del cliente el ${when}. ${onlyUpcomingHint(located.onlyUpcoming, zone)}No le digas que se reagendó.`,
     };
   }
 
-  const { appointment: found, event } = located;
-  if (event.startMs !== null && Math.abs(event.startMs - currentMs) > 60_000) {
-    return {
-      ok: false,
-      output: null,
-      error: `Esa cita ya no está a esa hora en el calendario (ahora es el ${describeInstant(event.startMs, zone)}). Consulta otra vez list_highlevel_appointments y confirma con el cliente.`,
-    };
-  }
+  const { appointment } = located;
   // Keep the appointment's length: HighLevel's end time doesn't follow the
   // start on its own.
   const durationMs =
-    event.startMs !== null && event.endMs !== null && event.endMs > event.startMs
-      ? event.endMs - event.startMs
+    appointment.endMs !== null && appointment.endMs > appointment.startMs
+      ? appointment.endMs - appointment.startMs
       : null;
   const body: Record<string, unknown> = { startTime: formatWithOffset(newMs, hlZone) };
   if (durationMs !== null) body.endTime = formatWithOffset(newMs + durationMs, hlZone);
+
+  // Nothing was written yet: saying so is true.
+  if (!hasTimeToWrite(startedAt, budgetMs)) {
+    return {
+      ok: false,
+      output: null,
+      error: "El calendario tardó demasiado, así que la cita NO se movió. Dile al cliente que lo intentas de nuevo en un momento.",
+    };
+  }
 
   const put = await (async () => {
     try {
       return await putHLEvent(
         cfg,
-        found.hlAppointmentId,
+        appointment.id,
         body,
         "No pude confirmar si la cita se movió. No le digas al cliente que quedó reagendada ni que falló: dile que una persona del equipo lo confirmará.",
       );
@@ -221,75 +228,13 @@ async function run(args: Args, ctx: ToolContext): Promise<ToolResult> {
     );
   }
 
-  // Record where it was moved from, so a retry of this call can tell it
-  // already went through. One local row per HighLevel appointment.
-  await recordMove(supabase, ctx, found, currentMs, newMs);
+  // The time it was moved from lets a retry of this call tell it went through.
+  await recordLocally(lookup, appointment.id, {
+    scheduled_at: new Date(newMs).toISOString(),
+    meta: { rescheduled_from: new Date(currentMs).toISOString() },
+  });
 
   return { ok: true, output: { rescheduled: true, new_datetime: formatWithOffset(newMs, zone) } };
-}
-
-/**
- * One local row per HighLevel appointment (unique on workspace and
- * appointment id): the located row, else the one already holding that id —
- * possibly written by someone else meanwhile — else a new one.
- */
-async function recordMove(
-  supabase: SupabaseClient,
-  ctx: ToolContext,
-  found: LocatedAppointment,
-  fromMs: number,
-  toMs: number,
-): Promise<void> {
-  const patch = (base: Record<string, unknown>, live: boolean) => ({
-    scheduled_at: new Date(toMs).toISOString(),
-    // HighLevel has it live: a local row that says otherwise was stale.
-    ...(live ? {} : { status: "booked" }),
-    meta: { ...base, rescheduled_from: new Date(fromMs).toISOString() },
-  });
-  const warn = (what: string, error: unknown) =>
-    console.warn(`[reschedule_highlevel] moved in HighLevel but failed to ${what}:`, error);
-  const update = async (id: string, base: Record<string, unknown>, live: boolean) => {
-    const { error } = await supabase
-      .from("appointments")
-      .update(patch(base, live))
-      .eq("id", id)
-      .eq("workspace_id", ctx.workspaceId);
-    if (error) warn("update the local row", error);
-  };
-  const updateByHlId = async () => {
-    const { data, error } = await supabase
-      .from("appointments")
-      .select("id, status, meta")
-      .eq("workspace_id", ctx.workspaceId)
-      .eq("hl_appointment_id", found.hlAppointmentId)
-      .maybeSingle();
-    if (error) {
-      // Don't insert a second row for an appointment that may have one.
-      warn("look up the local row", error);
-      return true;
-    }
-    const row = data as { id: string; status: string | null; meta: Record<string, unknown> | null } | null;
-    if (!row) return false;
-    await update(row.id, row.meta ?? {}, LOCAL_ACTIVE_STATUSES.includes(row.status ?? ""));
-    return true;
-  };
-
-  if (found.localId) return update(found.localId, found.meta, found.localActive);
-  if (await updateByHlId()) return;
-
-  const { error } = await supabase.from("appointments").insert({
-    workspace_id: ctx.workspaceId,
-    contact_id: ctx.contactId,
-    conversation_id: ctx.conversationId || null,
-    hl_appointment_id: found.hlAppointmentId,
-    ...patch({}, false),
-  });
-  // Written by a concurrent call between the lookup and the insert.
-  if (error?.code === "23505") {
-    await updateByHlId();
-    return;
-  }
-  if (error) warn("record it locally", error);
 }
 
 export const rescheduleHighLevelTool: Tool<Args> = {
