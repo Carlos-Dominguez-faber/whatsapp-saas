@@ -292,10 +292,19 @@ export async function PUT(
     });
   }
 
-  const mergedConfig = {
+  const mergedConfig: Record<string, unknown> = {
     ...((existing?.config as object) ?? {}),
     ...(parsed.data.config ?? {}),
   };
+  // HighLevel: the stored zone belongs to the location it was read from.
+  // Another location drops it until saveHLLocationTimeZone reads the new one.
+  if (
+    provider === "highlevel" &&
+    mergedConfig.location_id !== (existing?.config as Record<string, unknown> | null)?.location_id
+  ) {
+    delete mergedConfig.timezone;
+    delete mergedConfig.timezone_source;
+  }
 
   const { error } = await svc.from("integrations").upsert(
     {

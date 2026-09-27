@@ -185,10 +185,10 @@ export async function saveHLLocationTimeZone(
   location?: { timezone?: unknown },
 ): Promise<string | null> {
   try {
+    const cfg = await getHLConfig(workspaceId);
+    if (!cfg) return null;
     let loc = location;
     if (!loc) {
-      const cfg = await getHLConfig(workspaceId);
-      if (!cfg) return null;
       const res = await fetch(`${HL_BASE_URL}/locations/${cfg.locationId}`, {
         headers: { Authorization: `Bearer ${cfg.token}`, Version: HL_VERSION_LOCATIONS },
         signal: AbortSignal.timeout(5_000),
@@ -205,22 +205,29 @@ export async function saveHLLocationTimeZone(
     const supabase = svc();
     const { data, error } = await supabase
       .from("integrations")
-      .select("config")
+      .select("config, updated_at")
       .eq("workspace_id", workspaceId)
       .eq("provider", "highlevel")
       .maybeSingle();
     if (error || !data) return null;
     const config = (data.config as Record<string, unknown> | null) ?? {};
     if (config.timezone === tz.trim() && config.timezone_source === "location") return tz.trim();
-    const { error: updateError } = await supabase
+    // Guarded: only over the config just read, for the location just asked.
+    // A save in between (another location, other settings) wins, and its own
+    // lookup stores the zone.
+    const { data: written, error: updateError } = await supabase
       .from("integrations")
       .update({ config: { ...config, timezone: tz.trim(), timezone_source: "location" } })
       .eq("workspace_id", workspaceId)
-      .eq("provider", "highlevel");
+      .eq("provider", "highlevel")
+      .eq("updated_at", (data as { updated_at: string }).updated_at)
+      .eq("config->>location_id", cfg.locationId)
+      .select("workspace_id");
     if (updateError) {
       console.error("[HL] saving the location's zone failed:", updateError.message);
       return null;
     }
+    if ((written ?? []).length === 0) return null;
     return tz.trim();
   } catch (err) {
     console.warn("[HL] location zone lookup failed:", err instanceof Error ? err.message : err);

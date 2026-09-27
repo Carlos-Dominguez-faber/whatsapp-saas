@@ -28,6 +28,8 @@ function fake(opts: {
   config?: Record<string, unknown>;
   integrationsError?: boolean;
   location?: Record<string, unknown>;
+  /** The row changed after it was read: the guarded write matches nothing. */
+  changedMeanwhile?: boolean;
 }) {
   const calls: Call[] = [];
   const fn = async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
@@ -40,13 +42,14 @@ function fake(opts: {
       version: new Headers(init?.headers).get("Version"),
     });
     if (url.includes("/rest/v1/integrations")) {
-      if (method !== "GET") return new Response(null, { status: 204 });
+      if (method === "PATCH") return json(200, opts.changedMeanwhile ? [] : [{ workspace_id: "ws_1" }]);
       if (opts.integrationsError) return json(500, { message: "db down" });
       return json(200, [
         {
           credentials: { highlevel_pit: "tok_1" },
           config: { location_id: "loc_1", ...(opts.config ?? {}) },
           enabled: true,
+          updated_at: "2026-09-26T10:00:00+00:00",
         },
       ]);
     }
@@ -89,6 +92,10 @@ test("the location's zone is read with the spec's Version and stored, marked as 
   // GET /locations/{locationId} in HighLevel's OpenAPI spec.
   assert.equal(lookup?.version, "2021-07-28");
   const write = f.calls.find((c) => c.url.includes("/rest/v1/integrations") && c.method === "PATCH");
+  // Only over the row as read, for the location that was asked.
+  const guard = decodeURIComponent(write!.url);
+  assert.ok(guard.includes("updated_at=eq.2026-09-26T10:00:00+00:00"), guard);
+  assert.ok(guard.includes("config->>location_id=eq.loc_1"), guard);
   assert.deepEqual(write?.body, {
     config: {
       location_id: "loc_1",
@@ -97,6 +104,11 @@ test("the location's zone is read with the spec's Version and stored, marked as 
       timezone_source: "location",
     },
   });
+});
+
+test("a row saved in between (another location, other settings) wins over the zone write", async () => {
+  const f = fake({ location: { timezone: "America/Cancun" }, changedMeanwhile: true });
+  assert.equal(await withFetch(f, () => saveHLLocationTimeZone("ws_1")), null);
 });
 
 test("a location without a valid zone changes nothing", async () => {
