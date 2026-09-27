@@ -6,6 +6,7 @@ import { formatWithOffset } from "@/shared/lib/timezone";
 import {
   APPOINTMENT_TOOL_TIMEOUT_MS,
   confirmedInstantError,
+  hasTimeToLookUp,
   hasTimeToWrite,
   HL_API,
   HL_VERSION_EVENTS,
@@ -59,6 +60,13 @@ interface HLAppointmentResponse {
  * no longer available"). Unverified against a live account: see the PR.
  */
 const SLOT_TAKEN = /\bslot\b[^.]{0,60}\b(?:no longer available|not available|unavailable|already booked)\b/i;
+
+/**
+ * How recent the contact's own booking at that time must be to be this
+ * tool's earlier call, whose answer was lost: older, it's one they already
+ * had (a parent booking for a child), and no new one was made.
+ */
+const OWN_RETRY_WINDOW_MS = 10 * 60_000;
 
 const UNKNOWN_BOOKING =
   "No pude confirmar si la cita quedó agendada. No le digas al cliente que se agendó ni que falló: dile que una persona del equipo lo confirmará.";
@@ -164,7 +172,8 @@ async function run(args: Args, ctx: ToolContext, opts?: ToolRunOptions): Promise
       output: null,
       error: "Ese horario ya no está disponible, así que la cita NO se agendó. Consulta otra vez check_availability y ofrécele al cliente otro horario.",
     };
-    if (!dbContactId) return other;
+    // Without a contact, or the time to ask, "not booked" is still true.
+    if (!dbContactId || !hasTimeToLookUp(startedAt, budgetMs)) return other;
     let located;
     try {
       located = await locateAppointmentAt({
@@ -180,13 +189,20 @@ async function run(args: Args, ctx: ToolContext, opts?: ToolRunOptions): Promise
       located = { kind: "unconfirmed" as const };
     }
     if (located.kind === "found") {
+      const { appointment } = located;
+      const datetime = formatWithOffset(appointment.startMs, zone);
+      const age = appointment.addedMs === null ? null : Date.now() - appointment.addedMs;
+      // A minute of clock skew either way.
+      if (age !== null && age >= -60_000 && age <= OWN_RETRY_WINDOW_MS) {
+        return {
+          ok: true,
+          output: { appointment_id: appointment.id, datetime, already_booked: true },
+        };
+      }
       return {
-        ok: true,
-        output: {
-          appointment_id: located.appointment.id,
-          datetime: formatWithOffset(located.appointment.startMs, zone),
-          already_booked: true,
-        },
+        ok: false,
+        output: { existing_appointment: datetime },
+        error: "El cliente ya tenía una cita a esa hora, así que no se creó otra. Confírmale que esa sigue en pie o, si quería otra cita, ofrécele otro horario.",
       };
     }
     if (located.kind === "unconfirmed" || located.kind === "ambiguous") {
@@ -260,17 +276,36 @@ async function run(args: Args, ctx: ToolContext, opts?: ToolRunOptions): Promise
     };
   }
 
-  const data = (await res.json()) as HLAppointmentResponse;
-  const appointmentId = data.id ?? data.appointment?.id ?? null;
+  // Booked: whatever happens next, the answer is success.
+  let appointmentId: string | null = null;
+  try {
+    const data = (await res.json()) as HLAppointmentResponse;
+    appointmentId = data.id ?? data.appointment?.id ?? null;
+  } catch (err) {
+    console.error("[schedule_highlevel] booked, but the answer couldn't be read:", err);
+  }
+  if (!appointmentId) {
+    await noteForTeam(
+      supabase,
+      ctx,
+      "hl_appointment_unconfirmed",
+      `HighLevel agendó la cita del ${startTime} pero no devolvió su id. Revisa que esté en el calendario.`,
+    );
+  }
 
-  const { error: insertError } = await supabase.from("appointments").insert({
+  // One local row per HighLevel appointment: an earlier read may have
+  // written it already.
+  const row = {
     workspace_id: ctx.workspaceId,
     contact_id: dbContactId,
     conversation_id: ctx.conversationId,
     scheduled_at: new Date(start.ms).toISOString(),
     status: "booked",
     hl_appointment_id: appointmentId,
-  });
+  };
+  const { error: insertError } = appointmentId
+    ? await supabase.from("appointments").upsert(row, { onConflict: "workspace_id,hl_appointment_id" })
+    : await supabase.from("appointments").insert(row);
   if (insertError) {
     // The booking already exists in HighLevel and can't be undone by this
     // failure alone — don't error out to the user over a cita that actually

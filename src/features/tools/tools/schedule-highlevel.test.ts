@@ -36,7 +36,9 @@ function mockFetch(opts: {
   hlTimezone?: string;
   /** The contact's appointments in HighLevel, and each one's event read. */
   hlContactEvents?: Array<Record<string, unknown>>;
-  hlEvents?: Record<string, Record<string, unknown>>;
+  hlEvents?: Record<string, Record<string, unknown> | { httpStatus: number }>;
+  /** The booking's 2xx body isn't JSON. */
+  hlBodyRaw?: string;
 }) {
   const calls: FetchCall[] = [];
 
@@ -96,6 +98,7 @@ function mockFetch(opts: {
     }
     if (url.includes("leadconnectorhq.com/calendars/events/appointments/") && method === "GET") {
       const event = opts.hlEvents?.[url.split("/").pop()!];
+      if (event && "httpStatus" in event) return jsonResponse(event.httpStatus as number, {});
       return event ? jsonResponse(200, { event }) : jsonResponse(404, {});
     }
     if (url.includes("/rest/v1/messages")) {
@@ -109,6 +112,7 @@ function mockFetch(opts: {
       ) &&
       method === "POST"
     ) {
+      if (opts.hlBodyRaw !== undefined) return new Response(opts.hlBodyRaw, { status: opts.hlStatus });
       return jsonResponse(opts.hlStatus, opts.hlBody ?? {});
     }
 
@@ -349,7 +353,14 @@ test("'slot taken' by the contact's own booking (an earlier call's answer was lo
     hlContactEvents: [
       { id: "hl_mine", calendarId: "cal_1", appointmentStatus: "booked", startTime: "2027-06-12 10:00:00" },
     ],
-    hlEvents: { hl_mine: { appointmentStatus: "booked", startTime: "2027-06-12T10:00:00-06:00" } },
+    // Created a minute ago: this tool's earlier call.
+    hlEvents: {
+      hl_mine: {
+        appointmentStatus: "booked",
+        startTime: "2027-06-12T10:00:00-06:00",
+        dateAdded: new Date(Date.now() - 60_000).toISOString(),
+      },
+    },
   });
   const result = await runWith(fn as typeof fetch, { datetime_iso: "2027-06-12T10:00:00-06:00" });
   assert.equal(result.ok, true);
@@ -360,6 +371,87 @@ test("'slot taken' by the contact's own booking (an earlier call's answer was lo
   });
   // HighLevel's read is the answer, not a second booking.
   assert.equal(calls.filter((c) => c.method === "POST" && c.url.includes("leadconnectorhq")).length, 1);
+});
+
+const SLOT_TAKEN_400 = {
+  hlStatus: 400,
+  hlBody: { message: "The slot you have selected is no longer available." },
+  appointmentInsertStatus: 201,
+};
+const mineAt10 = (fields: Record<string, unknown>) => ({
+  hlContactEvents: [
+    { id: "hl_mine", calendarId: "cal_1", appointmentStatus: "booked", startTime: "2027-06-12 10:00:00" },
+  ],
+  hlEvents: { hl_mine: { appointmentStatus: "booked", startTime: "2027-06-12T10:00:00-06:00", ...fields } },
+});
+
+test("'slot taken' by an appointment the contact already had (not this tool's): nothing new, neutral answer", async () => {
+  // A parent booking for a child: the old booking is theirs, but no new one was made.
+  const { fn } = mockFetch({
+    ...SLOT_TAKEN_400,
+    ...mineAt10({ dateAdded: new Date(Date.now() - 30 * 24 * 3600_000).toISOString() }),
+  });
+  const result = await runWith(fn as typeof fetch, { datetime_iso: "2027-06-12T10:00:00-06:00" });
+  assert.equal(result.ok, false);
+  assert.match(result.error ?? "", /ya tenía una cita a esa hora/);
+  assert.match(result.error ?? "", /no se creó otra/);
+  assert.deepEqual(result.output, { existing_appointment: "2027-06-12T10:00:00-06:00" });
+
+  // Without dateAdded it can't be told apart: neutral too.
+  const { fn: noDate } = mockFetch({ ...SLOT_TAKEN_400, ...mineAt10({}) });
+  const r2 = await runWith(noDate as typeof fetch, { datetime_iso: "2027-06-12T10:00:00-06:00" });
+  assert.equal(r2.ok, false);
+});
+
+test("'slot taken' that can't be confirmed (a failed read, or two of theirs) hands off", async () => {
+  const { fn } = mockFetch({
+    ...SLOT_TAKEN_400,
+    hlContactEvents: [
+      { id: "hl_x", calendarId: "cal_1", appointmentStatus: "booked", startTime: "2027-06-12 10:00:00" },
+    ],
+    hlEvents: { hl_x: { httpStatus: 500 } },
+  });
+  const unconfirmed = await runWith(fn as typeof fetch, { datetime_iso: "2027-06-12T10:00:00-06:00" });
+  assert.deepEqual(unconfirmed.output, { needs_human: true });
+  assert.match(unconfirmed.error ?? "", /No pude confirmar/);
+
+  const two = { appointmentStatus: "booked", startTime: "2027-06-12T10:00:00-06:00" };
+  const { fn: ambiguous } = mockFetch({
+    ...SLOT_TAKEN_400,
+    hlContactEvents: [
+      { id: "hl_a", calendarId: "cal_1", appointmentStatus: "booked", startTime: "2027-06-12 10:00:00" },
+      { id: "hl_b", calendarId: "cal_1", appointmentStatus: "booked", startTime: "2027-06-12 10:00:00" },
+    ],
+    hlEvents: { hl_a: two, hl_b: two },
+  });
+  const r2 = await runWith(ambiguous as typeof fetch, { datetime_iso: "2027-06-12T10:00:00-06:00" });
+  assert.deepEqual(r2.output, { needs_human: true });
+});
+
+test("'slot taken' with no budget left to ask whose it is: a plain 'not booked'", async () => {
+  // 13 s: enough for the POST (10 s), not for the lookup after it (14 s).
+  const { fn, calls } = mockFetch({ ...SLOT_TAKEN_400, ...mineAt10({}) });
+  const result = await runWith(fn as typeof fetch, { datetime_iso: "2027-06-12T10:00:00-06:00" }, 13_000);
+  assert.equal(result.ok, false);
+  assert.match(result.error ?? "", /NO se agendó/);
+  assert.equal(result.output, null);
+  assert.ok(!calls.some((c) => c.url.includes("leadconnectorhq.com/contacts/")), "no lookup");
+});
+
+test("a 2xx whose body can't be read is still a booking: ok, no id, and a note for the team", async () => {
+  const { fn, calls } = mockFetch({ hlStatus: 201, hlBodyRaw: "<html>ok</html>", appointmentInsertStatus: 201 });
+  const result = await runWith(fn as typeof fetch, { datetime_iso: "2027-06-12T10:00:00-06:00" });
+  assert.equal(result.ok, true);
+  assert.equal((result.output as { appointment_id: unknown }).appointment_id, null);
+  assert.ok(calls.some((c) => c.method === "POST" && c.url.includes("/rest/v1/messages")), "a note");
+});
+
+test("the booking's local row is an upsert on the HighLevel id, keeping the conversation", async () => {
+  const { fn, calls } = mockFetch({ hlStatus: 200, hlBody: { id: "hl_evt_1" }, appointmentInsertStatus: 201 });
+  await runWith(fn as typeof fetch, { datetime_iso: "2027-06-12T10:00:00-06:00" });
+  const write = calls.find((c) => c.url.includes("/rest/v1/appointments") && c.method === "POST");
+  assert.ok(decodeURIComponent(write!.url).includes("on_conflict=workspace_id,hl_appointment_id"), write!.url);
+  assert.equal((write!.body as { conversation_id: string }).conversation_id, "conv_1");
 });
 
 test("the slot-taken wording is narrow: a 400 about something else isn't read as a taken slot", async () => {
