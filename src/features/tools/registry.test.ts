@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { z } from "zod";
-import { registry, sanitizeArgs } from "./registry.ts";
+import { registry, sanitizeArgs, WRITE_TIMEOUT_ERROR } from "./registry.ts";
 import type { Tool, ToolContext } from "./core/tool";
 
 process.env.NEXT_PUBLIC_SUPABASE_URL = "https://fake.supabase.co";
@@ -155,6 +155,37 @@ test("runTool executes a Tool object directly, without it being registered", asy
       undefined,
       "runTool must not have registered the tool as a side effect",
     );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("a write tool that times out tells the model the outcome is unknown; a read tool keeps the plain error", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () => new Response(null, { status: 204 })) as typeof fetch;
+  const slow = (sensitivity: "read" | "write"): Tool => ({
+    name: `slow_${sensitivity}`,
+    description: "test tool",
+    sensitivity,
+    schema: z.object({}),
+    enabledFor: () => true,
+    run: () => new Promise(() => {}),
+  });
+  try {
+    const executed: Array<boolean | null> = [];
+    const write = await registry.runTool(slow("write"), {}, ctx, {
+      timeoutMs: 20,
+      onExecuted: (e) => {
+        executed.push(e.ok);
+      },
+    });
+    assert.equal(write.ok, false);
+    assert.equal(write.error, WRITE_TIMEOUT_ERROR);
+    assert.match(write.error ?? "", /No le digas al cliente que se hizo ni que falló/);
+    assert.deepEqual(executed, [null], "reported as neither done nor failed");
+
+    const read = await registry.runTool(slow("read"), {}, ctx, { timeoutMs: 20, retries: 0 });
+    assert.equal(read.error, "Tool timeout");
   } finally {
     globalThis.fetch = originalFetch;
   }

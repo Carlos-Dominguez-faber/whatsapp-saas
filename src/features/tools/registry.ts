@@ -19,6 +19,13 @@ function svc() {
   );
 }
 
+class ToolTimeoutError extends Error {
+  constructor() {
+    super("Tool timeout");
+    this.name = "ToolTimeoutError";
+  }
+}
+
 async function runWithTimeout<T>(
   fn: () => Promise<T>,
   timeoutMs: number,
@@ -26,10 +33,17 @@ async function runWithTimeout<T>(
   return Promise.race([
     fn(),
     new Promise<never>((_, reject) =>
-      setTimeout(() => reject(new Error("Tool timeout")), timeoutMs),
+      setTimeout(() => reject(new ToolTimeoutError()), timeoutMs),
     ),
   ]);
 }
+
+/**
+ * What the model reads when a write tool runs out of time: the change may
+ * still land (the call keeps running), so it must claim neither outcome.
+ */
+export const WRITE_TIMEOUT_ERROR =
+  "No pude confirmar si la acción se completó (el sistema tardó demasiado en responder). No le digas al cliente que se hizo ni que falló: dile que una persona del equipo lo confirmará.";
 
 /**
  * SEC-01: Strip sensitive fields from args before logging.
@@ -172,6 +186,7 @@ class ToolRegistry {
     const start = Date.now();
     let result: ToolResult;
     let lastError: string | undefined;
+    let timedOut = false;
     const reportExecution = async (ok: boolean | null, output?: unknown) => {
       if (!opts?.onExecuted) return;
       const execution: ToolExecution = {
@@ -205,6 +220,7 @@ class ToolRegistry {
         return result;
       } catch (err) {
         lastError = err instanceof Error ? err.message : String(err);
+        timedOut = err instanceof ToolTimeoutError;
         if (i < retries) {
           console.warn(
             `[registry] tool "${tool.name}" failed (attempt ${i + 1}), retrying:`,
@@ -217,7 +233,10 @@ class ToolRegistry {
     const errorResult: ToolResult = {
       ok: false,
       output: null,
-      error: lastError ?? "Unknown tool error",
+      error:
+        timedOut && tool.sensitivity === "write"
+          ? WRITE_TIMEOUT_ERROR
+          : (lastError ?? "Unknown tool error"),
     };
     void logToolCall(
       tool.name,
