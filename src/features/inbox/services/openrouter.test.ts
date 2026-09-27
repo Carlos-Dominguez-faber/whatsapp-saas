@@ -186,3 +186,29 @@ test("a start hook that fails on the last step still fails the turn, even if the
     registryRun = async () => null;
   }
 });
+
+test("generateWithTools returns every step's tool results with their tool name", async () => {
+  generateImpl = async () => ({
+    text: "Te paso con una persona.",
+    usage: LAST_STEP,
+    totalUsage: ALL_STEPS,
+    steps: [
+      { toolResults: [{ toolName: "check_availability", output: { ok: true, output: [] } }] },
+      {
+        toolResults: [
+          { toolName: "handoff_human", output: { ok: true, output: { handoff: true, reason: "agent_stuck" } } },
+        ],
+      },
+      {},
+    ],
+  });
+  try {
+    const r = await generateWithTools({ ...toolParams, availableTools: [] } as never);
+    assert.deepEqual(r.toolResults, [
+      { toolName: "check_availability", output: { ok: true, output: [] } },
+      { toolName: "handoff_human", output: { ok: true, output: { handoff: true, reason: "agent_stuck" } } },
+    ]);
+  } finally {
+    generateImpl = null;
+  }
+});

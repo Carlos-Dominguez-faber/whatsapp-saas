@@ -47,6 +47,17 @@ mock.module("@supabase/supabase-js", {
   exports: { createClient: () => fakeClient },
 });
 
+// The acknowledgement settings live on the workspace's active WhatsApp row.
+mock.module("./whatsapp-provider.ts", {
+  exports: {
+    loadWhatsAppSettings: async () => ({
+      provider: "ycloud",
+      config: (integrationsRow.data as { config?: unknown } | null)?.config ?? {},
+    }),
+    WHATSAPP_NOT_CONNECTED: "WhatsApp integration not found",
+  },
+});
+
 const dispatchCalls: unknown[] = [];
 let dispatchResult: { ok: boolean; error?: string; errorCode?: string } = {
   ok: true,

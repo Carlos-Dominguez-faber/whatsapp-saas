@@ -46,6 +46,6 @@ test("reason inválido o ausente lo rechaza el schema, sin llegar a run", () => 
   }
 });
 
-test("es sensitivity 'write': registry.runTool no la reintenta", () => {
-  assert.equal(handoffHumanTool.sensitivity, "write");
+test("es sensitivity 'read': no escribe al correr, así que no cuenta como escritura del lote", () => {
+  assert.equal(handoffHumanTool.sensitivity, "read");
 });

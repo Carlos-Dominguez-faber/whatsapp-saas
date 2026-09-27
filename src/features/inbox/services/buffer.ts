@@ -525,6 +525,37 @@ function writeRunsOf(meta: Record<string, unknown>): WriteRun[] {
     : [];
 }
 
+/** Reasons handoff_human accepts (see handoff-human.ts). */
+const HANDOFF_REASONS = new Set(["customer_request", "agent_stuck"]);
+
+/**
+ * The reason of a handoff the agent asked for this turn with handoff_human,
+ * if it did. Only that tool's own results count — a workspace's n8n tool
+ * returning the same shape can't move the conversation — and a second call
+ * in the same turn hands off once.
+ */
+function findHandoffReason(
+  toolResults: { toolName: string; output: unknown }[] | undefined,
+): string | null {
+  for (const entry of toolResults ?? []) {
+    if (entry.toolName !== "handoff_human") continue;
+    const result = entry.output as { ok?: unknown; output?: unknown } | null;
+    if (!result || result.ok !== true) continue;
+    const output = result.output as { handoff?: unknown; reason?: unknown } | null;
+    if (output?.handoff !== true) continue;
+    if (typeof output.reason === "string" && HANDOFF_REASONS.has(output.reason)) {
+      return output.reason;
+    }
+  }
+  return null;
+}
+
+/** The handoff an earlier attempt decided, saved next to its reply. */
+function pendingHandoffOf(meta: Record<string, unknown>): string | null {
+  const reason = meta.pending_handoff;
+  return typeof reason === "string" && HANDOFF_REASONS.has(reason) ? reason : null;
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // processNextBatch (exported)
 // Called by the cron job (/api/cron/buffer-flush) or the internal trigger.
@@ -603,11 +634,18 @@ export async function processNextBatch(): Promise<ProcessBatchResult> {
         : null;
     // Any retry may follow a send whose worker died before closing the batch
     // (a lost checkpoint included): never send twice.
+    const pendingHandoff = pendingHandoffOf(batch.meta);
     if (
       (retryCount > 0 || pendingReply) &&
       (await settleEarlierSend(supabase, batch))
     ) {
       progress.replySent = true;
+      // The worker that sent the reply died before handing off: do it now.
+      // Whether the farewell arrived isn't known, so the contact gets the
+      // generic acknowledgement too.
+      if (pendingHandoff) {
+        await handOff(supabase, batch, `tool_unsent:${pendingHandoff}`);
+      }
       await markBatchProcessed(batch, mergedText, supabase);
       return done();
     }
@@ -621,6 +659,7 @@ export async function processNextBatch(): Promise<ProcessBatchResult> {
         pendingReply,
         isLastAttempt,
         progress,
+        pendingHandoff,
       );
       return done();
     }
@@ -929,7 +968,27 @@ export async function processNextBatch(): Promise<ProcessBatchResult> {
     // With no write done, regenerating is harmless: throw into the retry path.
     // After a write that went through or may have (a booking, a CRM write),
     // regenerating would run it again, so a person takes over instead.
+    // The agent asked for a person (handoff_human). The tool itself changes
+    // nothing: the handoff happens after the farewell is sent, below, because
+    // deliverReply doesn't send once the conversation left ai_active.
+    const handoffReason = findHandoffReason(reply.toolResults);
+
     if (!reply.text.trim()) {
+      // It asked for a person but wrote no farewell: hand off right away,
+      // and the contact gets the generic acknowledgement instead.
+      if (handoffReason) {
+        await handOff(supabase, batch, `tool_unsent:${handoffReason}`);
+        if (writeRuns.length > 0) {
+          await addInternalNote(
+            supabase,
+            batch,
+            `La IA ejecutó una acción (${[...new Set(writeRuns.map((w) => w.name))].join(", ")}) y pidió pasarte la conversación. Revisa qué quedó hecho.`,
+            "write_tool_unfinished",
+          );
+        }
+        await markBatchProcessed(batch, mergedText, supabase);
+        return done();
+      }
       if (writeRuns.length === 0) {
         throw new Error(EMPTY_REPLY_ERROR);
       }
@@ -941,8 +1000,13 @@ export async function processNextBatch(): Promise<ProcessBatchResult> {
     // From here on, any retry (or a reclaim after this worker dies) delivers
     // this same text instead of calling the model and its tools again. Not
     // sent unless saved: a reply sent without its checkpoint could be
-    // generated — and sent — again.
-    batch.meta = { ...batch.meta, pending_reply: reply.text };
+    // generated — and sent — again. A handoff the agent asked for travels
+    // with it, so a retry hands off too.
+    batch.meta = {
+      ...batch.meta,
+      pending_reply: reply.text,
+      ...(handoffReason ? { pending_handoff: handoffReason } : {}),
+    };
     await saveBatchMeta(supabase, batch, { required: true });
 
     // ── 9. Deliver it and close the batch ───────────────────────────────────
@@ -953,6 +1017,7 @@ export async function processNextBatch(): Promise<ProcessBatchResult> {
       reply.text,
       isLastAttempt,
       progress,
+      handoffReason,
     );
     if (!delivered) {
       return done();
@@ -1111,6 +1176,7 @@ async function deliverReply(
   text: string,
   isLastAttempt: boolean,
   progress: { replySent: boolean },
+  handoffReason: string | null = null,
 ): Promise<boolean> {
   // The turn can take 10-20 s. If a human took the thread meanwhile (the
   // inbox "take", a Business App echo), replying would talk over them.
@@ -1164,6 +1230,17 @@ async function deliverReply(
   }
 
   progress.replySent = true;
+  // The agent asked for a person: hand off now that its farewell was sent
+  // (tool:, no generic acknowledgement) or definitively wasn't (tool_unsent:,
+  // the contact gets the acknowledgement). Before closing the batch, so a
+  // worker that dies here leaves it to a retry that still hands off.
+  if (handoffReason) {
+    await handOff(
+      supabase,
+      batch,
+      dispatchResult.ok ? `tool:${handoffReason}` : `tool_unsent:${handoffReason}`,
+    );
+  }
   await markBatchProcessed(batch, mergedText, supabase);
   return true;
 }

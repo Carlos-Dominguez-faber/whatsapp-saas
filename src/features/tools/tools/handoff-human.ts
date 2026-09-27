@@ -20,9 +20,10 @@ type HandoffArgs = z.infer<typeof schema>;
  */
 export const handoffHumanTool: Tool<HandoffArgs> = {
   name: "handoff_human",
-  // "write": no escribe acá, pero su efecto es cambiar el estado de la
-  // conversación. Además "write" desactiva el retry de registry.runTool.
-  sensitivity: "write",
+  // "read": correrla no cambia nada (el traspaso lo aplica buffer.ts después
+  // de la despedida), así que un turno que falla puede repetirse sin
+  // riesgo y no cuenta como una escritura que obligue a derivar el lote.
+  sensitivity: "read",
   description:
     "Deriva la conversación a una persona del equipo. Úsala en dos casos y " +
     "solo en esos dos: reason='customer_request' cuando el cliente pide " +
