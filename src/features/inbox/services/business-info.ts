@@ -119,15 +119,13 @@ export function buildNowContext(timeZone?: string | null): string {
 }
 
 /**
- * Resolves the workspace's configured timezone from its business info,
- * falling back to the default when unset or invalid — the same fallback
- * `buildNowContext` uses, exposed here for callers (like the HighLevel
- * fallback appointment lookup) that need just the timezone, not the full
- * prompt-context string.
+ * The workspace's configured timezone from its business info, through the
+ * same resolver as buildNowContext and check_availability, so every place
+ * that reasons about "now" agrees on the zone.
  */
-export function resolveTimeZone(info: BusinessInfo | null): string {
+export function businessTimeZone(info: BusinessInfo | null): string {
   const tz = (info?.structured as { timezone?: string } | undefined)?.timezone;
-  return tz && isValidTimeZone(tz) ? tz : DEFAULT_TIMEZONE;
+  return resolveTimeZone(tz);
 }
 
 /**

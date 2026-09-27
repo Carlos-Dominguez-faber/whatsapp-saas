@@ -3,7 +3,7 @@ import { test } from "node:test";
 import {
   buildNowContext,
   buildUpcomingDaysTable,
-  resolveTimeZone,
+  businessTimeZone,
 } from "./business-info.ts";
 import type { BusinessInfo } from "./business-info.ts";
 
@@ -138,27 +138,27 @@ test("falls back to the default timezone instead of throwing on an invalid IANA 
   }
 });
 
-test("resolveTimeZone returns the configured timezone when it's a valid IANA zone", () => {
+test("businessTimeZone returns the configured timezone when it's a valid IANA zone", () => {
   const info: BusinessInfo = {
     structured: { timezone: "America/Santiago" },
     free_text: null,
   };
-  assert.equal(resolveTimeZone(info), "America/Santiago");
+  assert.equal(businessTimeZone(info), "America/Santiago");
 });
 
-test("resolveTimeZone falls back to the default when info is null", () => {
-  assert.equal(resolveTimeZone(null), "America/Mexico_City");
+test("businessTimeZone falls back to the default when info is null", () => {
+  assert.equal(businessTimeZone(null), "America/Mexico_City");
 });
 
-test("resolveTimeZone falls back to the default when structured.timezone is missing", () => {
+test("businessTimeZone falls back to the default when structured.timezone is missing", () => {
   const info: BusinessInfo = { structured: {}, free_text: null };
-  assert.equal(resolveTimeZone(info), "America/Mexico_City");
+  assert.equal(businessTimeZone(info), "America/Mexico_City");
 });
 
-test("resolveTimeZone falls back to the default when structured.timezone is not a valid IANA zone", () => {
+test("businessTimeZone falls back to the default when structured.timezone is not a valid IANA zone", () => {
   const info: BusinessInfo = {
     structured: { timezone: "not-a-real-timezone" },
     free_text: null,
   };
-  assert.equal(resolveTimeZone(info), "America/Mexico_City");
+  assert.equal(businessTimeZone(info), "America/Mexico_City");
 });

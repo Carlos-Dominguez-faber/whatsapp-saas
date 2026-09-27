@@ -23,7 +23,7 @@ const schema = z.object({
     .string()
     .optional()
     .describe(
-      "Teléfono del contacto en E.164 (ej: +5215512345678). Úsalo cuando el contacto no venga del chat (p. ej. en el playground de prueba).",
+      "Teléfono del contacto en E.164 (ej: +5215512345678). Solo se usa en el playground de prueba; en una conversación real se agenda al contacto del chat.",
     ),
 });
 
@@ -67,9 +67,10 @@ async function run(args: Args, ctx: ToolContext): Promise<ToolResult> {
     process.env.SUPABASE_SERVICE_ROLE_KEY!,
   );
 
-  // Resolve the contact: prefer an explicit phone arg (playground / when the
-  // contact isn't synced), otherwise read the chat's contact from the DB.
-  let phone = args.contact_phone ?? null;
+  // Resolve the contact. In a real conversation it is always the chat's own
+  // contact: a phone the model passes is honored only in the playground,
+  // which has no contact, so the model can't book on someone else's number.
+  let phone = ctx.contactId ? null : (args.contact_phone ?? null);
   let name = args.contact_name ?? null;
   let hlContactId: string | null = null;
   let dbContactId: string | null = null;

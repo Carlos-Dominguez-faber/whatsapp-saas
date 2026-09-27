@@ -1,5 +1,5 @@
 -- ============================================================
--- Migration: 20260906000002_seed_highlevel_cancel_reschedule_tools
+-- Migration: 20260930000000_seed_highlevel_cancel_reschedule_tools
 -- Agente WhatsApp — seed the HighLevel cancel/reschedule tools
 --
 -- Same reasoning as 20260617000001_seed_check_availability_tool:
@@ -11,17 +11,19 @@
 --
 -- The schema column is for catalog/display only — the agent builds the LLM
 -- tool schema from the code zod definition.
--- Idempotent via ON CONFLICT, matching the original tools seed.
+-- Idempotent via ON CONFLICT, matching the original tools seed. Installs that
+-- already ran #14's own seed (20260906000002, on provider/kapso) get the
+-- descriptions and schema updated to the confirmed-date arguments.
 -- ============================================================
 
 INSERT INTO public.tools (key, name, description, schema, sensitivity) VALUES
   ('cancel_highlevel', 'Cancelar cita en HighLevel',
-   'Cancels the contact''s next active appointment in HighLevel',
-   '{"type":"object","properties":{}}',
+   'Cancels the contact''s HighLevel appointment at the date and time the customer confirmed',
+   '{"type":"object","properties":{"appointment_datetime_iso":{"type":"string"}},"required":["appointment_datetime_iso"]}',
    'write'),
   ('reschedule_highlevel', 'Reagendar cita en HighLevel',
-   'Reschedules the contact''s next active HighLevel appointment to a new time',
-   '{"type":"object","properties":{"new_datetime_iso":{"type":"string"}},"required":["new_datetime_iso"]}',
+   'Moves the contact''s HighLevel appointment from the confirmed date and time to a new one',
+   '{"type":"object","properties":{"appointment_datetime_iso":{"type":"string"},"new_datetime_iso":{"type":"string"}},"required":["appointment_datetime_iso","new_datetime_iso"]}',
    'write')
 ON CONFLICT (key) DO UPDATE
   SET name = EXCLUDED.name,
@@ -30,5 +32,5 @@ ON CONFLICT (key) DO UPDATE
       sensitivity = EXCLUDED.sensitivity;
 
 -- ============================================================
--- End of migration: 20260906000002_seed_highlevel_cancel_reschedule_tools
+-- End of migration: 20260930000000_seed_highlevel_cancel_reschedule_tools
 -- ============================================================

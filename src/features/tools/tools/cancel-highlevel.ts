@@ -1,23 +1,28 @@
 import { createClient as createSbClient } from "@supabase/supabase-js";
 import { z } from "zod";
 import type { Tool, ToolContext, ToolResult } from "../core/tool";
+import {
+  describeInstant,
+  locateAppointmentAt,
+  parseConfirmedInstant,
+} from "../lib/hl-appointment.ts";
 
-const schema = z.object({});
+const schema = z.object({
+  appointment_datetime_iso: z
+    .string()
+    .describe(
+      "Fecha y hora de la cita que el cliente confirmó cancelar, en ISO 8601 con zona horaria (ej: 2026-06-12T10:00:00-06:00). Pregúntale al cliente cuál cita es si no está claro.",
+    ),
+});
 
 type Args = z.infer<typeof schema>;
 
-interface ActiveAppointmentRow {
-  id: string;
-  hl_appointment_id: string | null;
-}
-
-interface ContactHLIdRow {
-  hl_contact_id: string | null;
-}
-
-async function run(_args: Args, ctx: ToolContext): Promise<ToolResult> {
-  const { getHLConfig, findActiveHLAppointmentByContact } = await import(
+async function run(args: Args, ctx: ToolContext): Promise<ToolResult> {
+  const { getHLConfig } = await import(
     "../../inbox/services/highlevel-client.ts"
+  );
+  const { getBusinessInfo, businessTimeZone } = await import(
+    "../../inbox/services/business-info.ts"
   );
 
   const cfg = await getHLConfig(ctx.workspaceId);
@@ -29,16 +34,22 @@ async function run(_args: Args, ctx: ToolContext): Promise<ToolResult> {
     };
   }
 
-  // No real contact (the playground has none) means there is no "this
-  // contact's appointment" to find. Returning early here also avoids relying
-  // on .eq("contact_id", null), which supabase-js sends as a literal
-  // eq.null filter — not the same as IS NULL — rather than guessing at that
-  // behavior.
+  // The playground has no real contact, so there's no "their appointment".
   if (!ctx.contactId) {
     return {
       ok: false,
       output: null,
-      error: "No encontré una cita activa para cancelar",
+      error: "No hay un contacto real en esta conversación; no se puede cancelar una cita.",
+    };
+  }
+
+  const instantMs = parseConfirmedInstant(args.appointment_datetime_iso);
+  if (instantMs === null) {
+    return {
+      ok: false,
+      output: null,
+      error:
+        "La fecha de la cita debe ir en ISO 8601 con zona horaria (ej: 2026-06-12T10:00:00-06:00).",
     };
   }
 
@@ -46,63 +57,57 @@ async function run(_args: Args, ctx: ToolContext): Promise<ToolResult> {
     process.env.NEXT_PUBLIC_SUPABASE_URL!,
     process.env.SUPABASE_SERVICE_ROLE_KEY!,
   );
+  let timeZone: string | null = null;
+  const zone = async () =>
+    (timeZone ??= businessTimeZone(await getBusinessInfo(ctx.workspaceId)));
 
-  const { data: appointment } = await supabase
-    .from("appointments")
-    .select("id, hl_appointment_id")
-    .eq("workspace_id", ctx.workspaceId)
-    .eq("contact_id", ctx.contactId)
-    .in("status", ["booked", "confirmed"])
-    // A row without an HighLevel id can't be acted on here, so it must not
-    // shadow one that can.
-    .not("hl_appointment_id", "is", null)
-    // A past appointment that never got marked 'completed' (no cron/webhook
-    // does that yet) must not shadow a real future one forever — "the
-    // active appointment" means the next upcoming one.
-    .gte("scheduled_at", new Date().toISOString())
-    .order("scheduled_at", { ascending: true })
-    .limit(1)
-    .maybeSingle();
-
-  const appointmentRow = appointment as ActiveAppointmentRow | null;
-  let hlAppointmentId = appointmentRow?.hl_appointment_id ?? null;
-
-  // The local row can be missing even when the appointment exists in
-  // HighLevel (e.g. its insert failed after the booking) — HighLevel is
-  // the source of truth, so fall back to asking it directly before failing.
-  if (!hlAppointmentId && ctx.contactId) {
-    const { data: contact } = await supabase
-      .from("contacts")
-      .select("hl_contact_id")
-      .eq("id", ctx.contactId)
-      .eq("workspace_id", ctx.workspaceId)
-      .maybeSingle();
-    const hlContactId =
-      (contact as ContactHLIdRow | null)?.hl_contact_id ?? null;
-    if (hlContactId) {
-      const { getBusinessInfo, resolveTimeZone } = await import(
-        "../../inbox/services/business-info.ts"
-      );
-      const timeZone = resolveTimeZone(await getBusinessInfo(ctx.workspaceId));
-      const found = await findActiveHLAppointmentByContact(
-        cfg,
-        hlContactId,
-        timeZone,
-      );
-      hlAppointmentId = found?.id ?? null;
-    }
-  }
-
-  if (!hlAppointmentId) {
+  let found;
+  try {
+    found = await locateAppointmentAt({
+      supabase,
+      cfg,
+      workspaceId: ctx.workspaceId,
+      contactId: ctx.contactId,
+      instantMs,
+      timeZone: zone,
+    });
+  } catch (err) {
+    console.error("[cancel_highlevel] lookup failed:", err);
     return {
       ok: false,
       output: null,
-      error: "No encontré una cita activa para cancelar",
+      error:
+        "No se pudo consultar la agenda en este momento. Dile al cliente que lo revisarás o pásalo a una persona.",
+    };
+  }
+
+  if (!found) {
+    return {
+      ok: false,
+      output: null,
+      error: `No encontré una cita del cliente el ${describeInstant(instantMs, await zone())}. Confirma con el cliente la fecha y hora exactas de su cita; no le digas que se canceló.`,
+    };
+  }
+
+  // Already cancelled: a retry of this same call, or a cancellation made
+  // elsewhere. Nothing to change.
+  if (found.state === "cancelled") {
+    return {
+      ok: true,
+      output: { cancelled: true, already_cancelled: true },
+    };
+  }
+  if (found.state !== "active") {
+    return {
+      ok: false,
+      output: null,
+      error:
+        "Esa cita ya no está activa (por ejemplo, ya pasó), así que no se puede cancelar.",
     };
   }
 
   const res = await fetch(
-    `https://services.leadconnectorhq.com/calendars/events/appointments/${hlAppointmentId}`,
+    `https://services.leadconnectorhq.com/calendars/events/appointments/${found.hlAppointmentId}`,
     {
       method: "PUT",
       headers: {
@@ -111,26 +116,29 @@ async function run(_args: Args, ctx: ToolContext): Promise<ToolResult> {
         "Content-Type": "application/json",
       },
       body: JSON.stringify({ appointmentStatus: "cancelled" }),
+      signal: AbortSignal.timeout(10_000),
     },
   );
 
   if (!res.ok) {
-    const err = await res.text();
+    // HighLevel's own wording (English, internal ids) stays in the logs.
+    console.error(
+      `[cancel_highlevel] HighLevel ${res.status}:`,
+      (await res.text()).slice(0, 300),
+    );
     return {
       ok: false,
       output: null,
-      error: `HL API error: ${res.status} ${err.slice(0, 150)}`,
+      error: `El calendario de HighLevel respondió con un error (${res.status}); la cita NO se canceló. Dile al cliente que lo revisarás o pásalo a una persona.`,
     };
   }
 
-  // Only a local row we already had can be marked cancelled here — when the
-  // appointment was resolved via the HighLevel fallback there was no local
-  // row to update.
-  if (appointmentRow) {
+  if (found.localId) {
     const { error: updateError } = await supabase
       .from("appointments")
       .update({ status: "cancelled" })
-      .eq("id", appointmentRow.id);
+      .eq("id", found.localId)
+      .eq("workspace_id", ctx.workspaceId);
     if (updateError) {
       console.warn(
         "[cancel_highlevel] cancelled in HighLevel but failed to update local status:",
@@ -148,7 +156,7 @@ async function run(_args: Args, ctx: ToolContext): Promise<ToolResult> {
 export const cancelHighLevelTool: Tool<Args> = {
   name: "cancel_highlevel",
   description:
-    "Cancela la cita activa más próxima del contacto en HighLevel. Úsala solo cuando el cliente haya confirmado explícitamente que quiere cancelar. Solo confirma la cancelación al cliente si esta herramienta responde con éxito — si falla o no encuentra una cita, dile la verdad, no inventes que se canceló.",
+    "Cancela en HighLevel la cita del cliente que empieza en la fecha y hora indicadas. Úsala solo cuando el cliente haya confirmado explícitamente cuál cita quiere cancelar. Solo confirma la cancelación si esta herramienta responde con éxito; si no encuentra la cita o falla, dile la verdad.",
   sensitivity: "write",
   schema,
   enabledFor: () => true,

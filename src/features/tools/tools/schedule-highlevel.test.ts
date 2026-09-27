@@ -148,7 +148,8 @@ test("reports the HighLevel error when the API call itself fails", async () => {
       ctx,
     );
     assert.equal(result.ok, false);
-    assert.match(result.error ?? "", /HL API error: 400/);
+    assert.match(result.error ?? "", /\(400\)/);
+    assert.doesNotMatch(result.error ?? "", /Slot not available/);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -212,6 +213,36 @@ test("logs a visible error event to the events table when the local insert fails
     assert.equal(body.conversation_id, "conv_1");
     assert.equal(body.payload.provider, "highlevel");
     assert.equal(body.payload.hl_appointment_id, "hl_evt_1");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("in a real conversation, a phone passed by the model is ignored: it books the chat's contact", async () => {
+  const { fn, calls } = mockFetch({
+    hlStatus: 200,
+    hlBody: { id: "hl_evt_1" },
+    appointmentInsertStatus: 201,
+  });
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = fn as typeof fetch;
+
+  try {
+    const result = await scheduleHighLevelTool.run(
+      { datetime_iso: "2026-06-12T10:00:00-06:00", contact_phone: "+15550009999" },
+      ctx,
+    );
+    assert.equal(result.ok, true);
+    const booking = calls.find(
+      (c) =>
+        c.method === "POST" &&
+        c.url.includes("services.leadconnectorhq.com/calendars/events/appointments"),
+    );
+    assert.equal((booking?.body as { contactId?: string }).contactId, "hl_contact_1");
+    assert.ok(
+      !calls.some((c) => c.url.includes("services.leadconnectorhq.com/contacts")),
+      "never upserts a HighLevel contact for the model's phone",
+    );
   } finally {
     globalThis.fetch = originalFetch;
   }
