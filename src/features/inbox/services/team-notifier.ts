@@ -1,6 +1,9 @@
 // Aviso por email al EQUIPO cuando una conversación entra en
 // `handoff_pending`. Hoy la única señal para un humano es tener el inbox
-// abierto; esto manda un correo a los operadores activos del workspace.
+// abierto; esto manda un correo a cada operador activo del workspace.
+//
+// Opt-in por workspace (`handoff_team_email` en la config de WhatsApp,
+// apagado por defecto), con un tope de correos por hora por workspace.
 //
 // Mismo contrato de dureza que handoff-notifier.ts: un fallo acá JAMÁS puede
 // romper ni revertir el handoff. Todo va en un solo try/catch y cada salida
@@ -8,6 +11,8 @@
 
 import { createClient as createSbClient } from "@supabase/supabase-js";
 import { logEvent, wasRecentlyLogged } from "./handoff-notifier";
+import { emitEventOncePerDay } from "./daily-events";
+import { loadWhatsAppSettings } from "./whatsapp-provider";
 
 function svc() {
   return createSbClient(
@@ -18,6 +23,8 @@ function svc() {
 
 const TEAM_NOTIFY_DEDUPE_MINUTES = 15;
 const MAX_RECIPIENTS = 20;
+/** Avisos (handoffs notificados) por workspace y hora; lo demás se salta. */
+export const TEAM_NOTIFY_HOURLY_CAP = 10;
 
 /** Roles que reciben el aviso — el mismo criterio de escritura del CRM (viewer queda fuera). */
 const NOTIFIABLE_ROLES = ["admin", "manager", "agent"];
@@ -53,7 +60,7 @@ export interface TeamHandoffParams {
 }
 
 interface MembershipEmailRow {
-  users: { email: string } | null;
+  users: { email: string; is_active: boolean | null } | null;
 }
 
 interface ConversationContactIdRow {
@@ -75,6 +82,15 @@ export async function notifyTeamHandoff(
   const { workspaceId, conversationId, trigger } = params;
 
   try {
+    const supabase = svc();
+
+    // Opt-in: sin el switch del workspace no se manda nada, ni se registra.
+    const whatsapp = await loadWhatsAppSettings(supabase, workspaceId);
+    const enabled =
+      (whatsapp?.config as { handoff_team_email?: boolean } | undefined)
+        ?.handoff_team_email === true;
+    if (!enabled) return;
+
     const apiKey = process.env.RESEND_API_KEY;
     const from = process.env.HANDOFF_NOTIFY_FROM;
 
@@ -114,11 +130,41 @@ export async function notifyTeamHandoff(
       return;
     }
 
-    const supabase = svc();
+    // Tope por workspace y hora: una racha de traspasos (por ejemplo, un
+    // corte de presupuesto con cost_cut_handoff) no se convierte en una
+    // ráfaga de correos. Se registra una vez al día que se llegó al tope.
+    const hourAgo = new Date(Date.now() - 60 * 60_000).toISOString();
+    const { count: sentLastHour, error: capError } = await supabase
+      .from("events")
+      .select("id", { count: "exact", head: true })
+      .eq("workspace_id", workspaceId)
+      .eq("type", "handoff_team_notified")
+      .gte("created_at", hourAgo);
+    if (capError) {
+      console.error("[team-notifier] hourly cap query failed:", capError.message);
+      await logEvent(
+        workspaceId,
+        conversationId,
+        "handoff_team_notify_failed",
+        "warn",
+        { reason: "cap_query_failed", trigger },
+      );
+      return;
+    }
+    if ((sentLastHour ?? 0) >= TEAM_NOTIFY_HOURLY_CAP) {
+      await emitEventOncePerDay(
+        supabase,
+        workspaceId,
+        "handoff_team_notify_capped",
+        "warn",
+        { hourly_cap: TEAM_NOTIFY_HOURLY_CAP },
+      );
+      return;
+    }
 
     const { data: memberships, error: membershipsError } = await supabase
       .from("memberships")
-      .select("users(email)")
+      .select("users(email, is_active)")
       .eq("workspace_id", workspaceId)
       .eq("is_active", true)
       .in("role", NOTIFIABLE_ROLES)
@@ -143,6 +189,7 @@ export async function notifyTeamHandoff(
     }
 
     const rawEmails = ((memberships ?? []) as unknown as MembershipEmailRow[])
+      .filter((m) => m.users?.is_active !== false)
       .map((m) => m.users?.email)
       .filter((email): email is string => Boolean(email));
 
@@ -234,6 +281,9 @@ export async function notifyTeamHandoff(
       .maybeSingle();
 
     let contactLabel: string;
+    // El asunto lleva a lo más el nombre, nunca el teléfono: el asunto se ve
+    // en notificaciones y vistas previas.
+    let subjectLabel = "un contacto";
     if (contactError) {
       // Acá sí se manda el correo: el equipo necesita saber que hay una
       // conversación esperando aunque no se haya podido resolver el nombre.
@@ -254,6 +304,7 @@ export async function notifyTeamHandoff(
       contactLabel = contact.name
         ? `${contact.name} (${contact.phone})`
         : contact.phone;
+      if (contact.name) subjectLabel = contact.name;
     } else {
       // Anomalía de datos: el contact_id de la conversación no calza con
       // este workspace. Se manda el correo igual (el equipo sigue
@@ -281,18 +332,22 @@ export async function notifyTeamHandoff(
 
     let resendOk = false;
     try {
-      const res = await fetch("https://api.resend.com/emails", {
+      // Un correo por destinatario (endpoint batch de Resend, una sola
+      // llamada): nadie ve las direcciones de los demás.
+      const res = await fetch("https://api.resend.com/emails/batch", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
           Authorization: `Bearer ${apiKey}`,
         },
-        body: JSON.stringify({
-          from,
-          to: recipients,
-          subject: `Un cliente necesita ayuda: ${contactLabel}`,
-          text,
-        }),
+        body: JSON.stringify(
+          recipients.map((to) => ({
+            from,
+            to: [to],
+            subject: `Un cliente necesita ayuda: ${subjectLabel}`,
+            text,
+          })),
+        ),
         // Este aviso corre con await ANTES del ACK al cliente (ver
         // handoff-notifier.ts): sin tope, un Resend colgado retrasa el
         // mensaje que le dice al cliente que alguien lo va a atender. Un

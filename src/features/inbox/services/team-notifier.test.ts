@@ -22,10 +22,32 @@ let contactRow: QueueEntry = {
   error: null,
 };
 let teamEventsRow: QueueEntry = { data: [], error: null };
+/** Handoffs already emailed in the last hour (the per-workspace cap). */
+let sentLastHour = 0;
+/** The workspace's switch in its WhatsApp config. */
+let teamEmailEnabled = true;
 const inserts: Array<{ table: string; row: unknown }> = [];
 
 const fakeClient = {
   from(table: string) {
+    // The workspace's active WhatsApp row, which carries the switch.
+    if (table === "integrations") {
+      const chain: Record<string, unknown> = {
+        select: () => chain,
+        eq: () => chain,
+        in: () => chain,
+        maybeSingle: async () => ({
+          data: {
+            id: "int_1",
+            provider: "ycloud",
+            enabled: true,
+            config: { handoff_team_email: teamEmailEnabled },
+          },
+          error: null,
+        }),
+      };
+      return chain;
+    }
     if (table === "memberships") {
       return {
         select: () => ({
@@ -56,21 +78,26 @@ const fakeClient = {
       };
     }
     if (table === "events") {
-      return {
-        select: () => ({
-          eq: () => ({
-            eq: () => ({
-              eq: () => ({
-                gte: () => ({ limit: async () => teamEventsRow }),
-              }),
-            }),
-          }),
-        }),
+      // select(...).eq(...)…: a head count (the hourly cap), a limited read
+      // (the 15-minute dedupe), or an insert.
+      let head = false;
+      const chain: Record<string, unknown> = {
+        select: (_cols: string, opts?: { head?: boolean }) => {
+          head = Boolean(opts?.head);
+          return chain;
+        },
+        eq: () => chain,
+        gte: () => chain,
+        contains: () => chain,
+        limit: async () => teamEventsRow,
+        then: (resolve: (v: unknown) => void) =>
+          resolve(head ? { count: sentLastHour, error: null } : teamEventsRow),
         insert: (row: unknown) => {
           inserts.push({ table, row });
           return Promise.resolve({ data: null, error: null });
         },
       };
+      return chain;
     }
     throw new Error(`unexpected table: ${table}`);
   },
@@ -79,6 +106,7 @@ const fakeClient = {
 mock.module("@supabase/supabase-js", {
   exports: { createClient: () => fakeClient },
 });
+
 
 const { notifyTeamHandoff } = await import("./team-notifier.ts");
 
@@ -90,6 +118,8 @@ function reset() {
   conversationRow = { data: { contact_id: "contact_1" }, error: null };
   contactRow = { data: { name: "Juanita", phone: "+15550001111" }, error: null };
   teamEventsRow = { data: [], error: null };
+  sentLastHour = 0;
+  teamEmailEnabled = true;
   inserts.length = 0;
   process.env.RESEND_API_KEY = "re_fake";
   process.env.HANDOFF_NOTIFY_FROM = "avisos@example.com";
@@ -121,10 +151,14 @@ test("manda el correo a los operadores activos y registra handoff_team_notified"
   }
 
   assert.equal(fetchCalls.length, 1);
-  const body = JSON.parse((fetchCalls[0] as { init: { body: string } }).init.body);
-  assert.deepEqual(body.to, ["a@ws.com", "b@ws.com"]);
-  assert.match(body.text, /Juanita/);
-  assert.match(body.text, /conv_1/);
+  const call = fetchCalls[0] as { url: string; init: { body: string } };
+  assert.equal(call.url, "https://api.resend.com/emails/batch");
+  const emails = JSON.parse(call.init.body) as Array<{ to: string[]; text: string; subject: string }>;
+  // One email per recipient: nobody sees the others' addresses.
+  assert.deepEqual(emails.map((e) => e.to), [["a@ws.com"], ["b@ws.com"]]);
+  assert.match(emails[0].text, /Juanita/);
+  assert.match(emails[0].text, /conv_1/);
+  assert.doesNotMatch(emails[0].subject, /\+1555/, "no phone number in the subject");
 
   const sent = eventsOfType("handoff_team_notified");
   assert.equal(sent.length, 1);
@@ -325,9 +359,10 @@ test("contacto de otro workspace: correo sale, sin nombre ni teléfono", async (
   });
 
   assert.equal(fetchCalls.length, 1, "el equipo igual tiene que enterarse");
-  const body = JSON.parse(fetchCalls[0].init.body);
+  const [body] = JSON.parse(fetchCalls[0].init.body) as Array<{ text: string; subject: string }>;
   assert.doesNotMatch(body.text, /Juanita/);
   assert.doesNotMatch(body.text, /\+1555/);
+  assert.doesNotMatch(body.subject, /Juanita/);
 
   const anomaly = eventsOfType("handoff_team_notify_anomaly");
   assert.equal(anomaly.length, 1);
@@ -396,8 +431,8 @@ test("un destinatario con email inválido se descarta; a los válidos sí les ll
   });
 
   assert.equal(fetchCalls.length, 1);
-  const body = JSON.parse(fetchCalls[0].init.body);
-  assert.deepEqual(body.to, ["a@ws.com", "b@ws.com"]);
+  const emails = JSON.parse(fetchCalls[0].init.body) as Array<{ to: string[] }>;
+  assert.deepEqual(emails.map((e) => e.to), [["a@ws.com"], ["b@ws.com"]]);
 
   const anomaly = eventsOfType("handoff_team_notify_anomaly").filter(
     (i) =>
@@ -504,7 +539,7 @@ test("error en la consulta de contacto: manda correo genérico, motivo contact_r
   });
 
   assert.equal(fetchCalls.length, 1, "el equipo igual tiene que enterarse");
-  const body = JSON.parse(fetchCalls[0].init.body);
+  const [body] = JSON.parse(fetchCalls[0].init.body) as Array<{ text: string }>;
   assert.doesNotMatch(body.text, /Juanita/);
 
   const failed = eventsOfType("handoff_team_notify_failed").filter(
@@ -544,4 +579,64 @@ test("el caso real de inconsistencia entre tenants sigue dando contact_workspace
       "contact_workspace_mismatch",
   );
   assert.equal(anomaly.length, 1);
+});
+
+test("apagado en el workspace (por defecto): no manda nada ni registra nada", async () => {
+  reset();
+  teamEmailEnabled = false;
+  let fetched = false;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () => {
+    fetched = true;
+    return { ok: true } as Response;
+  }) as typeof fetch;
+  try {
+    await notifyTeamHandoff({ workspaceId: "ws_1", conversationId: "conv_1", trigger: "keyword" });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  assert.equal(fetched, false);
+  assert.equal(inserts.length, 0);
+});
+
+test("tope por hora: con el workspace en el tope no manda, y lo registra una vez al día", async () => {
+  reset();
+  sentLastHour = 10;
+  let fetched = false;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () => {
+    fetched = true;
+    return { ok: true } as Response;
+  }) as typeof fetch;
+  try {
+    await notifyTeamHandoff({ workspaceId: "ws_1", conversationId: "conv_1", trigger: "keyword" });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  assert.equal(fetched, false);
+  assert.equal(eventsOfType("handoff_team_notify_capped").length, 1);
+});
+
+test("un usuario desactivado no recibe el aviso aunque su membresía siga activa", async () => {
+  reset();
+  membershipsRow = {
+    data: [
+      { users: { email: "a@ws.com", is_active: true } },
+      { users: { email: "baja@ws.com", is_active: false } },
+    ],
+    error: null,
+  };
+  const fetchCalls: Array<{ init: { body: string } }> = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async (_url: string, init: { body: string }) => {
+    fetchCalls.push({ init });
+    return { ok: true } as Response;
+  }) as typeof fetch;
+  try {
+    await notifyTeamHandoff({ workspaceId: "ws_1", conversationId: "conv_1", trigger: "keyword" });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  const emails = JSON.parse(fetchCalls[0].init.body) as Array<{ to: string[] }>;
+  assert.deepEqual(emails.map((e) => e.to), [["a@ws.com"]]);
 });

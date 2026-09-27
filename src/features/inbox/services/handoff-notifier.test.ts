@@ -158,7 +158,10 @@ test("un trigger 'tool_unsent:*' SÍ despacha el ACK (el cliente no recibió la 
 
 test("el aviso al equipo se intenta con config.enabled=false (ese flag es del ACK, no del equipo)", async () => {
   reset();
-  integrationsRow = { data: { config: { handoff_ack_enabled: false } }, error: null };
+  integrationsRow = {
+    data: { config: { handoff_ack_enabled: false, handoff_team_email: true } },
+    error: null,
+  };
   delete process.env.RESEND_API_KEY;
 
   await notifyHandoffPending({
@@ -180,6 +183,7 @@ test("el aviso al equipo se intenta con config.enabled=false (ese flag es del AC
 
 test("el aviso al equipo se intenta con trigger 'tool:*' (ese corte también es del ACK, no del equipo)", async () => {
   reset();
+  integrationsRow = { data: { config: { handoff_team_email: true } }, error: null };
   delete process.env.RESEND_API_KEY;
 
   await notifyHandoffPending({

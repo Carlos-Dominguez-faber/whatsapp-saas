@@ -199,6 +199,10 @@ function WhatsAppSection({
   const [costCutHandoff, setCostCutHandoff] = useState<boolean>(
     (settings.cost_cut_handoff as boolean | undefined) === true,
   );
+  // Off by default: emailing the team needs a Resend account (INSTALAR).
+  const [handoffTeamEmail, setHandoffTeamEmail] = useState<boolean>(
+    (settings.handoff_team_email as boolean | undefined) === true,
+  );
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
   const [copied, setCopied] = useState(false);
@@ -323,6 +327,7 @@ function WhatsAppSection({
       handoff_ack_enabled: handoffAckEnabled,
       handoff_ack_message: handoffAckMessage.trim(),
       cost_cut_handoff: costCutHandoff,
+      handoff_team_email: handoffTeamEmail,
     };
     const payload =
       selected === "kapso"
@@ -636,6 +641,25 @@ function WhatsAppSection({
             conversación que escriba en ese lapso queda en espera de un asesor
             (y recibe el aviso de arriba). Esas conversaciones no regresan solas
             a la IA: devuélvelas desde el inbox.
+          </p>
+        </div>
+
+        <div className="space-y-2 border-t border-border/60 pt-4">
+          <div className="flex items-center justify-between gap-4">
+            <Label htmlFor="whatsapp-handoff-team-email">
+              Avisar al equipo por correo cuando una conversación pase a una persona
+            </Label>
+            <Switch
+              id="whatsapp-handoff-team-email"
+              checked={handoffTeamEmail}
+              onCheckedChange={setHandoffTeamEmail}
+            />
+          </div>
+          <p className="text-xs text-muted-foreground">
+            Cada admin, manager y agente activo recibe su propio correo, con un
+            tope por hora por workspace. Requiere configurar Resend en la
+            instalación (RESEND_API_KEY y HANDOFF_NOTIFY_FROM); sin eso no se
+            manda nada.
           </p>
         </div>
 
