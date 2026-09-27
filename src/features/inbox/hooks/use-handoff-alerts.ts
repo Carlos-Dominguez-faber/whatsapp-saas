@@ -1,8 +1,8 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { RealtimePostgresChangesPayload } from "@supabase/supabase-js";
-import { isHandoffTransition } from "./handoff-alert";
+import { shouldNotifyHandoff } from "./handoff-alert";
 import type { ConversationRow, ConversationWithContact } from "@/features/inbox/types";
 
 type NotificationSupport = "unsupported" | NotificationPermission;
@@ -73,13 +73,25 @@ export function useHandoffAlerts(conversations: ConversationWithContact[]) {
     Notification.requestPermission().then(setPermission);
   }, []);
 
+  // Conversaciones que ya avisaron. Arranca con las que ya esperaban al
+  // cargar el inbox: esas no son una entrada nueva.
+  const notifiedRef = useRef<Set<string> | null>(null);
+  if (notifiedRef.current === null) {
+    notifiedRef.current = new Set(
+      conversations.filter((c) => c.state === "handoff_pending").map((c) => c.id),
+    );
+  }
+
   const handleConversationChange = useCallback(
     (payload: RealtimePostgresChangesPayload<ConversationRow>) => {
+      // El Set se actualiza aunque no haya permiso, para que concederlo más
+      // tarde no dispare avisos de esperas viejas.
+      const isNew = shouldNotifyHandoff(payload, notifiedRef.current!);
       if (typeof window === "undefined" || !("Notification" in window)) return;
       if (Notification.permission !== "granted") return;
-      if (!isHandoffTransition(payload)) return;
+      if (!isNew) return;
 
-      const conversationId = payload.new.id;
+      const conversationId = (payload.new as ConversationRow).id;
       const notification = new Notification("Un cliente pide hablar con una persona", {
         body: "Hay una conversación esperando en el inbox.",
         tag: `handoff-${conversationId}`,
