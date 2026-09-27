@@ -150,34 +150,62 @@ for (const row of rows) {
   changed++;
 }
 
-// n8n tools: one secret per row, bound to its workspace.
-// Before db-push the table doesn't exist yet (PGRST205): nothing to encrypt.
-const n8nRes = await fetch(
-  `${SUPABASE_URL}/rest/v1/n8n_tools?select=id,workspace_id,name,auth_header_value&auth_header_value=not.is.null`,
-  { headers: baseHeaders },
-);
+// n8n tools: one secret per row, bound to its workspace. Only rows still in
+// the clear are read (already-encrypted ones never leave the database), in
+// pages until none is left, and each PATCH only applies if the value is still
+// the one read — a header an admin changed meanwhile is left alone.
+const N8N_PLAINTEXT =
+  "n8n_tools?select=id,workspace_id,name,auth_header_value" +
+  "&auth_header_value=not.is.null&auth_header_value=not.like.enc:*&order=id&limit=200";
 let n8nRows = [];
-if (n8nRes.ok) {
-  n8nRows = await n8nRes.json();
-} else if (n8nRes.status === 404) {
-  log("  (sin tabla n8n_tools todavía: corre db-push y vuelve a correr este script)");
-} else {
-  fail(`GET n8n_tools → ${n8nRes.status} ${await n8nRes.text()}`);
+let n8nTableMissing = false;
+const skippedIds = new Set();
+// A dry run changes nothing, so it pages with an offset; a real run always
+// reads the first page, since every row it encrypts leaves the filter.
+let dryOffset = 0;
+for (;;) {
+  const res = await fetch(
+    `${SUPABASE_URL}/rest/v1/${N8N_PLAINTEXT}${DRY_RUN ? `&offset=${dryOffset}` : ""}`,
+    { headers: baseHeaders },
+  );
+  // Before db-push the table doesn't exist yet: nothing to encrypt.
+  if (res.status === 404) {
+    n8nTableMissing = true;
+    break;
+  }
+  if (!res.ok) fail(`GET n8n_tools → ${res.status} ${await res.text()}`);
+  const raw = await res.json();
+  dryOffset += raw.length;
+  const page = raw.filter((row) => !skippedIds.has(row.id));
+  if (!page.length) break;
+  n8nRows = n8nRows.concat(page);
+  for (const row of page) {
+    log(`  n8n "${row.name}" (workspace ${row.workspace_id})`);
+    log("    cifra: auth_header_value");
+    changed++;
+    if (DRY_RUN) continue;
+    const patch = await fetch(
+      `${SUPABASE_URL}/rest/v1/n8n_tools?id=eq.${row.id}` +
+        `&auth_header_value=eq.${encodeURIComponent(row.auth_header_value)}`,
+      {
+        method: "PATCH",
+        headers: { ...baseHeaders, Prefer: "return=representation" },
+        body: JSON.stringify({
+          auth_header_value: await encrypt(row.auth_header_value, `${row.workspace_id}:n8n_tool`),
+        }),
+      },
+    );
+    if (!patch.ok) fail(`PATCH n8n_tools ${row.id} → ${patch.status} ${await patch.text()}`);
+    if (!(await patch.json()).length) {
+      // Changed while we worked: counted as not done, and not read again.
+      changed--;
+      skippedIds.add(row.id);
+      log("    (cambió mientras se cifraba; se deja como está — vuelve a correr el script)");
+    }
+  }
 }
-for (const row of n8nRows) {
-  const value = row.auth_header_value;
-  if (typeof value !== "string" || value === "" || isEncrypted(value)) {
-    alreadyDone++;
-    continue;
-  }
-  log(`  n8n "${row.name}" (workspace ${row.workspace_id})`);
-  log("    cifra: auth_header_value");
-  if (!DRY_RUN) {
-    await call("PATCH", `n8n_tools?id=eq.${row.id}`, {
-      auth_header_value: await encrypt(value, `${row.workspace_id}:n8n_tool`),
-    });
-  }
-  changed++;
+if (n8nTableMissing) {
+  log("  (sin tabla n8n_tools todavía: corre db-push y vuelve a correr este script)");
 }
 
 log("");
