@@ -439,9 +439,10 @@ las migraciones, así que las migraciones van **antes** de `vercel --prod`.
   `America/Mexico_City`. Guárdala como zona IANA, por ejemplo `America/Bogota`.
 - El webhook de **YCloud** configurado con `?wsid=` ignora los mensajes dirigidos a
   otro número que no sea el del workspace, y lo deja en `events` una vez al día.
-  Solo lo comprueba si el número está guardado con lada internacional: si lo
-  escribiste como `998 123 4567`, los mensajes se aceptan y un evento diario te
-  pide corregirlo. Al guardar, el número se escribe en formato internacional
+  Solo lo comprueba si el número está guardado con lada internacional (`+52…`,
+  `0052…`, o los dígitos empezando con el código de país del negocio): si lo
+  escribiste como `998 123 4567` o `1 998 123 4567`, los mensajes se aceptan y un
+  evento diario te pide corregirlo. Al guardar, el número se escribe en formato internacional
   (`+52…`) si tu cuenta de YCloud lo confirma o si lo escribiste con lada; si no,
   se guarda como lo escribiste y un aviso te dice cómo corregirlo.
 - Las rutas del buffer y los webhooks pueden durar hasta 300 segundos. Vercel lo

@@ -66,11 +66,10 @@ export function samePhone(
 }
 
 /**
- * The digits of a number written WITH its country code — `+52 998…`,
- * `0052 998…`, or 11 to 15 digits not starting with a trunk `0` — or null for
- * a national number (`998 123 4567`, `(998) 123-4567`) or something that
- * isn't a number. A national number's country is a guess: `555 123 4567` is
- * Mexican in a workspace coded 52, and yet it may be a US line.
+ * The digits of a number written with an international prefix — `+52 998…`
+ * or `0052 998…` — or null. Bare digits are never taken as international
+ * here: `1 998 123 4567` is a Mexican mobile, not a US number (placePhone
+ * reads them with the workspace's country code).
  */
 export function internationalDigits(phone: string): string | null {
   const trimmed = phone.trim();
@@ -78,66 +77,9 @@ export function internationalDigits(phone: string): string | null {
   let international: string | null = null;
   if (trimmed.startsWith("+")) international = digits;
   else if (digits.startsWith("00")) international = digits.slice(2);
-  else if (digits.length >= 11 && !digits.startsWith("0")) international = digits;
   return international && international.length >= 8 && international.length <= 15
     ? international
     : null;
-}
-
-/**
- * Whether a number someone typed for one of the account's OWN WhatsApp lines
- * (settings) is `own`, as the provider lists it. With a country code, the
- * same line (samePhone); without one, its digits must end `own`'s — only
- * safe against the handful of lines one account has, never to find a
- * contact.
- */
-export function matchesOwnNumber(typed: string, own: string): boolean {
-  const international = internationalDigits(typed);
-  if (international) return samePhone(`+${international}`, own);
-  const national = typed.replace(/\D/g, "").replace(/^0+/, "");
-  if (national.length < 7) return false;
-  return [phoneKey(own), normalizePhone(own).slice(1)].some((digits) =>
-    digits.endsWith(national),
-  );
-}
-
-export type DestinationCheck =
-  /** No number configured: nothing to compare. */
-  | "unconfigured"
-  /** Configured without a country code (or no destination): not enforced. */
-  | "unenforced"
-  | "match"
-  | "mismatch";
-
-/**
- * Whether an inbound event's destination is the workspace's configured
- * number. Enforced only when the configured number carries its own country
- * code: completing a national one with a guessed code could reject every
- * message of a correctly connected number.
- */
-export function checkDestination(
-  configured: unknown,
-  destination: unknown,
-): DestinationCheck {
-  const configuredPhone = phoneString(configured);
-  if (!configuredPhone) return "unconfigured";
-  const international = internationalDigits(configuredPhone);
-  const destinationPhone = phoneString(destination);
-  if (!international || !destinationPhone) return "unenforced";
-  return samePhone(`+${international}`, destinationPhone) ? "match" : "mismatch";
-}
-
-/**
- * The forms the same line can be stored in: E.164 plus, for Mexican and
- * Argentinian mobiles, the variant with (or without) the extra mobile digit.
- * For looking a number up where it was stored as written.
- */
-export function phoneVariants(phone: string, defaultCountryCode?: string): string[] {
-  const key = phoneKey(phone, defaultCountryCode);
-  const variants = new Set([`+${key}`, normalizePhone(phone, defaultCountryCode)]);
-  if (key.length === 12 && key.startsWith("52")) variants.add(`+521${key.slice(2)}`);
-  if (key.length === 12 && key.startsWith("54")) variants.add(`+549${key.slice(2)}`);
-  return [...variants];
 }
 
 /**
@@ -197,32 +139,114 @@ function nationalNumber(digits: string, countryCode: string): string | null {
   return readings.find((n) => lengths.includes(n.length)) ?? null;
 }
 
+export interface PlacedPhone {
+  e164: string;
+  /**
+   * True when the number carried its country code (`+`, `00`, or bare digits
+   * starting with the workspace's own code). False for a national number the
+   * workspace's code completed: a reading, not a certainty.
+   */
+  international: boolean;
+  /** The national number, for a national reading. */
+  national: string | null;
+}
+
 /**
- * A number from another system (HighLevel) in E.164, or null when it can't be
- * placed with certainty. One written with `+` or `00` keeps its code. One
- * written without is read as a national number of the workspace's country
- * first (its length must fit, once the usual prefixes are dropped); failing
- * that, bare digits count as international only if they start with the
- * workspace's own country code. Anything else stays unmatched rather than
- * becoming a junk number.
+ * Where a number written by a person or another system belongs. With `+` or
+ * `00`, its own code. Without, it is read as a national number of the
+ * workspace's country first (its length must fit, once the usual prefixes
+ * are dropped); failing that, bare digits count as international only if
+ * they start with the workspace's own country code. Anything else — or any
+ * bare number without a country code to read it with — is null, never a
+ * junk number.
  */
-export function phoneWithCountryCode(
+export function placePhone(
   phone: string,
-  defaultCountryCode: string,
-): string | null {
+  defaultCountryCode?: string,
+): PlacedPhone | null {
+  const international = internationalDigits(phone);
+  if (international) return { e164: `+${international}`, international: true, national: null };
   const trimmed = phone.trim();
   const digits = trimmed.replace(/\D/g, "");
-  if (trimmed.startsWith("+") || digits.startsWith("00")) {
-    const international = internationalDigits(trimmed);
-    return international ? `+${international}` : null;
-  }
+  if (trimmed.startsWith("+") || digits.startsWith("00") || !defaultCountryCode) return null;
   const national = nationalNumber(digits, defaultCountryCode);
-  if (national) return `+${defaultCountryCode}${national}`;
+  if (national) {
+    return { e164: `+${defaultCountryCode}${national}`, international: false, national };
+  }
   if (
     digits.startsWith(defaultCountryCode) &&
     nationalNumber(digits.slice(defaultCountryCode.length), defaultCountryCode)
   ) {
-    return `+${digits}`;
+    return { e164: `+${digits}`, international: true, national: null };
   }
   return null;
+}
+
+/** placePhone's E.164, or null: for numbers from another system (HighLevel). */
+export function phoneWithCountryCode(
+  phone: string,
+  defaultCountryCode: string,
+): string | null {
+  return placePhone(phone, defaultCountryCode)?.e164 ?? null;
+}
+
+/**
+ * Whether a number someone typed for one of the account's OWN WhatsApp lines
+ * (settings) is `own`, as the provider lists it. With its country code, the
+ * same line (samePhone); as a national number, its national digits must end
+ * `own`'s — only safe against the handful of lines one account has, never to
+ * find a contact.
+ */
+export function matchesOwnNumber(
+  typed: string,
+  own: string,
+  defaultCountryCode?: string,
+): boolean {
+  const placed = placePhone(typed, defaultCountryCode);
+  if (placed?.international) return samePhone(placed.e164, own);
+  const national = placed?.national ?? typed.replace(/\D/g, "").replace(/^0+/, "");
+  if (national.length < 7) return false;
+  return [phoneKey(own), normalizePhone(own).slice(1)].some((digits) =>
+    digits.endsWith(national),
+  );
+}
+
+export type DestinationCheck =
+  /** No number configured: nothing to compare. */
+  | "unconfigured"
+  /** Configured without a country code (or no destination): not enforced. */
+  | "unenforced"
+  | "match"
+  | "mismatch";
+
+/**
+ * Whether an inbound event's destination is the workspace's configured
+ * number. Enforced only when the configured number carries its own country
+ * code (placePhone): completing a national one with the workspace's code
+ * could reject every message of a correctly connected number.
+ */
+export function checkDestination(
+  configured: unknown,
+  destination: unknown,
+  defaultCountryCode?: string,
+): DestinationCheck {
+  const configuredPhone = phoneString(configured);
+  if (!configuredPhone) return "unconfigured";
+  const placed = placePhone(configuredPhone, defaultCountryCode);
+  const destinationPhone = phoneString(destination);
+  if (!placed?.international || !destinationPhone) return "unenforced";
+  return samePhone(placed.e164, destinationPhone) ? "match" : "mismatch";
+}
+
+/**
+ * The forms the same line can be stored in: E.164 plus, for Mexican and
+ * Argentinian mobiles, the variant with (or without) the extra mobile digit.
+ * For looking a number up where it was stored as written.
+ */
+export function phoneVariants(phone: string, defaultCountryCode?: string): string[] {
+  const key = phoneKey(phone, defaultCountryCode);
+  const variants = new Set([`+${key}`, normalizePhone(phone, defaultCountryCode)]);
+  if (key.length === 12 && key.startsWith("52")) variants.add(`+521${key.slice(2)}`);
+  if (key.length === 12 && key.startsWith("54")) variants.add(`+549${key.slice(2)}`);
+  return [...variants];
 }

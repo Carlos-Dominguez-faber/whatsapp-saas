@@ -10,7 +10,8 @@
 
 import { createClient as createSbClient } from "@supabase/supabase-js";
 import { decryptCredentials } from "@/shared/lib/integration-secrets";
-import { DEFAULT_COUNTRY_CODE, phoneVariants, phoneWithCountryCode } from "./phone";
+import { phoneVariants, phoneWithCountryCode } from "./phone";
+import { workspaceCountryCode } from "./country-code";
 import { emitEventOncePerDay } from "./daily-events";
 
 const HL_BASE_URL = "https://services.leadconnectorhq.com";
@@ -374,21 +375,6 @@ export async function linkHLContact(
 
   console.error("[HL] Failed to save hl_contact_id:", error.message);
   return { linked: false, conflict: false, heldBy: null };
-}
-
-/** The workspace's country code for numbers written without one. */
-async function workspaceCountryCode(
-  supabase: ReturnType<typeof svc>,
-  workspaceId: string,
-): Promise<string> {
-  const { data } = await supabase
-    .from("business_info")
-    .select("structured")
-    .eq("workspace_id", workspaceId)
-    .maybeSingle();
-  const code = (data?.structured as { default_country_code?: unknown } | null)
-    ?.default_country_code;
-  return typeof code === "string" && /^\d{1,4}$/.test(code) ? code : DEFAULT_COUNTRY_CODE;
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
