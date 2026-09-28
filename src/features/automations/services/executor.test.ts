@@ -57,6 +57,9 @@ let disableRuleUpdateError: string | null = null;
 /** Lo que devuelve `mark_automation_run_dispatched`. */
 let dispatchClaim = "ok";
 let dispatchRpcError: string | null = null;
+/** release_automation_run_dispatch: whether the mark was undone. */
+let releaseResult = true;
+let releaseRpcError: string | null = null;
 /** Error de la RPC del claim, para el corte del drenaje. */
 let claimRpcError: { message: string } | null = null;
 /** Reclamos que salen BIEN antes de que empiece a fallar `claimRpcError`. */
@@ -227,6 +230,14 @@ const fakeClient = {
   },
   rpc(fn: string, args?: unknown) {
     rpcCalls.push({ fn, args });
+    if (fn === "release_automation_run_dispatch") {
+      callLog.push("release");
+      return Promise.resolve(
+        releaseRpcError
+          ? { data: null, error: { message: releaseRpcError } }
+          : { data: releaseResult, error: null },
+      );
+    }
     if (fn === "mark_automation_run_dispatched") {
       callLog.push("markDispatched");
       return Promise.resolve(
@@ -345,7 +356,30 @@ mock.module("./variables.ts", {
   },
 });
 
-const { executeRun, drainAutomationRuns } = await import("./executor.ts");
+// HighLevel is the source of truth for a reminder's appointment.
+let hlConfig: unknown = null;
+let hlEvent: unknown = null;
+let hlEventThrows = false;
+const hlEventCalls: unknown[] = [];
+mock.module("@/features/inbox/services/highlevel-client.ts", {
+  exports: { getHLConfig: async () => hlConfig },
+});
+mock.module("@/features/tools/lib/hl-appointment.ts", {
+  exports: {
+    hlTimeZone: (_cfg: unknown, zone: string) => zone,
+    fetchHLEvent: async (_cfg: unknown, id: string) => {
+      hlEventCalls.push(id);
+      if (hlEventThrows) throw new Error("HighLevel respondió 502");
+      return hlEvent;
+    },
+  },
+});
+mock.module("@/features/automations/lib/workspace-timezone.ts", {
+  exports: { resolveWorkspaceTimezone: async () => "America/Mexico_City" },
+});
+
+const { executeRun, drainAutomationRuns, SEND_COOLDOWN_HOURS, DAILY_TEMPLATE_CAP } =
+  await import("./executor.ts");
 
 // ── Fixtures ─────────────────────────────────────────────────────────────────
 
@@ -453,6 +487,12 @@ function reset() {
   disableRuleUpdateError = null;
   dispatchClaim = "ok";
   dispatchRpcError = null;
+  releaseResult = true;
+  releaseRpcError = null;
+  hlConfig = null;
+  hlEvent = null;
+  hlEventThrows = false;
+  hlEventCalls.length = 0;
   claimRpcError = null;
   claimOkBeforeError = 0;
   claimQueue = [];
@@ -928,17 +968,17 @@ test("24. la RPC de despacho con error de base se reintenta y no envía", async 
   assert.equal(lastRunUpdate().status, "pending");
 });
 
-test("25. un envío que falla con retryable true queda failed, NUNCA retry", async () => {
+test("25. un envío cortado por timeout (resultado desconocido) queda failed, NUNCA retry", async () => {
   reset();
   ruleRow = { ...TEMPLATE_RULE };
   withLiveConversation();
-  // Lo que devuelve sendPreparedTemplate cuando el AbortSignal de kapsoFetch
-  // cortó la llamada a los 20 s: SEND_FAILED con retryable true.
+  // Lo que devuelve sendPreparedTemplate cuando el proveedor no contestó a
+  // tiempo: SEND_FAILED sin código de Meta y retryable false (pudo haber salido).
   sendResult = {
     ok: false,
     error: "La operación tardó demasiado",
     errorCode: "SEND_FAILED",
-    retryable: true,
+    retryable: false,
   };
 
   assert.equal(
@@ -1435,7 +1475,11 @@ test("51. un opt-out entre el preflight y el envío corta el WhatsApp", async ()
   assert.equal(await executeRun(makeRun()), "done");
   assert.equal(sendCalls.length, 1);
   assert.equal(dispatchRpcCalls().at(-1)!.fn, "mark_automation_run_dispatched");
-  assert.deepEqual(dispatchRpcCalls().at(-1)!.args, { p_run_id: "run_1" });
+  assert.deepEqual(dispatchRpcCalls().at(-1)!.args, {
+    p_run_id: "run_1",
+    p_cooldown_hours: SEND_COOLDOWN_HOURS,
+    p_daily_cap: DAILY_TEMPLATE_CAP,
+  });
 
   // Camino de error: el contacto se dio de baja DESPUÉS del preflight. El guard
   // temprano no lo vio; la RPC sí, porque comprueba y marca en la misma
@@ -1542,7 +1586,7 @@ test("55. el UPDATE que apaga la regla filtra por workspace_id (aislamiento de t
   ]);
 });
 
-test("56. 132001 cierra failed/outcome_unknown y NO apaga la regla", async () => {
+test("56. un rechazo definitivo de Meta (132001) cierra failed/send_rejected y NO apaga la regla", async () => {
   reset();
   ruleRow = { ...TEMPLATE_RULE };
   withLiveConversation();
@@ -1557,7 +1601,7 @@ test("56. 132001 cierra failed/outcome_unknown y NO apaga la regla", async () =>
   const outcome = await executeRun(makeRun());
 
   assert.equal(outcome, "failed");
-  assert.equal(lastRunUpdate().error, "outcome_unknown");
+  assert.equal(lastRunUpdate().error, "send_rejected");
   assert.equal(
     updates.some((u) => u.table === "automation_rules"),
     false,
@@ -1573,7 +1617,7 @@ test("57. un fallo de envío SIN providerCode se comporta como antes (no rompe e
     ok: false,
     error: "La operación tardó demasiado",
     errorCode: "SEND_FAILED",
-    retryable: true,
+    retryable: false,
   };
 
   const outcome = await executeRun(makeRun());
@@ -1808,4 +1852,160 @@ test("66. un trigger que no es appointment_upcoming no consulta automation_event
     (loadVariableContextCalls.at(-1) as Record<string, unknown>).appointmentId,
     null,
   );
+});
+
+// ── Phase 4: cooldown, daily cap, release, language, reminders ─────────────
+
+test("cooldown: la regla ya le mandó una plantilla a este contacto → skipped, sin envío", async () => {
+  reset();
+  ruleRow = { ...TEMPLATE_RULE };
+  withLiveConversation();
+  dispatchClaim = "cooldown";
+  assert.equal(await executeRun(makeRun()), "skipped");
+  assert.equal(lastRunUpdate().error, "cooldown");
+  assert.equal(sendCalls.length, 0);
+});
+
+test("tope diario: el workspace llegó al máximo de envíos automáticos → skipped, sin envío", async () => {
+  reset();
+  ruleRow = { ...TEMPLATE_RULE };
+  withLiveConversation();
+  dispatchClaim = "daily_cap";
+  assert.equal(await executeRun(makeRun()), "skipped");
+  assert.equal(lastRunUpdate().error, "daily_cap");
+  assert.equal(sendCalls.length, 0);
+});
+
+test("un envío que WhatsApp no aceptó (retryable) libera la marca y reintenta", async () => {
+  reset();
+  ruleRow = { ...TEMPLATE_RULE };
+  withLiveConversation();
+  sendResult = { ok: false, errorCode: "SEND_FAILED", retryable: true, providerCode: 130429 };
+  assert.equal(await executeRun(makeRun()), "retry");
+  assert.deepEqual(callLog.slice(-2), ["send", "release"]);
+  assert.equal(lastRunUpdate().status, "pending");
+  assert.equal(lastRunUpdate().error, "send_not_accepted");
+});
+
+test("si la marca no se puede liberar, cierra outcome_unknown en vez de arriesgar un duplicado", async () => {
+  reset();
+  ruleRow = { ...TEMPLATE_RULE };
+  withLiveConversation();
+  sendResult = { ok: false, errorCode: "DB_ERROR", retryable: true };
+  releaseResult = false;
+  assert.equal(await executeRun(makeRun()), "failed");
+  assert.equal(lastRunUpdate().error, "outcome_unknown");
+});
+
+test("la plantilla sale en el idioma guardado en la regla, con la regla y el run en el meta", async () => {
+  reset();
+  ruleRow = {
+    ...TEMPLATE_RULE,
+    action_config: { ...TEMPLATE_RULE.action_config, template_language: "es_MX" },
+  };
+  withLiveConversation();
+  assert.equal(await executeRun(makeRun()), "done");
+  const call = prepareCalls[0] as Record<string, unknown>;
+  assert.equal(call.templateLanguage, "es_MX");
+  assert.deepEqual(call.meta, { automation_rule_id: "rule_1", automation_run_id: "run_1" });
+});
+
+test("una conversación que ya no existe al preparar el envío → skipped/no_conversation", async () => {
+  reset();
+  ruleRow = { ...TEMPLATE_RULE };
+  withLiveConversation();
+  prepareResult = { ok: false, errorCode: "NOT_FOUND", error: "x", retryable: false };
+  assert.equal(await executeRun(makeRun()), "skipped");
+  assert.equal(lastRunUpdate().error, "no_conversation");
+  assert.equal(dispatchRpcCalls().length, 0);
+});
+
+const REMINDER_EVENT = {
+  id: 42,
+  workspace_id: "ws_1",
+  event_type: "appointment_upcoming",
+  subject_id: "appt_1",
+};
+
+function reminderContext(over: Record<string, unknown> = {}) {
+  return async () => ({
+    ok: true,
+    ctx: {
+      ...OK_CONTEXT.ctx,
+      appointment: {
+        status: "booked",
+        date: "martes 8 de septiembre",
+        time: "20:00",
+        scheduledAt: new Date(Date.now() + 3_600_000).toISOString(),
+        hlAppointmentId: "hl_1",
+        ...over,
+      },
+    },
+  });
+}
+
+test("recordatorio de una cita que ya pasó → skipped/appointment_passed, sin envío", async () => {
+  reset();
+  ruleRow = { ...APPOINTMENT_RULE };
+  withLiveConversation();
+  eventRow = REMINDER_EVENT;
+  loadVariableContextImpl = reminderContext({
+    scheduledAt: new Date(Date.now() - 60_000).toISOString(),
+  });
+  assert.equal(await executeRun(makeRun({ trigger_type: "appointment_upcoming" })), "skipped");
+  assert.equal(lastRunUpdate().error, "appointment_passed");
+  assert.equal(sendCalls.length, 0);
+});
+
+test("recordatorio de una cita que HighLevel canceló → skipped, sin envío", async () => {
+  reset();
+  ruleRow = { ...APPOINTMENT_RULE };
+  withLiveConversation();
+  eventRow = REMINDER_EVENT;
+  loadVariableContextImpl = reminderContext();
+  hlConfig = { token: "t", locationId: "l", calendarId: "c" };
+  hlEvent = { state: "cancelled", startMs: Date.now() + 3_600_000 };
+  assert.equal(await executeRun(makeRun({ trigger_type: "appointment_upcoming" })), "skipped");
+  assert.equal(lastRunUpdate().error, "appointment_not_active");
+  assert.deepEqual(hlEventCalls, ["hl_1"]);
+  assert.equal(sendCalls.length, 0);
+});
+
+test("recordatorio de una cita que el equipo movió en HighLevel → skipped/appointment_moved", async () => {
+  reset();
+  ruleRow = { ...APPOINTMENT_RULE };
+  withLiveConversation();
+  eventRow = REMINDER_EVENT;
+  loadVariableContextImpl = reminderContext();
+  hlConfig = { token: "t", locationId: "l", calendarId: "c" };
+  hlEvent = { state: "active", startMs: Date.now() + 5 * 3_600_000 };
+  assert.equal(await executeRun(makeRun({ trigger_type: "appointment_upcoming" })), "skipped");
+  assert.equal(lastRunUpdate().error, "appointment_moved");
+  assert.equal(sendCalls.length, 0);
+});
+
+test("si HighLevel no responde, el recordatorio se reintenta (no se manda a ciegas)", async () => {
+  reset();
+  ruleRow = { ...APPOINTMENT_RULE };
+  withLiveConversation();
+  eventRow = REMINDER_EVENT;
+  loadVariableContextImpl = reminderContext();
+  hlConfig = { token: "t", locationId: "l", calendarId: "c" };
+  hlEventThrows = true;
+  assert.equal(await executeRun(makeRun({ trigger_type: "appointment_upcoming" })), "retry");
+  assert.equal(lastRunUpdate().error, "hl_read_failed");
+  assert.equal(sendCalls.length, 0);
+});
+
+test("recordatorio con la cita activa y a la misma hora en HighLevel → sí se envía", async () => {
+  reset();
+  ruleRow = { ...APPOINTMENT_RULE };
+  withLiveConversation();
+  eventRow = REMINDER_EVENT;
+  const at = Date.now() + 3_600_000;
+  loadVariableContextImpl = reminderContext({ scheduledAt: new Date(at).toISOString() });
+  hlConfig = { token: "t", locationId: "l", calendarId: "c" };
+  hlEvent = { state: "active", startMs: at };
+  assert.equal(await executeRun(makeRun({ trigger_type: "appointment_upcoming" })), "done");
+  assert.equal(sendCalls.length, 1);
 });

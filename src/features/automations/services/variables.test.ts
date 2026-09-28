@@ -45,6 +45,15 @@ mock.module("@supabase/supabase-js", {
   exports: { createClient: () => fakeClient },
 });
 
+// The workspace's zone comes from the shared resolver (tested on its own in
+// workspace-timezone.test.ts); null means it couldn't be read.
+let workspaceZone: string | null = "UTC";
+mock.module("@/features/automations/lib/workspace-timezone.ts", {
+  exports: {
+    resolveWorkspaceTimezone: async () => workspaceZone,
+  },
+});
+
 const { resolveVariables, buildTemplateComponents, loadVariableContext } =
   await import("./variables.ts");
 
@@ -82,6 +91,8 @@ test("con appointment en el contexto, los marcadores de cita resuelven la fecha 
         status: "confirmed",
         date: "martes 9 de septiembre",
         time: "15:00",
+        scheduledAt: "2026-09-09T21:00:00.000Z",
+        hlAppointmentId: null,
       },
     }),
     ["martes 9 de septiembre", "15:00"],
@@ -157,9 +168,7 @@ test("con appointmentId y cita legible, la fecha y hora salen formateadas en la 
   contactRow = { name: "María", phone: "+15550000001" };
   // 2026-09-08T23:00:00Z = martes 8 de septiembre 20:00 en America/Santiago.
   appointmentRow = { status: "confirmed", scheduled_at: "2026-09-08T23:00:00.000Z" };
-  integrationsRows = [
-    { provider: "highlevel", config: { timezone: "America/Santiago" } },
-  ];
+  workspaceZone = "America/Santiago";
   errorTables = [];
 
   const loaded = await loadVariableContext({
@@ -172,10 +181,12 @@ test("con appointmentId y cita legible, la fecha y hora salen formateadas en la 
     status: "confirmed",
     date: "martes 8 de septiembre",
     time: "20:00",
+    scheduledAt: "2026-09-08T23:00:00.000Z",
+    hlAppointmentId: null,
   });
 });
 
-test("con una zona horaria inválida NO se formatea en UTC: appointment queda null y el run no despacha", async () => {
+test("sin zona confiable NO se formatea en UTC: appointment queda null y el run no despacha", async () => {
   businessInfoRow = { structured: { name: "Veterinaria Demo" } };
   contactRow = { name: "María", phone: "+15550000001" };
   appointmentRow = { status: "confirmed", scheduled_at: "2026-09-08T23:00:00.000Z" };
@@ -184,7 +195,7 @@ test("con una zona horaria inválida NO se formatea en UTC: appointment queda nu
   // "miércoles 9 de septiembre, 23:00" para una cita que es el martes a las
   // 20:00 — el cliente llegaría un día tarde por culpa nuestra. Sin cita
   // resuelta el ejecutor cierra `missing_appointment` y no manda nada.
-  integrationsRows = [{ provider: "highlevel", config: { timezone: "Santiago" } }];
+  workspaceZone = null;
   errorTables = [];
 
   const loaded = await loadVariableContext({

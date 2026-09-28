@@ -35,9 +35,27 @@ import {
   resolveVariables,
 } from "./variables";
 import type { ActionType, TriggerType } from "../lib/rule-schema";
+import { getHLConfig } from "@/features/inbox/services/highlevel-client";
+import { fetchHLEvent, hlTimeZone } from "@/features/tools/lib/hl-appointment";
+import { resolveWorkspaceTimezone } from "../lib/workspace-timezone";
 
 /** Marcador que obliga a tener `business_info.structured.name` configurado. */
 const BUSINESS_NAME_MARKER = "{{business.name}}";
+
+/**
+ * A rule never sends the same contact another template within this window
+ * (a keyword typed ten times, a stage toggled back and forth).
+ */
+export const SEND_COOLDOWN_HOURS = 24;
+
+/**
+ * Automated template sends per workspace in any 24 hours. Templates cost
+ * money; this is the ceiling on what a misconfigured rule can spend in a day.
+ */
+export const DAILY_TEMPLATE_CAP = 300;
+
+/** How far an appointment may have moved in HighLevel and still match. */
+const APPOINTMENT_MATCH_TOLERANCE_MS = 60_000;
 
 function svc() {
   return createSbClient(
@@ -323,7 +341,13 @@ async function resolveAppointmentSubjectId(
 }
 
 /** Los cuatro desenlaces de `mark_automation_run_dispatched`. */
-type DispatchClaim = "ok" | "opted_out" | "already_dispatched" | "not_found";
+type DispatchClaim =
+  | "ok"
+  | "opted_out"
+  | "cooldown"
+  | "daily_cap"
+  | "already_dispatched"
+  | "not_found";
 
 /**
  * Escribe `dispatched_at` INMEDIATAMENTE antes del POST a Kapso — nunca antes
@@ -348,6 +372,8 @@ async function markDispatched(
 ): Promise<{ claim: DispatchClaim | null; dbError: boolean }> {
   const { data, error } = await svc().rpc("mark_automation_run_dispatched", {
     p_run_id: run.id,
+    p_cooldown_hours: SEND_COOLDOWN_HOURS,
+    p_daily_cap: DAILY_TEMPLATE_CAP,
   });
 
   if (error) {
@@ -383,6 +409,111 @@ async function runIsProcessing(run: AutomationRun): Promise<boolean> {
 }
 
 /**
+ * Undoes the dispatch mark when the send provably did not happen (the
+ * outbound row couldn't be queued, or WhatsApp refused it for a reason that
+ * clears), so the retry sends once. False when it couldn't be undone: the run
+ * then closes as outcome_unknown rather than risk a second send.
+ */
+async function releaseDispatch(run: AutomationRun): Promise<boolean> {
+  const { data, error } = await svc().rpc("release_automation_run_dispatch", {
+    p_run_id: run.id,
+  });
+  if (error) {
+    console.error("[automations] could not release the dispatch mark:", {
+      runId: run.id,
+      message: error.message,
+    });
+    return false;
+  }
+  return data === true;
+}
+
+/**
+ * The language to send the template in: the rule's, else the approved
+ * template's own (rules saved before the language was stored), else 'es'.
+ */
+async function templateLanguageFor(
+  workspaceId: string,
+  rule: RuleRow,
+  templateName: string,
+): Promise<{ language: string; dbError: boolean }> {
+  const configured = rule.action_config.template_language;
+  if (typeof configured === "string" && configured.trim()) {
+    return { language: configured.trim(), dbError: false };
+  }
+  const { data, error } = await svc()
+    .from("templates")
+    .select("language")
+    .eq("workspace_id", workspaceId)
+    .eq("name", templateName)
+    .eq("status", "approved")
+    .limit(1);
+  if (error) {
+    console.error("[automations] could not read the template language:", error.message);
+    return { language: "es", dbError: true };
+  }
+  const row = ((data as Array<{ language: string }> | null) ?? [])[0];
+  return { language: row?.language || "es", dbError: false };
+}
+
+/**
+ * A reminder goes out only for an appointment HighLevel still has, active, at
+ * the time we have. HighLevel is the source of truth: staff cancel and move
+ * appointments there. A moved or cancelled one is written back to the local
+ * row, so the next scan reminds at the new time (a new occurrence). Without a
+ * HighLevel connection or id, the local row is all there is.
+ */
+async function confirmAppointmentWithHL(
+  run: AutomationRun,
+  appointmentId: string,
+  appointment: { scheduledAt: string; hlAppointmentId: string | null },
+): Promise<"active" | "not_active" | "moved" | "error"> {
+  if (!appointment.hlAppointmentId) return "active";
+  const cfg = await getHLConfig(run.workspace_id);
+  if (!cfg) return "active";
+  const zone = await resolveWorkspaceTimezone(svc(), run.workspace_id);
+  if (!zone) return "error";
+
+  let event: Awaited<ReturnType<typeof fetchHLEvent>>;
+  try {
+    event = await fetchHLEvent(cfg, appointment.hlAppointmentId, hlTimeZone(cfg, zone));
+  } catch (err) {
+    console.error("[automations] could not confirm the appointment in HighLevel:", {
+      runId: run.id,
+      message: err instanceof Error ? err.message : String(err),
+    });
+    return "error";
+  }
+
+  const local = Date.parse(appointment.scheduledAt);
+  if (!event || event.state !== "active") {
+    await svc()
+      .from("appointments")
+      .update({ status: "cancelled" })
+      .eq("id", appointmentId)
+      .eq("workspace_id", run.workspace_id)
+      .then(
+        () => {},
+        () => {},
+      );
+    return "not_active";
+  }
+  if (event.startMs !== null && Math.abs(event.startMs - local) > APPOINTMENT_MATCH_TOLERANCE_MS) {
+    await svc()
+      .from("appointments")
+      .update({ scheduled_at: new Date(event.startMs).toISOString() })
+      .eq("id", appointmentId)
+      .eq("workspace_id", run.workspace_id)
+      .then(
+        () => {},
+        () => {},
+      );
+    return "moved";
+  }
+  return "active";
+}
+
+/**
  * Meta pausó la plantilla (132015): apaga la regla para no seguir
  * disparando envíos que van a fallar todos igual.
  *
@@ -402,7 +533,7 @@ async function disableRuleForTemplatePause(
 ): Promise<void> {
   const { data, error } = await svc()
     .from("automation_rules")
-    .update({ enabled: false })
+    .update({ enabled: false, paused_reason: "template_paused" })
     .eq("id", ruleId)
     .eq("workspace_id", workspaceId)
     .select("id");
@@ -493,6 +624,17 @@ async function actSendTemplate(
     return skip("appointment_not_active");
   }
 
+  if (appointmentId && load.ctx.appointment) {
+    // A reminder after the appointment is noise at best.
+    if (Date.parse(load.ctx.appointment.scheduledAt) <= Date.now()) {
+      return skip("appointment_passed");
+    }
+    const confirmed = await confirmAppointmentWithHL(run, appointmentId, load.ctx.appointment);
+    if (confirmed === "error") return retry("hl_read_failed");
+    if (confirmed === "not_active") return skip("appointment_not_active");
+    if (confirmed === "moved") return skip("appointment_moved");
+  }
+
   if (rawVariables.includes(BUSINESS_NAME_MARKER) && !load.ctx.businessName) {
     // Sin respaldo a workspaces.name a propósito: ese es el nombre
     // interno de la cuenta y mandárselo al cliente es una fuga.
@@ -503,16 +645,22 @@ async function actSendTemplate(
   // opt-in, integración de Kapso) ocurren ACÁ, antes de marcar nada. Con el
   // orden anterior, una caída transitoria leyendo la integración cerraba el run
   // como fallo definitivo sin que jamás hubiera existido un request externo.
+  const language = await templateLanguageFor(run.workspace_id, rule, templateName);
+  if (language.dbError) return retry("db_read_failed");
+
   const prep = await prepareTemplateDispatch({
     workspaceId: run.workspace_id,
     conversationId: run.conversation_id,
     templateName,
-    templateLanguage: "es",
+    templateLanguage: language.language,
     components: buildTemplateComponents(resolveVariables(rawVariables, load.ctx)),
+    // Traceability on the outbound row: which rule and run sent it.
+    meta: { automation_rule_id: rule.id, automation_run_id: run.id },
   });
 
   if (!prep.ok) {
     if (prep.errorCode === "OPT_OUT") return skip("opted_out");
+    if (prep.errorCode === "NOT_FOUND") return skip("no_conversation");
     // `retryable` acá sí se mira, y es seguro: todavía no se marcó el despacho
     // ni se llamó a Kapso, así que reintentar no puede duplicar nada.
     if (prep.retryable) {
@@ -535,6 +683,12 @@ async function actSendTemplate(
       // El contacto se dio de baja entre el preflight y esta línea. No es un
       // fallo del motor: es el sistema respetando el opt-out.
       return skip("opted_out");
+    case "cooldown":
+      // This rule already sent this contact a template within the cooldown.
+      return skip("cooldown");
+    case "daily_cap":
+      // The workspace hit its daily ceiling of automated sends.
+      return skip("daily_cap");
     case "already_dispatched":
       // El efecto externo ya salió en otro intento. Nunca `done`: un éxito no
       // verificado no se registra como éxito.
@@ -566,17 +720,25 @@ async function actSendTemplate(
   const result = await sendPreparedTemplate(prep.prepared);
 
   if (result.ok) return DONE;
-  if (result.errorCode === "OPT_OUT") return skip("opted_out");
-  // 132015 = plantilla pausada por Meta. Reintentar no la descongela:
-  // fail(), no retry(), así que no gasta los 3 intentos. Cualquier otro
-  // código (132001 incluido) sigue cerrando outcome_unknown sin apagar nada.
+  // 132015 = template paused by Meta. Retrying won't unpause it: fail, and
+  // switch the rule off with a reason the tab shows.
   if (result.providerCode === 132015) {
     await disableRuleForTemplatePause(run.workspace_id, rule.id);
     return fail("template_paused");
   }
-  // Después de dispatched_at NO se reintenta, y NO se mira `retryable`: para un
-  // timeout de Kapso viene `true`, y reintentar es exactamente el duplicado que
-  // dispatched_at existe para evitar.
+  // `retryable` from dispatch means nothing was sent (the row couldn't be
+  // queued, or WhatsApp refused it for a reason that clears): undo the mark
+  // and retry. Anything else after the mark is never retried.
+  if (result.retryable) {
+    return (await releaseDispatch(run))
+      ? retry("send_not_accepted")
+      : fail("outcome_unknown");
+  }
+  // WhatsApp answered with a definite refusal: nothing went out.
+  if (result.errorCode === "SEND_FAILED" && result.providerCode !== undefined) {
+    return fail("send_rejected");
+  }
+  // A timeout or network error: it may have gone out.
   return fail("outcome_unknown");
 }
 
@@ -1041,6 +1203,20 @@ export async function executeRun(claimed: AutomationRun): Promise<RunOutcome> {
  * de 20 s de `kapsoFetch`. Las filas agotadas no cortan el drenaje: la
  * RPC las descarta y sigue.
  */
+/**
+ * True when at least one rule is enabled anywhere (or when that can't be
+ * read): the cron skips the time scan and the expansion otherwise.
+ */
+export async function hasEnabledAutomationRules(): Promise<boolean> {
+  const { data, error } = await svc()
+    .from("automation_rules")
+    .select("id")
+    .eq("enabled", true)
+    .limit(1);
+  if (error) return true;
+  return ((data as unknown[] | null) ?? []).length > 0;
+}
+
 export async function drainAutomationRuns(
   max: number,
   deadline: number,

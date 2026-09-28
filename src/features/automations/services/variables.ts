@@ -50,7 +50,15 @@ export interface VariableContext {
    * "¿sigue booked/confirmed justo antes de enviar?" vive en el ejecutor, acá
    * solo se entrega el dato.
    */
-  appointment: { status: string; date: string; time: string } | null;
+  appointment: {
+    status: string;
+    date: string;
+    time: string;
+    /** The local row's instant (ISO), to check it's still ahead. */
+    scheduledAt: string;
+    /** HighLevel's id, to confirm the appointment there before reminding. */
+    hlAppointmentId: string | null;
+  } | null;
 }
 
 /**
@@ -190,7 +198,7 @@ export async function loadVariableContext(params: {
     params.appointmentId
       ? supabase
           .from("appointments")
-          .select("status, scheduled_at")
+          .select("status, scheduled_at, hl_appointment_id")
           .eq("id", params.appointmentId)
           .eq("workspace_id", params.workspaceId)
           .maybeSingle()
@@ -232,7 +240,7 @@ export async function loadVariableContext(params: {
 
   let appointment: VariableContext["appointment"] = null;
   const appointmentRow = appointmentRes.data as
-    | { status: string; scheduled_at: string }
+    | { status: string; scheduled_at: string; hl_appointment_id: string | null }
     | null;
   if (params.appointmentId && appointmentRow) {
     const tz = await resolveWorkspaceTimezone(supabase, params.workspaceId);
@@ -248,7 +256,13 @@ export async function loadVariableContext(params: {
       // `null`: el ejecutor lo trata igual que "cita ausente", nunca manda la
       // plantilla con la fecha vacía.
       if (date && time) {
-        appointment = { status: appointmentRow.status, date, time };
+        appointment = {
+          status: appointmentRow.status,
+          date,
+          time,
+          scheduledAt: appointmentRow.scheduled_at,
+          hlAppointmentId: appointmentRow.hl_appointment_id ?? null,
+        };
       }
     }
   }
