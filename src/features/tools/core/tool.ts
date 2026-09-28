@@ -13,6 +13,15 @@ export interface ToolContext {
    * idempotency key from it.
    */
   batchId?: string;
+  /**
+   * Set only by the playground (test-chat): who is testing, and what they
+   * typed. A write tool acts only on data the tester wrote there.
+   */
+  playground?: {
+    userId: string;
+    /** The user turns of this request, verbatim. */
+    userMessages: string[];
+  };
 }
 
 export interface ToolResult {

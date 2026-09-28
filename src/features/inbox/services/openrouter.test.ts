@@ -238,6 +238,8 @@ test("generateChatReply retries a transient failure, but never after a write too
         tools: [bookTool],
         toolContext: { workspaceId: "ws_1", conversationId: "", contactId: "" },
       } as never),
+      // The caller learns a write ran, so it doesn't invite a blind retry.
+      (err: unknown) => (err as { wroteSomething?: unknown }).wroteSomething === true,
     );
     assert.equal(attempts, 1, "a turn that ran a write tool is not run again");
   } finally {
@@ -264,5 +266,37 @@ test("generateChatReply does retry a transient failure when no write ran", async
     assert.equal(attempts, 2);
   } finally {
     generateImpl = null;
+  }
+});
+
+test("generateChatReply gives every tool call of one request the same seed, retries included", async () => {
+  const transient = Object.assign(new Error("upstream 503"), { statusCode: 503 });
+  const lookup = { ...bookTool, name: "lookup", sensitivity: "read" };
+  const seen: unknown[] = [];
+  let attempts = 0;
+  generateImpl = async (args) => {
+    attempts++;
+    await args.tools?.lookup.execute({ q: 1 });
+    await args.tools?.lookup.execute({ q: 2 });
+    if (attempts < 2) throw transient;
+    return { text: "ok", usage: LAST_STEP, totalUsage: ALL_STEPS, steps: [{}] };
+  };
+  registryRun = async (_name, _args, ctx) => {
+    seen.push((ctx as { batchId?: string }).batchId);
+    return { ok: true, output: null };
+  };
+  try {
+    await generateChatReply({
+      systemPrompt: "s",
+      messages: [{ role: "user", content: "u" }],
+      workspaceId: "ws_1",
+      tools: [lookup],
+      toolContext: { workspaceId: "ws_1", conversationId: "", contactId: "", batchId: "playground:seed-1" },
+    } as never);
+    assert.equal(attempts, 2, "a read-only turn is retried");
+    assert.deepEqual(seen, Array(4).fill("playground:seed-1"));
+  } finally {
+    generateImpl = null;
+    registryRun = async () => null;
   }
 });

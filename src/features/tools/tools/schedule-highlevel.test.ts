@@ -501,8 +501,75 @@ test("a 5xx or no answer from HighLevel is an unknown outcome, not a failure", a
   );
 });
 
-test("an admin's playground booking (no conversation, a typed phone) stores no conversation id", async () => {
+/** Runs the tool as the playground does: no contact, no conversation. */
+async function runInPlayground(
+  fn: typeof fetch,
+  args: Record<string, unknown>,
+  userMessages: string[],
+) {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = fn;
+  try {
+    return await scheduleHighLevelTool.run(
+      { datetime_iso: "2027-06-12T10:00:00-06:00", ...args } as never,
+      {
+        workspaceId: "ws_1",
+        conversationId: "",
+        contactId: "",
+        playground: { userId: "admin_1", userMessages },
+      },
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+}
+
+test("playground: a phone the tester typed books a marked test appointment, with a trace", async () => {
   const { fn, calls } = mockFetch({ hlStatus: 200, hlBody: { id: "hl_evt_pg" }, appointmentInsertStatus: 201 });
+  // Typed with spaces and the old Mexican mobile prefix; the model passes it compact.
+  const result = await runInPlayground(
+    fn as typeof fetch,
+    { contact_phone: "+525512345678", contact_name: "Nombre Inventado" },
+    ["hola, quiero agendar", "mi teléfono de prueba es +52 1 55 1234 5678"],
+  );
+  assert.equal(result.ok, true);
+
+  // An existing HighLevel contact on that number keeps its name.
+  const upsert = calls.find((c) => c.url.includes("/contacts/upsert"));
+  assert.deepEqual(upsert?.body, { locationId: "loc_1", phone: "+525512345678" });
+
+  const booking = calls.find((c) => c.method === "POST" && c.url.endsWith("/calendars/events/appointments"));
+  assert.equal((booking?.body as { contactId: string }).contactId, "hl_playground_contact");
+  assert.match((booking?.body as { title: string }).title, /^\[Prueba\] /);
+
+  // Who ran it, with what phone.
+  const trace = calls.find((c) => c.url.includes("/rest/v1/events") && c.method === "POST");
+  const event = trace?.body as { type: string; payload: Record<string, unknown> };
+  assert.equal(event.type, "playground_write");
+  assert.equal(event.payload.user_id, "admin_1");
+  assert.equal(event.payload.tool, "schedule_highlevel");
+  assert.equal(event.payload.phone, "+525512345678");
+
+  // No conversation: null, not "".
+  const row = calls.find((c) => c.url.includes("/rest/v1/appointments") && c.method === "POST");
+  assert.equal((row?.body as { conversation_id: unknown }).conversation_id, null);
+});
+
+test("playground: a phone the tester never typed is refused before anything is written", async () => {
+  for (const phone of ["+5215512345678", "+5215599990000"]) {
+    const { fn, calls } = mockFetch({ hlStatus: 200, hlBody: { id: "x" }, appointmentInsertStatus: 201 });
+    const result = await runInPlayground(fn as typeof fetch, { contact_phone: phone }, [
+      "quiero una cita el martes",
+      "mi número es +52 998 111 2222",
+    ]);
+    assert.equal(result.ok, false, phone);
+    assert.match(result.error ?? "", /escribe en el chat el teléfono de prueba/);
+    assert.ok(!calls.some((c) => c.url.includes("leadconnectorhq")), phone);
+  }
+});
+
+test("outside the playground, a turn with no contact never books on a phone the model passes", async () => {
+  const { fn, calls } = mockFetch({ hlStatus: 200, hlBody: { id: "x" }, appointmentInsertStatus: 201 });
   const originalFetch = globalThis.fetch;
   globalThis.fetch = fn as typeof fetch;
   try {
@@ -510,12 +577,18 @@ test("an admin's playground booking (no conversation, a typed phone) stores no c
       { datetime_iso: "2027-06-12T10:00:00-06:00", contact_phone: "+5215512345678" },
       { workspaceId: "ws_1", conversationId: "", contactId: "" },
     );
-    assert.equal(result.ok, true);
-    const booking = calls.find((c) => c.method === "POST" && c.url.endsWith("/calendars/events/appointments"));
-    assert.equal((booking?.body as { contactId: string }).contactId, "hl_playground_contact");
-    const row = calls.find((c) => c.url.includes("/rest/v1/appointments") && c.method === "POST");
-    assert.equal((row?.body as { conversation_id: unknown }).conversation_id, null);
+    assert.equal(result.ok, false);
+    assert.ok(!calls.some((c) => c.url.includes("leadconnectorhq")));
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+test("the tool's descriptions carry no example phone the model could use", () => {
+  const shape = (scheduleHighLevelTool.schema as unknown as {
+    shape: Record<string, { description?: string }>;
+  }).shape;
+  const texts = [scheduleHighLevelTool.description, ...Object.values(shape).map((f) => f.description ?? "")];
+  assert.match(shape.contact_phone.description ?? "", /tal como el usuario lo escribió/);
+  for (const text of texts) assert.doesNotMatch(text, /\+\d[\d\s]{9,}/, text);
 });

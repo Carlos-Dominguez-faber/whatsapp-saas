@@ -266,23 +266,33 @@ export async function generateChatReply(params: {
   }
   const hasTools = Object.keys(aiTools).length > 0;
 
-  const result = await withTransientRetry(
-    () =>
-    generateText({
-      model: openrouter.chat(modelId),
-      messages: [
-        { role: "system", content: params.systemPrompt },
-        ...params.messages,
-      ],
-      tools: hasTools ? aiTools : undefined,
-      stopWhen: hasTools ? stepCountIs(5) : undefined,
-      maxOutputTokens: params.maxOutputTokens ?? 512,
-      abortSignal: AbortSignal.timeout(
-        hasTools ? LLM_TOOL_TURN_TIMEOUT_MS : LLM_TIMEOUT_MS,
-      ),
-    }),
-    { canRetry: () => !wroteSomething },
-  );
+  let result;
+  try {
+    result = await withTransientRetry(
+      () =>
+      generateText({
+        model: openrouter.chat(modelId),
+        messages: [
+          { role: "system", content: params.systemPrompt },
+          ...params.messages,
+        ],
+        tools: hasTools ? aiTools : undefined,
+        stopWhen: hasTools ? stepCountIs(5) : undefined,
+        maxOutputTokens: params.maxOutputTokens ?? 512,
+        abortSignal: AbortSignal.timeout(
+          hasTools ? LLM_TOOL_TURN_TIMEOUT_MS : LLM_TIMEOUT_MS,
+        ),
+      }),
+      { canRetry: () => !wroteSomething },
+    );
+  } catch (err) {
+    // The caller must know a write ran before the failure: sending the
+    // same turn again would run it again.
+    if (wroteSomething && err && typeof err === "object") {
+      Object.assign(err, { wroteSomething: true });
+    }
+    throw err;
+  }
 
   // totalUsage, not usage: with tools the model runs up to 5 steps, and usage
   // only reports the last one.

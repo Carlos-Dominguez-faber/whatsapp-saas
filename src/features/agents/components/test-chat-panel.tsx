@@ -12,6 +12,8 @@ import type { AgentDto } from "@/features/agents/types";
 interface Msg {
   role: "user" | "assistant";
   content: string;
+  /** An error shown in the panel, never sent back as part of the history. */
+  error?: boolean;
 }
 
 export function TestChatPanel({
@@ -51,23 +53,29 @@ export function TestChatPanel({
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ messages: next }),
+          // Error bubbles stay in the panel: the model never sees them.
+          body: JSON.stringify({
+            messages: next
+              .filter((m) => !m.error)
+              .map(({ role, content }) => ({ role, content })),
+          }),
         },
       );
       const json = (await res.json()) as { text?: string; error?: string };
       setMessages((prev) => [
         ...prev,
-        {
-          role: "assistant",
-          content: res.ok
-            ? formatWhatsAppMarkdown(json.text ?? "")
-            : `⚠️ ${json.error ?? "Error al generar la respuesta"}`,
-        },
+        res.ok
+          ? { role: "assistant", content: formatWhatsAppMarkdown(json.text ?? "") }
+          : {
+              role: "assistant",
+              content: `⚠️ ${json.error ?? "Error al generar la respuesta"}`,
+              error: true,
+            },
       ]);
     } catch {
       setMessages((prev) => [
         ...prev,
-        { role: "assistant", content: "⚠️ Error de conexión" },
+        { role: "assistant", content: "⚠️ Error de conexión", error: true },
       ]);
     } finally {
       setLoading(false);
@@ -85,12 +93,13 @@ export function TestChatPanel({
       {isAdmin ? (
         <p className="text-xs text-warning">
           Como admin, aquí corren también las herramientas de escritura que estén
-          activas: una cita agendada o cancelada en la prueba es real.
+          activas: una cita agendada en la prueba es real (en HighLevel aparece
+          como &ldquo;[Prueba]&rdquo;, en el teléfono que escribas aquí).
         </p>
       ) : (
         <p className="text-xs text-muted-foreground">
           En tu prueba solo corren las herramientas de lectura; las de escritura
-          (agendar, cancelar, tools de n8n que escriben) solo corren para admins.
+          (agendar, tools de n8n que escriben) solo corren para admins.
         </p>
       )}
 

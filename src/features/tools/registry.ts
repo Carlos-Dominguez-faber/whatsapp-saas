@@ -75,11 +75,12 @@ async function logToolCall(
 ): Promise<void> {
   try {
     const supabase = svc();
-    await supabase.from("events").insert({
+    const { error } = await supabase.from("events").insert({
       type: "tool_call",
       level: result.ok ? "info" : "error",
       workspace_id: ctx.workspaceId,
-      conversation_id: ctx.conversationId,
+      // The playground has no conversation: "" is not a uuid.
+      conversation_id: ctx.conversationId || null,
       payload: {
         tool_name: name,
         args_summary: sanitizeArgs(args, sensitiveArgKeys),
@@ -87,8 +88,10 @@ async function logToolCall(
         latency_ms: latencyMs,
         error: result.error ?? null,
         requires_confirmation: result.requiresConfirmation ?? false,
+        ...(ctx.playground ? { playground: true, user_id: ctx.playground.userId } : {}),
       },
     });
+    if (error) console.warn("[registry] logToolCall failed:", error.message);
   } catch (logErr) {
     // Fire-and-forget: never let logging failures surface to caller
     console.warn("[registry] logToolCall failed:", logErr);

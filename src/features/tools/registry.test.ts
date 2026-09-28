@@ -191,6 +191,73 @@ test("a write tool that times out tells the model the outcome is unknown; a read
   }
 });
 
+test("a playground tool call is logged with no conversation, flagged, with who ran it", async () => {
+  const originalFetch = globalThis.fetch;
+  const inserts: Array<Record<string, unknown>> = [];
+  globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+    if (String(url).includes("/rest/v1/events") && init?.method === "POST") {
+      inserts.push(JSON.parse(String(init.body)));
+    }
+    return new Response(null, { status: 201 });
+  }) as typeof fetch;
+  const lookup: Tool = {
+    name: "pg_lookup",
+    description: "test tool",
+    sensitivity: "read",
+    schema: z.object({}),
+    enabledFor: () => true,
+    run: async () => ({ ok: true, output: null }),
+  };
+  try {
+    await registry.runTool(lookup, {}, {
+      workspaceId: "ws_1",
+      conversationId: "",
+      contactId: "",
+      playground: { userId: "admin_1", userMessages: [] },
+    });
+    // The log is fire-and-forget: let it land.
+    await new Promise((r) => setTimeout(r, 20));
+    // Earlier tests' fire-and-forget logs may land here too: pick this one.
+    const event = inserts.find(
+      (e) => e.type === "tool_call" && (e.payload as { tool_name?: string }).tool_name === "pg_lookup",
+    );
+    assert.ok(event, "logged");
+    assert.equal(event!.conversation_id, null);
+    assert.equal((event!.payload as Record<string, unknown>).playground, true);
+    assert.equal((event!.payload as Record<string, unknown>).user_id, "admin_1");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("a tool-call log the database refuses is reported, not swallowed", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalWarn = console.warn;
+  const warned: unknown[] = [];
+  console.warn = (...args: unknown[]) => void warned.push(args);
+  globalThis.fetch = (async () =>
+    new Response(JSON.stringify({ message: "invalid input syntax for type uuid" }), {
+      status: 400,
+      headers: { "content-type": "application/json" },
+    })) as typeof fetch;
+  const lookup: Tool = {
+    name: "pg_lookup_2",
+    description: "test tool",
+    sensitivity: "read",
+    schema: z.object({}),
+    enabledFor: () => true,
+    run: async () => ({ ok: true, output: null }),
+  };
+  try {
+    await registry.runTool(lookup, {}, ctx);
+    await new Promise((r) => setTimeout(r, 20));
+    assert.ok(warned.some((w) => String((w as unknown[])[0]).includes("logToolCall failed")));
+  } finally {
+    globalThis.fetch = originalFetch;
+    console.warn = originalWarn;
+  }
+});
+
 test("sanitizeArgs redacts a key flagged sensitive by the tool, even without a matching secret-name pattern", () => {
   const result = sanitizeArgs(
     { codigo_cliente: "1234-5678", note: "hola" },

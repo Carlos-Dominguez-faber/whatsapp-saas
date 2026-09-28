@@ -38,7 +38,7 @@ const schema = z.object({
     .string()
     .optional()
     .describe(
-      "Teléfono del contacto en E.164 (ej: +5215512345678). Solo se usa en el playground de prueba; en una conversación real se agenda al contacto del chat.",
+      "Solo en el chat de prueba: el teléfono de prueba tal como el usuario lo escribió en el chat. En una conversación real se agenda al contacto del chat y esto se ignora.",
     ),
 });
 
@@ -67,6 +67,25 @@ const SLOT_TAKEN = /\bslot\b[^.]{0,60}\b(?:no longer available|not available|una
  * had (a parent booking for a child), and no new one was made.
  */
 const OWN_RETRY_WINDOW_MS = 10 * 60_000;
+
+/** Digit runs that look like a phone number, as typed in a chat message. */
+const PHONE_LIKE = /\+?\d[\d\s().-]{6,}\d/g;
+
+/**
+ * The playground has no contact: it books on a phone the tester typed in
+ * this conversation, never one the model came up with (a real person's
+ * number would get a real appointment and HighLevel's confirmations).
+ */
+function phoneTypedByTester(
+  phone: string,
+  userMessages: string[],
+  countryCode: string,
+  samePhone: (a: string, b: string, cc?: string) => boolean,
+): boolean {
+  return userMessages.some((message) =>
+    (message.match(PHONE_LIKE) ?? []).some((typed) => samePhone(typed, phone, countryCode)),
+  );
+}
 
 const UNKNOWN_BOOKING =
   "No pude confirmar si la cita quedó agendada. No le digas al cliente que se agendó ni que falló: dile que una persona del equipo lo confirmará.";
@@ -115,10 +134,33 @@ async function run(args: Args, ctx: ToolContext, opts?: ToolRunOptions): Promise
   );
 
   // Resolve the contact. In a real conversation it is always the chat's own
-  // contact: a phone the model passes is honored only in the playground,
-  // which has no contact, so the model can't book on someone else's number.
-  let phone = ctx.contactId ? null : (args.contact_phone ?? null);
+  // contact. Only the playground, which has none, books on a phone passed
+  // here — and only one the tester typed in this conversation.
+  let phone: string | null = null;
   let name = args.contact_name ?? null;
+  const playground = !ctx.contactId ? ctx.playground : undefined;
+  if (playground) {
+    const { samePhone } = await import("../../inbox/services/phone.ts");
+    const { workspaceCountryCode } = await import("../../inbox/services/country-code.ts");
+    const typed =
+      args.contact_phone &&
+      phoneTypedByTester(
+        args.contact_phone,
+        playground.userMessages,
+        await workspaceCountryCode(supabase, ctx.workspaceId),
+        samePhone,
+      );
+    if (!typed) {
+      return {
+        ok: false,
+        output: null,
+        error: "Para probar el agendado, escribe en el chat el teléfono de prueba.",
+      };
+    }
+    phone = args.contact_phone!;
+    // An existing HighLevel contact on that number keeps its name.
+    name = null;
+  }
   let hlContactId: string | null = null;
   let dbContactId: string | null = null;
 
@@ -148,7 +190,7 @@ async function run(args: Args, ctx: ToolContext, opts?: ToolRunOptions): Promise
 
   // Ensure the contact exists in HighLevel (create/upsert by phone if needed).
   if (!hlContactId) {
-    hlContactId = await upsertHLContactByPhone(cfg, { name, phone });
+    hlContactId = await upsertHLContactByPhone(cfg, playground ? { phone } : { name, phone });
     if (hlContactId && dbContactId) {
       // A conflict (another local contact already holds this HighLevel id) is
       // logged and evented by linkHLContact; the booking still goes ahead.
@@ -230,6 +272,23 @@ async function run(args: Args, ctx: ToolContext, opts?: ToolRunOptions): Promise
     };
   }
 
+  // A real appointment from the playground: leave who, what and where.
+  if (playground) {
+    const { error: traceError } = await supabase.from("events").insert({
+      type: "playground_write",
+      level: "warn",
+      workspace_id: ctx.workspaceId,
+      payload: {
+        user_id: playground.userId,
+        tool: "schedule_highlevel",
+        phone,
+        start_time: startTime,
+        calendar_id: calendarId,
+      },
+    });
+    if (traceError) console.warn("[schedule_highlevel] playground trace failed:", traceError.message);
+  }
+
   let res: Response;
   try {
     res = await fetch(`${HL_API}/calendars/events/appointments`, {
@@ -245,7 +304,7 @@ async function run(args: Args, ctx: ToolContext, opts?: ToolRunOptions): Promise
         locationId: cfg.locationId,
         contactId: hlContactId,
         startTime,
-        title: `Cita${args.contact_name ? ` — ${args.contact_name}` : ""}`,
+        title: `${playground ? "[Prueba] " : ""}Cita${args.contact_name ? ` — ${args.contact_name}` : ""}`,
       }),
       signal: AbortSignal.timeout(WRITE_TIMEOUT_MS),
     });
