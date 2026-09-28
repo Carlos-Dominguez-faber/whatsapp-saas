@@ -153,14 +153,16 @@ node scripts/seed-admin.mjs
 
 (Crea SOLO el super admin. Los workspaces de clientes se crean desde la app, paso 10.)
 
-**9. Agenda el cron del buffer (automático).**
+**9. Agenda los crons (automático).**
 
 ```bash
 node scripts/setup.mjs cron-apply
 ```
 
-Usa el `SUPABASE_ACCESS_TOKEN` del paso 7 para agendar el cron vía Management API e
-imprime la verificación. Si no hay token, cae al camino manual: corre
+Agenda dos jobs, cada minuto: `buffer-flush` (responde los mensajes) y
+`automations` (corre las automatizaciones). Usa el `SUPABASE_ACCESS_TOKEN` del paso 7
+para agendarlos vía Management API e imprime la verificación. Correrlo otra vez no
+duplica nada: actualiza los jobs existentes. Si no hay token, cae al camino manual: corre
 `node scripts/setup.mjs cron-sql` y pega el SQL en **Supabase → SQL Editor → Run**.
 
 **10. Entra y crea tu primer workspace.** Abre `https://TU-URL.vercel.app/login`,
@@ -567,6 +569,63 @@ las migraciones, así que las migraciones van **antes** de `vercel --prod`.
 - **Eventos:** las sesiones ya no pueden insertar filas en `events` (solo el
   servidor), así nadie puede falsear un registro ni silenciar un aviso.
 
+**Motor de automatizaciones (Fase 4, principios de oct-2026):**
+
+Las reglas de **Configuración → Automatizaciones** ahora sí se ejecutan solas, y
+pueden mandar plantillas de WhatsApp que **Meta cobra** y que llegan a clientes
+reales. El orden del upgrade es:
+
+```bash
+SUPABASE_DB_PASSWORD='tu-contraseña-de-la-base' node scripts/setup.mjs db-push   # 1. migraciones
+vercel --prod                                                                     # 2. deploy
+node scripts/setup.mjs cron-apply                                                 # 3. agenda el job 'automations'
+```
+
+Sin el paso 3 no corre nada: las reglas se guardan, pero ningún job las ejecuta.
+
+- **Todas las reglas que estaban encendidas se apagan en el upgrade.** Antes nada
+  las ejecutaba; encenderlas solas sería mandar mensajes que nadie revisó. La pestaña
+  muestra un aviso con cuántas se apagaron, y cada una dice por qué está apagada.
+  Revísalas y enciende las que quieras. Editar una regla nunca la enciende: solo el
+  interruptor.
+- **Disparadores:** primer mensaje, palabra clave, pide humano, lead calificado y
+  recordatorio de cita (de 1 a 168 horas antes, solo dentro de la ventana horaria de
+  la regla, 8 a 22 por defecto). **Acciones:** mandar plantilla, asignar a un
+  agente, etiquetar, cerrar y pasar a humano. Hasta 20 reglas activas por workspace.
+- **Nada se manda tarde:** cada evento vence si no se ejecutó a tiempo (palabra
+  clave 1 h, pide humano 2 h, primer mensaje, lead calificado y recordatorio 6 h).
+  Un recordatorio de una cita que ya pasó se descarta.
+- **Recordatorios con la hora local del negocio:** la zona sale de la misma
+  configuración que la agenda de la Fase 3 (Business info o HighLevel; si no hay
+  ninguna, `America/Mexico_City`). Antes de mandarlo, la app confirma la cita en
+  HighLevel: si la cancelaron o la movieron, no manda el recordatorio y actualiza la
+  cita local. Si HighLevel no responde, reintenta en vez de mandarlo a ciegas.
+- **Límites de envío:** una misma regla no le manda plantilla al mismo contacto más
+  de una vez cada 24 horas, y un workspace no manda más de 300 plantillas
+  automáticas en 24 horas. Lo que se salta queda registrado como evento
+  `automation_skipped` (con el motivo); todavía no hay un panel para verlo.
+- **Sin duplicados:** cada envío se marca antes de salir. Si no se sabe si salió
+  (por ejemplo, WhatsApp no contestó a tiempo), el intento queda como fallido con
+  "resultado desconocido" en lugar de mandarse otra vez. Solo se reintenta lo que
+  WhatsApp rechazó sin enviarlo (límites de envío). Si Meta pausa la plantilla de una
+  regla, la regla se apaga y la pestaña lo explica.
+- **Las plantillas se mandan en el idioma elegido en la regla.** Las reglas
+  guardadas antes usan el idioma de la plantilla aprobada (o `es`).
+- **STOP / BAJA:** si un contacto escribe solo `STOP`, `BAJA`, `ALTO`, `DAR DE BAJA`,
+  `NO MÁS MENSAJES` o `UNSUBSCRIBE` (sin importar mayúsculas ni acentos), queda dado
+  de baja: no recibe automatizaciones ni mensajes del agente o del equipo, y escribir
+  de nuevo **no** lo vuelve a dar de alta. Vuelve con `ALTA`, `START` o
+  `SUSCRIBIRME`, o si alguien lo reactiva a mano en el CRM. Una frase que solo
+  contiene la palabra ("quiero darme de baja del plan") no cuenta: la contesta el
+  agente.
+- **Permisos:** las reglas, los eventos y la cola de ejecuciones solo los escribe el
+  servidor; los miembros solo los leen. Una automatización nunca puede apuntar a un
+  contacto o conversación de otro workspace.
+- **Para apagar todo el motor** sin tocar las reglas, en Supabase → SQL Editor:
+  `select cron.unschedule('automations');` (vuelve con `setup.mjs cron-apply`).
+- La ruta del cron puede durar hasta 120 segundos (Fluid Compute, igual que el
+  buffer).
+
 **Si instalaste desde la antigua rama `provider/kapso`** (Kapso), cámbiate a `main`,
 donde ahora viven los dos proveedores. Cada workspace sigue con el proveedor que
 tenía **activo**: si tenía Kapso (o Kapso y YCloud a la vez), queda en Kapso; si solo
@@ -586,17 +645,22 @@ vercel --prod
 `db-push` marca como revertidas las dos migraciones que solo existían en esa rama
 (`20260731000000/1`; su contenido ya viene en las de `main`) y aplica las nuevas.
 
-**Si además aplicaste ramas de los PRs #8, #9, #11, #12 o #14 de la comunidad**
-(Francisco Velásquez), `db-push` también marca como revertidas sus versiones que
+**Si además aplicaste ramas de los PRs #8, #9, #11, #12, #14, #15 o #16 de la
+comunidad** (Francisco Velásquez), `db-push` también marca como revertidas sus versiones que
 `main` no tiene (la lista está en `scripts/setup.mjs`); si no, `supabase db push` se
 niega a seguir. Eso solo destraba el historial: lo que esas migraciones crearon
 sigue en tu base. Lo que `main` adoptó de ellas vuelve con versiones nuevas que se
 aplican encima (por ejemplo, la tabla `n8n_tools` de #11 se conserva y solo se le
 cambian los permisos). El PR #11 también borraba `custom_webhook` del catálogo de
 tools (sin migrar sus configuraciones); en `main` lo retira `20260930000007`, que
-no hace nada si ya no está.
+no hace nada si ya no está. El motor de automatizaciones de #16 vuelve como
+`20261001000000`, que se aplica encima de lo que #16 creó: conserva sus eventos y
+ejecuciones, apaga las reglas que #16 encendió solo por existir (las que alguien
+encendió con su motor siguen encendidas) y cambia sus referencias por unas que no
+pueden cruzar workspaces. Lo de Cal.com (#15) se queda en tu base, pero `main` no lo
+usa todavía.
 
-**Si aplicaste ramas de otros PRs de la comunidad (#13, #15, #16 o #17)**, traen
+**Si aplicaste ramas de otros PRs de la comunidad (#13 o #17)**, traen
 versiones que ni `main` ni esa lista conocen, y `supabase db push` se va a negar a
 seguir. Es a propósito: nada se aplica a ciegas sobre una base con cambios
 desconocidos.
