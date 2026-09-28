@@ -111,6 +111,11 @@ export interface DispatchResult {
    * so sending the same text again cannot duplicate it.
    */
   retryable?: boolean;
+  /**
+   * Meta's numeric code for a SEND_FAILED, for internal branching only (e.g.
+   * 132015 = template paused). Never show it to the team or the browser.
+   */
+  providerCode?: number;
 }
 
 /**
@@ -359,6 +364,7 @@ async function sendQueuedRow(opts: {
       error: waError.message,
       errorCode: "SEND_FAILED",
       retryable,
+      providerCode: typeof waError.code === "number" ? waError.code : undefined,
     };
   }
 
@@ -549,9 +555,47 @@ export async function dispatchText(
 // ──────────────────────────────────────────────────────────────────────────────
 // dispatchTemplate — sends an approved template (bypasses 24h window)
 // ──────────────────────────────────────────────────────────────────────────────
-export async function dispatchTemplate(
-  params: DispatchTemplateParams,
-): Promise<DispatchResult> {
+/**
+ * Everything a template send needs to READ, in one place and never throwing:
+ * the conversation, the contact's phone and opt-in, and the workspace's
+ * WhatsApp sender. Split from the send so the automation engine can mark its
+ * run as dispatched right before the provider call and not before these
+ * reads — a database blip here is retryable because nothing was attempted.
+ */
+export interface PreparedTemplateDispatch {
+  workspaceId: string;
+  conversationId: string;
+  templateName: string;
+  templateLanguage: string;
+  components?: TemplateComponents;
+  senderUserId?: string;
+  /** Extra keys for the outbound row's meta (e.g. the automation run). */
+  meta?: Record<string, unknown>;
+  toPhone: string;
+  sender: WhatsAppSender;
+}
+
+export type PrepareTemplateResult =
+  | { ok: true; prepared: PreparedTemplateDispatch }
+  | {
+      ok: false;
+      error: string;
+      errorCode: "NOT_FOUND" | "OPT_OUT" | "DB_ERROR" | "CONFIG_ERROR";
+      /** True only when trying again later can succeed (a database error). */
+      retryable: boolean;
+    };
+
+export async function prepareTemplateDispatch(
+  params: DispatchTemplateParams & { meta?: Record<string, unknown> },
+  opts: {
+    /**
+     * A missing or "placeholder" provider key is development mode: the row is
+     * recorded as queued and nothing is sent. Interactive sends accept that;
+     * an unattended engine must not, or it would count a send that never left.
+     */
+    allowDevMode?: boolean;
+  } = {},
+): Promise<PrepareTemplateResult> {
   const {
     workspaceId,
     conversationId,
@@ -559,31 +603,124 @@ export async function dispatchTemplate(
     templateLanguage = "es",
     components,
     senderUserId,
+    meta,
   } = params;
-
   const supabase = svc();
 
-  // 1. Load contact phone (templates bypass the window guard entirely)
-  const loaded = await loadConversationAndPhone(
-    conversationId,
+  let loaded: Awaited<ReturnType<typeof loadConversationAndPhone>>;
+  try {
+    loaded = await loadConversationAndPhone(conversationId, workspaceId, supabase);
+  } catch (err) {
+    return {
+      ok: false,
+      error: err instanceof Error ? err.message : String(err),
+      errorCode: "DB_ERROR",
+      retryable: true,
+    };
+  }
+  if (!loaded) {
+    return { ok: false, error: NOT_FOUND.error!, errorCode: "NOT_FOUND", retryable: false };
+  }
+  // Templates skip the 24h guard entirely, but never the opt-out.
+  if (!loaded.optIn) {
+    return { ok: false, error: OPT_OUT_MESSAGE, errorCode: "OPT_OUT", retryable: false };
+  }
+
+  let row: Awaited<ReturnType<typeof loadWhatsAppIntegration>>;
+  try {
+    row = await loadWhatsAppIntegration(supabase, workspaceId);
+  } catch (err) {
+    // A read that failed is not a missing integration: try again later.
+    return {
+      ok: false,
+      error: err instanceof Error ? err.message : String(err),
+      errorCode: "DB_ERROR",
+      retryable: true,
+    };
+  }
+  if (!row) {
+    return {
+      ok: false,
+      error: WHATSAPP_NOT_CONNECTED,
+      errorCode: "CONFIG_ERROR",
+      retryable: false,
+    };
+  }
+
+  let sender: WhatsAppSender;
+  try {
+    const credentials = await decryptWhatsAppCredentials(row, workspaceId);
+    sender = whatsappSender(row.provider, credentials, row.config);
+  } catch (err) {
+    // Technical detail to the log only.
+    console.error("[dispatch] could not load the WhatsApp sender:", {
+      workspaceId,
+      message: err instanceof Error ? err.message : String(err),
+    });
+    return {
+      ok: false,
+      error: "credentials_unreadable",
+      errorCode: "CONFIG_ERROR",
+      retryable: false,
+    };
+  }
+
+  if (!sender.live && !opts.allowDevMode) {
+    return {
+      ok: false,
+      error: "missing_whatsapp_credentials",
+      errorCode: "CONFIG_ERROR",
+      retryable: false,
+    };
+  }
+
+  return {
+    ok: true,
+    prepared: {
+      workspaceId,
+      conversationId,
+      templateName,
+      templateLanguage,
+      components,
+      senderUserId,
+      meta,
+      toPhone: loaded.toPhone,
+      sender,
+    },
+  };
+}
+
+/**
+ * The side effect: queue the outbound row, call the provider, record the
+ * outcome. Reads nothing before the provider call except the insert, so a
+ * caller can mark its own dispatch right before calling it. `retryable` on a
+ * failure still means nothing was sent (queue insert failed, or the provider
+ * refused it for a reason that clears).
+ */
+export async function sendPreparedTemplate(
+  prepared: PreparedTemplateDispatch,
+): Promise<DispatchResult> {
+  const {
     workspaceId,
-    supabase,
-  );
-  if (!loaded) return NOT_FOUND;
-  const { toPhone } = loaded;
+    conversationId,
+    templateName,
+    templateLanguage,
+    components,
+    senderUserId,
+    meta,
+    toPhone,
+    sender,
+  } = prepared;
+  const supabase = svc();
 
-  // SEC-10: Block outbound to opted-out contacts
-  if (!loaded.optIn) return OPT_OUT;
-
-  // 2. Resolve the workspace's WhatsApp provider
-  const sender = await loadSender(workspaceId, supabase);
   const rowMeta: Record<string, unknown> = {
+    ...(meta ?? {}),
     template_name: templateName,
     template_language: templateLanguage,
     dev_mode: sender.live ? undefined : true,
   };
 
-  // 3. Queue the row — type='template' bypasses the 24h trigger
+  // Queue the row — type='template' bypasses the 24h trigger
   const queued = await insertQueuedRow(supabase, {
     workspace_id: workspaceId,
     conversation_id: conversationId,
@@ -608,7 +745,6 @@ export async function dispatchTemplate(
     return { ok: true };
   }
 
-  // 4. Send and record the outcome on the row
   const result = await sendQueuedRow({
     supabase,
     sender,
@@ -628,4 +764,18 @@ export async function dispatchTemplate(
 
   if (result.ok) await touchConversation(supabase, conversationId);
   return result;
+}
+
+export async function dispatchTemplate(
+  params: DispatchTemplateParams,
+): Promise<DispatchResult> {
+  const prep = await prepareTemplateDispatch(params, { allowDevMode: true });
+  if (!prep.ok) {
+    // Same contract as always: not found / opt-out are results, a database
+    // error or a missing integration throw for the caller to log.
+    if (prep.errorCode === "NOT_FOUND") return NOT_FOUND;
+    if (prep.errorCode === "OPT_OUT") return OPT_OUT;
+    throw new Error(`[dispatch] ${prep.error}`);
+  }
+  return sendPreparedTemplate(prep.prepared);
 }
