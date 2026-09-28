@@ -503,12 +503,15 @@ las migraciones, así que las migraciones van **antes** de `vercel --prod`.
     HighLevel y dispara los workflows de n8n que escriben. Cancelar y reagendar no
     aplican (la prueba no tiene contacto).
   - Para agendar en la prueba, escribe en el chat el teléfono de prueba: solo se
-    usa un número que tú escribiste (nunca uno que invente el agente). La cita
+    usa un número que tú escribiste (nunca uno que invente el agente), leído con el
+    código de país del workspace, y es ese número el que va a HighLevel. La cita
     aparece en HighLevel como "[Prueba]", y si ese número ya era un contacto, no se
-    le cambia el nombre. Cada una deja un evento `playground_write` con quién la
-    hizo y el teléfono.
-  - Si la respuesta falla después de ejecutar una acción, la pantalla lo dice:
-    revisa qué quedó hecho antes de reintentar.
+    le cambia el nombre. Antes de tocar HighLevel queda un evento
+    `playground_write` con quién la hizo y el teléfono (si no se puede registrar,
+    no se agenda), y después se anota cómo terminó.
+  - Si la respuesta falla después de ejecutar una acción (o se corta la conexión
+    en la prueba de un admin), la pantalla lo dice y el agente recibe una nota
+    para no repetirla: revisa qué quedó hecho antes de reintentar.
 - **Tools de n8n por workspace** (Configuración → n8n, solo admins): cada fila es una
   tool que llama a un webhook de n8n.
   - El header de autenticación se guarda **cifrado** y nunca se vuelve a mostrar;
@@ -525,6 +528,9 @@ las migraciones, así que las migraciones van **antes** de `vercel --prod`.
     sin mandar el header a otro dominio).
   - El agente ve a lo más 16 KB de la respuesta: haz que el workflow devuelva solo
     lo que el agente necesita decirle al cliente.
+  - Las llamadas desde el chat de prueba (solo las de un admin corren tools de
+    escritura) llevan `playground: true` en el cuerpo, para que tu workflow pueda
+    distinguirlas de una conversación real.
   - Una tool nueva es de "escritura" salvo que la marques de lectura (las de
     escritura nunca se reintentan). Un nombre igual al de una tool del sistema se
     rechaza.
@@ -535,8 +541,8 @@ las migraciones, así que las migraciones van **antes** de `vercel --prod`.
   `webhook_personalizado` (o `webhook_personalizado_2`, … si el nombre ya estaba en
   uso), con la misma URL, modo asíncrono y de escritura. Después borra
   `custom_webhook` del catálogo y sus configuraciones; el `db push` imprime cuántas
-  movió. **Admins: revisen cada tool migrada en Configuración → n8n antes de
-  activarla.** Su descripción dice "Migrada desde custom_webhook — revisa antes de
+  movió y cuántos headers descartó por inválidos. **Admins: revisen cada tool
+  migrada en Configuración → n8n antes de activarla.** Su descripción dice "Migrada desde custom_webhook — revisa antes de
   activar" y lista los campos que enviaba. El workflow ya no recibe
   `{ workspace_id, payload }`, sino `workspace_id`, `conversation_id`, `contact_id`,
   `idempotency_key` y `args.note`, así que hay que ajustarlo. Si la configuración

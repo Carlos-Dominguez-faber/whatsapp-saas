@@ -20,8 +20,8 @@
 -- scripts/encrypt-credentials.mjs encrypts on its next run (sessions never
 -- read that column, see 20260930000001), if it passes the API's rules; if
 -- not it is dropped and a NOTICE says so (the runner checks again).
--- Then its tool_configs rows and its catalog row go. A NOTICE gives the
--- count.
+-- Then its tool_configs rows and its catalog row go. A NOTICE gives how many
+-- moved and how many headers were dropped.
 --
 -- The work is a function, kept (callable only by the service role) so
 -- pgTAP can exercise it; a second run finds no catalog row and does nothing.
@@ -131,6 +131,8 @@ BEGIN
 
   DELETE FROM public.tool_configs WHERE tool_id = v_tool_id;
   DELETE FROM public.tools WHERE id = v_tool_id;
+  RAISE NOTICE 'custom_webhook: % configuration(s) moved to n8n_tools, disabled; % auth header(s) dropped (they broke the n8n rules). Review and activate them in Configuración → n8n.',
+    v_migrated, v_dropped;
   RETURN v_migrated;
 END;
 $$;
@@ -138,14 +140,8 @@ $$;
 REVOKE ALL ON FUNCTION public.retire_custom_webhook() FROM PUBLIC, anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.retire_custom_webhook() TO service_role;
 
-DO $$
-DECLARE
-  v_count INT;
-BEGIN
-  v_count := public.retire_custom_webhook();
-  RAISE NOTICE 'custom_webhook: % configuration(s) moved to n8n_tools, disabled: review and activate them in Configuración → n8n.', v_count;
-END
-$$;
+-- The function's own NOTICE gives the counts.
+SELECT public.retire_custom_webhook();
 
 -- ============================================================
 -- End of migration: 20260930000007_retire_custom_webhook
