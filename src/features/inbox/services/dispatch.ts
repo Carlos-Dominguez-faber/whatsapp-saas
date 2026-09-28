@@ -462,13 +462,10 @@ export async function dispatchText(
   }
   const { window_expires_at, toPhone } = loaded;
 
-  // SEC-10: Block outbound to opted-out contacts
-  if (!loaded.optIn) {
-    if (noteWhenBlocked) {
-      await noteBlockedSend(supabase, workspaceId, conversationId, OPT_OUT_MESSAGE, body);
-    }
-    return OPT_OUT;
-  }
+  // No opt-out check here, on purpose: STOP/BAJA stops automations and
+  // templates (the proactive messages), not the replies the agent or the team
+  // write inside the 24h window the contact opened. The window guard below
+  // still applies.
 
   // 2. App-level 24h window guard (DB trigger is the final enforcer)
   if (
@@ -621,7 +618,8 @@ export async function prepareTemplateDispatch(
   if (!loaded) {
     return { ok: false, error: NOT_FOUND.error!, errorCode: "NOT_FOUND", retryable: false };
   }
-  // Templates skip the 24h guard entirely, but never the opt-out.
+  // Templates skip the 24h guard entirely, but never the opt-out: they are
+  // the proactive messages STOP/BAJA refuses.
   if (!loaded.optIn) {
     return { ok: false, error: OPT_OUT_MESSAGE, errorCode: "OPT_OUT", retryable: false };
   }

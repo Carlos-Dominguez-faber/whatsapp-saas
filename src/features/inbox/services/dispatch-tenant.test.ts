@@ -244,15 +244,18 @@ test("a conversation from another workspace is not sent nor persisted", async ()
   assert.equal(msgs().length, 0);
 });
 
-test("an opted-out contact is not sent to", async () => {
+test("an opted-out contact still gets replies in the open window, never a template", async () => {
   reset();
   (tables.contacts[0] as Row).opt_in = false;
-  const res = await dispatchText({ workspaceId: "ws_a", conversationId: "conv_a", body: "hola" });
-  assert.equal(res.ok, false);
-  assert.equal(res.errorCode, "OPT_OUT");
-  assert.match(res.error ?? "", /pidió no recibir/);
-  assert.equal(sends.length, 0);
-  assert.equal(msgs().length, 0);
+  const reply = await dispatchText({ workspaceId: "ws_a", conversationId: "conv_a", body: "hola" });
+  assert.equal(reply.ok, true, "STOP stops proactive messages, not the replies they asked for");
+  assert.equal(sends.length, 1);
+
+  const tpl = await dispatchTemplate({ workspaceId: "ws_a", conversationId: "conv_a", templateName: "welcome" });
+  assert.equal(tpl.ok, false);
+  assert.equal(tpl.errorCode, "OPT_OUT");
+  assert.match(tpl.error ?? "", /no recibir mensajes automáticos ni plantillas/);
+  assert.equal(sends.length, 1, "the template never left");
 });
 
 test("a workspace without an active WhatsApp provider fails loudly", async () => {
@@ -390,8 +393,10 @@ test("extra meta (the buffer's batch id) lands on the outbound row", async () =>
 });
 
 test("a blocked AI reply leaves an internal note with its text; a person's send doesn't", async () => {
+  const closeWindow = () =>
+    ((tables.conversations[0] as Row).window_expires_at = "2020-01-01T00:00:00Z");
   reset();
-  (tables.contacts[0] as Row).opt_in = false;
+  closeWindow();
   await dispatchText({ workspaceId: "ws_a", conversationId: "conv_a", body: "tu cita", noteWhenBlocked: true });
   assert.equal(sends.length, 0);
   assert.equal(msgs().length, 1);
@@ -400,8 +405,9 @@ test("a blocked AI reply leaves an internal note with its text; a person's send 
   assert.match(String(msgs()[0].body), /tu cita/);
 
   reset();
-  (tables.contacts[0] as Row).opt_in = false;
+  closeWindow();
   await dispatchText({ workspaceId: "ws_a", conversationId: "conv_a", body: "hola" });
+  (tables.conversations[0] as Row).window_expires_at = null;
   assert.equal(msgs().length, 0);
 });
 
