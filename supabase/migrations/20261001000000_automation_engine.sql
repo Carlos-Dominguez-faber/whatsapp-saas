@@ -10,8 +10,10 @@
 --     (paused_reason = 'upgrade'); the Automations tab asks the team to review
 --     and re-enable them explicitly.
 --   * Captured events expire (per-type TTL), a reminder for an appointment
---     that already passed is discarded, sends have a per-contact cooldown and
---     a per-workspace daily cap, and nothing is sent to an opted-out contact.
+--     that already passed is discarded, sends have a cooldown (per contact, or
+--     per appointment for reminders) and a per-workspace daily cap, and no
+--     automation reaches an opted-out contact. Only a manager or admin can
+--     opt a contact back in, and every manual change leaves an event.
 --   * Every reference is workspace-consistent (composite FKs), and every RPC
 --     is callable by service_role only.
 --
@@ -115,6 +117,66 @@ DROP TRIGGER IF EXISTS trg_contacts_keep_opt_out ON public.contacts;
 CREATE TRIGGER trg_contacts_keep_opt_out
   BEFORE INSERT OR UPDATE ON public.contacts
   FOR EACH ROW EXECUTE FUNCTION public.keep_contact_opt_out();
+
+-- A contact someone opted out by hand before this migration (opt_in turned
+-- false after it had been true) is an explicit opt-out too. Idempotent: once
+-- stamped, opted_out_at is no longer NULL.
+UPDATE public.contacts
+   SET opted_out_at = updated_at
+ WHERE opt_in = false
+   AND opted_out_at IS NULL
+   AND opt_in_at IS NOT NULL;
+
+-- Opting a contact back in after an opt-out is a manager's call, and every
+-- manual change of a contact's opt-in from a user session leaves an event
+-- with who made it. Server writes (the STOP/ALTA keywords, service_role) pass
+-- untouched. Named to run after trg_contacts_keep_opt_out (BEFORE triggers
+-- fire alphabetically), so it sees the opt_in that will be stored.
+CREATE OR REPLACE FUNCTION public.guard_contact_opt_in_change()
+RETURNS TRIGGER
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = ''
+AS $$
+BEGIN
+  -- The role PostgREST switched to for this request. SECURITY DEFINER changes
+  -- current_user, not this setting; server and migration writes pass.
+  IF coalesce(current_setting('role', true), 'none') NOT IN ('authenticated', 'anon') THEN
+    RETURN NEW;
+  END IF;
+  IF NEW.opt_in IS NOT DISTINCT FROM OLD.opt_in
+     AND NEW.opted_out_at IS NOT DISTINCT FROM OLD.opted_out_at THEN
+    RETURN NEW;
+  END IF;
+
+  IF OLD.opted_out_at IS NOT NULL AND NEW.opted_out_at IS NULL
+     AND NOT public.auth_has_role(NEW.workspace_id, ARRAY['admin', 'manager']::public.workspace_role[])
+     AND NOT public.is_super_admin()
+  THEN
+    RAISE EXCEPTION 'only a workspace admin or manager can opt a contact back in after an opt-out'
+      USING ERRCODE = '42501';
+  END IF;
+
+  INSERT INTO public.events (workspace_id, type, level, payload)
+  VALUES (
+    NEW.workspace_id,
+    'contact_opt_in_changed',
+    'info',
+    jsonb_build_object(
+      'contact_id',      NEW.id,
+      'user_id',         auth.uid(),
+      'opt_in',          NEW.opt_in,
+      'previous_opt_in', OLD.opt_in,
+      'opt_out_cleared', OLD.opted_out_at IS NOT NULL AND NEW.opted_out_at IS NULL
+    )
+  );
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS trg_contacts_opt_in_guard ON public.contacts;
+CREATE TRIGGER trg_contacts_opt_in_guard
+  BEFORE UPDATE ON public.contacts
+  FOR EACH ROW EXECUTE FUNCTION public.guard_contact_opt_in_change();
 
 -- ──────────────────────────────────────────────────────────
 -- 2. automation_rules
@@ -241,6 +303,15 @@ CREATE TABLE IF NOT EXISTS public.automation_events (
 
 ALTER TABLE public.automation_events ADD COLUMN IF NOT EXISTS rule_id UUID;
 
+-- #16 keyed a reminder as '<h>h:<iso>'; the key now leads with the rule id.
+-- Rewriting #16's rows keeps a reminder it already sent from going out again
+-- under the new key. Idempotent: a rewritten key no longer starts with '<h>h:'.
+UPDATE public.automation_events
+   SET occurrence = rule_id::text || ':' || occurrence
+ WHERE event_type = 'appointment_upcoming'
+   AND rule_id IS NOT NULL
+   AND occurrence ~ '^\d+h:';
+
 ALTER TABLE public.automation_events
   DROP CONSTRAINT IF EXISTS automation_events_event_type_check;
 ALTER TABLE public.automation_events
@@ -333,6 +404,10 @@ CREATE INDEX IF NOT EXISTS idx_automation_runs_dispatched
 CREATE INDEX IF NOT EXISTS idx_automation_runs_rule_contact_dispatched
   ON public.automation_runs (rule_id, contact_id, dispatched_at)
   WHERE dispatched_at IS NOT NULL;
+-- The tab's per-rule health (last outcome, failures in 24 h).
+CREATE INDEX IF NOT EXISTS idx_automation_runs_rule_finished
+  ON public.automation_runs (workspace_id, rule_id, finished_at DESC)
+  WHERE finished_at IS NOT NULL;
 
 ALTER TABLE public.automation_runs ENABLE ROW LEVEL SECURITY;
 
@@ -594,7 +669,8 @@ $$;
 -- FOR UPDATE SKIP LOCKED, round-robin across workspaces by the data itself
 -- (the workspace served longest ago first), a 7-minute lease above the cron's
 -- maxDuration. Before handing a run out it discards, with an event:
---   * runs out of attempts (max_attempts, or outcome_unknown if dispatched);
+--   * runs out of attempts (max_attempts:<last cause>, or outcome_unknown if
+--     dispatched);
 --   * runs whose rule was re-enabled after the event (rule_reenabled);
 --   * runs whose event is older than its TTL (stale).
 -- A discard never stops the drain: the loop moves to the next row (up to 50
@@ -648,8 +724,10 @@ BEGIN
 
     v_reason := NULL;
     IF v_run.attempts >= 3 THEN
+      -- The last retry's cause stays visible ('max_attempts:db_read_failed').
       v_reason := CASE WHEN v_run.dispatched_at IS NOT NULL
-                       THEN 'outcome_unknown' ELSE 'max_attempts' END;
+                       THEN 'outcome_unknown'
+                       ELSE 'max_attempts:' || coalesce(v_run.error, 'unknown') END;
       v_status := 'failed';
     ELSIF v_run.dispatched_at IS NOT NULL AND (v_floor OR v_stale) THEN
       -- The effect may already have left: never skip it silently.
@@ -767,12 +845,13 @@ $$;
 -- 10. mark_automation_run_dispatched(run, cooldown, cap)
 --
 -- Right before the provider call, in ONE transaction: the run is still ours
--- and not dispatched, the conversation's contact is opted in, this rule hasn't
--- sent to this contact within the cooldown, and the workspace is under its
--- daily cap of automated sends. Advisory locks serialize the checks per
--- (rule, contact) and per workspace, so two concurrent runs can't both slip
--- under a limit. Returns:
---   'ok' | 'opted_out' | 'cooldown' | 'daily_cap'
+-- and not dispatched, its rule is still enabled, the conversation's contact is
+-- opted in, this rule hasn't sent to this contact within the cooldown, and the
+-- workspace is under its daily cap of automated sends. A reminder's cooldown
+-- is per appointment instead (two appointments of one contact both get
+-- theirs). Advisory locks serialize the checks per cooldown key and per
+-- workspace, so two concurrent runs can't both slip under a limit. Returns:
+--   'ok' | 'opted_out' | 'cooldown' | 'daily_cap' | 'rule_disabled'
 --   'already_dispatched'  -> the effect already left once (outcome unknown)
 --   'not_found'           -> the run is no longer ours, or its conversation
 --                            or contact is gone
@@ -793,6 +872,7 @@ DECLARE
   v_run        public.automation_runs;
   v_contact_id UUID;
   v_opt_in     BOOLEAN;
+  v_subject_id UUID;
   v_count      INT;
 BEGIN
   SELECT r.* INTO v_run
@@ -805,6 +885,15 @@ BEGIN
   END IF;
   IF v_run.dispatched_at IS NOT NULL THEN
     RETURN 'already_dispatched';
+  END IF;
+
+  IF NOT EXISTS (
+    SELECT 1 FROM public.automation_rules ru
+     WHERE ru.id = v_run.rule_id
+       AND ru.workspace_id = v_run.workspace_id
+       AND ru.enabled
+  ) THEN
+    RETURN 'rule_disabled';
   END IF;
 
   SELECT ct.id, ct.opt_in
@@ -823,7 +912,28 @@ BEGIN
     RETURN 'opted_out';
   END IF;
 
-  IF p_cooldown_hours > 0 THEN
+  IF p_cooldown_hours > 0 AND v_run.trigger_type = 'appointment_upcoming' THEN
+    SELECT e.subject_id INTO v_subject_id
+      FROM public.automation_events e
+     WHERE e.id = v_run.event_id
+       AND e.workspace_id = v_run.workspace_id;
+    PERFORM pg_advisory_xact_lock(
+      hashtextextended('automation_cooldown:' || v_run.rule_id::text || ':appt:' || coalesce(v_subject_id::text, ''), 0)
+    );
+    IF EXISTS (
+      SELECT 1
+        FROM public.automation_runs r2
+        JOIN public.automation_events e2
+          ON e2.id = r2.event_id
+         AND e2.workspace_id = r2.workspace_id
+       WHERE r2.rule_id = v_run.rule_id
+         AND e2.subject_id = v_subject_id
+         AND r2.id <> v_run.id
+         AND r2.dispatched_at > NOW() - make_interval(hours => p_cooldown_hours)
+    ) THEN
+      RETURN 'cooldown';
+    END IF;
+  ELSIF p_cooldown_hours > 0 THEN
     PERFORM pg_advisory_xact_lock(
       hashtextextended('automation_cooldown:' || v_run.rule_id::text || ':' || v_contact_id::text, 0)
     );
@@ -885,6 +995,47 @@ END;
 $$;
 
 -- ──────────────────────────────────────────────────────────
+-- 11b. automation_rule_health(workspace) — what the tab shows per rule
+--
+-- The last finished run (status, cause, when) and the failures in the last
+-- 24 hours, for each rule of one workspace. The server calls it after its own
+-- membership check.
+-- ──────────────────────────────────────────────────────────
+CREATE OR REPLACE FUNCTION public.automation_rule_health(p_workspace_id UUID)
+RETURNS TABLE (
+  rule_id          UUID,
+  last_status      TEXT,
+  last_error       TEXT,
+  last_finished_at TIMESTAMPTZ,
+  failures_24h     INT
+)
+LANGUAGE sql STABLE SECURITY DEFINER
+SET search_path = ''
+AS $$
+  SELECT ru.id,
+         last.status,
+         last.error,
+         last.finished_at,
+         (SELECT count(*)::int
+            FROM public.automation_runs f
+           WHERE f.workspace_id = ru.workspace_id
+             AND f.rule_id = ru.id
+             AND f.status = 'failed'
+             AND f.finished_at > NOW() - INTERVAL '24 hours')
+    FROM public.automation_rules ru
+    LEFT JOIN LATERAL (
+      SELECT r.status, r.error, r.finished_at
+        FROM public.automation_runs r
+       WHERE r.workspace_id = ru.workspace_id
+         AND r.rule_id = ru.id
+         AND r.finished_at IS NOT NULL
+       ORDER BY r.finished_at DESC
+       LIMIT 1
+    ) last ON true
+   WHERE ru.workspace_id = p_workspace_id;
+$$;
+
+-- ──────────────────────────────────────────────────────────
 -- 12. Grants: service_role only, for every RPC. Revoke PUBLIC (inherited) and
 -- anon/authenticated (direct), then grant service_role. Trigger functions
 -- need no EXECUTE grant to fire.
@@ -898,12 +1049,15 @@ REVOKE ALL ON FUNCTION public.emit_automation_event_on_message()                
 REVOKE ALL ON FUNCTION public.emit_automation_event_on_state()                     FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.emit_automation_event_on_stage()                     FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.keep_contact_opt_out()                               FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.guard_contact_opt_in_change()                        FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.automation_rule_health(UUID)                         FROM PUBLIC, anon, authenticated;
 
 GRANT EXECUTE ON FUNCTION public.claim_next_automation_run()                       TO service_role;
 GRANT EXECUTE ON FUNCTION public.append_contact_tags(UUID, UUID, TEXT[])           TO service_role;
 GRANT EXECUTE ON FUNCTION public.mark_automation_run_dispatched(UUID, INT, INT)    TO service_role;
 GRANT EXECUTE ON FUNCTION public.release_automation_run_dispatch(UUID)             TO service_role;
 GRANT EXECUTE ON FUNCTION public.automation_event_ttl(TEXT)                        TO service_role;
+GRANT EXECUTE ON FUNCTION public.automation_rule_health(UUID)                      TO service_role;
 
 -- ============================================================
 -- End of migration: 20261001000000_automation_engine

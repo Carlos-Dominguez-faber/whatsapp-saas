@@ -8,7 +8,7 @@ BEGIN;
 CREATE EXTENSION IF NOT EXISTS pgtap WITH SCHEMA extensions;
 SET search_path = public, extensions;
 
-SELECT plan(183);
+SELECT plan(196);
 
 -- ── public.users: read-only for sessions ────────────────────────────────────
 SELECT ok(NOT has_table_privilege('authenticated', 'public.users', 'UPDATE'),
@@ -798,9 +798,71 @@ UPDATE public.contacts SET opt_in = true, opted_out_at = NULL WHERE id = 'b00000
 SELECT is((SELECT opt_in FROM public.contacts WHERE id = 'b0000000-0000-4000-8000-0000000000c9'), true,
   'ALTA (clearing the opt-out) opts them back in');
 
--- the claim discards what expired instead of sending it late
+-- a rule switched off after the claim sends nothing
+UPDATE public.automation_rules SET enabled = false WHERE id = 'b0000000-0000-4000-8000-0000000000a9';
+SELECT is(public.mark_automation_run_dispatched('b0000000-0000-4000-8000-0000000000f8', 0, 0), 'rule_disabled',
+  'the mark re-checks that the rule is still on');
+UPDATE public.automation_rules SET enabled = true WHERE id = 'b0000000-0000-4000-8000-0000000000a9';
+
+-- a reminder's cooldown is per appointment: two appointments of one contact both get theirs
+INSERT INTO public.appointments (id, workspace_id, contact_id, conversation_id, scheduled_at, status) VALUES
+  ('b0000000-0000-4000-8000-0000000000e8', 'b0000000-0000-4000-8000-000000000001', 'b0000000-0000-4000-8000-0000000000c9',
+   'b0000000-0000-4000-8000-0000000000d9', now() + interval '20 hours', 'booked'),
+  ('b0000000-0000-4000-8000-0000000000e9', 'b0000000-0000-4000-8000-000000000001', 'b0000000-0000-4000-8000-0000000000c9',
+   'b0000000-0000-4000-8000-0000000000d9', now() + interval '22 hours', 'booked');
+INSERT INTO public.automation_rules (id, workspace_id, name, trigger_type, trigger_config, action_type, action_config, enabled) VALUES
+  ('b0000000-0000-4000-8000-0000000000a8', 'b0000000-0000-4000-8000-000000000001', 'Recordatorio',
+   'appointment_upcoming', '{"hours_before": 24}', 'send_template', '{"template_name": "recordatorio"}', true);
+INSERT INTO public.automation_events (id, workspace_id, event_type, subject_id, occurrence, conversation_id, contact_id, rule_id) VALUES
+  (900010, 'b0000000-0000-4000-8000-000000000001', 'appointment_upcoming', 'b0000000-0000-4000-8000-0000000000e8', 'x:24h:1',
+   'b0000000-0000-4000-8000-0000000000d9', 'b0000000-0000-4000-8000-0000000000c9', 'b0000000-0000-4000-8000-0000000000a8'),
+  (900011, 'b0000000-0000-4000-8000-000000000001', 'appointment_upcoming', 'b0000000-0000-4000-8000-0000000000e9', 'x:24h:2',
+   'b0000000-0000-4000-8000-0000000000d9', 'b0000000-0000-4000-8000-0000000000c9', 'b0000000-0000-4000-8000-0000000000a8'),
+  (900012, 'b0000000-0000-4000-8000-000000000001', 'appointment_upcoming', 'b0000000-0000-4000-8000-0000000000e8', 'x:24h:3',
+   'b0000000-0000-4000-8000-0000000000d9', 'b0000000-0000-4000-8000-0000000000c9', 'b0000000-0000-4000-8000-0000000000a8');
+INSERT INTO public.automation_runs (id, workspace_id, rule_id, event_id, trigger_type, conversation_id, status, claimed_at) VALUES
+  ('b0000000-0000-4000-8000-0000000000f1', 'b0000000-0000-4000-8000-000000000001', 'b0000000-0000-4000-8000-0000000000a8',
+   900010, 'appointment_upcoming', 'b0000000-0000-4000-8000-0000000000d9', 'processing', now()),
+  ('b0000000-0000-4000-8000-0000000000f2', 'b0000000-0000-4000-8000-000000000001', 'b0000000-0000-4000-8000-0000000000a8',
+   900011, 'appointment_upcoming', 'b0000000-0000-4000-8000-0000000000d9', 'processing', now()),
+  ('b0000000-0000-4000-8000-0000000000f3', 'b0000000-0000-4000-8000-000000000001', 'b0000000-0000-4000-8000-0000000000a8',
+   900012, 'appointment_upcoming', 'b0000000-0000-4000-8000-0000000000d9', 'processing', now());
+SELECT is(public.mark_automation_run_dispatched('b0000000-0000-4000-8000-0000000000f1', 24, 0), 'ok',
+  'the first reminder for an appointment goes out');
+SELECT is(public.mark_automation_run_dispatched('b0000000-0000-4000-8000-0000000000f2', 24, 0), 'ok',
+  'the same contact''s other appointment gets its own reminder');
+SELECT is(public.mark_automation_run_dispatched('b0000000-0000-4000-8000-0000000000f3', 24, 0), 'cooldown',
+  'a second reminder for the same appointment within the cooldown is refused');
+
+-- only a manager or admin opts a contact back in, and every manual change is recorded
+INSERT INTO auth.users (id, email, instance_id, aud, role) VALUES
+  ('b0000000-0000-4000-8000-0000000000e2', 'sec-b-agent@test.local', '00000000-0000-0000-0000-000000000000', 'authenticated', 'authenticated');
+INSERT INTO public.users (id, full_name, email) VALUES
+  ('b0000000-0000-4000-8000-0000000000e2', 'B agent', 'sec-b-agent@test.local');
+INSERT INTO public.memberships (workspace_id, user_id, role, is_active) VALUES
+  ('b0000000-0000-4000-8000-000000000001', 'b0000000-0000-4000-8000-0000000000e2', 'agent', true);
+UPDATE public.contacts SET opted_out_at = now() WHERE id = 'b0000000-0000-4000-8000-0000000000c9';
+SET LOCAL ROLE authenticated;
+SELECT set_config('request.jwt.claims',
+  '{"sub":"b0000000-0000-4000-8000-0000000000e2","role":"authenticated"}', true);
+SELECT throws_ok(
+  $$UPDATE public.contacts SET opt_in = true, opted_out_at = NULL WHERE id = 'b0000000-0000-4000-8000-0000000000c9'$$,
+  '42501', NULL, 'an agent cannot undo a contact''s opt-out');
+SELECT set_config('request.jwt.claims',
+  '{"sub":"b0000000-0000-4000-8000-0000000000e1","role":"authenticated"}', true);
+SELECT lives_ok(
+  $$UPDATE public.contacts SET opt_in = true, opted_out_at = NULL WHERE id = 'b0000000-0000-4000-8000-0000000000c9'$$,
+  'an admin can');
+RESET ROLE;
+SELECT results_eq(
+  $$SELECT payload->>'user_id', (payload->>'opt_out_cleared')::boolean FROM public.events
+     WHERE type = 'contact_opt_in_changed' AND payload->>'contact_id' = 'b0000000-0000-4000-8000-0000000000c9'$$,
+  $$VALUES ('b0000000-0000-4000-8000-0000000000e1'::text, true)$$,
+  'the override is recorded with who made it');
+
+-- the claim discards what expired instead of sending it late (nothing else queued)
 UPDATE public.automation_runs SET status = 'done', finished_at = now()
- WHERE workspace_id = 'b0000000-0000-4000-8000-000000000001';
+ WHERE status IN ('pending', 'processing');
 UPDATE public.automation_events SET occurred_at = now() - interval '3 hours' WHERE id = 900001;
 -- The rule has been on since yesterday (the trigger stamps enabled_since itself).
 ALTER TABLE public.automation_rules DISABLE TRIGGER trg_automation_rules_enabled_since;
@@ -820,6 +882,31 @@ SELECT results_eq(
      WHERE rule_id = 'b0000000-0000-4000-8000-0000000000a9' AND event_id = 900001$$,
   $$VALUES ('skipped'::text, 'stale'::text)$$,
   'it is closed as skipped/stale, with a trace');
+
+-- the claim gives up after the last attempt, keeping that attempt's cause
+INSERT INTO public.automation_events (id, workspace_id, event_type, subject_id, occurrence, conversation_id)
+  VALUES (900013, 'b0000000-0000-4000-8000-000000000001', 'inbound_message', gen_random_uuid(), '1',
+          'b0000000-0000-4000-8000-0000000000d9');
+INSERT INTO public.automation_runs (id, workspace_id, rule_id, event_id, trigger_type, conversation_id, status, attempts, error)
+  VALUES ('b0000000-0000-4000-8000-0000000000f4', 'b0000000-0000-4000-8000-000000000001',
+          'b0000000-0000-4000-8000-0000000000a9', 900013, 'keyword_match',
+          'b0000000-0000-4000-8000-0000000000d9', 'pending', 3, 'db_read_failed');
+SELECT is_empty($$SELECT * FROM public.claim_next_automation_run()$$,
+  'a run out of attempts is not handed out');
+SELECT is((SELECT error FROM public.automation_runs WHERE id = 'b0000000-0000-4000-8000-0000000000f4'),
+  'max_attempts:db_read_failed', 'and it fails with the cause of its last retry');
+
+-- what the tab shows per rule: server-only, one workspace at a time
+SELECT ok(NOT has_function_privilege('authenticated', 'public.automation_rule_health(uuid)', 'EXECUTE'),
+  'sessions cannot call automation_rule_health');
+SELECT ok(NOT has_function_privilege('authenticated', 'public.guard_contact_opt_in_change()', 'EXECUTE'),
+  'nor the opt-in guard');
+SELECT ok((SELECT failures_24h FROM public.automation_rule_health('b0000000-0000-4000-8000-000000000001')
+            WHERE rule_id = 'b0000000-0000-4000-8000-0000000000a9') >= 1,
+  'a rule''s failures in the last 24 hours are counted');
+SELECT is_empty($$SELECT 1 FROM public.automation_rule_health('a0000000-0000-4000-8000-000000000001')
+                   WHERE rule_id = 'b0000000-0000-4000-8000-0000000000a9'$$,
+  'another workspace''s health never lists this workspace''s rules');
 
 -- ── password-reset audit: append-only, server-only ──────────────────────────
 SELECT ok(NOT has_table_privilege('authenticated', 'public.member_password_resets', 'SELECT'),
