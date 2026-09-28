@@ -8,13 +8,11 @@ import { cn } from "@/lib/utils";
 import { findCatalogModel } from "@/features/agents/lib/model-catalog";
 import { formatWhatsAppMarkdown } from "@/features/inbox/services/text-formatter";
 import type { AgentDto } from "@/features/agents/types";
-
-interface Msg {
-  role: "user" | "assistant";
-  content: string;
-  /** An error shown in the panel, never sent back as part of the history. */
-  error?: boolean;
-}
+import {
+  afterFailure,
+  historyToSend,
+  type PlaygroundMsg as Msg,
+} from "@/features/agents/lib/playground-history";
 
 export function TestChatPanel({
   workspaceId,
@@ -54,28 +52,34 @@ export function TestChatPanel({
           method: "POST",
           headers: { "Content-Type": "application/json" },
           // Error bubbles stay in the panel: the model never sees them.
-          body: JSON.stringify({
-            messages: next
-              .filter((m) => !m.error)
-              .map(({ role, content }) => ({ role, content })),
-          }),
+          body: JSON.stringify({ messages: historyToSend(next) }),
         },
       );
-      const json = (await res.json()) as { text?: string; error?: string };
+      const json = (await res.json()) as {
+        text?: string;
+        error?: string;
+        wroteSomething?: boolean;
+      };
       setMessages((prev) => [
         ...prev,
-        res.ok
-          ? { role: "assistant", content: formatWhatsAppMarkdown(json.text ?? "") }
-          : {
-              role: "assistant",
-              content: `⚠️ ${json.error ?? "Error al generar la respuesta"}`,
-              error: true,
-            },
+        ...(res.ok
+          ? [{ role: "assistant" as const, content: formatWhatsAppMarkdown(json.text ?? "") }]
+          : afterFailure({
+              errorText: json.error ?? "Error al generar la respuesta",
+              wroteSomething: json.wroteSomething === true,
+              connectionLost: false,
+              isAdmin,
+            })),
       ]);
     } catch {
       setMessages((prev) => [
         ...prev,
-        { role: "assistant", content: "⚠️ Error de conexión", error: true },
+        ...afterFailure({
+          errorText: "Error de conexión",
+          wroteSomething: false,
+          connectionLost: true,
+          isAdmin,
+        }),
       ]);
     } finally {
       setLoading(false);
@@ -116,7 +120,9 @@ export function TestChatPanel({
                 "max-w-[85%] rounded-lg px-3 py-2 text-sm whitespace-pre-wrap",
                 m.role === "user"
                   ? "ml-auto bg-primary/15"
-                  : "mr-auto border border-border/60 bg-card",
+                  : m.note
+                    ? "mr-auto border border-dashed border-border/60 text-xs text-muted-foreground"
+                    : "mr-auto border border-border/60 bg-card",
               )}
             >
               {m.content}

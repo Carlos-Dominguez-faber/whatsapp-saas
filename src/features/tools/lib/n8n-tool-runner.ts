@@ -117,6 +117,8 @@ export function buildN8nToolRun(
       contact_id: ctx.contactId,
       idempotency_key: n8nIdempotencyKey(row, args, ctx),
       args,
+      // An admin's test in the playground: the workflow can tell it apart.
+      ...(ctx.playground ? { playground: true } : {}),
     });
 
     const remainingMs = Math.max(0, row.timeout_ms - (Date.now() - start));

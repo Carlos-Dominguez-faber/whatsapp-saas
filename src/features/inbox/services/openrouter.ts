@@ -241,7 +241,11 @@ export async function generateChatReply(params: {
 
   // Bridge Forge tools → AI SDK ToolSet (same shape as generateWithTools).
   // Once a tool that isn't read-only has run, a failed call is not retried:
-  // the whole turn would run, and repeat, that tool.
+  // the whole turn would run, and repeat, that tool. "Has run" is what the
+  // registry reports: a write the tool refused or reported as failed changed
+  // nothing (like the buffer's write record), and one that never started
+  // (bad arguments, a sensitive tool) doesn't count; one that threw or timed
+  // out (ok null) may have written, so it does.
   let wroteSomething = false;
   const aiTools: ToolSet = {};
   if (params.tools && params.toolContext) {
@@ -250,17 +254,17 @@ export async function generateChatReply(params: {
       aiTools[forgeTool.name] = tool({
         description: forgeTool.description,
         inputSchema: zodSchema(forgeTool.schema),
-        execute: async (args: unknown): Promise<unknown> => {
-          if (forgeTool.sensitivity !== "read") wroteSomething = true;
-          return registry.runTool(
-            forgeTool,
-            args,
-            ctx,
-            forgeTool.preferredTimeoutMs !== undefined
+        execute: async (args: unknown): Promise<unknown> =>
+          registry.runTool(forgeTool, args, ctx, {
+            ...(forgeTool.preferredTimeoutMs !== undefined
               ? { timeoutMs: forgeTool.preferredTimeoutMs }
-              : undefined,
-          );
-        },
+              : {}),
+            onExecuted: (execution) => {
+              if (execution.sensitivity !== "read" && execution.ok !== false) {
+                wroteSomething = true;
+              }
+            },
+          }),
       });
     }
   }

@@ -228,7 +228,11 @@ test("generateChatReply retries a transient failure, but never after a write too
     }
     throw transient;
   };
-  registryRun = async () => ({ ok: true, output: null });
+  // As the registry does: the write ran and reported done.
+  registryRun = async (name, _a, _c, o) => {
+    await o?.onExecuted?.({ callId: "c1", name, sensitivity: "write", ok: true });
+    return { ok: true, output: null };
+  };
   try {
     await assert.rejects(
       generateChatReply({
@@ -295,6 +299,74 @@ test("generateChatReply gives every tool call of one request the same seed, retr
     } as never);
     assert.equal(attempts, 2, "a read-only turn is retried");
     assert.deepEqual(seen, Array(4).fill("playground:seed-1"));
+  } finally {
+    generateImpl = null;
+    registryRun = async () => null;
+  }
+});
+
+test("generateChatReply still retries when the write tool refused or never started", async () => {
+  const transient = Object.assign(new Error("upstream 503"), { statusCode: 503 });
+  for (const run of [
+    // The tool refused (asked to type the phone): it reported failure, nothing changed.
+    async (name: string, o: RunOpts) => {
+      await o?.onExecuted?.({ callId: "c1", name, sensitivity: "write", ok: false });
+      return { ok: false, output: null, error: "Para probar el agendado, escribe en el chat el teléfono de prueba." };
+    },
+    // Bad arguments or a sensitive tool: the registry returns before running it.
+    async () => ({ ok: false, output: null, error: "Invalid input" }),
+  ]) {
+    let attempts = 0;
+    generateImpl = async (args) => {
+      attempts++;
+      if (attempts === 1) {
+        await args.tools?.book.execute({});
+        throw transient;
+      }
+      return { text: "ok", usage: LAST_STEP, totalUsage: ALL_STEPS, steps: [{}] };
+    };
+    registryRun = async (name, _a, _c, o) => run(name, o);
+    try {
+      const r = await generateChatReply({
+        systemPrompt: "s",
+        messages: [{ role: "user", content: "u" }],
+        workspaceId: "ws_1",
+        tools: [bookTool],
+        toolContext: { workspaceId: "ws_1", conversationId: "", contactId: "" },
+      } as never);
+      assert.equal(r.text, "ok");
+      assert.equal(attempts, 2, "nothing was written: the turn is retried");
+    } finally {
+      generateImpl = null;
+      registryRun = async () => null;
+    }
+  }
+});
+
+test("generateChatReply counts a write that threw or timed out (ok null) as maybe written", async () => {
+  const transient = Object.assign(new Error("upstream 503"), { statusCode: 503 });
+  let attempts = 0;
+  generateImpl = async (args) => {
+    attempts++;
+    await args.tools?.book.execute({});
+    throw transient;
+  };
+  registryRun = async (name, _a, _c, o) => {
+    await o?.onExecuted?.({ callId: "c1", name, sensitivity: "write", ok: null });
+    return { ok: false, output: null, error: "Tool timeout" };
+  };
+  try {
+    await assert.rejects(
+      generateChatReply({
+        systemPrompt: "s",
+        messages: [{ role: "user", content: "u" }],
+        workspaceId: "ws_1",
+        tools: [bookTool],
+        toolContext: { workspaceId: "ws_1", conversationId: "", contactId: "" },
+      } as never),
+      (err: unknown) => (err as { wroteSomething?: unknown }).wroteSomething === true,
+    );
+    assert.equal(attempts, 1);
   } finally {
     generateImpl = null;
     registryRun = async () => null;

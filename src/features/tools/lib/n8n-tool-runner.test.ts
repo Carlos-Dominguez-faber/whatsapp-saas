@@ -238,6 +238,16 @@ test("an invalid auth header (a migrated or hand-edited row) is never sent: the 
   }
 });
 
+test("a call from the playground says so in the body; a real one doesn't", async () => {
+  reset();
+  const run = buildN8nToolRun({ ...baseRow, mode: "sync", sensitivity: "write" });
+  await run({}, { ...ctx, conversationId: "", contactId: "", playground: { userId: "admin_1", userMessages: [] } });
+  await run({}, ctx);
+  const [fromPlayground, real] = fetchPinnedCalls.map((c) => JSON.parse(c.opts.body ?? "{}"));
+  assert.equal(fromPlayground.playground, true);
+  assert.equal(real.playground, undefined);
+});
+
 test("passes the resolved IP and the full timeout budget through when DNS is instant", async () => {
   reset();
   validateImpl = async () => ({ error: null, resolvedIp: "1.2.3.4" });
