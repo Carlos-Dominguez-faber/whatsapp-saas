@@ -39,6 +39,7 @@ interface Props {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   onSaved: (agent: Partial<AgentDto> & { id: string }) => void;
+  isAdmin?: boolean;
 }
 
 export function AgentConfigSheet({
@@ -47,6 +48,7 @@ export function AgentConfigSheet({
   open,
   onOpenChange,
   onSaved,
+  isAdmin = false,
 }: Props) {
   const meta = AGENT_TYPE_META[agent.type];
   const [name, setName] = useState(agent.name);
@@ -271,7 +273,7 @@ export function AgentConfigSheet({
           )}
 
           <TabsContent value="prueba">
-            <TestChatPanel workspaceId={workspaceId} agent={agent} />
+            <TestChatPanel workspaceId={workspaceId} agent={agent} isAdmin={isAdmin} />
           </TabsContent>
         </Tabs>
       </SheetContent>

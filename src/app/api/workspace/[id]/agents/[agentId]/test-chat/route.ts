@@ -205,14 +205,16 @@ export async function POST(
   });
 
   try {
-    // Only the workspace's read-only tools run in the playground (checking
-    // availability, an n8n lookup): a manager tests the agent, and must not
-    // book, cancel or fire the admin's n8n write workflows from here, with a
-    // draft prompt of their own. The seed gives every call of this request
-    // the same idempotency key base, retries included.
-    const tools = (await getEnabledTools(workspaceId)).filter(
-      (t) => t.sensitivity === "read",
-    );
+    // An admin tests with every tool the workspace has on, writes included
+    // (booking, cancelling, the n8n write workflows): they are the ones who
+    // turned them on. A manager gets only the read-only ones (checking
+    // availability, an n8n lookup): they must not book, cancel or fire the
+    // admin's write workflows from here, with a draft prompt of their own.
+    // The role comes from the membership read above, never from the request.
+    // The seed gives every call of this request the same idempotency key
+    // base, and generateChatReply doesn't retry a turn after a write.
+    const enabled = await getEnabledTools(workspaceId);
+    const tools = role === "admin" ? enabled : enabled.filter((t) => t.sensitivity === "read");
     const reply = await generateChatReply({
       model,
       systemPrompt,
@@ -245,6 +247,7 @@ export async function POST(
       inputTokens: reply.promptTokens,
       outputTokens: reply.completionTokens,
       model,
+      writeTools: role === "admin",
     });
   } catch (err) {
     console.error("[agents/test-chat]", err);

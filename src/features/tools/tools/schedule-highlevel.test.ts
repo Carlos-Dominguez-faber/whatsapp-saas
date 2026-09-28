@@ -92,6 +92,11 @@ function mockFetch(opts: {
       return jsonResponse(200, wantsObject ? row : [row]);
     }
 
+    // HighLevel: a contact upserted by phone (the playground books that way).
+    if (url.includes("leadconnectorhq.com/contacts/upsert")) {
+      return jsonResponse(200, { contact: { id: "hl_playground_contact" } });
+    }
+
     // HighLevel: the contact's appointments, and one appointment.
     if (url.includes("leadconnectorhq.com/contacts/hl_contact_1/appointments")) {
       return jsonResponse(200, { events: opts.hlContactEvents ?? [] });
@@ -494,4 +499,23 @@ test("a 5xx or no answer from HighLevel is an unknown outcome, not a failure", a
     runWith(dropped, { datetime_iso: "2027-06-12T10:00:00-06:00" }),
     (err: unknown) => err instanceof UnknownOutcomeError,
   );
+});
+
+test("an admin's playground booking (no conversation, a typed phone) stores no conversation id", async () => {
+  const { fn, calls } = mockFetch({ hlStatus: 200, hlBody: { id: "hl_evt_pg" }, appointmentInsertStatus: 201 });
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = fn as typeof fetch;
+  try {
+    const result = await scheduleHighLevelTool.run(
+      { datetime_iso: "2027-06-12T10:00:00-06:00", contact_phone: "+5215512345678" },
+      { workspaceId: "ws_1", conversationId: "", contactId: "" },
+    );
+    assert.equal(result.ok, true);
+    const booking = calls.find((c) => c.method === "POST" && c.url.endsWith("/calendars/events/appointments"));
+    assert.equal((booking?.body as { contactId: string }).contactId, "hl_playground_contact");
+    const row = calls.find((c) => c.url.includes("/rest/v1/appointments") && c.method === "POST");
+    assert.equal((row?.body as { conversation_id: unknown }).conversation_id, null);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });

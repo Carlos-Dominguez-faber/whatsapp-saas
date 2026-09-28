@@ -82,6 +82,7 @@ export function SettingsShell({
               initialAgents={initialAgents}
               jev={jev}
               canManage={role === "admin" || role === "manager"}
+              isAdmin={role === "admin"}
             />
           </div>
         </TabsContent>

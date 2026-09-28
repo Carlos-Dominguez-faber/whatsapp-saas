@@ -17,9 +17,12 @@ interface Msg {
 export function TestChatPanel({
   workspaceId,
   agent,
+  isAdmin = false,
 }: {
   workspaceId: string;
   agent: AgentDto;
+  /** An admin's test runs write tools too; the server decides by role. */
+  isAdmin?: boolean;
 }) {
   const [messages, setMessages] = useState<Msg[]>([]);
   const [input, setInput] = useState("");
@@ -79,6 +82,17 @@ export function TestChatPanel({
         modelo <span className="font-medium text-foreground">{modelLabel}</span>
         . Usa el prompt publicado. No se envía nada por WhatsApp.
       </p>
+      {isAdmin ? (
+        <p className="text-xs text-warning">
+          Como admin, aquí corren también las herramientas de escritura que estén
+          activas: una cita agendada o cancelada en la prueba es real.
+        </p>
+      ) : (
+        <p className="text-xs text-muted-foreground">
+          En tu prueba solo corren las herramientas de lectura; las de escritura
+          (agendar, cancelar, tools de n8n que escriben) solo corren para admins.
+        </p>
+      )}
 
       <div className="h-72 space-y-2 overflow-y-auto rounded-md border border-border/60 bg-muted/20 p-3">
         {messages.length === 0 ? (

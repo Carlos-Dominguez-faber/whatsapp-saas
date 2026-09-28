@@ -30,11 +30,14 @@ export function AgentsTab({
   initialAgents,
   jev,
   canManage,
+  isAdmin = false,
 }: {
   workspaceId: string;
   initialAgents: AgentDto[];
   jev: JevSettings;
   canManage: boolean;
+  /** Only an admin's playground runs write tools (the server decides; this is the note). */
+  isAdmin?: boolean;
 }) {
   const router = useRouter();
   const [agents, setAgents] = useState<AgentDto[]>(() =>
@@ -123,6 +126,7 @@ export function AgentsTab({
             if (!o) setEditing(null);
           }}
           onSaved={handleSaved}
+          isAdmin={isAdmin}
         />
       )}
 

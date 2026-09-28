@@ -15,10 +15,11 @@ let agentRow: Record<string, unknown> = {
   config: {},
 };
 
+let memberRole = "manager";
 const membershipChain: any = {
   select: () => membershipChain,
   eq: () => membershipChain,
-  maybeSingle: async () => ({ data: { role: "manager" }, error: null }),
+  maybeSingle: async () => ({ data: { role: memberRole }, error: null }),
 };
 mock.module("@/lib/supabase/server.ts", {
   exports: {
@@ -129,6 +130,7 @@ function reset() {
   guardResult = { ok: true, reservationId: "res_1" };
   policy = (model: string) => model;
   agentRow = { ...agentRow, model: "anthropic/claude-sonnet-4.6" };
+  memberRole = "manager";
 }
 
 test("the guard runs after the model policy and before the KB search and the model", async () => {
@@ -177,14 +179,16 @@ test("the playground calls the model the policy resolved (workspace default incl
   assert.equal(recorded[0].model, "openai/gpt-4o-mini");
 });
 
-test("the playground offers only read-only tools, with a stable idempotency seed", async () => {
+const WORKSPACE_TOOLS = [
+  { name: "check_availability", sensitivity: "read" },
+  { name: "schedule_highlevel", sensitivity: "write" },
+  { name: "n8n_crm_write", sensitivity: "write" },
+  { name: "n8n_lookup", sensitivity: "read" },
+];
+
+test("a manager's playground offers only read-only tools, with a stable idempotency seed", async () => {
   reset();
-  enabledTools = [
-    { name: "check_availability", sensitivity: "read" },
-    { name: "schedule_highlevel", sensitivity: "write" },
-    { name: "n8n_crm_write", sensitivity: "write" },
-    { name: "n8n_lookup", sensitivity: "read" },
-  ];
+  enabledTools = WORKSPACE_TOOLS;
   const res = await post();
   assert.equal(res.status, 200);
   assert.deepEqual(
@@ -192,4 +196,30 @@ test("the playground offers only read-only tools, with a stable idempotency seed
     ["check_availability", "n8n_lookup"],
   );
   assert.match(generateOpts[0].toolContext?.batchId ?? "", /^playground:/);
+  assert.equal((await res.json()).writeTools, false);
+});
+
+test("an admin's playground runs every enabled tool, writes included", async () => {
+  reset();
+  memberRole = "admin";
+  enabledTools = WORKSPACE_TOOLS;
+  const res = await post();
+  assert.equal(res.status, 200);
+  assert.deepEqual(
+    generateOpts[0].tools?.map((t) => t.name),
+    ["check_availability", "schedule_highlevel", "n8n_crm_write", "n8n_lookup"],
+  );
+  assert.match(generateOpts[0].toolContext?.batchId ?? "", /^playground:/);
+  assert.equal((await res.json()).writeTools, true);
+});
+
+test("the role comes from the membership, not from the request", async () => {
+  reset();
+  enabledTools = WORKSPACE_TOOLS;
+  const res = await post({ role: "admin", writeTools: true });
+  assert.equal(res.status, 200);
+  assert.deepEqual(
+    generateOpts[0].tools?.map((t) => t.name),
+    ["check_availability", "n8n_lookup"],
+  );
 });

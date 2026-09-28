@@ -298,7 +298,8 @@ async function run(args: Args, ctx: ToolContext, opts?: ToolRunOptions): Promise
   const row = {
     workspace_id: ctx.workspaceId,
     contact_id: dbContactId,
-    conversation_id: ctx.conversationId,
+    // The playground has no conversation.
+    conversation_id: ctx.conversationId || null,
     scheduled_at: new Date(start.ms).toISOString(),
     status: "booked",
     hl_appointment_id: appointmentId,
@@ -320,7 +321,7 @@ async function run(args: Args, ctx: ToolContext, opts?: ToolRunOptions): Promise
       type: "appointment_persist_failed",
       level: "error",
       workspace_id: ctx.workspaceId,
-      conversation_id: ctx.conversationId,
+      conversation_id: ctx.conversationId || null,
       payload: {
         provider: "highlevel",
         hl_appointment_id: appointmentId,
