@@ -39,6 +39,10 @@ function mockFetch(opts: {
   hlEvents?: Record<string, Record<string, unknown> | { httpStatus: number }>;
   /** The booking's 2xx body isn't JSON. */
   hlBodyRaw?: string;
+  /** The events table refuses inserts (the playground trace). */
+  eventsFail?: boolean;
+  /** The workspace's country code (business_info), for numbers typed without one. */
+  countryCode?: string;
 }) {
   const calls: FetchCall[] = [];
 
@@ -71,11 +75,13 @@ function mockFetch(opts: {
     }
 
     if (url.includes("/rest/v1/business_info")) {
+      const structured = {
+        ...(opts.businessTimezone ? { timezone: opts.businessTimezone } : {}),
+        ...(opts.countryCode ? { default_country_code: opts.countryCode } : {}),
+      };
       return jsonResponse(
         200,
-        opts.businessTimezone
-          ? [{ structured: { timezone: opts.businessTimezone }, free_text: null }]
-          : [],
+        Object.keys(structured).length > 0 ? [{ structured, free_text: null }] : [],
       );
     }
 
@@ -133,9 +139,15 @@ function mockFetch(opts: {
       );
     }
 
-    // Supabase events table: log errors when persistence fails
+    // Supabase events table: the playground trace (insert, then its
+    // outcome), and persist failures.
     if (url.includes("/rest/v1/events") && method === "POST") {
-      return jsonResponse(201, {});
+      if (opts.eventsFail) return jsonResponse(500, { message: "db down" });
+      const wantsObject = new Headers(init?.headers).get("Accept")?.includes("pgrst.object");
+      return jsonResponse(201, wantsObject ? { id: "evt_trace" } : [{ id: "evt_trace" }]);
+    }
+    if (url.includes("/rest/v1/events") && method === "PATCH") {
+      return new Response(null, { status: 204 });
     }
 
     throw new Error(`unexpected fetch call: ${method} ${url}`);
@@ -534,21 +546,28 @@ test("playground: a phone the tester typed books a marked test appointment, with
   );
   assert.equal(result.ok, true);
 
-  // An existing HighLevel contact on that number keeps its name.
+  // The number as typed (placed), and an existing contact keeps its name.
   const upsert = calls.find((c) => c.url.includes("/contacts/upsert"));
-  assert.deepEqual(upsert?.body, { locationId: "loc_1", phone: "+525512345678" });
+  assert.deepEqual(upsert?.body, { locationId: "loc_1", phone: "+5215512345678" });
 
   const booking = calls.find((c) => c.method === "POST" && c.url.endsWith("/calendars/events/appointments"));
   assert.equal((booking?.body as { contactId: string }).contactId, "hl_playground_contact");
   assert.match((booking?.body as { title: string }).title, /^\[Prueba\] /);
 
-  // Who ran it, with what phone.
-  const trace = calls.find((c) => c.url.includes("/rest/v1/events") && c.method === "POST");
-  const event = trace?.body as { type: string; payload: Record<string, unknown> };
+  // Who ran it, with what phone — recorded before HighLevel is touched —
+  // and then how it went.
+  const traceAt = calls.findIndex((c) => c.url.includes("/rest/v1/events") && c.method === "POST");
+  const upsertAt = calls.findIndex((c) => c.url.includes("/contacts/upsert"));
+  assert.ok(traceAt >= 0 && traceAt < upsertAt, "the trace comes first");
+  const event = calls[traceAt].body as { type: string; payload: Record<string, unknown> };
   assert.equal(event.type, "playground_write");
   assert.equal(event.payload.user_id, "admin_1");
   assert.equal(event.payload.tool, "schedule_highlevel");
-  assert.equal(event.payload.phone, "+525512345678");
+  assert.equal(event.payload.phone, "+5215512345678");
+  assert.equal(event.payload.outcome, "attempted");
+  const outcome = calls.find((c) => c.url.includes("/rest/v1/events") && c.method === "PATCH");
+  assert.equal((outcome?.body as { payload: Record<string, unknown> }).payload.outcome, "booked");
+  assert.equal((outcome?.body as { payload: Record<string, unknown> }).payload.appointment_id, "hl_evt_pg");
 
   // No conversation: null, not "".
   const row = calls.find((c) => c.url.includes("/rest/v1/appointments") && c.method === "POST");
@@ -591,4 +610,104 @@ test("the tool's descriptions carry no example phone the model could use", () =>
   const texts = [scheduleHighLevelTool.description, ...Object.values(shape).map((f) => f.description ?? "")];
   assert.match(shape.contact_phone.description ?? "", /tal como el usuario lo escribió/);
   for (const text of texts) assert.doesNotMatch(text, /\+\d[\d\s]{9,}/, text);
+});
+
+/** The phone HighLevel was asked to upsert, if any. */
+const upsertedPhone = (calls: FetchCall[]) =>
+  (calls.find((c) => c.url.includes("/contacts/upsert"))?.body as { phone?: string } | undefined)?.phone;
+
+test("playground: a Mexican mobile typed with its old 1 is not a US number the model can swap in", async () => {
+  const { fn, calls } = mockFetch({ hlStatus: 200, hlBody: { id: "x" }, appointmentInsertStatus: 201 });
+  // "1 55 1234 5678", bare, is a Mexican mobile (+52 1 55…); "+15512345678" is a US line.
+  const result = await runInPlayground(fn as typeof fetch, { contact_phone: "+15512345678" }, [
+    "mi cel es 1 55 1234 5678",
+  ]);
+  assert.equal(result.ok, false);
+  assert.equal(upsertedPhone(calls), undefined);
+
+  // The model's value for the same line books the typed number.
+  const ok = mockFetch({ hlStatus: 200, hlBody: { id: "x" }, appointmentInsertStatus: 201 });
+  const booked = await runInPlayground(ok.fn as typeof fetch, { contact_phone: "+525512345678" }, [
+    "mi cel es 1 55 1234 5678",
+  ]);
+  assert.equal(booked.ok, true);
+  assert.equal(upsertedPhone(ok.calls), "+525512345678");
+});
+
+test("playground: an Argentine mobile typed with its 9 is not an Indian number", async () => {
+  const { fn, calls } = mockFetch({
+    hlStatus: 200,
+    hlBody: { id: "x" },
+    appointmentInsertStatus: 201,
+    countryCode: "54",
+  });
+  const result = await runInPlayground(fn as typeof fetch, { contact_phone: "+91123456789" }, [
+    "llamame al 9 11 2345 6789",
+  ]);
+  assert.equal(result.ok, false);
+  assert.equal(upsertedPhone(calls), undefined);
+
+  const ok = mockFetch({ hlStatus: 200, hlBody: { id: "x" }, appointmentInsertStatus: 201, countryCode: "54" });
+  const booked = await runInPlayground(ok.fn as typeof fetch, { contact_phone: "+5491123456789" }, [
+    "llamame al 9 11 2345 6789",
+  ]);
+  assert.equal(booked.ok, true);
+  assert.equal(upsertedPhone(ok.calls), "+541123456789");
+});
+
+test("playground: whatever the model adds to the number, HighLevel gets the typed one", async () => {
+  const { fn, calls } = mockFetch({ hlStatus: 200, hlBody: { id: "x" }, appointmentInsertStatus: 201 });
+  const result = await runInPlayground(fn as typeof fetch, { contact_phone: "+529981112222 (casa)" }, [
+    "es el +52 998 111 2222",
+  ]);
+  assert.equal(result.ok, true);
+  assert.equal(upsertedPhone(calls), "+529981112222");
+
+  // Digits the tester never typed make it another number.
+  const extra = mockFetch({ hlStatus: 200, hlBody: { id: "x" }, appointmentInsertStatus: 201 });
+  const refused = await runInPlayground(extra.fn as typeof fetch, { contact_phone: "+52 998 111 2222 ext 5" }, [
+    "es el +52 998 111 2222",
+  ]);
+  assert.equal(refused.ok, false);
+});
+
+test("playground: the same digits under another country code are another line", async () => {
+  const { fn, calls } = mockFetch({ hlStatus: 200, hlBody: { id: "x" }, appointmentInsertStatus: 201 });
+  const result = await runInPlayground(fn as typeof fetch, { contact_phone: "+1 998 111 2222" }, [
+    "es el +52 998 111 2222",
+  ]);
+  assert.equal(result.ok, false);
+  assert.equal(upsertedPhone(calls), undefined);
+});
+
+test("playground: without its trace, nothing is booked", async () => {
+  const { fn, calls } = mockFetch({
+    hlStatus: 200,
+    hlBody: { id: "x" },
+    appointmentInsertStatus: 201,
+    eventsFail: true,
+  });
+  const result = await runInPlayground(fn as typeof fetch, { contact_phone: "+529981112222" }, [
+    "+52 998 111 2222",
+  ]);
+  assert.equal(result.ok, false);
+  assert.match(result.error ?? "", /NO se agendó/);
+  assert.ok(!calls.some((c) => c.url.includes("leadconnectorhq")), "HighLevel untouched");
+});
+
+test("playground: a refused or unknown booking is recorded as such in its trace", async () => {
+  const outcomeOf = (calls: FetchCall[]) =>
+    (calls.find((c) => c.url.includes("/rest/v1/events") && c.method === "PATCH")?.body as {
+      payload: { outcome: string };
+    } | undefined)?.payload.outcome;
+
+  const refused = mockFetch({ hlStatus: 401, hlBody: { message: "Invalid JWT" }, appointmentInsertStatus: 201 });
+  await runInPlayground(refused.fn as typeof fetch, { contact_phone: "+529981112222" }, ["+52 998 111 2222"]);
+  assert.equal(outcomeOf(refused.calls), "refused");
+
+  const unknown = mockFetch({ hlStatus: 503, appointmentInsertStatus: 201 });
+  await assert.rejects(
+    runInPlayground(unknown.fn as typeof fetch, { contact_phone: "+529981112222" }, ["+52 998 111 2222"]),
+  );
+  assert.equal(outcomeOf(unknown.calls), "unknown");
 });

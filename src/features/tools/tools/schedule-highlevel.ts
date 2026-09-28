@@ -74,17 +74,29 @@ const PHONE_LIKE = /\+?\d[\d\s().-]{6,}\d/g;
 /**
  * The playground has no contact: it books on a phone the tester typed in
  * this conversation, never one the model came up with (a real person's
- * number would get a real appointment and HighLevel's confirmations).
+ * number would get a real appointment and HighLevel's confirmations). Both
+ * are read as a person writes them (placePhone, with the workspace's
+ * country: "1 55 1234 5678" is a Mexican mobile, not a US number) and must
+ * be the same line. Returns the TYPED number's E.164, or null.
  */
 function phoneTypedByTester(
   phone: string,
   userMessages: string[],
   countryCode: string,
-  samePhone: (a: string, b: string, cc?: string) => boolean,
-): boolean {
-  return userMessages.some((message) =>
-    (message.match(PHONE_LIKE) ?? []).some((typed) => samePhone(typed, phone, countryCode)),
-  );
+  phones: {
+    placePhone: (p: string, cc?: string) => { e164: string } | null;
+    samePhone: (a: string, b: string, cc?: string) => boolean;
+  },
+): string | null {
+  const wanted = phones.placePhone(phone, countryCode);
+  if (!wanted) return null;
+  for (const message of userMessages) {
+    for (const typed of message.match(PHONE_LIKE) ?? []) {
+      const placed = phones.placePhone(typed, countryCode);
+      if (placed && phones.samePhone(placed.e164, wanted.e164)) return placed.e164;
+    }
+  }
+  return null;
 }
 
 const UNKNOWN_BOOKING =
@@ -139,17 +151,18 @@ async function run(args: Args, ctx: ToolContext, opts?: ToolRunOptions): Promise
   let phone: string | null = null;
   let name = args.contact_name ?? null;
   const playground = !ctx.contactId ? ctx.playground : undefined;
+  let traceId: string | null = null;
   if (playground) {
-    const { samePhone } = await import("../../inbox/services/phone.ts");
+    const { placePhone, samePhone } = await import("../../inbox/services/phone.ts");
     const { workspaceCountryCode } = await import("../../inbox/services/country-code.ts");
-    const typed =
-      args.contact_phone &&
-      phoneTypedByTester(
-        args.contact_phone,
-        playground.userMessages,
-        await workspaceCountryCode(supabase, ctx.workspaceId),
-        samePhone,
-      );
+    const typed = args.contact_phone
+      ? phoneTypedByTester(
+          args.contact_phone,
+          playground.userMessages,
+          await workspaceCountryCode(supabase, ctx.workspaceId),
+          { placePhone, samePhone },
+        )
+      : null;
     if (!typed) {
       return {
         ok: false,
@@ -157,10 +170,60 @@ async function run(args: Args, ctx: ToolContext, opts?: ToolRunOptions): Promise
         error: "Para probar el agendado, escribe en el chat el teléfono de prueba.",
       };
     }
-    phone = args.contact_phone!;
+    // The number as the tester wrote it, never the model's version of it.
+    phone = typed;
     // An existing HighLevel contact on that number keeps its name.
     name = null;
+
+    // A real appointment from the playground leaves who, what and where
+    // before anything is written in HighLevel; without that trace, nothing is.
+    const { data: trace, error: traceError } = await supabase
+      .from("events")
+      .insert({
+        type: "playground_write",
+        level: "warn",
+        workspace_id: ctx.workspaceId,
+        payload: {
+          user_id: playground.userId,
+          tool: "schedule_highlevel",
+          phone,
+          start_time: startTime,
+          calendar_id: calendarId,
+          outcome: "attempted",
+        },
+      })
+      .select("id")
+      .single();
+    if (traceError || !trace) {
+      console.error("[schedule_highlevel] playground trace failed:", traceError?.message);
+      return {
+        ok: false,
+        output: null,
+        error: "No pude registrar la prueba, así que la cita NO se agendó. Inténtalo de nuevo.",
+      };
+    }
+    traceId = (trace as { id: string }).id;
   }
+  /** The playground trace's outcome. Never throws. */
+  const traceOutcome = async (outcome: string, extra: Record<string, unknown> = {}) => {
+    if (!traceId || !playground) return;
+    const { error } = await supabase
+      .from("events")
+      .update({
+        payload: {
+          user_id: playground.userId,
+          tool: "schedule_highlevel",
+          phone,
+          start_time: startTime,
+          calendar_id: calendarId,
+          outcome,
+          ...extra,
+        },
+      })
+      .eq("id", traceId)
+      .eq("workspace_id", ctx.workspaceId);
+    if (error) console.warn("[schedule_highlevel] playground trace outcome failed:", error.message);
+  };
   let hlContactId: string | null = null;
   let dbContactId: string | null = null;
 
@@ -199,6 +262,7 @@ async function run(args: Args, ctx: ToolContext, opts?: ToolRunOptions): Promise
   }
 
   if (!hlContactId) {
+    await traceOutcome("not_sent", { reason: "contact_upsert_failed" });
     return {
       ok: false,
       output: null,
@@ -265,28 +329,12 @@ async function run(args: Args, ctx: ToolContext, opts?: ToolRunOptions): Promise
 
   // Nothing was written yet: saying so is true.
   if (!hasTimeToWrite(startedAt, budgetMs)) {
+    await traceOutcome("not_sent", { reason: "no_time" });
     return {
       ok: false,
       output: null,
       error: "El calendario tardó demasiado, así que la cita NO se agendó. Dile al cliente que lo intentas de nuevo en un momento.",
     };
-  }
-
-  // A real appointment from the playground: leave who, what and where.
-  if (playground) {
-    const { error: traceError } = await supabase.from("events").insert({
-      type: "playground_write",
-      level: "warn",
-      workspace_id: ctx.workspaceId,
-      payload: {
-        user_id: playground.userId,
-        tool: "schedule_highlevel",
-        phone,
-        start_time: startTime,
-        calendar_id: calendarId,
-      },
-    });
-    if (traceError) console.warn("[schedule_highlevel] playground trace failed:", traceError.message);
   }
 
   let res: Response;
@@ -311,6 +359,7 @@ async function run(args: Args, ctx: ToolContext, opts?: ToolRunOptions): Promise
   } catch (err) {
     // Sent, and no answer: the booking may exist.
     console.error("[schedule_highlevel] booking got no answer:", err);
+    await traceOutcome("unknown");
     throw new UnknownOutcomeError(UNKNOWN_BOOKING);
   }
 
@@ -319,7 +368,11 @@ async function run(args: Args, ctx: ToolContext, opts?: ToolRunOptions): Promise
     // it, but give the model a plain reason it can relay.
     const detail = (await res.text()).slice(0, 300);
     console.error(`[schedule_highlevel] HighLevel ${res.status}:`, detail);
-    if (res.status >= 500) throw new UnknownOutcomeError(UNKNOWN_BOOKING);
+    if (res.status >= 500) {
+      await traceOutcome("unknown", { status: res.status });
+      throw new UnknownOutcomeError(UNKNOWN_BOOKING);
+    }
+    await traceOutcome("refused", { status: res.status });
     if (SLOT_TAKEN.test(detail)) return slotTaken();
     // Credentials, the calendar or the request itself: a person fixes it.
     await noteForTeam(
@@ -391,6 +444,7 @@ async function run(args: Args, ctx: ToolContext, opts?: ToolRunOptions): Promise
     });
   }
 
+  await traceOutcome("booked", { appointment_id: appointmentId });
   return {
     ok: true,
     output: {
