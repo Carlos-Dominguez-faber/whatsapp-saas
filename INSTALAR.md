@@ -593,19 +593,27 @@ Sin el paso 3 no corre nada: las reglas se guardan, pero ningún job las ejecuta
   la regla, 8 a 22 por defecto). **Acciones:** mandar plantilla, asignar a un
   agente, etiquetar, cerrar y pasar a humano. Hasta 20 reglas activas por workspace.
 - **Nada se manda tarde:** cada evento vence si no se ejecutó a tiempo (palabra
-  clave 1 h, pide humano 2 h, primer mensaje, lead calificado y recordatorio 6 h).
-  Un recordatorio de una cita que ya pasó se descarta, y también uno que llegaría
-  con menos de la mitad de su anticipación (mínimo 30 minutos): por ejemplo, un
-  recordatorio de 24 h no sale si la cita ya está a menos de 12 h (pasa al
-  encender una regla nueva o si el cron estuvo caído). Al ejecutarse se vuelve a
-  revisar el horario de envío de la regla.
+  clave 1 h, pide humano 2 h, primer mensaje y lead calificado 6 h).
+- **Cuándo sale un recordatorio:** toca `hours_before` antes de la cita; si esa hora
+  cae fuera del horario de envío de la regla (8 a 22 por defecto), toca cuando el
+  horario abre. Sale en ese momento. Se omite solo si:
+  - faltan menos de 30 minutos para la cita (o ya pasó);
+  - le tocaba antes de encender la regla (una regla nueva no manda los recordatorios
+    que ya debían haber salido);
+  - pasaron más de 30 minutos de horario de envío desde que le tocaba (el cron
+    estuvo caído).
+
+  Si al ejecutarse está fuera del horario, espera a que abra. Los cambios de horario
+  de verano pueden correr esa apertura una hora.
 - **Recordatorios con la hora local del negocio:** la zona sale de la misma
   configuración que la agenda de la Fase 3 (Business info o HighLevel; si no hay
   ninguna, `America/Mexico_City`). Antes de mandarlo, la app confirma la cita en
-  HighLevel: si la cancelaron o la movieron, no manda el recordatorio y actualiza la
-  cita local. Si HighLevel no responde, no encuentra la cita o devuelve un estado
-  desconocido, reintenta en vez de mandarlo a ciegas (y no marca la cita como
-  cancelada).
+  HighLevel, antes que cualquier otra revisión: si la cancelaron o la movieron, no
+  manda el recordatorio y actualiza la cita local (si esa escritura falla, reintenta).
+  Si HighLevel no responde, no encuentra la cita o devuelve un estado desconocido,
+  reintenta en vez de mandarlo a ciegas (y no marca la cita como cancelada). Una
+  cita de HighLevel en un workspace sin HighLevel conectado no recibe recordatorio
+  (motivo `hl_not_connected`).
 - **Límites de envío:** una misma regla no le manda plantilla al mismo contacto más
   de una vez cada 24 horas (en los recordatorios, el límite es por cita: dos citas
   del mismo contacto reciben cada una el suyo), y un workspace no manda más de 300
@@ -630,17 +638,26 @@ Sin el paso 3 no corre nada: las reglas se guardan, pero ningún job las ejecuta
   "Detener promociones" / "Stop promotions" (sin importar mayúsculas ni acentos),
   queda dado de baja de las **automatizaciones y plantillas**. El agente y el equipo
   **sí** pueden seguir respondiéndole mientras su conversación esté abierta (24 h
-  desde su último mensaje). Escribir de nuevo **no** lo vuelve a dar de alta; vuelve
-  con `START`, `SUSCRIBIRME` o `REANUDAR MENSAJES`. Palabras sueltas como "baja",
-  "alta" o "alto" no cuentan (son respuestas normales: "¿planta alta o baja?"), ni
-  una frase que solo contiene la palabra ("quiero darme de baja del plan"). Un STOP
-  que el proveedor reenvía (mismo mensaje) no deshace un START posterior.
+  desde su último mensaje); el aviso automático de traspaso de una automatización no
+  le llega. Escribir de nuevo **no** lo vuelve a dar de alta; vuelve con `START`,
+  `SUSCRIBIRME` o `REANUDAR MENSAJES`. Palabras sueltas como "baja", "alta" o "alto"
+  no cuentan (son respuestas normales: "¿planta alta o baja?"), ni una frase que solo
+  contiene la palabra ("quiero darme de baja del plan"). La base de datos aplica la
+  baja junto con el mensaje, así que no se pierde ni la deshace un reenvío del mismo
+  mensaje.
+- **La baja es del número:** queda en `contact_opt_outs` por teléfono, así que borrar
+  y volver a crear el contacto, o pasarle ese número a otro contacto, no la quita.
+  Solo un admin o manager puede borrar contactos.
 - **Reactivar a mano:** en el panel del contacto, solo un **admin o manager** puede
   volver a dar de alta a quien pidió la baja; la base lo exige también. Cada cambio
   manual de opt-in queda como evento `contact_opt_in_changed` con quién lo hizo.
-  Guardar el panel sin tocar el interruptor ya no cambia el opt-in (antes, un panel
-  abierto desde antes del STOP lo deshacía al guardar). Las bajas manuales hechas
-  antes de esta versión cuentan como bajas explícitas.
+  Guardar el panel sin tocar el interruptor ya no cambia el opt-in, y si el contacto
+  escribe STOP mientras guardas, la app pide recargar en vez de borrarlo. Las bajas
+  manuales hechas antes de esta versión cuentan como bajas explícitas (el `db push`
+  imprime cuántas y deja un evento por cada una).
+- **Pie de baja de las plantillas:** usa "Responde STOP para no recibir más
+  mensajes" (el generador con IA y la casilla del formulario lo ponen igual). No
+  escribas "BAJA": ya no da de baja a nadie.
 - **Permisos:** las reglas, los eventos y la cola de ejecuciones solo los escribe el
   servidor; los miembros solo los leen. Una automatización nunca puede apuntar a un
   contacto o conversación de otro workspace.
