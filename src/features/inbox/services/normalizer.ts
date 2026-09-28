@@ -3,6 +3,7 @@ import type { OutboundEcho } from "./kapso-webhook-handler";
 import type { ContactRow, ConversationRow, MessageRow } from "../types/index";
 import type { ConversationState } from "./state-machine";
 import { DEFAULT_COUNTRY_CODE, normalizePhone } from "./phone";
+import { optOutIntent } from "./opt-out";
 
 /**
  * The fields every provider's webhook parser produces (YCloud's and Kapso's
@@ -63,8 +64,9 @@ export async function processInbound(
 
   // 1. Upsert contact
   // A user messaging the business first is implicit opt-in for service
-  // messages within the 24h window, so inbound contacts are opted in.
-  // (STOP-keyword opt-out handling is future work and would guard this.)
+  // messages within the 24h window, so inbound contacts are opted in — unless
+  // they opted out explicitly: trg_contacts_keep_opt_out keeps opt_in false
+  // while contacts.opted_out_at is set.
   const { data: contactData, error: contactError } = await supabase
     .from("contacts")
     .upsert(
@@ -90,7 +92,32 @@ export async function processInbound(
     );
   }
 
-  const contact = contactData as ContactRow;
+  let contact = contactData as ContactRow;
+
+  // 1b. STOP/BAJA opts the contact out of proactive messages; ALTA/START opts
+  //     them back in. Recorded before anything else runs on this message.
+  const intent = normalized.type === "text" ? optOutIntent(normalized.text) : null;
+  if (intent) {
+    const now = new Date().toISOString();
+    const { data: updated, error: optError } = await supabase
+      .from("contacts")
+      .update(
+        intent === "stop"
+          ? { opt_in: false, opted_out_at: now }
+          : { opt_in: true, opt_in_at: now, opted_out_at: null },
+      )
+      .eq("id", contact.id)
+      .eq("workspace_id", workspaceId)
+      .select()
+      .maybeSingle();
+    if (optError) {
+      // Before the migration that adds opted_out_at this fails; the message
+      // itself must still be stored.
+      console.error("[normalizer] opt-out update failed:", optError.message);
+    } else if (updated) {
+      contact = updated as ContactRow;
+    }
+  }
 
   // 2. Upsert conversation — reset 24h window on every inbound
   const windowExpiresAt = new Date(

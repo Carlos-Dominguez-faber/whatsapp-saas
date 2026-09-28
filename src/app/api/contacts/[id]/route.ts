@@ -6,6 +6,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
 import { createClient } from "@/lib/supabase/server";
+import { manualOptInFields } from "@/features/inbox/services/opt-out";
 
 const PatchContactSchema = z.object({
   name: z.string().min(1, "El nombre no puede estar vacío").optional(),
@@ -67,7 +68,11 @@ export async function PATCH(req: NextRequest, { params }: RouteParams) {
   // 4. Update (RLS enforces workspace ownership)
   const { data: updated, error: updateError } = await supabase
     .from("contacts")
-    .update({ ...parsed.data, updated_at: new Date().toISOString() })
+    .update({
+      ...parsed.data,
+      ...manualOptInFields(parsed.data.opt_in),
+      updated_at: new Date().toISOString(),
+    })
     .eq("id", contactId)
     .select()
     .single();

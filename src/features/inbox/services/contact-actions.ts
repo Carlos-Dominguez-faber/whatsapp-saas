@@ -9,6 +9,7 @@ import { createClient } from "@/lib/supabase/server";
 import { checkWorkspaceMember } from "@/lib/auth/workspace-access";
 import { syncContactToHL } from "./highlevel-client";
 import type { ContactRow } from "@/features/inbox/types";
+import { manualOptInFields } from "./opt-out";
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Schemas
@@ -62,7 +63,11 @@ export async function updateContact(
   // 3. Update contact (RLS ensures user can only update their workspace's contacts)
   const { data: updated, error: updateError } = await supabase
     .from("contacts")
-    .update({ ...parsed.data, updated_at: new Date().toISOString() })
+    .update({
+      ...parsed.data,
+      ...manualOptInFields(parsed.data.opt_in),
+      updated_at: new Date().toISOString(),
+    })
     .eq("id", contactId)
     .select("id, workspace_id")
     .single();
