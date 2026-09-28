@@ -80,7 +80,19 @@ const fakeSvc = {
   from: () => ({
     select: (_cols?: string, opts?: { count?: string; head?: boolean }) => {
       if (opts?.head) return countChain();
-      return { single: async () => ({ data: { id: "rule_x" }, error: null }) };
+      const listFilters: unknown[][] = [];
+      const q: Record<string, unknown> = {
+        single: async () => ({ data: { id: "rule_x" }, error: null }),
+        eq: (col: string, val: unknown) => {
+          listFilters.push([col, val]);
+          return q;
+        },
+        order: async () => {
+          listCalls.push(listFilters);
+          return { data: [{ id: "rule_1", workspace_id: "ws_1" }], error: null };
+        },
+      };
+      return q;
     },
     insert: (row: unknown) => {
       inserted.push(row);
@@ -133,6 +145,22 @@ const fakeSvc = {
 
 mock.module("@supabase/supabase-js", {
   exports: { createClient: () => fakeSvc },
+});
+
+const listCalls: unknown[][][] = [];
+const healthCalls: string[] = [];
+const HEALTH = {
+  rules: { rule_1: { lastStatus: "failed", lastError: "send_rejected", lastFinishedAt: null, failures24h: 1 } },
+  dailyCapHit: false,
+  outcomeUnknown24h: 0,
+};
+mock.module("@/features/automations/services/rule-health.ts", {
+  exports: {
+    loadAutomationHealth: async (_db: unknown, workspaceId: string) => {
+      healthCalls.push(workspaceId);
+      return HEALTH;
+    },
+  },
 });
 
 const { GET, POST, PATCH, DELETE } = await import("./route.ts");
@@ -464,4 +492,19 @@ test("DELETE: sin usuario autenticado responde 401", async () => {
   const res = await DELETE(deleteReq({ id: RULE_ID }), params);
   assert.equal(res.status, 401);
   assert.equal(deleted.length, 0);
+});
+
+test("GET: returns the workspace's rules with their health, both scoped to it", async () => {
+  authUser = { id: "user_1" };
+  memberRow = { role: "agent" };
+  memberActive = true;
+  listCalls.length = 0;
+  healthCalls.length = 0;
+  const res = await GET(new NextRequest("http://localhost/api/workspace/ws_1/automations"), params);
+  assert.equal(res.status, 200);
+  const body = (await res.json()) as { data: unknown[]; health: unknown };
+  assert.deepEqual(body.health, HEALTH);
+  assert.deepEqual(listCalls, [[["workspace_id", "ws_1"]]]);
+  assert.deepEqual(healthCalls, ["ws_1"]);
+  memberRow = { role: "admin" };
 });

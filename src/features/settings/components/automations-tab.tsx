@@ -27,6 +27,10 @@ import {
   type ActionType,
 } from "../services/automation-actions";
 import { AutomationRuleForm } from "./automation-rule-form";
+import type {
+  AutomationHealth,
+  RuleHealth,
+} from "@/features/automations/services/rule-health";
 import type { TemplateRow } from "@/features/inbox/services/templates";
 
 // ── Trigger metadata ──────────────────────────────────────────────────────────
@@ -133,8 +137,69 @@ const PAUSED_REASON_LABELS: Record<string, string> = {
     "Apagada porque Meta pausó su plantilla. Revisa la plantilla antes de activarla.",
 };
 
+const STATUS_LABELS: Record<string, string> = {
+  done: "Se ejecutó",
+  skipped: "Se omitió",
+  failed: "Falló",
+};
+
+/** The run causes a person needs to read; any other shows as its code. */
+const REASON_LABELS: Record<string, string> = {
+  cooldown: "ya le había enviado en las últimas 24 h",
+  daily_cap: "se alcanzó el tope diario",
+  opted_out: "el contacto pidió no recibir mensajes",
+  outcome_unknown: "no se sabe si llegó",
+  send_rejected: "WhatsApp la rechazó",
+  template_paused: "Meta pausó la plantilla",
+  reminder_too_late: "demasiado cerca de la cita",
+  outside_send_window: "fuera del horario de envío",
+  appointment_not_active: "la cita ya no está activa",
+  appointment_moved: "la cita cambió de hora",
+  appointment_passed: "la cita ya pasó",
+  stale: "el evento venció",
+  rule_reenabled: "ocurrió antes de activar la regla",
+  rule_disabled: "la regla estaba apagada",
+  no_conversation: "sin conversación",
+};
+
+function reasonLabel(code: string): string {
+  if (code.startsWith("missing_variable:")) {
+    return `falta el dato ${code.slice("missing_variable:".length)}`;
+  }
+  if (code.startsWith("max_attempts:")) {
+    return `se agotaron los intentos (${code.slice("max_attempts:".length)})`;
+  }
+  return REASON_LABELS[code] ?? code;
+}
+
+function RuleHealthLine({ health }: { health: RuleHealth | undefined }) {
+  if (!health?.lastStatus) return null;
+  const when = health.lastFinishedAt
+    ? new Date(health.lastFinishedAt).toLocaleString("es-MX", {
+        dateStyle: "short",
+        timeStyle: "short",
+      })
+    : null;
+  return (
+    <p className="text-xs text-muted-foreground">
+      Última ejecución: {STATUS_LABELS[health.lastStatus] ?? health.lastStatus}
+      {health.lastError && health.lastStatus !== "done"
+        ? ` (${reasonLabel(health.lastError)})`
+        : ""}
+      {when ? ` · ${when}` : ""}
+      {health.failures24h > 0 && (
+        <span className="text-destructive">
+          {" "}
+          · {health.failures24h} falla{health.failures24h !== 1 ? "s" : ""} en 24 h
+        </span>
+      )}
+    </p>
+  );
+}
+
 interface RuleCardProps {
   rule: AutomationRule;
+  health: RuleHealth | undefined;
   onEdit: (rule: AutomationRule) => void;
   onDelete: (rule: AutomationRule) => void;
   onToggle: (rule: AutomationRule, enabled: boolean) => void;
@@ -143,6 +208,7 @@ interface RuleCardProps {
 
 function RuleCard({
   rule,
+  health,
   onEdit,
   onDelete,
   onToggle,
@@ -207,6 +273,7 @@ function RuleCard({
                 </span>
               )}
           </div>
+          <RuleHealthLine health={health} />
           {!rule.enabled && rule.paused_reason && (
             <p className="text-xs text-amber-700 dark:text-amber-400">
               {PAUSED_REASON_LABELS[rule.paused_reason] ??
@@ -258,6 +325,7 @@ interface Props {
 
 export function AutomationsTab({ workspaceId }: Props) {
   const [rules, setRules] = useState<AutomationRule[]>([]);
+  const [health, setHealth] = useState<AutomationHealth | null>(null);
   const [templates, setTemplates] = useState<TemplateRow[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -284,6 +352,7 @@ export function AutomationsTab({ workspaceId }: Props) {
 
       const rulesJson = (await rulesRes.json()) as {
         data?: AutomationRule[];
+        health?: AutomationHealth | null;
         error?: string;
       };
       const templatesJson = (await templatesRes.json()) as {
@@ -296,6 +365,7 @@ export function AutomationsTab({ workspaceId }: Props) {
       }
 
       setRules(rulesJson.data ?? []);
+      setHealth(rulesJson.health ?? null);
       setTemplates(templatesJson.data ?? []);
     } catch (err) {
       const msg =
@@ -431,6 +501,35 @@ export function AutomationsTab({ workspaceId }: Props) {
           </div>
         )}
 
+        {!isLoading && !loadError && health && (health.dailyCapHit || health.outcomeUnknown24h > 0) && (
+          <div
+            role="status"
+            className="flex gap-3 rounded-lg border border-destructive/30 bg-destructive/10 px-4 py-3 text-sm text-destructive"
+          >
+            <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" aria-hidden="true" />
+            <div className="space-y-1 text-xs">
+              {health.dailyCapHit && (
+                <p>
+                  <strong>Se alcanzó el tope de 300 plantillas automáticas</strong> en
+                  las últimas 24 horas: las siguientes se omitieron.
+                </p>
+              )}
+              {health.outcomeUnknown24h > 0 && (
+                <p>
+                  <strong>
+                    {health.outcomeUnknown24h === 1
+                      ? "Un envío quedó"
+                      : `${health.outcomeUnknown24h} envíos quedaron`}{" "}
+                    con resultado desconocido
+                  </strong>{" "}
+                  en las últimas 24 horas. No se reintentan para no duplicar; revisa en
+                  el inbox si llegaron.
+                </p>
+              )}
+            </div>
+          </div>
+        )}
+
         {/* Content — 4 states */}
         {isLoading ? (
           <AutomationsSkeleton />
@@ -454,6 +553,7 @@ export function AutomationsTab({ workspaceId }: Props) {
               <RuleCard
                 key={rule.id}
                 rule={rule}
+                health={health?.rules[rule.id]}
                 onEdit={openEdit}
                 onDelete={handleDelete}
                 onToggle={handleToggle}

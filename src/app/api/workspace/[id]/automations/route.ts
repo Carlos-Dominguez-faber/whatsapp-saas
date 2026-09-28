@@ -13,6 +13,7 @@ import {
   assertActiveRuleCap,
   RuleCapError,
 } from "@/features/automations/services/rule-cap";
+import { loadAutomationHealth } from "@/features/automations/services/rule-health";
 
 // ── Service-role client ───────────────────────────────────────────────────────
 
@@ -84,7 +85,9 @@ export async function GET(
     );
   }
 
-  return NextResponse.json({ data: data ?? [] });
+  // How each rule is doing; null when it can't be read (the rules still load).
+  const health = await loadAutomationHealth(db, workspaceId);
+  return NextResponse.json({ data: data ?? [], health });
 }
 
 // ── POST /api/workspace/[id]/automations ──────────────────────────────────────
