@@ -6,7 +6,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
 import { createClient } from "@/lib/supabase/server";
-import { manualOptInFields } from "@/features/inbox/services/opt-out";
+import { applyContactUpdate } from "@/features/inbox/services/contact-update";
 
 const PatchContactSchema = z.object({
   name: z.string().min(1, "El nombre no puede estar vacío").optional(),
@@ -65,36 +65,12 @@ export async function PATCH(req: NextRequest, { params }: RouteParams) {
     );
   }
 
-  // 4. Update (RLS enforces workspace ownership)
-  const { data: updated, error: updateError } = await supabase
-    .from("contacts")
-    .update({
-      ...parsed.data,
-      ...manualOptInFields(parsed.data.opt_in),
-      updated_at: new Date().toISOString(),
-    })
-    .eq("id", contactId)
-    .select()
-    .single();
-
-  if (updateError) {
-    console.error(
-      "[PATCH /api/contacts/:id] Supabase error:",
-      updateError.message,
-    );
-
-    if (updateError.code === "PGRST116") {
-      return NextResponse.json(
-        { error: "Contacto no encontrado" },
-        { status: 404 },
-      );
-    }
-
-    return NextResponse.json(
-      { error: "Error al actualizar el contacto" },
-      { status: 500 },
-    );
+  // 4. Update (RLS enforces workspace ownership; the opt-in only changes when
+  //    it differs from the stored one, and reopening an opt-out takes a manager)
+  const result = await applyContactUpdate(supabase, contactId, parsed.data);
+  if (!result.ok) {
+    return NextResponse.json({ error: result.error }, { status: result.status });
   }
 
-  return NextResponse.json({ ok: true, contact: updated });
+  return NextResponse.json({ ok: true, contact: result.contact });
 }
