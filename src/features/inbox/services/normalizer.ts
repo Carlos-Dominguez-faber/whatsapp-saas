@@ -3,7 +3,6 @@ import type { OutboundEcho } from "./kapso-webhook-handler";
 import type { ContactRow, ConversationRow, MessageRow } from "../types/index";
 import type { ConversationState } from "./state-machine";
 import { DEFAULT_COUNTRY_CODE, normalizePhone } from "./phone";
-import { optOutIntent } from "./opt-out";
 
 /**
  * The fields every provider's webhook parser produces (YCloud's and Kapso's
@@ -65,8 +64,8 @@ export async function processInbound(
   // 1. Upsert contact
   // A user messaging the business first is implicit opt-in for service
   // messages within the 24h window, so inbound contacts are opted in — unless
-  // they opted out explicitly: trg_contacts_keep_opt_out keeps opt_in false
-  // while contacts.opted_out_at is set.
+  // they opted out explicitly: trg_contacts_opt_out keeps opt_in false while
+  // their phone is in contact_opt_outs.
   const { data: contactData, error: contactError } = await supabase
     .from("contacts")
     .upsert(
@@ -92,7 +91,7 @@ export async function processInbound(
     );
   }
 
-  let contact = contactData as ContactRow;
+  const contact = contactData as ContactRow;
 
   // 2. Upsert conversation — reset 24h window on every inbound
   const windowExpiresAt = new Date(
@@ -160,32 +159,10 @@ export async function processInbound(
 
   const message = msgData ? (msgData as MessageRow) : null;
 
-  // 4. An explicit STOP opts the contact out of proactive messages; START
-  //    opts them back in. Only for a message stored just now: a redelivered
-  //    STOP (same wamid) must not undo a later START.
-  const intent =
-    message && normalized.type === "text" ? optOutIntent(normalized.text) : null;
-  if (intent) {
-    const now = new Date().toISOString();
-    const { data: updated, error: optError } = await supabase
-      .from("contacts")
-      .update(
-        intent === "stop"
-          ? { opt_in: false, opted_out_at: now }
-          : { opt_in: true, opt_in_at: now, opted_out_at: null },
-      )
-      .eq("id", contact.id)
-      .eq("workspace_id", workspaceId)
-      .select()
-      .maybeSingle();
-    if (optError) {
-      // Before the migration that adds opted_out_at this fails; the message
-      // itself is already stored.
-      console.error("[normalizer] opt-out update failed:", optError.message);
-    } else if (updated) {
-      contact = updated as ContactRow;
-    }
-  }
+  // 4. STOP / START: applied by the database in the same statement that
+  //    stored the message (trg_messages_opt_out), so a failure fails the
+  //    insert and the webhook is retried, and a redelivery (not inserted)
+  //    never re-applies an old STOP.
 
   // F8-D1: media download hooks in here when message.type !== 'text' and message is not a dedup.
   // The webhook handler extracts the media `link` from the raw provider payload and passes it

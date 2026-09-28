@@ -167,6 +167,20 @@ export async function notifyHandoffPending(
 
     if (!config.enabled) return;
 
+    // An automation's handoff is not a reply the contact asked for: a contact
+    // who opted out gets no acknowledgement from it (a read that fails is
+    // treated the same, below).
+    if (trigger === "automation") {
+      const { conversationContactOptedOut } = await import("./opt-out");
+      if (await conversationContactOptedOut(svc(), workspaceId, conversationId)) {
+        await logEvent(workspaceId, conversationId, "handoff_ack_skipped", "info", {
+          reason: "opted_out",
+          trigger,
+        });
+        return;
+      }
+    }
+
     // El corte aplica SOLO al prefijo "tool:", que significa "la despedida
     // del agente ya salió" (dispatch de 10a exitoso en buffer.ts). Mandar
     // igual el ACK genérico ahí duplicaría el mensaje. "tool_unsent:" — el

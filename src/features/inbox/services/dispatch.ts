@@ -16,6 +16,7 @@
 
 import { createClient as createSbClient } from "@supabase/supabase-js";
 import { formatWhatsAppMarkdown } from "./text-formatter";
+import { isPhoneOptedOut } from "./opt-out";
 import {
   decryptWhatsAppCredentials,
   loadWhatsAppIntegration,
@@ -462,7 +463,7 @@ export async function dispatchText(
   }
   const { window_expires_at, toPhone } = loaded;
 
-  // No opt-out check here, on purpose: STOP/BAJA stops automations and
+  // No opt-out check here, on purpose: STOP stops automations and
   // templates (the proactive messages), not the replies the agent or the team
   // write inside the 24h window the contact opened. The window guard below
   // still applies.
@@ -619,9 +620,22 @@ export async function prepareTemplateDispatch(
     return { ok: false, error: NOT_FOUND.error!, errorCode: "NOT_FOUND", retryable: false };
   }
   // Templates skip the 24h guard entirely, but never the opt-out: they are
-  // the proactive messages STOP/BAJA refuses.
+  // the proactive messages STOP refuses. The phone's suppression counts too,
+  // so a contact re-created (or a phone moved) after a STOP is still refused.
   if (!loaded.optIn) {
     return { ok: false, error: OPT_OUT_MESSAGE, errorCode: "OPT_OUT", retryable: false };
+  }
+  try {
+    if (await isPhoneOptedOut(supabase, workspaceId, loaded.toPhone)) {
+      return { ok: false, error: OPT_OUT_MESSAGE, errorCode: "OPT_OUT", retryable: false };
+    }
+  } catch (err) {
+    return {
+      ok: false,
+      error: err instanceof Error ? err.message : String(err),
+      errorCode: "DB_ERROR",
+      retryable: true,
+    };
   }
 
   let row: Awaited<ReturnType<typeof loadWhatsAppIntegration>>;

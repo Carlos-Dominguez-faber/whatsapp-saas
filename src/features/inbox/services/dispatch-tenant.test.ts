@@ -48,6 +48,7 @@ const tables: Record<string, Row[]> = {
 let upserted: Array<{ table: string; row: Row }> = [];
 tables.messages = [];
 tables.events = [];
+tables.contact_opt_outs = [];
 /** The messages table as dispatch left it. */
 const msgs = () => tables.messages;
 
@@ -77,6 +78,10 @@ function query(table: string, mode: "select" | "update" | "delete" = "select", p
         ? { data: r[0], error: null }
         : { data: null, error: { message: "JSON object requested, multiple (or no) rows returned" } };
     },
+    limit: async (n: number) =>
+      failReads.has(table)
+        ? { data: null, error: { message: "connection refused" } }
+        : { data: rows().slice(0, n), error: null },
     maybeSingle: async () => {
       if (failReads.has(table)) return { data: null, error: { message: "connection refused" } };
       const r = rows();
@@ -189,6 +194,7 @@ function reset() {
   sends = [];
   ycloudFailure = null;
   failReads.clear();
+  tables.contact_opt_outs = [];
   (tables.contacts[0] as Row).opt_in = true;
 }
 
@@ -524,4 +530,17 @@ test("an unattended sender refuses development mode; an interactive send accepts
   } finally {
     tables.integrations[0].credentials = live;
   }
+});
+
+test("a phone that opted out is refused a template even if its contact row says opted in", async () => {
+  reset();
+  // The contact was deleted and re-created after its STOP: the row is clean,
+  // the phone's suppression is not.
+  tables.contact_opt_outs.push({ workspace_id: "ws_a", phone_key: "15550000001" });
+  const tpl = await dispatchTemplate({ workspaceId: "ws_a", conversationId: "conv_a", templateName: "welcome" });
+  assert.equal(tpl.errorCode, "OPT_OUT");
+  assert.equal(sends.length, 0);
+
+  const other = await dispatchTemplate({ workspaceId: "ws_b", conversationId: "conv_b", templateName: "welcome" });
+  assert.equal(other.ok, true, "another workspace's suppression doesn't apply");
 });

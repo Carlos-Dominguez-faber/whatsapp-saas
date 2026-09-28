@@ -1,46 +1,51 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import type { SupabaseClient } from "@supabase/supabase-js";
 
-import { manualOptInFields, optOutIntent } from "./opt-out.ts";
+import { isPhoneOptedOut, manualOptInFields, phoneKey } from "./opt-out.ts";
 
-test("an explicit opt-out counts as a whole message, any case, accents or punctuation", () => {
-  for (const text of [
-    "STOP",
-    "stop.",
-    "Darme de baja",
-    "No más mensajes",
-    "No quiero recibir mensajes!",
-    "unsubscribe",
-    "Stop promotions",
-    "Detener promociones",
-  ]) {
-    assert.equal(optOutIntent(text), "stop", text);
-  }
+test("a phone's key is its digits, however it was written", () => {
+  assert.equal(phoneKey("+52 1 (998) 123-4567"), "5219981234567");
+  assert.equal(phoneKey("5219981234567"), "5219981234567");
+  assert.equal(phoneKey(""), null);
+  assert.equal(phoneKey(null), null);
 });
 
-test("only an explicit phrase brings the contact back", () => {
-  for (const text of ["START", "Suscribirme", "reanudar mensajes"]) {
-    assert.equal(optOutIntent(text), "start", text);
-  }
+function suppressions(rows: Array<{ workspace_id: string; phone_key: string }>, error?: { code?: string; message: string }) {
+  return {
+    from: () => ({
+      select: () => {
+        const filters: Array<[string, unknown]> = [];
+        const q: any = {
+          eq: (c: string, v: unknown) => (filters.push([c, v]), q),
+          limit: async () =>
+            error
+              ? { data: null, error }
+              : { data: rows.filter((r) => filters.every(([c, v]) => (r as Record<string, unknown>)[c] === v)), error: null },
+        };
+        return q;
+      },
+    }),
+  } as unknown as SupabaseClient;
+}
+
+test("a suppressed phone is opted out in its workspace only, whatever its format", async () => {
+  const db = suppressions([{ workspace_id: "ws_1", phone_key: "5215550001111" }]);
+  assert.equal(await isPhoneOptedOut(db, "ws_1", "+52 1 555 000 1111"), true);
+  assert.equal(await isPhoneOptedOut(db, "ws_2", "+5215550001111"), false);
+  assert.equal(await isPhoneOptedOut(db, "ws_1", "+5215550002222"), false);
 });
 
-test("one-word answers and list taps are never an opt-out or an opt-in", () => {
-  for (const text of ["baja", "Baja", "alta", "ALTA", "alto", "Alto!", "bajo", "no", "listo"]) {
-    assert.equal(optOutIntent(text), null, text);
-  }
-});
-
-test("a sentence that merely contains a phrase is a question for the agent", () => {
-  for (const text of [
-    "me quiero dar de baja del gimnasio, ¿cómo le hago?",
-    "quiero darme de baja del plan",
-    "stop motion",
-    "hola",
-    "",
-    null,
-    undefined,
-  ]) {
-    assert.equal(optOutIntent(text), null, String(text));
+test("a failed lookup throws (callers fail closed); a missing table reads as not suppressed", async () => {
+  await assert.rejects(() => isPhoneOptedOut(suppressions([], { message: "connection refused" }), "ws_1", "+1555"));
+  const errorMock = (await import("node:test")).mock.method(console, "error", () => {});
+  try {
+    assert.equal(
+      await isPhoneOptedOut(suppressions([], { code: "42P01", message: "missing" }), "ws_1", "+1555"),
+      false,
+    );
+  } finally {
+    errorMock.mock.restore();
   }
 });
 
