@@ -94,31 +94,6 @@ export async function processInbound(
 
   let contact = contactData as ContactRow;
 
-  // 1b. STOP/BAJA opts the contact out of proactive messages; ALTA/START opts
-  //     them back in. Recorded before anything else runs on this message.
-  const intent = normalized.type === "text" ? optOutIntent(normalized.text) : null;
-  if (intent) {
-    const now = new Date().toISOString();
-    const { data: updated, error: optError } = await supabase
-      .from("contacts")
-      .update(
-        intent === "stop"
-          ? { opt_in: false, opted_out_at: now }
-          : { opt_in: true, opt_in_at: now, opted_out_at: null },
-      )
-      .eq("id", contact.id)
-      .eq("workspace_id", workspaceId)
-      .select()
-      .maybeSingle();
-    if (optError) {
-      // Before the migration that adds opted_out_at this fails; the message
-      // itself must still be stored.
-      console.error("[normalizer] opt-out update failed:", optError.message);
-    } else if (updated) {
-      contact = updated as ContactRow;
-    }
-  }
-
   // 2. Upsert conversation — reset 24h window on every inbound
   const windowExpiresAt = new Date(
     Date.now() + 24 * 60 * 60 * 1000,
@@ -184,6 +159,33 @@ export async function processInbound(
   }
 
   const message = msgData ? (msgData as MessageRow) : null;
+
+  // 4. An explicit STOP opts the contact out of proactive messages; START
+  //    opts them back in. Only for a message stored just now: a redelivered
+  //    STOP (same wamid) must not undo a later START.
+  const intent =
+    message && normalized.type === "text" ? optOutIntent(normalized.text) : null;
+  if (intent) {
+    const now = new Date().toISOString();
+    const { data: updated, error: optError } = await supabase
+      .from("contacts")
+      .update(
+        intent === "stop"
+          ? { opt_in: false, opted_out_at: now }
+          : { opt_in: true, opt_in_at: now, opted_out_at: null },
+      )
+      .eq("id", contact.id)
+      .eq("workspace_id", workspaceId)
+      .select()
+      .maybeSingle();
+    if (optError) {
+      // Before the migration that adds opted_out_at this fails; the message
+      // itself is already stored.
+      console.error("[normalizer] opt-out update failed:", optError.message);
+    } else if (updated) {
+      contact = updated as ContactRow;
+    }
+  }
 
   // F8-D1: media download hooks in here when message.type !== 'text' and message is not a dedup.
   // The webhook handler extracts the media `link` from the raw provider payload and passes it

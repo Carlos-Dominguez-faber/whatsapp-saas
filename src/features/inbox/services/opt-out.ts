@@ -1,23 +1,26 @@
 import { normalizeText } from "./state-machine";
 
 /**
- * Whole-message keywords a contact sends to stop, or resume, the business's
- * proactive messages. Only an exact message counts (after lowercasing,
- * dropping accents and punctuation): "baja" is an opt-out, "me doy de baja
- * del gimnasio, ¿cómo le hago?" is a question for the agent.
+ * Whole-message phrases a contact sends to stop, or resume, the business's
+ * proactive messages (automations and templates; replies in an open window
+ * still go out). Only an explicit, exact message counts, after lowercasing and
+ * dropping accents and punctuation. Bare words like "baja", "alta" or "alto"
+ * are ordinary one-word answers ("¿planta alta o baja?", a list or button
+ * tap), so they don't count; "me quiero dar de baja del gimnasio" is a
+ * question for the agent.
  */
-const STOP_KEYWORDS = new Set([
+const STOP_PHRASES = new Set([
   "stop",
-  "baja",
-  "alto",
   "unsubscribe",
   "darme de baja",
-  "dar de baja",
-  "cancelar suscripcion",
   "no mas mensajes",
+  "no quiero recibir mensajes",
+  // Meta's opt-out button on marketing templates.
+  "stop promotions",
+  "detener promociones",
 ]);
 
-const START_KEYWORDS = new Set(["start", "alta", "unstop", "suscribir", "suscribirme"]);
+const START_PHRASES = new Set(["start", "suscribirme", "reanudar mensajes"]);
 
 export type OptOutIntent = "stop" | "start" | null;
 
@@ -28,8 +31,8 @@ export function optOutIntent(text: string | null | undefined): OptOutIntent {
     .replace(/\s+/g, " ")
     .trim();
   if (!clean || clean.length > 40) return null;
-  if (STOP_KEYWORDS.has(clean)) return "stop";
-  if (START_KEYWORDS.has(clean)) return "start";
+  if (STOP_PHRASES.has(clean)) return "stop";
+  if (START_PHRASES.has(clean)) return "start";
   return null;
 }
 

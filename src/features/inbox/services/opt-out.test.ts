@@ -3,22 +3,37 @@ import { test } from "node:test";
 
 import { manualOptInFields, optOutIntent } from "./opt-out.ts";
 
-test("the opt-out keywords count as a whole message, any case, accents or punctuation", () => {
-  for (const text of ["STOP", "Baja", "baja.", " ALTO! ", "Darme de baja", "No más mensajes", "unsubscribe"]) {
+test("an explicit opt-out counts as a whole message, any case, accents or punctuation", () => {
+  for (const text of [
+    "STOP",
+    "stop.",
+    "Darme de baja",
+    "No más mensajes",
+    "No quiero recibir mensajes!",
+    "unsubscribe",
+    "Stop promotions",
+    "Detener promociones",
+  ]) {
     assert.equal(optOutIntent(text), "stop", text);
   }
 });
 
-test("the opt-in keywords bring the contact back", () => {
-  for (const text of ["START", "alta", "Suscribirme", "unstop"]) {
+test("only an explicit phrase brings the contact back", () => {
+  for (const text of ["START", "Suscribirme", "reanudar mensajes"]) {
     assert.equal(optOutIntent(text), "start", text);
   }
 });
 
-test("a sentence that merely contains a keyword is a question for the agent", () => {
+test("one-word answers and list taps are never an opt-out or an opt-in", () => {
+  for (const text of ["baja", "Baja", "alta", "ALTA", "alto", "Alto!", "bajo", "no", "listo"]) {
+    assert.equal(optOutIntent(text), null, text);
+  }
+});
+
+test("a sentence that merely contains a phrase is a question for the agent", () => {
   for (const text of [
     "me quiero dar de baja del gimnasio, ¿cómo le hago?",
-    "alto ahí, tengo una duda",
+    "quiero darme de baja del plan",
     "stop motion",
     "hola",
     "",
