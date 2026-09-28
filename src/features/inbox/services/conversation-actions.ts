@@ -16,6 +16,7 @@
 import { createClient as createSbClient } from "@supabase/supabase-js";
 import { applyTransition, TransitionError } from "./decision-engine";
 import { syncContactToHL } from "./highlevel-client";
+import { isMissingFunctionError, reportMissingFunctionOnce } from "@/shared/lib/db-errors";
 
 function svc() {
   return createSbClient(
@@ -46,6 +47,62 @@ interface AppendTagsRow {
 }
 
 /**
+ * Adds tags to a contact in one atomic UPDATE (`append_contact_tags`), so a
+ * concurrent writer can't drop a tag another one just added. Before the
+ * migration that creates the RPC, falls back to the old read-merge-write.
+ * Throws on a database error; `contact_found` false means the contact isn't in
+ * this workspace.
+ */
+export async function appendContactTags(
+  workspaceId: string,
+  contactId: string,
+  tags: string[],
+): Promise<AppendTagsRow> {
+  const supabase = svc();
+  const { data, error } = await supabase.rpc("append_contact_tags", {
+    p_workspace_id: workspaceId,
+    p_contact_id: contactId,
+    p_tags: tags,
+  });
+
+  if (error && isMissingFunctionError(error, "append_contact_tags")) {
+    reportMissingFunctionOnce("append_contact_tags", "tags are merged with a read and a write");
+    const { data: contact, error: readError } = await supabase
+      .from("contacts")
+      .select("tags")
+      .eq("id", contactId)
+      .eq("workspace_id", workspaceId)
+      .maybeSingle();
+    if (readError) throw new Error(`append tags read: ${readError.message}`);
+    if (!contact) return { contact_found: false, tags_added: 0 };
+    const existing = Array.isArray(contact.tags) ? (contact.tags as string[]) : [];
+    const clean = tags.map((t) => t.trim()).filter(Boolean);
+    const merged = Array.from(new Set([...existing, ...clean]));
+    const added = merged.length - existing.length;
+    if (added > 0) {
+      const { error: writeError } = await supabase
+        .from("contacts")
+        .update({ tags: merged })
+        .eq("id", contactId)
+        .eq("workspace_id", workspaceId);
+      if (writeError) throw new Error(`append tags write: ${writeError.message}`);
+    }
+    return { contact_found: true, tags_added: added };
+  }
+
+  if (error) {
+    console.error("[conversation-actions] append_contact_tags error:", error.message);
+    throw new Error(`append_contact_tags: ${error.message}`);
+  }
+
+  // RETURNS TABLE llega como array de filas. Sin fila no se sabe qué pasó, y
+  // "no sé" se trata como transitorio (se reintenta), nunca como éxito.
+  const row = ((data as AppendTagsRow[] | null) ?? [])[0];
+  if (!row) throw new Error("append_contact_tags no devolvió ninguna fila");
+  return row;
+}
+
+/**
  * Agrega una etiqueta al contacto y empuja el cambio a HighLevel best-effort
  * (no-op si HL no está conectado).
  *
@@ -70,24 +127,7 @@ export async function addTagToContact(params: {
   // guardó sin `tag`. Reintentarla tres veces no la arregla.
   if (!tag) throw new ConfigError("empty_tag");
 
-  const { data, error } = await svc().rpc("append_contact_tags", {
-    p_workspace_id: params.workspaceId,
-    p_contact_id: params.contactId,
-    p_tags: [tag],
-  });
-
-  if (error) {
-    console.error(
-      "[conversation-actions] append_contact_tags error:",
-      error.message,
-    );
-    throw new Error(`append_contact_tags: ${error.message}`);
-  }
-
-  // RETURNS TABLE llega como array de filas. Sin fila no se sabe qué pasó, y
-  // "no sé" se trata como transitorio (se reintenta), nunca como éxito.
-  const row = ((data as AppendTagsRow[] | null) ?? [])[0];
-  if (!row) throw new Error("append_contact_tags no devolvió ninguna fila");
+  const row = await appendContactTags(params.workspaceId, params.contactId, [tag]);
 
   if (!row.contact_found) throw new ConfigError("contact_not_found");
 

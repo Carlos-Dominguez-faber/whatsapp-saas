@@ -87,16 +87,26 @@ export async function maybeAutoProcess(opts: {
         .filter(Boolean)
         .slice(0, 3);
       if (newTags.length > 0) {
-        const { data: contact } = await db
-          .from("contacts")
-          .select("tags")
-          .eq("id", contactId)
-          .maybeSingle();
-        const existing = Array.isArray(contact?.tags)
-          ? (contact?.tags as string[])
-          : [];
-        const merged = Array.from(new Set([...existing, ...newTags]));
-        await db.from("contacts").update({ tags: merged }).eq("id", contactId);
+        // One atomic append (the RPC merges inside its own UPDATE, with the
+        // row locked): the read-modify-write that was here dropped tags an
+        // automation had just added.
+        try {
+          const { appendContactTags } = await import(
+            "@/features/inbox/services/conversation-actions"
+          );
+          const row = await appendContactTags(workspaceId, contactId, newTags);
+          if (!row.contact_found) {
+            console.warn("[auto-tagging] contact not in workspace", {
+              workspaceId,
+              contactId,
+            });
+          }
+        } catch (err) {
+          console.error(
+            "[auto-tagging] append tags failed:",
+            err instanceof Error ? err.message : err,
+          );
+        }
       }
     }
 

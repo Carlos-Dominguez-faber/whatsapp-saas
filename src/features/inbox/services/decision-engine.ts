@@ -6,11 +6,17 @@ import {
   aiShouldRespond,
   canTransition,
   detectsHandoffTrigger,
+  TransitionError,
   type ConversationState,
 } from "./state-machine";
+import { isMissingColumnError, reportMissingFunctionOnce } from "@/shared/lib/db-errors";
 import { reserveLlmTurn } from "./cost-tracker";
 import { getEnabledTools } from "@/features/tools/services/tool-configs";
 import type { Tool } from "@/features/tools/core/tool";
+
+// The class lives in the pure state-machine module; callers of applyTransition
+// (the automation executor among them) import both from here.
+export { TransitionError };
 
 function svc() {
   return createSbClient(
@@ -145,13 +151,30 @@ export async function applyTransition(
   const { userId, trigger, workspaceId } = opts;
   const supabase = svc();
 
-  // 1. Load current state (scoped to the workspace when the caller gives one)
-  let lookup = supabase
-    .from("conversations")
-    .select("state, workspace_id")
-    .eq("id", conversationId);
-  if (workspaceId) lookup = lookup.eq("workspace_id", workspaceId);
-  const { data: conv, error: convError } = await lookup.single();
+  // 1. Load current state (scoped to the workspace when the caller gives one).
+  //    state_version is the compare-and-swap token below. Before the Phase 4
+  //    migration it doesn't exist: fall back to a state-only compare instead of
+  //    failing every handoff, take and toggle.
+  const loadState = async (columns: string) => {
+    let lookup = supabase
+      .from("conversations")
+      .select(columns)
+      .eq("id", conversationId);
+    if (workspaceId) lookup = lookup.eq("workspace_id", workspaceId);
+    return lookup.single();
+  };
+  let { data: conv, error: convError } = await loadState(
+    "state, workspace_id, state_version",
+  );
+  let hasVersion = true;
+  if (convError && isMissingColumnError(convError, "state_version")) {
+    reportMissingFunctionOnce(
+      "conversations.state_version",
+      "transitions compare on state only",
+    );
+    hasVersion = false;
+    ({ data: conv, error: convError } = await loadState("state, workspace_id"));
+  }
 
   if (convError || !conv) {
     throw new Error(
@@ -159,11 +182,18 @@ export async function applyTransition(
     );
   }
 
-  const currentState = conv.state as ConversationState;
+  const row = conv as unknown as {
+    state: ConversationState;
+    workspace_id: string;
+    state_version?: number;
+  };
+  const currentState = row.state;
+  // The value read HERE: the compare-and-swap must compare against the
+  // version this caller actually saw, not one read later.
+  const currentVersion = row.state_version;
 
   // 2. Validate transition (throws TransitionError if invalid)
   if (!canTransition(currentState, to)) {
-    const { TransitionError } = await import("./state-machine");
     throw new TransitionError(currentState, to);
   }
 
@@ -177,13 +207,27 @@ export async function applyTransition(
   if (to === "human_active" && userId) {
     updatePayload.assigned_to = userId;
   }
+  // Whether this UPDATE carried an assignment: losing the race can only count
+  // as success for a pure state change.
+  const carriedAssignment = updatePayload.assigned_to !== undefined;
 
+  // 3b. Compare-and-swap on the state (and its version) read in step 1. Without
+  //     it, two callers that both read `ai_active` both write
+  //     `handoff_pending`, and the automation trigger emits two
+  //     `handoff_requested` events — two paid templates for one handoff. The
+  //     version closes the A→B→A case, where the state alone matches again.
   let update = supabase
     .from("conversations")
     .update(updatePayload)
-    .eq("id", conversationId);
+    .eq("id", conversationId)
+    .eq("state", currentState);
+  if (hasVersion && typeof currentVersion === "number") {
+    update = update.eq("state_version", currentVersion);
+  }
   if (workspaceId) update = update.eq("workspace_id", workspaceId);
-  const { error: updateError } = await update;
+  const { data: updatedRow, error: updateError } = await update
+    .select("id")
+    .maybeSingle();
 
   if (updateError) {
     throw new Error(
@@ -191,11 +235,50 @@ export async function applyTransition(
     );
   }
 
+  // No row updated: another caller won the race. Re-read where it left the
+  // conversation instead of assuming it wrote `to`.
+  if (!updatedRow) {
+    let recheck = supabase
+      .from("conversations")
+      .select("state")
+      .eq("id", conversationId);
+    if (workspaceId) recheck = recheck.eq("workspace_id", workspaceId);
+    const { data: actual, error: recheckError } = await recheck.maybeSingle();
+
+    if (recheckError || !actual) {
+      throw new Error(
+        `[decision-engine] transition lost race and state re-read failed: ${
+          recheckError?.message ?? "conversation not found"
+        }`,
+      );
+    }
+
+    const actualState = (actual as { state: ConversationState }).state;
+    if (actualState === to && !carriedAssignment) {
+      // The winner wrote exactly what this caller asked for: idempotent, and
+      // no second event or notification for the same fact.
+      console.warn("[decision-engine] transition lost race (same target)", {
+        conversationId,
+        from: currentState,
+        to,
+      });
+      return;
+    }
+    // Either the state moved elsewhere, or it matches but this caller's
+    // assignment was not written (two operators taking the same thread).
+    console.warn("[decision-engine] transition lost race", {
+      conversationId,
+      requested: to,
+      actual: actualState,
+    });
+    throw new TransitionError(actualState, to, "state_mismatch");
+  }
+
   // 4. Log the state change to events
   await supabase.from("events").insert({
     type: "state_change",
     level: "info",
-    workspace_id: conv.workspace_id,
+    workspace_id: row.workspace_id,
     conversation_id: conversationId,
     payload: {
       from: currentState,
@@ -212,7 +295,7 @@ export async function applyTransition(
     try {
       const { notifyHandoffPending } = await import("./handoff-notifier");
       await notifyHandoffPending({
-        workspaceId: conv.workspace_id as string,
+        workspaceId: row.workspace_id,
         conversationId,
         trigger: trigger ?? (userId ? "manual" : "agent"),
       });

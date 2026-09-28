@@ -35,7 +35,7 @@ import {
   type ConversationTurn,
 } from "./conversation-history";
 import { getSetterConfig, evaluateLead } from "./setter";
-import { syncContactToHL, createHLOpportunity } from "./highlevel-client";
+import { createHLOpportunity } from "./highlevel-client";
 import { workspaceSchedulingTimeZone } from "./scheduling-timezone";
 import {
   loadWhatsAppSettings,
@@ -1940,13 +1940,14 @@ async function executeSetterPostAction(p: PostActionParams): Promise<void> {
         const tag =
           typeof p.postAction.tag === "string" ? p.postAction.tag.trim() : "";
         if (!tag) break;
-        const merged = Array.from(new Set([...p.existingTags, tag]));
-        await p.supabase
-          .from("contacts")
-          .update({ tags: merged })
-          .eq("id", p.contactId);
-        // Best-effort push to HighLevel (no-op if HL not connected).
-        void syncContactToHL(p.workspaceId, p.contactId);
+        // One atomic append (no read-modify-write that could drop a tag an
+        // automation just added); it also pushes to HighLevel best-effort.
+        const { addTagToContact } = await import("./conversation-actions");
+        await addTagToContact({
+          workspaceId: p.workspaceId,
+          contactId: p.contactId,
+          tag,
+        });
         break;
       }
 

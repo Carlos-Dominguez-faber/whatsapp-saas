@@ -25,10 +25,31 @@ const TRANSITIONS: Record<ConversationState, ConversationState[]> = {
   closed: [], // terminal
 };
 
+export type TransitionErrorCode = "invalid_transition" | "state_mismatch";
+
 export class TransitionError extends Error {
-  constructor(from: ConversationState, to: ConversationState) {
-    super(`Invalid transition: ${from} → ${to}`);
+  /**
+   * `invalid_transition`: the state machine does not allow from → to.
+   * `state_mismatch`: applyTransition's compare-and-swap lost the race —
+   *   another caller moved the state between the read and the UPDATE, and
+   *   `from` is the state the row actually ended in.
+   */
+  readonly code: TransitionErrorCode;
+
+  constructor(
+    from: ConversationState,
+    to: ConversationState,
+    code: TransitionErrorCode = "invalid_transition",
+  ) {
+    // The "Invalid transition:" prefix is a contract: handoff, take and
+    // toggle-ai branch on it to answer 422 instead of 500. Both codes keep it.
+    super(
+      code === "state_mismatch"
+        ? `Invalid transition: ${from} → ${to} (state moved under us)`
+        : `Invalid transition: ${from} → ${to}`,
+    );
     this.name = "TransitionError";
+    this.code = code;
   }
 }
 
@@ -89,7 +110,11 @@ const HANDOFF_PHRASES = [
   "soporte humano",
 ];
 
-function normalizeText(text: string): string {
+/**
+ * Lowercase + NFD without diacritics. Exported because the automations'
+ * keyword matching must normalize exactly like the handoff detector does.
+ */
+export function normalizeText(text: string): string {
   return text
     .toLowerCase()
     .normalize("NFD")
