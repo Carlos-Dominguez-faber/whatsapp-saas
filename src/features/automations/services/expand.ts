@@ -71,7 +71,9 @@ export const EVENT_TTL_MS: Record<AutomationEventType, number> = {
   handoff_requested: 2 * 3_600_000,
   first_message: 6 * 3_600_000,
   lead_qualified: 6 * 3_600_000,
-  appointment_upcoming: 6 * 3_600_000,
+  // Long enough for one overnight wait for the sending hours; the executor
+  // decides whether a reminder is late (reminder-window.ts).
+  appointment_upcoming: 26 * 3_600_000,
 };
 
 /** True when the event is too old to act on (see EVENT_TTL_MS). */

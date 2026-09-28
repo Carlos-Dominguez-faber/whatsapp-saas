@@ -45,6 +45,8 @@ let leaseHeld = true;
 let runUpdateError: string | null = null;
 /** Only the write that persists a resolved conversation on the run fails. */
 let persistUpdateError: string | null = null;
+/** Writes to appointments (HighLevel write-back) fail. */
+let appointmentUpdateError: string | null = null;
 /**
  * Cuántas filas devuelve el UPDATE de conversations con `assigned_to IS NULL`.
  * 1 = se asignó; 0 = ya tenía dueño (o no existe) y el ejecutor relee.
@@ -105,6 +107,9 @@ function rowFor(table: string): Row {
 }
 
 function updateResponse(table: string, row: Record<string, unknown>) {
+  if (table === "appointments" && appointmentUpdateError) {
+    return { data: null, error: { message: appointmentUpdateError }, wrote: false };
+  }
   if (table === "automation_runs") {
     if (persistUpdateError && "conversation_id" in row) {
       return { data: null, error: { message: persistUpdateError }, wrote: false };
@@ -485,6 +490,9 @@ const APPOINTMENT_RULE = {
   enabled: true,
 };
 
+/** An appointment whose 2 h reminder fell due 10 minutes ago. */
+const dueNow = () => new Date(Date.now() + 110 * 60_000).toISOString();
+
 function reset() {
   updates.length = 0;
   successfulRunUpdates.length = 0;
@@ -511,6 +519,7 @@ function reset() {
   leaseHeld = true;
   runUpdateError = null;
   persistUpdateError = null;
+  appointmentUpdateError = null;
   assignUpdateRows = 1;
   deleteConversationOnAssign = false;
   disableRuleUpdateRows = 1;
@@ -736,14 +745,9 @@ test("9b. el ejecutor NO evalúa el piso temporal: eso lo decide el claim", asyn
     "`rule_reenabled` ya no lo escribe este archivo: lo escribe la RPC del claim",
   );
 
-  // Y no se pide la columna: el fake no proyecta de verdad, así que afirmar el
-  // `select` es lo único que nota que alguien reintrodujo el guard viejo junto
-  // con su lectura.
-  assert.doesNotMatch(
-    String(firstColumnsFor("automation_rules")),
-    /\benabled_since\b/,
-    "el select de automation_rules ya no necesita enabled_since: el piso temporal vive en claim_next_automation_run()",
-  );
+  // enabled_since is read now, but only for a reminder's timing (a reminder
+  // due before the rule was enabled isn't sent); for every other run the
+  // floor is the claim's, as asserted above.
 });
 
 test("10. una regla renombrada DESPUÉS de expandir el run igual se ejecuta", async () => {
@@ -1714,7 +1718,7 @@ test("59. appointment_upcoming resuelve subject_id vía automation_events y pasa
       contactName: "María",
       contactPhone: "+15550000001",
       businessName: "Vet Demo",
-      appointment: { status: "confirmed", date: "martes 8 de septiembre", time: "20:00" },
+      appointment: { status: "confirmed", date: "martes 8 de septiembre", time: "20:00", scheduledAt: dueNow() },
     },
   });
 
@@ -1803,7 +1807,7 @@ test("63. la cita cancelada justo antes de enviar queda skipped/appointment_not_
       contactName: "María",
       contactPhone: "+15550000001",
       businessName: "Vet Demo",
-      appointment: { status: "cancelled", date: "martes 8 de septiembre", time: "20:00" },
+      appointment: { status: "cancelled", date: "martes 8 de septiembre", time: "20:00", scheduledAt: dueNow() },
     },
   });
 
@@ -1835,7 +1839,7 @@ test("64. booked y confirmed SÍ envían", async () => {
         contactName: "María",
         contactPhone: "+15550000001",
         businessName: "Vet Demo",
-        appointment: { status, date: "martes 8 de septiembre", time: "20:00" },
+        appointment: { status, date: "martes 8 de septiembre", time: "20:00", scheduledAt: dueNow() },
       },
     });
 
@@ -1968,8 +1972,9 @@ function reminderContext(over: Record<string, unknown> = {}) {
         status: "booked",
         date: "martes 8 de septiembre",
         time: "20:00",
-        scheduledAt: new Date(Date.now() + 90 * 60_000).toISOString(),
-        hlAppointmentId: "hl_1",
+        scheduledAt: dueNow(),
+        // Linked to HighLevel whenever the test sets up a HighLevel connection.
+        hlAppointmentId: hlConfig || hlConfigThrows ? "hl_1" : null,
         ...over,
       },
     },
@@ -1996,7 +2001,7 @@ test("recordatorio de una cita que HighLevel canceló → skipped, sin envío", 
   eventRow = REMINDER_EVENT;
   loadVariableContextImpl = reminderContext();
   hlConfig = { token: "t", locationId: "l", calendarId: "c" };
-  hlEvent = { state: "cancelled", startMs: Date.now() + 90 * 60_000 };
+  hlEvent = { state: "cancelled", startMs: Date.parse(dueNow()) };
   assert.equal(await executeRun(makeRun({ trigger_type: "appointment_upcoming" })), "skipped");
   assert.equal(lastRunUpdate().error, "appointment_not_active");
   assert.deepEqual(hlEventCalls, ["hl_1"]);
@@ -2034,7 +2039,7 @@ test("recordatorio con la cita activa y a la misma hora en HighLevel → sí se 
   ruleRow = { ...APPOINTMENT_RULE };
   withLiveConversation();
   eventRow = REMINDER_EVENT;
-  const at = Date.now() + 90 * 60_000;
+  const at = Date.now() + 110 * 60_000;
   loadVariableContextImpl = reminderContext({ scheduledAt: new Date(at).toISOString() });
   hlConfig = { token: "t", locationId: "l", calendarId: "c" };
   hlEvent = { state: "active", startMs: at };
@@ -2081,7 +2086,7 @@ test("un estado de HighLevel que no conocemos tampoco se escribe como cancelada"
   eventRow = REMINDER_EVENT;
   loadVariableContextImpl = reminderContext();
   hlConfig = { token: "t", locationId: "l", calendarId: "c" };
-  hlEvent = { state: "other", startMs: Date.now() + 90 * 60_000 };
+  hlEvent = { state: "other", startMs: Date.parse(dueNow()) };
   assert.equal(await executeRun(makeRun({ trigger_type: "appointment_upcoming" })), "retry");
   assert.equal(updates.some((u) => u.table === "appointments"), false);
 });
@@ -2093,34 +2098,99 @@ test("una cancelación definitiva en HighLevel sí se escribe en la cita local",
   eventRow = REMINDER_EVENT;
   loadVariableContextImpl = reminderContext();
   hlConfig = { token: "t", locationId: "l", calendarId: "c" };
-  hlEvent = { state: "cancelled", startMs: Date.now() + 90 * 60_000 };
+  hlEvent = { state: "cancelled", startMs: Date.parse(dueNow()) };
   assert.equal(await executeRun(makeRun({ trigger_type: "appointment_upcoming" })), "skipped");
   const write = updates.find((u) => u.table === "appointments");
   assert.equal(write?.row.status, "cancelled");
 });
 
-test("un recordatorio demasiado cerca de la cita (menos de la mitad de su anticipación) se omite", async () => {
+test("un recordatorio a menos de 30 minutos de la cita se omite", async () => {
   reset();
-  ruleRow = { ...APPOINTMENT_RULE }; // 2 h antes: el piso es 1 h
+  ruleRow = { ...APPOINTMENT_RULE };
   withLiveConversation();
   eventRow = REMINDER_EVENT;
   loadVariableContextImpl = reminderContext({
-    scheduledAt: new Date(Date.now() + 40 * 60_000).toISOString(),
+    scheduledAt: new Date(Date.now() + 20 * 60_000).toISOString(),
   });
   assert.equal(await executeRun(makeRun({ trigger_type: "appointment_upcoming" })), "skipped");
-  assert.equal(lastRunUpdate().error, "reminder_too_late");
+  assert.equal(lastRunUpdate().error, "reminder_too_close");
   assert.equal(sendCalls.length, 0);
 });
 
-test("fuera del horario de envío de la regla, un recordatorio atrasado no sale", async () => {
+test("un recordatorio que venció antes de encender la regla no sale (no es de esta regla)", async () => {
+  reset();
+  ruleRow = { ...APPOINTMENT_RULE, enabled_since: new Date(Date.now() - 5 * 60_000).toISOString() };
+  withLiveConversation();
+  eventRow = REMINDER_EVENT;
+  loadVariableContextImpl = reminderContext(); // venció hace 10 min
+  assert.equal(await executeRun(makeRun({ trigger_type: "appointment_upcoming" })), "skipped");
+  assert.equal(lastRunUpdate().error, "reminder_too_late");
+});
+
+test("un recordatorio atrasado más de 30 minutos de horario de envío (un backlog) no sale", async () => {
+  reset();
+  ruleRow = { ...APPOINTMENT_RULE };
+  withLiveConversation();
+  eventRow = REMINDER_EVENT;
+  loadVariableContextImpl = reminderContext({
+    scheduledAt: new Date(Date.now() + 70 * 60_000).toISOString(), // venció hace 50 min
+  });
+  assert.equal(await executeRun(makeRun({ trigger_type: "appointment_upcoming" })), "skipped");
+  assert.equal(lastRunUpdate().error, "reminder_too_late");
+});
+
+test("HighLevel va primero: una cita movida se escribe aunque el recordatorio ya no toque", async () => {
+  reset();
+  ruleRow = { ...APPOINTMENT_RULE };
+  withLiveConversation();
+  eventRow = REMINDER_EVENT;
+  hlConfig = { token: "t", locationId: "l", calendarId: "c" };
+  loadVariableContextImpl = reminderContext({
+    scheduledAt: new Date(Date.now() + 20 * 60_000).toISOString(),
+  });
+  hlEvent = { state: "active", startMs: Date.now() + 5 * 3_600_000 };
+  assert.equal(await executeRun(makeRun({ trigger_type: "appointment_upcoming" })), "skipped");
+  assert.equal(lastRunUpdate().error, "appointment_moved");
+  assert.ok(updates.some((u) => u.table === "appointments" && "scheduled_at" in u.row));
+});
+
+test("si no se puede escribir la hora nueva de una cita movida, se reintenta", async () => {
+  reset();
+  ruleRow = { ...APPOINTMENT_RULE };
+  withLiveConversation();
+  eventRow = REMINDER_EVENT;
+  hlConfig = { token: "t", locationId: "l", calendarId: "c" };
+  loadVariableContextImpl = reminderContext();
+  hlEvent = { state: "active", startMs: Date.now() + 5 * 3_600_000 };
+  appointmentUpdateError = "connection refused";
+  assert.equal(await executeRun(makeRun({ trigger_type: "appointment_upcoming" })), "retry");
+  assert.equal(lastRunUpdate().error, "db_write_failed");
+});
+
+test("una cita de HighLevel sin conexión a HighLevel no se manda: se omite con motivo", async () => {
+  reset();
+  ruleRow = { ...APPOINTMENT_RULE };
+  withLiveConversation();
+  eventRow = REMINDER_EVENT;
+  loadVariableContextImpl = reminderContext({ hlAppointmentId: "hl_1" });
+  assert.equal(await executeRun(makeRun({ trigger_type: "appointment_upcoming" })), "skipped");
+  assert.equal(lastRunUpdate().error, "hl_not_connected");
+  assert.equal(sendCalls.length, 0);
+});
+
+test("fuera del horario de envío, el recordatorio espera a que abra (reintento con not_before)", async () => {
   reset();
   // Mediodía local, y la regla solo manda de 13 a 20.
   ruleRow = { ...APPOINTMENT_RULE, trigger_config: { hours_before: 2, quiet_start: 13, quiet_end: 20 } };
   withLiveConversation();
   eventRow = REMINDER_EVENT;
-  loadVariableContextImpl = reminderContext();
-  assert.equal(await executeRun(makeRun({ trigger_type: "appointment_upcoming" })), "skipped");
+  loadVariableContextImpl = reminderContext({
+    scheduledAt: new Date(Date.now() + 3 * 3_600_000).toISOString(),
+  });
+  assert.equal(await executeRun(makeRun({ trigger_type: "appointment_upcoming" })), "retry");
   assert.equal(lastRunUpdate().error, "outside_send_window");
+  const wait = Date.parse(String(lastRunUpdate().not_before)) - Date.now();
+  assert.ok(wait > 0 && wait <= 60 * 60_000, `waits for 13:00, not the usual backoff (${wait} ms)`);
   assert.equal(sendCalls.length, 0);
 });
 

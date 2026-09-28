@@ -39,11 +39,7 @@ import type { ActionType, TriggerType } from "../lib/rule-schema";
 import { loadHLConfig } from "@/features/inbox/services/highlevel-client";
 import { fetchHLEvent, hlTimeZone } from "@/features/tools/lib/hl-appointment";
 import { resolveWorkspaceTimezone } from "../lib/workspace-timezone";
-import {
-  parseReminderConfig,
-  reminderLeadFloorMs,
-  withinSendWindow,
-} from "../lib/reminder-window";
+import { parseReminderConfig, reminderTiming } from "../lib/reminder-window";
 
 /** Marcador que obliga a tener `business_info.structured.name` configurado. */
 const BUSINESS_NAME_MARKER = "{{business.name}}";
@@ -99,6 +95,8 @@ interface RuleRow {
   action_type: ActionType;
   action_config: Record<string, unknown>;
   trigger_config?: Record<string, unknown> | null;
+  /** When the rule was last enabled: a reminder due before it is not sent. */
+  enabled_since?: string | null;
   enabled: boolean;
 }
 
@@ -106,6 +104,8 @@ interface ActionResult {
   outcome: RunOutcome;
   /** Motivo fijo (ver más abajo). Va a automation_runs.error. */
   error?: string;
+  /** Only for a retry: when to try again, instead of the usual backoff. */
+  notBefore?: string;
 }
 
 /**
@@ -116,14 +116,16 @@ interface ActionResult {
  *   skipped: rule_disabled | rule_reenabled | no_conversation | conversation_gone
  *            | transition_not_allowed | opted_out | already_assigned
  *            | appointment_not_active | appointment_passed | appointment_moved
- *            | reminder_too_late | outside_send_window | cooldown | daily_cap
+ *            | reminder_too_close | reminder_too_late | hl_not_connected
+ *            | cooldown | daily_cap
  *   failed:  outcome_unknown | cross_workspace | conversation_not_found
  *            | missing_business_name | missing_appointment | contact_not_found
  *            | missing_variable:<name> | invalid_config | empty_tag
  *            | internal_error | template_paused | send_rejected
  *   retry:   db_read_failed | db_write_failed | dispatch_prepare_failed
  *            | dispatch_mark_failed | send_not_accepted | hl_read_failed
- *            | hl_appointment_unknown | tag_write_failed | handoff_failed
+ *            | hl_appointment_unknown | outside_send_window (until the sending
+ *            hours open) | tag_write_failed | handoff_failed
  *            | close_failed | assign_failed
  *
  * When the claim gives up after the last retry it writes
@@ -190,6 +192,12 @@ const fail = (error: string): ActionResult => ({ outcome: "failed", error });
  * que acompaña a cada uno, server-side.
  */
 const retry = (error: string): ActionResult => ({ outcome: "retry", error });
+/** A retry at a given time (a reminder waiting for the sending hours). */
+const retryAt = (error: string, atMs: number): ActionResult => ({
+  outcome: "retry",
+  error,
+  notBefore: new Date(atMs).toISOString(),
+});
 
 /** El UPDATE terminal devolvió error. NO es "no afectó filas" (eso es `lost`). */
 class FinishError extends Error {
@@ -480,15 +488,16 @@ async function templateLanguageFor(
  * row: 'cancelled' when HighLevel says cancelled, the new time when it moved
  * (the next scan then reminds at the new time, under a new occurrence). A 404
  * or a status we don't know is `unknown` — try again later, never "cancelled"
- * (same rule as hl-appointment.ts). Without a HighLevel connection or id, the
- * local row is all there is; a failed read of the connection is an error.
+ * (same rule as hl-appointment.ts). An appointment with a HighLevel id but no
+ * usable HighLevel connection is `not_connected`: it can't be confirmed, so
+ * it isn't sent. Without a HighLevel id the local row is all there is.
  */
 async function confirmAppointmentWithHL(
   run: AutomationRun,
   appointmentId: string,
   appointment: { scheduledAt: string; hlAppointmentId: string | null },
   zone: string,
-): Promise<"active" | "cancelled" | "moved" | "unknown" | "error"> {
+): Promise<"active" | "cancelled" | "moved" | "unknown" | "not_connected" | "error" | "write_failed"> {
   if (!appointment.hlAppointmentId) return "active";
 
   let cfg: Awaited<ReturnType<typeof loadHLConfig>>;
@@ -501,7 +510,7 @@ async function confirmAppointmentWithHL(
     });
     return "error";
   }
-  if (!cfg) return "active";
+  if (!cfg) return "not_connected";
 
   let event: Awaited<ReturnType<typeof fetchHLEvent>>;
   try {
@@ -514,32 +523,32 @@ async function confirmAppointmentWithHL(
     return "error";
   }
 
-  if (event?.state === "cancelled") {
-    await svc()
+  const writeBack = async (patch: Record<string, unknown>): Promise<boolean> => {
+    const { error } = await svc()
       .from("appointments")
-      .update({ status: "cancelled" })
+      .update(patch)
       .eq("id", appointmentId)
-      .eq("workspace_id", run.workspace_id)
-      .then(
-        () => {},
-        () => {},
-      );
-    return "cancelled";
+      .eq("workspace_id", run.workspace_id);
+    if (error) {
+      console.error("[automations] could not update the appointment from HighLevel:", {
+        runId: run.id,
+        message: error.message,
+      });
+      return false;
+    }
+    return true;
+  };
+
+  if (event?.state === "cancelled") {
+    return (await writeBack({ status: "cancelled" })) ? "cancelled" : "write_failed";
   }
   if (!event || event.state !== "active" || event.startMs === null) return "unknown";
 
   const local = Date.parse(appointment.scheduledAt);
   if (Math.abs(event.startMs - local) > APPOINTMENT_MATCH_TOLERANCE_MS) {
-    await svc()
-      .from("appointments")
-      .update({ scheduled_at: new Date(event.startMs).toISOString() })
-      .eq("id", appointmentId)
-      .eq("workspace_id", run.workspace_id)
-      .then(
-        () => {},
-        () => {},
-      );
-    return "moved";
+    return (await writeBack({ scheduled_at: new Date(event.startMs).toISOString() }))
+      ? "moved"
+      : "write_failed";
   }
   return "active";
 }
@@ -658,16 +667,11 @@ async function actSendTemplate(
   if (appointmentId && load.ctx.appointment) {
     const reminder = parseReminderConfig(rule.trigger_config);
     if (!reminder) return fail("invalid_config");
-    const leadMs = Date.parse(load.ctx.appointment.scheduledAt) - Date.now();
-    // A reminder after the appointment is noise at best.
-    if (leadMs <= 0) return skip("appointment_passed");
-    // Too close to be the reminder the rule promises (a rule enabled today, a
-    // scan catching up after an outage): skipped, not sent late.
-    if (leadMs < reminderLeadFloorMs(reminder)) return skip("reminder_too_late");
     const zone = await resolveWorkspaceTimezone(svc(), run.workspace_id);
     if (!zone) return retry("db_read_failed");
-    // The scan emitted inside the sending hours; a backlog must not send at 3 am.
-    if (!withinSendWindow(reminder, zone, new Date())) return skip("outside_send_window");
+
+    // HighLevel first, before any timing decision: a move or a cancellation
+    // is written back to the local row whatever happens to this reminder.
     const confirmed = await confirmAppointmentWithHL(
       run,
       appointmentId,
@@ -675,9 +679,24 @@ async function actSendTemplate(
       zone,
     );
     if (confirmed === "error") return retry("hl_read_failed");
+    if (confirmed === "write_failed") return retry("db_write_failed");
     if (confirmed === "unknown") return retry("hl_appointment_unknown");
+    if (confirmed === "not_connected") return skip("hl_not_connected");
     if (confirmed === "cancelled") return skip("appointment_not_active");
     if (confirmed === "moved") return skip("appointment_moved");
+
+    const scheduledMs = Date.parse(load.ctx.appointment.scheduledAt);
+    if (!Number.isFinite(scheduledMs)) return fail("missing_appointment");
+    const timing = reminderTiming({
+      config: reminder,
+      tz: zone,
+      scheduledMs,
+      nowMs: Date.now(),
+      enabledSinceMs: rule.enabled_since ? Date.parse(rule.enabled_since) : null,
+    });
+    // Outside the sending hours it waits for them to open, never at 3 am.
+    if (timing.action === "wait") return retryAt("outside_send_window", timing.untilMs);
+    if (timing.action === "skip") return skip(timing.reason);
   }
 
   if (rawVariables.includes(BUSINESS_NAME_MARKER) && !load.ctx.businessName) {
@@ -1008,7 +1027,7 @@ async function finish(
             status: "pending",
             error: result.error ?? null,
             claimed_at: null,
-            not_before: backoffFrom(run.attempts),
+            not_before: result.notBefore ?? backoffFrom(run.attempts),
           }
         : {
             status: result.outcome,
@@ -1097,7 +1116,7 @@ export async function executeRun(claimed: AutomationRun): Promise<RunOutcome> {
     const ruleLoad = await loadScoped<RuleRow>(
       "automation_rules",
       run.rule_id,
-      "id, name, action_type, action_config, trigger_config, enabled",
+      "id, name, action_type, action_config, trigger_config, enabled, enabled_since",
       run.workspace_id,
     );
     if (ruleLoad.problem === "db") {
