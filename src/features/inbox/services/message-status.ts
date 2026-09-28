@@ -16,6 +16,7 @@
 
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { recordMessageError, type WhatsAppError } from "./whatsapp-errors";
+import { recordAutomationSendFailure } from "@/features/automations/services/send-failure";
 
 // WH-02: monotonic status order — never go backwards
 const STATUS_ORDER = ["queued", "sent", "delivered", "read"] as const;
@@ -36,6 +37,7 @@ interface MessageMatch {
   id: string;
   status: MessageStatus | null;
   wamid: string | null;
+  meta?: Record<string, unknown> | null;
 }
 
 /**
@@ -51,7 +53,7 @@ async function findMessage(
   if (event.wamid) {
     const { data, error } = await supabase
       .from("messages")
-      .select("id, status, wamid")
+      .select("id, status, wamid, meta")
       .eq("workspace_id", workspaceId)
       .eq("wamid", event.wamid)
       .limit(1);
@@ -64,7 +66,7 @@ async function findMessage(
     // messages.meta serves it; `meta->>ycloud_id` would scan the workspace.
     const { data, error } = await supabase
       .from("messages")
-      .select("id, status, wamid")
+      .select("id, status, wamid, meta")
       .eq("workspace_id", workspaceId)
       .eq("direction", "out")
       .contains("meta", { ycloud_id: event.providerMessageId })
@@ -107,6 +109,15 @@ export async function applyMessageStatus(
   let patch: Record<string, unknown>;
   let allowedFrom: string;
   if (newStatus === "failed") {
+    // An automation's template that failed after the send: close its run and,
+    // for a paused template, its rule. Before the message update, so a
+    // database error here is retried with the whole event.
+    await recordAutomationSendFailure(
+      supabase,
+      workspaceId,
+      msg.meta,
+      typeof event.error?.code === "number" ? event.error.code : null,
+    );
     patch = { status: "failed" };
     if (event.error) patch.error_message = event.error.message;
     allowedFrom = "status.is.null,status.neq.failed";
