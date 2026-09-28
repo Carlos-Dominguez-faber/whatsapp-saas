@@ -251,3 +251,19 @@ test("deshabilitar siempre pasa, aunque el workspace esté al tope", async () =>
   assert.equal(saved.error, undefined);
   assert.equal(countCalls.length, 0, "guardar deshabilitada tampoco lo consulta");
 });
+
+test("saveAutomationRule: editar sin tocar el interruptor no enciende la regla ni cuenta el tope", async () => {
+  reset();
+  const { enabled: _enabled, ...withoutEnabled } = VALID_RULE;
+  const res = await saveAutomationRule("ws_1", { ...withoutEnabled, id: RULE_ID });
+  assert.equal(res.error, undefined);
+  assert.equal(countCalls.length, 0, "no enabled, no cap check");
+  assert.equal("enabled" in (updated[0] as object), false, "the rule keeps its state");
+});
+
+test("saveAutomationRule: crear sin enabled la deja habilitada (el default de una regla nueva)", async () => {
+  reset();
+  const { enabled: _enabled, ...withoutEnabled } = VALID_RULE;
+  await saveAutomationRule("ws_1", withoutEnabled);
+  assert.equal((inserted[0] as { enabled: boolean }).enabled, true);
+});

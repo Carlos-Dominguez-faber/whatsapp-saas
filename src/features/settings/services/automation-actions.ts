@@ -6,6 +6,7 @@ import { createClient } from "@/lib/supabase/server";
 import { createClient as createSbClient } from "@supabase/supabase-js";
 import {
   AutomationRuleInputSchema,
+  AutomationRuleUpdateSchema,
   firstErrorMessage,
   type ActionType,
   type TriggerType,
@@ -79,26 +80,32 @@ export async function saveAutomationRule(
   workspaceId: string,
   rule: Omit<
     AutomationRule,
-    "workspace_id" | "created_at" | "updated_at" | "id"
+    "workspace_id" | "created_at" | "updated_at" | "id" | "enabled"
   > & {
     id?: string;
+    /** Omitted on an edit that didn't touch the switch: the rule keeps its state. */
+    enabled?: boolean;
   },
 ): Promise<{ data?: AutomationRule; error?: string }> {
   const authCheck = await assertAdminOrManager(workspaceId);
   if (authCheck && "error" in authCheck) return authCheck;
 
-  const parsed = AutomationRuleInputSchema.safeParse(rule);
+  // An edit goes through the update schema, where `enabled` has no default:
+  // saving a rule never switches it on unless the switch says so.
+  const parsed = rule.id
+    ? AutomationRuleUpdateSchema.safeParse(rule)
+    : AutomationRuleInputSchema.safeParse(rule);
   if (!parsed.success) {
     return { error: firstErrorMessage(parsed.error) };
   }
 
   const db = svc();
-  const { id, ...fields } = parsed.data;
+  const { id, ...fields } = parsed.data as typeof parsed.data & { id?: string };
 
   // Tope de reglas activas. Mismo criterio que la ruta de API: solo
   // se comprueba cuando la regla queda HABILITADA, y al editar se excluye a sí
   // misma del conteo (si no, guardar la regla nº 20 se rechazaría sola).
-  if (fields.enabled) {
+  if (fields.enabled === true) {
     try {
       await assertActiveRuleCap(db, workspaceId, { excludeRuleId: id });
     } catch (err) {

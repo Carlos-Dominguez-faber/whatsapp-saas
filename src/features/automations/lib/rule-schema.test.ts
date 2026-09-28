@@ -523,3 +523,19 @@ test("send_template keeps the template language and rejects a malformed one", ()
   }
   assert.ok(rule(undefined).success, "a rule saved before the language was stored still parses");
 });
+
+test("keyword lists are bounded: 50 keywords, 100 characters each", () => {
+  const rule = (keywords: string[]) =>
+    AutomationRuleInputSchema.safeParse(
+      base({
+        trigger_type: "keyword_match",
+        trigger_config: { keywords },
+        action_type: "handoff_human",
+        action_config: {},
+      }),
+    );
+  assert.ok(rule(Array.from({ length: 50 }, (_, i) => `k${i}`)).success);
+  assert.equal(rule(Array.from({ length: 51 }, (_, i) => `k${i}`)).success, false);
+  assert.ok(rule(["a".repeat(100)]).success);
+  assert.equal(rule(["a".repeat(101)]).success, false);
+});

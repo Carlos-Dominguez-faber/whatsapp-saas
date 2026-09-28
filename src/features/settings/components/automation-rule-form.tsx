@@ -110,6 +110,9 @@ export function AutomationRuleForm({
     rule?.action_type ?? "send_template",
   );
   const [enabled, setEnabled] = useState(rule?.enabled ?? true);
+  // An edit sends `enabled` only if the switch was touched: a sheet opened
+  // before the rule was paused must not switch it back on when saved.
+  const [enabledTouched, setEnabledTouched] = useState(false);
   const [keywords, setKeywords] = useState<string>(
     Array.isArray(rule?.trigger_config?.keywords)
       ? (rule.trigger_config.keywords as string[]).join(", ")
@@ -168,6 +171,7 @@ export function AutomationRuleForm({
       setTriggerType(rule?.trigger_type ?? "first_message");
       setActionType(rule?.action_type ?? "send_template");
       setEnabled(rule?.enabled ?? true);
+      setEnabledTouched(false);
       setKeywords(
         Array.isArray(rule?.trigger_config?.keywords)
           ? (rule.trigger_config.keywords as string[]).join(", ")
@@ -358,7 +362,7 @@ export function AutomationRuleForm({
     const draft = {
       id: rule?.id ?? undefined,
       name: name.trim(),
-      enabled,
+      ...(rule?.id && !enabledTouched ? {} : { enabled }),
       trigger_type: triggerType,
       trigger_config: buildTriggerConfig(),
       action_type: actionType,
@@ -753,7 +757,10 @@ export function AutomationRuleForm({
             </div>
             <Switch
               checked={enabled}
-              onCheckedChange={setEnabled}
+              onCheckedChange={(value) => {
+                setEnabled(value);
+                setEnabledTouched(true);
+              }}
               aria-label="Habilitar automatización"
             />
           </div>

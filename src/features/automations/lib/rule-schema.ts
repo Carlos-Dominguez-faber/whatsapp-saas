@@ -89,9 +89,14 @@ const TriggerVariant = z.discriminatedUnion(
       trigger_config: z.object({
         keywords: z
           .array(
-            z.string().trim().min(1, "Las palabras clave no pueden estar vacías"),
+            z
+              .string()
+              .trim()
+              .min(1, "Las palabras clave no pueden estar vacías")
+              .max(100, "Cada palabra clave puede tener hasta 100 caracteres"),
           )
-          .min(1, "Agrega al menos una palabra clave"),
+          .min(1, "Agrega al menos una palabra clave")
+          .max(50, "Puedes usar hasta 50 palabras clave por regla"),
       }),
     }),
     z.object({ trigger_type: z.literal("first_message"), trigger_config: NoConfig }),
