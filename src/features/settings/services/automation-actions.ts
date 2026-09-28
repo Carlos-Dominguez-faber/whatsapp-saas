@@ -28,6 +28,12 @@ export interface AutomationRule {
   trigger_config: Record<string, unknown>;
   action_type: ActionType;
   action_config: Record<string, unknown>;
+  /**
+   * Why the system switched the rule off, when it did: 'upgrade' (enabled
+   * before the automation engine existed, so it never ran) or
+   * 'template_paused' (Meta paused its template). Cleared on re-enable.
+   */
+  paused_reason?: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -56,6 +62,7 @@ async function assertAdminOrManager(
     .select("role")
     .eq("workspace_id", workspaceId)
     .eq("user_id", user.id)
+    .eq("is_active", true)
     .maybeSingle();
 
   if (!member) return { error: "Sin permisos" };

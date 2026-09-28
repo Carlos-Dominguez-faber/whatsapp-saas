@@ -8,19 +8,31 @@ process.env.SUPABASE_SERVICE_ROLE_KEY = "fake-service-key";
 // ── Cliente de sesión: auth + membresía ──────────────────────────────────────
 let authUser: unknown = { id: "user_1" };
 let memberRow: unknown = { role: "admin" };
+/** False: the membership exists but is inactive (is_active = false). */
+let memberActive = true;
+
+/** A membership lookup that honors its filters (is_active included). */
+function membershipQuery() {
+  const filters: Record<string, unknown> = {};
+  const q = {
+    eq(col: string, val: unknown) {
+      filters[col] = val;
+      return q;
+    },
+    maybeSingle: async () => ({
+      data: filters.is_active === true && !memberActive ? null : memberRow,
+      error: null,
+    }),
+  };
+  return q;
+}
 
 const fakeSession = {
   auth: {
     getUser: async () => ({ data: { user: authUser }, error: null }),
   },
   from: () => ({
-    select: () => ({
-      eq: () => ({
-        eq: () => ({
-          maybeSingle: async () => ({ data: memberRow, error: null }),
-        }),
-      }),
-    }),
+    select: () => membershipQuery(),
   }),
 };
 
@@ -174,6 +186,7 @@ const VALID_RULE = {
 function reset() {
   authUser = { id: "user_1" };
   memberRow = { role: "admin" };
+  memberActive = true;
   activeCount = 0;
   countError = null;
   countCalls = [];
@@ -314,25 +327,24 @@ test("PATCH: el conteo excluye la propia regla (deshabilitar y reactivar libera 
   ]);
 });
 
-test("PATCH: renombrar una regla activa corre el tope (excluyéndose a sí misma) y no la bloquea si hay cupo", async () => {
-  // El schema completo siempre trae `enabled` (con default `true` si el body
-  // no lo manda explícito — BaseFields en rule-schema.ts), así que un PATCH
-  // que solo cambia el nombre no puede distinguirse de uno que reafirma
-  // enabled:true. La regla activa se excluye de su propio conteo, así que
-  // renombrarla nunca se rechaza salvo que YA existan 20 activas aparte de
-  // esta (ventana de carrera aceptada, ver rule-cap.ts). Se fija el workspace AL TOPE
-  // (sin contar esta regla) para que el 200 pruebe algo: con activeCount bajo
-  // el 200 sería trivial y no distinguiría "excluye a sí misma" de "nunca
-  // llega a consultar el tope".
+test("PATCH: renombrar sin `enabled` no consulta el tope ni toca el estado", async () => {
+  // `enabled` no tiene default en el schema de update: un PATCH que solo
+  // renombra deja la regla como estaba (activa o no), así que no hay nada que
+  // contar contra el tope. El workspace va lleno para que el 200 pruebe algo.
   reset();
-  activeCount = MAX_ACTIVE_RULES_PER_WORKSPACE - 1; // el workspace queda lleno
+  activeCount = MAX_ACTIVE_RULES_PER_WORKSPACE;
   const res = await PATCH(
     patchReq({ ...VALID_RULE, id: RULE_ID, name: "otro nombre" }),
     params,
   );
   assert.equal(res.status, 200);
-  assert.equal(countCalls.length, 1, "el payload completo trae enabled implícito, sí consulta el tope");
+  assert.equal(countCalls.length, 0, "sin enabled explícito no se consulta el tope");
   assert.equal(updated.length, 1);
+  assert.equal(
+    (updated[0] as Record<string, unknown>).enabled,
+    undefined,
+    "el UPDATE no lleva enabled: la regla conserva su estado",
+  );
 });
 
 test("PATCH: deshabilitar nunca se rechaza, aunque el workspace esté al tope", async () => {
@@ -346,23 +358,10 @@ test("PATCH: deshabilitar nunca se rechaza, aunque el workspace esté al tope", 
   assert.equal(countCalls.length, 0);
 });
 
-test("PATCH: es full-replace — omitir enabled REACTIVA la regla, no la deja como estaba", async () => {
-  // CONTRATO DELIBERADO, no un bug: el PATCH reemplaza la regla entera contra
-  // `AutomationRuleUpdateSchema`, cuyo `enabled` es `z.boolean().default(true)`
-  // (BaseFields en rule-schema.ts). Omitir el campo NO es "dejalo como está",
-  // es "ponelo en el default", así que un PATCH que solo cambia el nombre de
-  // una regla DESHABILITADA la deja habilitada y escribiendo.
-  //
-  // No es alcanzable desde la UI: automation-rule-form.tsx:172-175 siempre
-  // manda `enabled` explícito. Solo se llega por HTTP directo.
-  //
-  // Este test existe para que el comportamiento sea una decisión y no un
-  // accidente: si alguien lo ve raro y quiere que omitir `enabled` preserve el
-  // valor actual, eso es cambiar el contrato del endpoint (PATCH parcial en vez
-  // de full-replace) y se decide antes de tocar el schema. Que este test se
-  // ponga rojo es la señal de que se cambió sin decidirlo.
-  // VALID_RULE no trae `enabled`: el body es el de un edit que solo renombra.
-  // La regla en la base está deshabilitada; da igual, la ruta no la lee.
+test("PATCH: omitir enabled NO reactiva una regla apagada", async () => {
+  // Reactivar una regla que puede mandar plantillas tiene que ser explícito.
+  // Antes el PATCH era full-replace con enabled por default `true`: un rename
+  // por HTTP de una regla apagada la dejaba enviando.
   reset();
   const res = await PATCH(
     patchReq({ ...VALID_RULE, id: RULE_ID, name: "solo cambié el nombre" }),
@@ -370,11 +369,24 @@ test("PATCH: es full-replace — omitir enabled REACTIVA la regla, no la deja co
   );
   assert.equal(res.status, 200);
   assert.equal(updated.length, 1);
-  assert.equal(
-    (updated[0] as { enabled?: unknown }).enabled,
-    true,
-    "full-replace: sin `enabled` en el body, la ruta escribe el default `true`",
+  assert.ok(
+    !("enabled" in (updated[0] as Record<string, unknown>)) ||
+      (updated[0] as Record<string, unknown>).enabled === undefined,
+    "sin enabled en el body, el UPDATE no lo escribe",
   );
+});
+
+test("POST/PATCH: una membresía inactiva no gestiona automatizaciones", async () => {
+  reset();
+  memberActive = false;
+  const post = await POST(postReq(VALID_RULE), params);
+  assert.equal(post.status, 403);
+  const patch = await PATCH(
+    patchReq({ ...VALID_RULE, id: RULE_ID, enabled: true }),
+    params,
+  );
+  assert.equal(patch.status, 403);
+  assert.equal(inserted.length + updated.length, 0);
 });
 
 test("PATCH: el UPDATE filtra por id Y por workspace_id (aislamiento entre tenants)", async () => {

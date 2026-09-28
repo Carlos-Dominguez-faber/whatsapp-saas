@@ -157,6 +157,14 @@ const ActionVariant = z.discriminatedUnion(
           .array(z.string())
           .max(10, "Máximo 10 variables por plantilla")
           .optional(),
+        // The template's language as Meta has it (es, es_MX, en_US…). The form
+        // stores the selected template's; a rule without it falls back to the
+        // approved template's own language at send time.
+        template_language: z
+          .string()
+          .trim()
+          .regex(/^[a-z]{2,3}(_[A-Z]{2})?$/, "Idioma de plantilla inválido")
+          .optional(),
       }),
     }),
     z.object({
@@ -203,9 +211,19 @@ export const AutomationRuleInputSchema = BaseFields.and(TriggerVariant).and(
 export type AutomationRuleInput = z.infer<typeof AutomationRuleInputSchema>;
 
 /** El mismo schema, pero con `id` obligatorio (PATCH y update). */
-export const AutomationRuleUpdateSchema = AutomationRuleInputSchema.and(
-  z.object({ id: z.uuid("ID de regla inválido") }),
-);
+/**
+ * An update never enables a rule by omission: `enabled` has no default here,
+ * and a missing `enabled` keeps the rule's current value (enabling one that
+ * sends templates must be an explicit choice).
+ */
+export const AutomationRuleUpdateSchema = BaseFields.extend({
+  enabled: z.boolean().optional(),
+})
+  .and(TriggerVariant)
+  .and(ActionVariant)
+  .and(z.object({ id: z.uuid("ID de regla inválido") }));
+
+export type AutomationRuleUpdate = z.infer<typeof AutomationRuleUpdateSchema>;
 
 /**
  * Primer mensaje de error en español, listo para un toast. Nunca devuelve el

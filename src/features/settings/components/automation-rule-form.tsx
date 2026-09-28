@@ -135,6 +135,13 @@ export function AutomationRuleForm({
       ? rule.action_config.template_name
       : "",
   );
+  // The template's language travels with the rule: Meta rejects a template
+  // sent in a language it wasn't approved in.
+  const [selectedLanguage, setSelectedLanguage] = useState<string>(
+    typeof rule?.action_config?.template_language === "string"
+      ? rule.action_config.template_language
+      : "",
+  );
   const [tagName, setTagName] = useState<string>(
     typeof rule?.action_config?.tag === "string" ? rule.action_config.tag : "",
   );
@@ -184,6 +191,11 @@ export function AutomationRuleForm({
       setSelectedTemplate(
         typeof rule?.action_config?.template_name === "string"
           ? rule.action_config.template_name
+          : "",
+      );
+      setSelectedLanguage(
+        typeof rule?.action_config?.template_language === "string"
+          ? rule.action_config.template_language
           : "",
       );
       setTagName(
@@ -313,11 +325,19 @@ export function AutomationRuleForm({
     return {};
   }
 
+  // The chosen template's language: the one picked in the selector, else the
+  // approved template's own (rules saved before the language was stored).
+  const templateLanguage =
+    selectedLanguage ||
+    approvedTemplates.find((t) => t.name === selectedTemplate)?.language ||
+    "";
+
   function buildActionConfig(): Record<string, unknown> {
     switch (actionType) {
       case "send_template":
         return {
           template_name: selectedTemplate,
+          ...(templateLanguage ? { template_language: templateLanguage } : {}),
           ...(variables.length > 0 ? { variables } : {}),
         };
       case "add_tag":
@@ -583,16 +603,24 @@ export function AutomationRuleForm({
                   </p>
                 ) : (
                   <Select
-                    value={selectedTemplate}
-                    onValueChange={setSelectedTemplate}
+                    value={
+                      selectedTemplate && templateLanguage
+                        ? `${selectedTemplate}::${templateLanguage}`
+                        : selectedTemplate
+                    }
+                    onValueChange={(value) => {
+                      const [name, language] = value.split("::");
+                      setSelectedTemplate(name ?? "");
+                      setSelectedLanguage(language ?? "");
+                    }}
                   >
                     <SelectTrigger id="rule-template">
                       <SelectValue placeholder="Selecciona un template" />
                     </SelectTrigger>
                     <SelectContent>
                       {approvedTemplates.map((t) => (
-                        <SelectItem key={t.id} value={t.name}>
-                          {t.name}
+                        <SelectItem key={t.id} value={`${t.name}::${t.language}`}>
+                          {t.name} ({t.language})
                         </SelectItem>
                       ))}
                     </SelectContent>

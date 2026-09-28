@@ -484,3 +484,42 @@ test("rechaza un nombre vacío", () => {
   assert.equal(parsed.success, false);
   assert.equal(firstErrorMessage(parsed.error!), "El nombre es obligatorio");
 });
+
+// ── Phase 4: an edit never turns a rule on; the template's language ──────────
+
+test("an update without enabled leaves it undefined: editing never turns a rule on", () => {
+  const parsed = AutomationRuleUpdateSchema.safeParse({
+    id: UUID,
+    name: "Regla",
+    trigger_type: "first_message",
+    trigger_config: {},
+    action_type: "handoff_human",
+    action_config: {},
+  });
+  assert.ok(parsed.success);
+  assert.equal(parsed.data.enabled, undefined);
+});
+
+test("send_template keeps the template language and rejects a malformed one", () => {
+  const rule = (template_language: unknown) =>
+    AutomationRuleInputSchema.safeParse(
+      base({
+        trigger_type: "first_message",
+        trigger_config: {},
+        action_type: "send_template",
+        action_config: { template_name: "bienvenida", template_language },
+      }),
+    );
+  for (const lang of ["es", "es_MX", "en_US", "fil"]) {
+    const parsed = rule(lang);
+    assert.ok(parsed.success, lang);
+    assert.equal(
+      (parsed.data.action_config as { template_language?: string }).template_language,
+      lang,
+    );
+  }
+  for (const lang of ["ES", "es-MX", "español", ""]) {
+    assert.equal(rule(lang).success, false, lang);
+  }
+  assert.ok(rule(undefined).success, "a rule saved before the language was stored still parses");
+});

@@ -125,6 +125,14 @@ function EmptyState({ onNew }: { onNew: () => void }) {
 
 // ── Rule card ─────────────────────────────────────────────────────────────────
 
+/** Why the system switched a rule off (automation_rules.paused_reason). */
+const PAUSED_REASON_LABELS: Record<string, string> = {
+  upgrade:
+    "Apagada al actualizar: antes no se ejecutaba. Revísala y actívala si la quieres.",
+  template_paused:
+    "Apagada porque Meta pausó su plantilla. Revisa la plantilla antes de activarla.",
+};
+
 interface RuleCardProps {
   rule: AutomationRule;
   onEdit: (rule: AutomationRule) => void;
@@ -199,6 +207,12 @@ function RuleCard({
                 </span>
               )}
           </div>
+          {!rule.enabled && rule.paused_reason && (
+            <p className="text-xs text-amber-700 dark:text-amber-400">
+              {PAUSED_REASON_LABELS[rule.paused_reason] ??
+                "El sistema apagó esta automatización. Revísala antes de activarla."}
+            </p>
+          )}
         </div>
 
         {/* Right: controls */}
@@ -332,7 +346,11 @@ export function AutomationsTab({ workspaceId }: Props) {
     setTogglingId(rule.id);
     // Optimistic update
     setRules((prev) =>
-      prev.map((r) => (r.id === rule.id ? { ...r, enabled } : r)),
+      prev.map((r) =>
+        r.id === rule.id
+          ? { ...r, enabled, paused_reason: enabled ? null : r.paused_reason }
+          : r,
+      ),
     );
 
     const result = await toggleAutomationRule(workspaceId, rule.id, enabled);
@@ -342,7 +360,11 @@ export function AutomationsTab({ workspaceId }: Props) {
       toast.error(result.error);
       // Rollback
       setRules((prev) =>
-        prev.map((r) => (r.id === rule.id ? { ...r, enabled: !enabled } : r)),
+        prev.map((r) =>
+          r.id === rule.id
+            ? { ...r, enabled: !enabled, paused_reason: rule.paused_reason }
+            : r,
+        ),
       );
       return;
     }
@@ -359,6 +381,9 @@ export function AutomationsTab({ workspaceId }: Props) {
   // ── Derived ──────────────────────────────────────────────────────────────────
 
   const enabledCount = rules.filter((r) => r.enabled).length;
+  const pausedByUpgrade = rules.filter(
+    (r) => !r.enabled && r.paused_reason === "upgrade",
+  ).length;
 
   // ── Render ───────────────────────────────────────────────────────────────────
 
@@ -384,6 +409,27 @@ export function AutomationsTab({ workspaceId }: Props) {
             Nueva automatización
           </Button>
         </div>
+
+        {!isLoading && !loadError && pausedByUpgrade > 0 && (
+          <div
+            role="status"
+            className="flex gap-3 rounded-lg border border-amber-300/60 bg-amber-50 px-4 py-3 text-sm text-amber-900 dark:border-amber-500/30 dark:bg-amber-950/40 dark:text-amber-200"
+          >
+            <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" aria-hidden="true" />
+            <div className="space-y-1">
+              <p className="font-medium">
+                {pausedByUpgrade === 1
+                  ? "Una automatización se apagó al actualizar"
+                  : `${pausedByUpgrade} automatizaciones se apagaron al actualizar`}
+              </p>
+              <p className="text-xs">
+                Antes las automatizaciones solo se guardaban; ahora se ejecutan solas y
+                pueden enviar plantillas de WhatsApp con costo. Revisa cada una y
+                actívala solo si todavía la quieres.
+              </p>
+            </div>
+          </div>
+        )}
 
         {/* Content — 4 states */}
         {isLoading ? (

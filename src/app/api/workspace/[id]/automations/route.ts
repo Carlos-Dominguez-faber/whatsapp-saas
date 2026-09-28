@@ -35,6 +35,7 @@ async function resolveMember(
     .select("role")
     .eq("workspace_id", workspaceId)
     .eq("user_id", userId)
+    .eq("is_active", true)
     .maybeSingle();
   return data;
 }
@@ -220,14 +221,11 @@ export async function PATCH(
 
   const db = svc();
 
-  // Tope de reglas activas. Solo se comprueba cuando este PATCH deja
-  // la regla habilitada. AutomationRuleUpdateSchema exige el registro completo
-  // y `enabled` tiene default `true` (BaseFields en rule-schema.ts), así que un
-  // body sin `enabled` explícito igual llega aquí como `true` — un rename no se
-  // distingue de una reactivación a nivel de schema. `excludeRuleId` es lo que
-  // evita que la regla se rechace a sí misma cuando ya estaba activa.
-  // `fields.enabled` solo es `false` cuando el body lo trae explícito, y ahí sí
-  // se salta el conteo: deshabilitar nunca puede pasarse del tope.
+  // Active-rule cap: checked only when this PATCH explicitly enables the rule.
+  // `enabled` has no default in the update schema, so a PATCH without it
+  // (a rename, a new template) keeps the rule's current state and never
+  // re-enables it. `excludeRuleId` keeps an already-active rule from counting
+  // against itself.
   if (fields.enabled === true) {
     try {
       await assertActiveRuleCap(db, workspaceId, { excludeRuleId: id });

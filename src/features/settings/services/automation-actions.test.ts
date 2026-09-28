@@ -13,13 +13,14 @@ const fakeSession = {
     getUser: async () => ({ data: { user: { id: "user_1" } }, error: null }),
   },
   from: () => ({
-    select: () => ({
-      eq: () => ({
-        eq: () => ({
-          maybeSingle: async () => ({ data: { role: "admin" }, error: null }),
-        }),
-      }),
-    }),
+    select: () => {
+      // Chainable, whatever filters the check applies (is_active included).
+      const q = {
+        eq: () => q,
+        maybeSingle: async () => ({ data: { role: "admin" }, error: null }),
+      };
+      return q;
+    },
   }),
 };
 
