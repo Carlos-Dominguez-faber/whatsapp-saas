@@ -361,11 +361,12 @@ las migraciones, así que las migraciones van **antes** de `vercel --prod`.
 - Si al revisar el presupuesto la base no responde, el lote se reintenta (y tras 3
   reintentos queda como `batch_dead_letter` en `events`) en vez de perderse sin
   aviso. El reintento no gasta otro turno del tope por hora.
-- El tool **Webhook personalizado** sigue hasta 3 redirects, siempre por HTTPS y
-  revisando cada destino. Así funcionan, por ejemplo, las web apps de Google Apps
-  Script, que responden a cada POST con un redirect después de ejecutarlo. Si el
-  webhook respondió al POST con un redirect y un salto posterior falla, la llamada
-  cuenta como entregada: el webhook ya la recibió, y el agente no la repite.
+- Las **tools de n8n** (que reemplazan al antiguo "Webhook personalizado", ver
+  abajo) siguen hasta 3 redirects, siempre por HTTPS y revisando cada destino. Así
+  funcionan, por ejemplo, las web apps de Google Apps Script, que responden a cada
+  POST con un redirect después de ejecutarlo. Si el webhook respondió al POST con un
+  redirect y un salto posterior falla, la llamada cuenta como entregada: el webhook
+  ya la recibió, y el agente no la repite.
 
 **Cambios en el buffer y los envíos (Fase 2, finales de sep-2026):**
 
@@ -469,14 +470,16 @@ las migraciones, así que las migraciones van **antes** de `vercel --prod`.
 - **Equipo:** invitar un correo que **ya tiene cuenta** responde "Ese correo ya tiene
   cuenta; pídele a la agencia que lo agregue", salvo que esa persona ya esté en
   este workspace. Solo el super admin agrega cuentas existentes.
-- **Citas en HighLevel** (apagadas hasta que las actives en Configuración → Tools):
+- **Citas en HighLevel, beta** (apagadas hasta que las actives en Configuración →
+  Tools, donde llevan la etiqueta "Beta"; pruébalas primero en una sub-cuenta de
+  HighLevel):
   - `list_highlevel_appointments` (lectura): las próximas citas del contacto, con la
     fecha y hora exactas que el agente debe copiar.
   - `cancel_highlevel` y `reschedule_highlevel`: el agente pasa la fecha y hora de
     la cita que el cliente confirmó, y la tool solo actúa sobre la cita del
-    contacto a esa hora. La hora se lee en la zona del negocio (Configuración →
-    Negocio), así que una fecha del otro lado de un cambio de horario sigue
-    empatando; una fecha que no existe se rechaza.
+    contacto a esa hora. Las fechas van en la zona de agenda (la del negocio, o la
+    de la ubicación de HighLevel); una fecha con el offset de otra zona o que no
+    existe se rechaza.
   - Si la cita ya estaba cancelada, o ya está en el horario nuevo por un cambio
     anterior, lo dice y no cambia nada: un reintento nunca cancela ni mueve otra
     cita. Tampoco actúa sobre citas pasadas ni cuando hay dos citas a la misma hora.
@@ -485,14 +488,27 @@ las migraciones, así que las migraciones van **antes** de `vercel --prod`.
     dice al cliente que se hizo ni que falló: dice que una persona lo confirmará.
     Cada vez que la consulta o el cambio fallan, queda una **nota interna** en la
     conversación para el equipo.
-  - Busca primero en tu base; si ahí no está, le pregunta a HighLevel **solo si el
-    workspace tiene un calendario configurado**.
+  - **HighLevel manda:** con un calendario configurado, las citas del contacto se
+    leen de HighLevel (su hora, estado y duración), y la tabla local solo guarda una
+    copia. Si el equipo mueve o cancela una cita en HighLevel, el agente ve el
+    cambio. Sin calendario, la tabla local solo dice qué citas leer.
   - Usan los encabezados `Version` que documenta HighLevel (`2021-04-15` para las
     citas, `2021-07-28` para las citas de un contacto).
-  - `schedule_highlevel` agenda siempre al contacto de la conversación.
-- **Chat de prueba de agentes:** solo corre las tools de **lectura** (consultar
-  disponibilidad, una tool de n8n de lectura). No agenda, no cancela ni dispara
-  workflows de escritura.
+  - `schedule_highlevel` agenda siempre al contacto de la conversación; en el chat
+    de prueba, ver abajo.
+- **Chat de prueba de agentes:**
+  - Un **manager** solo corre las tools de **lectura** (consultar disponibilidad,
+    una tool de n8n de lectura).
+  - Un **admin** corre también las de **escritura** activas: agenda de verdad en
+    HighLevel y dispara los workflows de n8n que escriben. Cancelar y reagendar no
+    aplican (la prueba no tiene contacto).
+  - Para agendar en la prueba, escribe en el chat el teléfono de prueba: solo se
+    usa un número que tú escribiste (nunca uno que invente el agente). La cita
+    aparece en HighLevel como "[Prueba]", y si ese número ya era un contacto, no se
+    le cambia el nombre. Cada una deja un evento `playground_write` con quién la
+    hizo y el teléfono.
+  - Si la respuesta falla después de ejecutar una acción, la pantalla lo dice:
+    revisa qué quedó hecho antes de reintentar.
 - **Tools de n8n por workspace** (Configuración → n8n, solo admins): cada fila es una
   tool que llama a un webhook de n8n.
   - El header de autenticación se guarda **cifrado** y nunca se vuelve a mostrar;
