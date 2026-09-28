@@ -8,7 +8,7 @@ BEGIN;
 CREATE EXTENSION IF NOT EXISTS pgtap WITH SCHEMA extensions;
 SET search_path = public, extensions;
 
-SELECT plan(141);
+SELECT plan(183);
 
 -- ── public.users: read-only for sessions ────────────────────────────────────
 SELECT ok(NOT has_table_privilege('authenticated', 'public.users', 'UPDATE'),
@@ -665,6 +665,161 @@ SELECT results_eq($$SELECT enabled FROM public.n8n_tools WHERE name = 'webhook_p
 SELECT throws_ok($$SELECT auth_header_value FROM public.n8n_tools WHERE name = 'webhook_personalizado_2'$$,
   '42501', NULL, 'and cannot read its header');
 RESET ROLE;
+
+-- ── automation engine: server-only outbox, workspace-bound, capped ─────────
+SELECT ok(NOT has_function_privilege('anon', 'public.claim_next_automation_run()', 'EXECUTE'),
+  'anon cannot claim automation runs');
+SELECT ok(NOT has_function_privilege('authenticated', 'public.claim_next_automation_run()', 'EXECUTE'),
+  'sessions cannot claim automation runs');
+SELECT ok(has_function_privilege('service_role', 'public.claim_next_automation_run()', 'EXECUTE'),
+  'service_role can claim automation runs');
+SELECT ok(NOT has_function_privilege('anon', 'public.mark_automation_run_dispatched(uuid, integer, integer)', 'EXECUTE'),
+  'anon cannot mark a run dispatched');
+SELECT ok(NOT has_function_privilege('authenticated', 'public.mark_automation_run_dispatched(uuid, integer, integer)', 'EXECUTE'),
+  'sessions cannot mark a run dispatched');
+SELECT ok(NOT has_function_privilege('authenticated', 'public.release_automation_run_dispatch(uuid)', 'EXECUTE'),
+  'sessions cannot release a dispatch');
+SELECT ok(NOT has_function_privilege('authenticated', 'public.append_contact_tags(uuid, uuid, text[])', 'EXECUTE'),
+  'sessions cannot append tags through the definer function');
+SELECT ok(NOT has_function_privilege('authenticated', 'public.automation_event_ttl(text)', 'EXECUTE'),
+  'sessions cannot call automation_event_ttl');
+SELECT hasnt_function('public', 'mark_automation_run_dispatched', ARRAY['uuid'],
+  'the one-argument mark (no cooldown, no cap) is gone');
+SELECT ok(NOT has_table_privilege('authenticated', 'public.automation_events', 'INSERT'),
+  'sessions cannot insert into the automation outbox');
+SELECT ok(NOT has_table_privilege('authenticated', 'public.automation_runs', 'INSERT'),
+  'sessions cannot queue automation runs');
+SELECT ok(NOT has_table_privilege('authenticated', 'public.automation_runs', 'UPDATE'),
+  'sessions cannot change automation runs');
+SELECT ok(NOT has_table_privilege('authenticated', 'public.automation_rules', 'UPDATE'),
+  'sessions cannot write rules: the server checks the role, the schema and the cap');
+SELECT policies_are('public', 'automation_rules', ARRAY['ws members read automations'],
+  'members only read rules');
+SELECT ok((SELECT relrowsecurity FROM pg_class WHERE oid = 'public.automation_events'::regclass),
+  'automation_events has RLS');
+SELECT ok((SELECT relrowsecurity FROM pg_class WHERE oid = 'public.automation_runs'::regclass),
+  'automation_runs has RLS');
+SELECT fk_ok('public', 'automation_events', ARRAY['workspace_id', 'conversation_id'], 'public', 'conversations', ARRAY['workspace_id', 'id']);
+SELECT fk_ok('public', 'automation_events', ARRAY['workspace_id', 'contact_id'], 'public', 'contacts', ARRAY['workspace_id', 'id']);
+SELECT fk_ok('public', 'automation_events', ARRAY['workspace_id', 'message_id'], 'public', 'messages', ARRAY['workspace_id', 'id']);
+SELECT fk_ok('public', 'automation_events', ARRAY['workspace_id', 'rule_id'], 'public', 'automation_rules', ARRAY['workspace_id', 'id']);
+SELECT fk_ok('public', 'automation_runs', ARRAY['workspace_id', 'conversation_id'], 'public', 'conversations', ARRAY['workspace_id', 'id']);
+SELECT fk_ok('public', 'automation_runs', ARRAY['workspace_id', 'contact_id'], 'public', 'contacts', ARRAY['workspace_id', 'id']);
+SELECT fk_ok('public', 'automation_runs', ARRAY['workspace_id', 'rule_id'], 'public', 'automation_rules', ARRAY['workspace_id', 'id']);
+SELECT fk_ok('public', 'automation_runs', ARRAY['workspace_id', 'event_id'], 'public', 'automation_events', ARRAY['workspace_id', 'id']);
+SELECT is_empty($$SELECT 1 FROM public.automation_rules WHERE enabled AND enabled_since IS NULL$$,
+  'no rule is on without having been enabled under the engine (legacy rules start off)');
+
+INSERT INTO public.contacts (id, workspace_id, phone, opt_in) VALUES
+  ('b0000000-0000-4000-8000-0000000000c9', 'b0000000-0000-4000-8000-000000000001', '+15550009999', true);
+INSERT INTO public.conversations (id, workspace_id, contact_id) VALUES
+  ('b0000000-0000-4000-8000-0000000000d9', 'b0000000-0000-4000-8000-000000000001',
+   'b0000000-0000-4000-8000-0000000000c9');
+INSERT INTO public.automation_rules (id, workspace_id, name, trigger_type, action_type, action_config, enabled, paused_reason) VALUES
+  ('b0000000-0000-4000-8000-0000000000a9', 'b0000000-0000-4000-8000-000000000001', 'Bienvenida',
+   'first_message', 'send_template', '{"template_name": "bienvenida"}', false, 'upgrade');
+UPDATE public.automation_rules SET enabled = true WHERE id = 'b0000000-0000-4000-8000-0000000000a9';
+SELECT results_eq(
+  $$SELECT enabled_since IS NOT NULL, paused_reason FROM public.automation_rules
+     WHERE id = 'b0000000-0000-4000-8000-0000000000a9'$$,
+  $$VALUES (true, NULL::text)$$,
+  'enabling a paused rule stamps enabled_since and clears why it was paused');
+
+INSERT INTO public.messages (id, workspace_id, conversation_id, direction, type, body) VALUES
+  ('b0000000-0000-4000-8000-0000000000b9', 'b0000000-0000-4000-8000-000000000001',
+   'b0000000-0000-4000-8000-0000000000d9', 'in', 'text', 'hola');
+SELECT results_eq(
+  $$SELECT event_type, contact_id FROM public.automation_events
+     WHERE subject_id = 'b0000000-0000-4000-8000-0000000000d9'$$,
+  $$VALUES ('first_message'::text, 'b0000000-0000-4000-8000-0000000000c9'::uuid)$$,
+  'the first inbound message emits one first_message event, in the same transaction');
+
+SET LOCAL ROLE authenticated;
+SELECT set_config('request.jwt.claims',
+  '{"sub":"b0000000-0000-4000-8000-0000000000e1","role":"authenticated"}', true);
+SELECT throws_ok(
+  $$INSERT INTO public.automation_events (workspace_id, event_type, subject_id, occurrence)
+    VALUES ('b0000000-0000-4000-8000-000000000001', 'first_message', gen_random_uuid(), 'x')$$,
+  '42501', NULL, 'even an admin cannot plant an event in the outbox');
+SELECT throws_ok(
+  $$UPDATE public.automation_rules SET enabled = true$$,
+  '42501', NULL, 'even an admin cannot switch a rule on behind the server');
+SELECT isnt_empty($$SELECT 1 FROM public.automation_events$$,
+  'a member reads the trace of their workspace');
+RESET ROLE;
+
+SELECT throws_ok(
+  $$INSERT INTO public.automation_events (workspace_id, event_type, subject_id, occurrence, contact_id)
+    VALUES ('a0000000-0000-4000-8000-000000000001', 'first_message', gen_random_uuid(), 'x',
+            'b0000000-0000-4000-8000-0000000000c9')$$,
+  '23503', NULL, 'an event "in A" cannot point at a contact of B');
+SELECT throws_ok(
+  $$INSERT INTO public.automation_runs (workspace_id, rule_id, event_id, trigger_type, conversation_id)
+    SELECT 'a0000000-0000-4000-8000-000000000001', 'b0000000-0000-4000-8000-0000000000a9', e.id,
+           'first_message', 'b0000000-0000-4000-8000-0000000000d9'
+      FROM public.automation_events e WHERE e.subject_id = 'b0000000-0000-4000-8000-0000000000d9'$$,
+  '23503', NULL, 'a run "in A" cannot use a rule, event or conversation of B');
+
+-- mark: opt-in, cooldown per (rule, contact), daily cap per workspace
+INSERT INTO public.automation_runs (id, workspace_id, rule_id, event_id, trigger_type, conversation_id, status, claimed_at)
+  SELECT 'b0000000-0000-4000-8000-0000000000f7', 'b0000000-0000-4000-8000-000000000001',
+         'b0000000-0000-4000-8000-0000000000a9', e.id, 'first_message',
+         'b0000000-0000-4000-8000-0000000000d9', 'processing', now()
+    FROM public.automation_events e WHERE e.subject_id = 'b0000000-0000-4000-8000-0000000000d9';
+INSERT INTO public.automation_events (id, workspace_id, event_type, subject_id, occurrence, conversation_id, contact_id)
+  VALUES (900001, 'b0000000-0000-4000-8000-000000000001', 'handoff_requested',
+          'b0000000-0000-4000-8000-0000000000d9', '1',
+          'b0000000-0000-4000-8000-0000000000d9', 'b0000000-0000-4000-8000-0000000000c9');
+INSERT INTO public.automation_runs (id, workspace_id, rule_id, event_id, trigger_type, conversation_id, status, claimed_at)
+  VALUES ('b0000000-0000-4000-8000-0000000000f8', 'b0000000-0000-4000-8000-000000000001',
+          'b0000000-0000-4000-8000-0000000000a9', 900001, 'handoff_requested',
+          'b0000000-0000-4000-8000-0000000000d9', 'processing', now());
+SELECT is(public.mark_automation_run_dispatched('b0000000-0000-4000-8000-0000000000f7', 24, 300), 'ok',
+  'the first send of a rule to a contact is allowed');
+SELECT is(public.mark_automation_run_dispatched('b0000000-0000-4000-8000-0000000000f7', 24, 300), 'already_dispatched',
+  'a run marked once is never marked again');
+SELECT is(public.mark_automation_run_dispatched('b0000000-0000-4000-8000-0000000000f8', 24, 300), 'cooldown',
+  'the same rule to the same contact within the cooldown is refused');
+SELECT is(public.mark_automation_run_dispatched('b0000000-0000-4000-8000-0000000000f8', 0, 1), 'daily_cap',
+  'past the workspace''s daily cap nothing more is sent');
+SELECT ok(public.release_automation_run_dispatch('b0000000-0000-4000-8000-0000000000f7'),
+  'a send that provably did not happen releases its mark');
+UPDATE public.contacts SET opted_out_at = now() WHERE id = 'b0000000-0000-4000-8000-0000000000c9';
+SELECT is(public.mark_automation_run_dispatched('b0000000-0000-4000-8000-0000000000f8', 0, 0), 'opted_out',
+  'nothing is sent to a contact who opted out');
+
+-- an explicit opt-out survives the inbound upsert that opts writers in
+INSERT INTO public.contacts (workspace_id, phone, opt_in, opt_in_at)
+  VALUES ('b0000000-0000-4000-8000-000000000001', '+15550009999', true, now())
+  ON CONFLICT (workspace_id, phone) DO UPDATE SET opt_in = EXCLUDED.opt_in, opt_in_at = EXCLUDED.opt_in_at;
+SELECT is((SELECT opt_in FROM public.contacts WHERE id = 'b0000000-0000-4000-8000-0000000000c9'), false,
+  'writing again after STOP does not opt the contact back in');
+UPDATE public.contacts SET opt_in = true, opted_out_at = NULL WHERE id = 'b0000000-0000-4000-8000-0000000000c9';
+SELECT is((SELECT opt_in FROM public.contacts WHERE id = 'b0000000-0000-4000-8000-0000000000c9'), true,
+  'ALTA (clearing the opt-out) opts them back in');
+
+-- the claim discards what expired instead of sending it late
+UPDATE public.automation_runs SET status = 'done', finished_at = now()
+ WHERE workspace_id = 'b0000000-0000-4000-8000-000000000001';
+UPDATE public.automation_events SET occurred_at = now() - interval '3 hours' WHERE id = 900001;
+-- The rule has been on since yesterday (the trigger stamps enabled_since itself).
+ALTER TABLE public.automation_rules DISABLE TRIGGER trg_automation_rules_enabled_since;
+UPDATE public.automation_rules SET enabled_since = now() - interval '1 day'
+ WHERE id = 'b0000000-0000-4000-8000-0000000000a9';
+ALTER TABLE public.automation_rules ENABLE TRIGGER trg_automation_rules_enabled_since;
+INSERT INTO public.automation_runs (id, workspace_id, rule_id, event_id, trigger_type, conversation_id, status)
+  VALUES ('b0000000-0000-4000-8000-0000000000f9', 'b0000000-0000-4000-8000-000000000001',
+          'b0000000-0000-4000-8000-0000000000a9', 900001, 'handoff_requested',
+          'b0000000-0000-4000-8000-0000000000d9', 'pending')
+  ON CONFLICT (rule_id, event_id) DO UPDATE SET status = 'pending', dispatched_at = NULL, not_before = now();
+SELECT is_empty($$SELECT * FROM public.claim_next_automation_run()
+                   WHERE workspace_id = 'b0000000-0000-4000-8000-000000000001'$$,
+  'a handoff event older than its 2-hour TTL is never handed out');
+SELECT results_eq(
+  $$SELECT status, error FROM public.automation_runs
+     WHERE rule_id = 'b0000000-0000-4000-8000-0000000000a9' AND event_id = 900001$$,
+  $$VALUES ('skipped'::text, 'stale'::text)$$,
+  'it is closed as skipped/stale, with a trace');
 
 -- ── password-reset audit: append-only, server-only ──────────────────────────
 SELECT ok(NOT has_table_privilege('authenticated', 'public.member_password_resets', 'SELECT'),
