@@ -143,7 +143,7 @@ export async function getHLConfig(
  * zone used to look like, so it counts only when the location lookup wrote
  * it (timezone_source "location", see saveHLLocationTimeZone).
  */
-function hlZoneOf(config: Record<string, unknown>): string | null {
+export function hlZoneOf(config: Record<string, unknown>): string | null {
   const tz = config.timezone;
   if (!isIanaTimeZone(tz)) return null;
   if (tz.trim() === "UTC" && config.timezone_source !== "location") return null;

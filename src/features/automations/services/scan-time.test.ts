@@ -125,6 +125,17 @@ mock.module("@supabase/supabase-js", {
   },
 });
 
+// The zone comes from the shared resolver (business zone → HighLevel's →
+// DEFAULT_TIMEZONE; null when the settings can't be read). Its own rules are
+// tested in workspace-timezone.test.ts; here each workspace just has one.
+let zones: Record<string, string | null> = {};
+mock.module("@/features/automations/lib/workspace-timezone.ts", {
+  exports: {
+    resolveWorkspaceTimezone: async (_db: unknown, ws: string) =>
+      ws in zones ? zones[ws] : "UTC",
+  },
+});
+
 const { scanTimeTriggers } = await import("./scan-time.ts");
 
 const FAR = () => Date.now() + 60_000; // deadline holgado
@@ -132,6 +143,7 @@ const FAR = () => Date.now() + 60_000; // deadline holgado
 function resetFakes() {
   responses = {};
   calls = [];
+  zones = {};
 }
 
 const WS1 = "11111111-1111-1111-1111-111111111111";
@@ -157,34 +169,13 @@ function appt(over: Record<string, unknown> = {}) {
   };
 }
 
-/** No hay fila en `integrations` para el workspace: default UTC. */
+/** The workspace's scheduling zone is UTC (the fixtures' times are in UTC). */
 function noIntegrations(ws: string) {
-  responses[`integrations.select:${ws}`] = [{ data: [], error: null }];
+  zones[ws] = "UTC";
 }
 
-function integrationsTimezone(
-  ws: string,
-  timezone: string | null,
-  provider = "highlevel",
-) {
-  responses[`integrations.select:${ws}`] = [
-    { data: [{ provider, config: { timezone } }], error: null },
-  ];
-}
-
-/** Las dos integraciones configuradas, cada una en su zona. */
-function integrationsBothTimezones(ws: string, highlevel: string, caldotcom: string) {
-  responses[`integrations.select:${ws}`] = [
-    {
-      // A propósito con Cal.com PRIMERO en la respuesta: el desempate no puede
-      // depender del orden en que PostgREST devuelva las filas.
-      data: [
-        { provider: "caldotcom", config: { timezone: caldotcom } },
-        { provider: "highlevel", config: { timezone: highlevel } },
-      ],
-      error: null,
-    },
-  ];
+function integrationsTimezone(ws: string, timezone: string | null) {
+  zones[ws] = timezone;
 }
 
 const NOW = "2026-09-09T12:00:00.000Z"; // hora 12 UTC — dentro de [8,22)
@@ -222,7 +213,9 @@ test("cita dentro de la ventana → inserta el evento con el occurrence esperado
       workspace_id: WS1,
       event_type: "appointment_upcoming",
       subject_id: "appt_1",
-      occurrence: "24h:2026-09-09T22:00:00.000Z",
+      // The rule id leads the occurrence: two reminder rules with the same lead
+      // time get one event each.
+      occurrence: "rule_1:24h:2026-09-09T22:00:00.000Z",
       contact_id: "cont_1",
       conversation_id: "conv_1",
       rule_id: "rule_1",
@@ -262,7 +255,7 @@ test("cita reagendada → el occurrence lleva el scheduled_at nuevo, no el viejo
   const { rows } = calls.find((c) => c.key === "events.upsert")!.arg as {
     rows: Array<{ occurrence: string }>;
   };
-  assert.equal(rows[0].occurrence, "24h:2026-09-10T09:00:00.000Z");
+  assert.equal(rows[0].occurrence, "rule_1:24h:2026-09-10T09:00:00.000Z");
 });
 
 // ── filtros que decide Postgres (se prueba el filtro que se manda) ──
@@ -349,9 +342,9 @@ test("conversation_id null → no inserta", async () => {
   assert.equal(calls.some((c) => c.key === "events.upsert"), false);
 });
 
-// ── Ventana horaria, y default UTC cuando integrations.config es null ─
+// ── Ventana horaria, en la zona del workspace ─
 
-test("fuera de la ventana horaria (default 8-22, timezone null = UTC) → no inserta", async () => {
+test("fuera de la ventana horaria (default 8-22, zona UTC) → no inserta", async () => {
   resetFakes();
   responses["rules.select"] = [{ data: [rule()], error: null }];
   noIntegrations(WS1); // timezone null → UTC
@@ -362,7 +355,7 @@ test("fuera de la ventana horaria (default 8-22, timezone null = UTC) → no ins
   assert.equal(calls.some((c) => c.key === "appointments.select"), false);
 });
 
-test("dentro de la ventana (timezone null = UTC) → sí evalúa", async () => {
+test("dentro de la ventana (zona UTC) → sí evalúa", async () => {
   resetFakes();
   responses["rules.select"] = [{ data: [rule()], error: null }];
   noIntegrations(WS1);
@@ -387,50 +380,16 @@ test("America/Santiago corrida respecto de UTC — la misma hora que excluye en 
   assert.equal(calls.some((c) => c.key === "appointments.select"), true);
 });
 
-test("con las dos integraciones en zonas distintas, gana highlevel — y no el orden de las filas", async () => {
-  resetFakes();
-  responses["rules.select"] = [{ data: [rule()], error: null }];
-  // HighLevel en Santiago (19:30 u 20:30 a las 23:30 UTC → DENTRO de [8,22));
-  // Cal.com en UTC (23:30 → FUERA). El resultado dice cuál se usó.
-  integrationsBothTimezones(WS1, "America/Santiago", "UTC");
-  responses[`appointments.select:${WS1}`] = [{ data: [], error: null }];
 
-  await withClock("2026-09-09T23:30:00.000Z", () => scanTimeTriggers(FAR()));
 
-  assert.equal(
-    calls.some((c) => c.key === "appointments.select"),
-    true,
-    "el desempate tiene que ser fijo: si gana Cal.com, la ventana se evalúa en UTC y no evalúa nada",
-  );
-});
-
-test("sin timezone en highlevel, cae a la de caldotcom antes que a UTC", async () => {
-  resetFakes();
-  responses["rules.select"] = [{ data: [rule()], error: null }];
-  responses[`integrations.select:${WS1}`] = [
-    {
-      data: [
-        { provider: "highlevel", config: { timezone: null } },
-        { provider: "caldotcom", config: { timezone: "America/Santiago" } },
-      ],
-      error: null,
-    },
-  ];
-  responses[`appointments.select:${WS1}`] = [{ data: [], error: null }];
-
-  await withClock("2026-09-09T23:30:00.000Z", () => scanTimeTriggers(FAR()));
-
-  assert.equal(calls.some((c) => c.key === "appointments.select"), true);
-});
-
-test("una zona horaria inválida NO evalúa este tick (no degrada a UTC)", async () => {
+test("sin zona confiable (el resolvedor devuelve null) NO evalúa este tick", async () => {
   resetFakes();
   responses["rules.select"] = [{ data: [rule()], error: null }];
   // "Santiago" en vez de "America/Santiago": Intl lanza RangeError dentro de
   // resolveWorkspaceTimezone, que ahora devuelve null en vez de degradar a
   // UTC. Un recordatorio con la hora corrida es peor que ningún recordatorio
   // así que la regla se salta este tick, no inserta nada.
-  integrationsTimezone(WS1, "Santiago");
+  integrationsTimezone(WS1, null);
   const errSpy = mock.method(console, "error", () => {});
 
   try {
@@ -453,75 +412,7 @@ test("una zona horaria inválida NO evalúa este tick (no degrada a UTC)", async
   }
 });
 
-test("highlevel con zona inválida y caldotcom válida → usa la de caldotcom, y avisa igual del typo", async () => {
-  resetFakes();
-  responses["rules.select"] = [{ data: [rule()], error: null }];
-  // Un negocio tiene UNA zona horaria: si el proveedor prioritario la tiene mal
-  // escrita y el otro bien, la bien escrita ES la del negocio. El orden de
-  // TIMEZONE_PROVIDER_ORDER desempata entre zonas VÁLIDAS, no propaga el error
-  // de la primera fila — cortar acá dejaría al tenant sin recordatorios por un
-  // typo en una integración que quizás ni usa para agendar.
-  responses[`integrations.select:${WS1}`] = [
-    {
-      data: [
-        { provider: "highlevel", config: { timezone: "Santiago" } },
-        { provider: "caldotcom", config: { timezone: "America/Santiago" } },
-      ],
-      error: null,
-    },
-  ];
-  responses[`appointments.select:${WS1}`] = [{ data: [], error: null }];
-  const errSpy = mock.method(console, "error", () => {});
 
-  try {
-    // 23:30 UTC = 19:30 o 20:30 en Santiago, dentro de [8,22). En UTC sería
-    // la hora 23 y quedaría fuera, así que evaluar prueba que usó Santiago.
-    const tally = await withClock("2026-09-09T23:30:00.000Z", () =>
-      scanTimeTriggers(FAR()),
-    );
-
-    assert.equal(
-      calls.some((c) => c.key === "appointments.select"),
-      true,
-      "la zona válida de caldotcom tiene que salvar el recordatorio",
-    );
-    assert.equal(tally.errors, 0, "usar el respaldo no es un error de la regla");
-    assert.ok(
-      errSpy.mock.calls.some((c) => String(c.arguments[0]).includes("Santiago")),
-      "el typo se loguea igual, o no se arregla nunca",
-    );
-  } finally {
-    errSpy.mock.restore();
-  }
-});
-
-test("falla la lectura de integrations → no evalúa este tick, cuenta como error", async () => {
-  resetFakes();
-  responses["rules.select"] = [{ data: [rule()], error: null }];
-  responses[`integrations.select:${WS1}`] = [
-    { data: null, error: { message: "db down" } },
-  ];
-  const errSpy = mock.method(console, "error", () => {});
-
-  try {
-    const tally = await withClock(NOW, () => scanTimeTriggers(FAR()));
-
-    assert.equal(
-      calls.some((c) => c.key === "appointments.select"),
-      false,
-      "sin poder leer integrations no sabemos la zona: asumir UTC sería el mismo daño activo por la puerta de atrás",
-    );
-    assert.deepEqual(tally, { events: 0, errors: 1 });
-    assert.ok(
-      errSpy.mock.calls.some((c) =>
-        String(c.arguments[0]).includes(WS1) && String(c.arguments[0]).includes("rule_1"),
-      ),
-      "el console.error tiene que nombrar workspace y regla",
-    );
-  } finally {
-    errSpy.mock.restore();
-  }
-});
 
 // ── trigger_config inválido: se descarta la regla, nunca revienta ─────────
 
@@ -600,4 +491,28 @@ test("deadline alcanzado entre reglas → corta y deja el resto para el próximo
 
   assert.deepEqual(tally, { events: 0, errors: 0 });
   assert.equal(calls.some((c) => c.key === "appointments.select"), false);
+});
+
+test("dos reglas con la misma anticipación generan un evento cada una", async () => {
+  resetFakes();
+  responses["rules.select"] = [
+    { data: [rule({ id: "rule_a" }), rule({ id: "rule_b" })], error: null },
+  ];
+  noIntegrations(WS1);
+  responses[`appointments.select:${WS1}`] = [
+    { data: [appt()], error: null },
+    { data: [appt()], error: null },
+  ];
+  responses["events.upsert"] = [
+    { data: [{ id: 1 }], error: null },
+    { data: [{ id: 2 }], error: null },
+  ];
+
+  const tally = await withClock(NOW, () => scanTimeTriggers(FAR()));
+
+  const occurrences = calls
+    .filter((c) => c.key === "events.upsert")
+    .map((c) => (c.arg as { rows: Array<{ occurrence: string }> }).rows[0].occurrence);
+  assert.equal(tally.events, 2);
+  assert.notEqual(occurrences[0], occurrences[1], "cada regla tiene su propia ocurrencia");
 });

@@ -65,12 +65,24 @@ const fakeClient = {
           });
           return chain;
         },
-        update: (row: unknown) => ({
-          in: (_col: string, ids: unknown[]) => {
-            push("events.update", { row, ids });
-            return Promise.resolve(take("events.update"));
-          },
-        }),
+        update: (row: unknown) => {
+          const filters: Record<string, unknown> = {};
+          const chain = {
+            eq: (col: string, val: unknown) => {
+              filters[col] = val;
+              return chain;
+            },
+            in: (_col: string, ids: unknown[]) => {
+              push("events.update", {
+                row,
+                ids,
+                ...(filters.workspace_id ? { ws: filters.workspace_id } : {}),
+              });
+              return Promise.resolve(take("events.update"));
+            },
+          };
+          return chain;
+        },
       };
     }
     if (table === "messages") {
@@ -146,6 +158,7 @@ const {
   EVENT_TO_TRIGGER,
   MAX_EXPAND_ATTEMPTS,
   EXPAND_ERROR_CODE,
+  isStale,
 } = await import("./expand.ts");
 
 const FAR = () => Date.now() + 60_000; // deadline holgado
@@ -155,9 +168,12 @@ function reset() {
   calls = [];
 }
 
-const T0 = "2026-09-03T10:00:00.000Z";
-const T1 = "2026-09-03T11:00:00.000Z";
-const T2 = "2026-09-03T12:00:00.000Z";
+// Relative to now: events older than their TTL (1 h for inbound messages) are
+// dropped as stale, so the fixtures' event (T1) is ten minutes old.
+const T1_MS = Date.now() - 10 * 60_000;
+const T0 = new Date(T1_MS - 3_600_000).toISOString();
+const T1 = new Date(T1_MS).toISOString();
+const T2 = new Date(T1_MS + 3_600_000).toISOString();
 
 const WS1 = "11111111-1111-1111-1111-111111111111";
 const WS2 = "22222222-2222-2222-2222-222222222222";
@@ -537,6 +553,7 @@ test("si el upsert falla, el evento NO se marca expandido, errors = 1 y sube exp
   assert.deepEqual(writes[0].arg, {
     row: { expand_attempts: 1 },
     ids: [1],
+    ws: WS1,
   });
 });
 
@@ -882,4 +899,35 @@ test("si faltan las credenciales de Supabase, no lanza: devuelve errors = 1", as
     process.env.NEXT_PUBLIC_SUPABASE_URL = url;
     process.env.SUPABASE_SERVICE_ROLE_KEY = key;
   }
+});
+
+test("un evento más viejo que su TTL no crea runs: se marca expandido y queda registrado", async () => {
+  reset();
+  scan(WS1);
+  // inbound_message caduca en 1 hora; este es de hace 2.
+  const old = new Date(Date.now() - 2 * 3_600_000).toISOString();
+  responses["events.select"] = [
+    {
+      data: [ev({ event_type: "inbound_message", occurred_at: old })],
+      error: null,
+    },
+  ];
+  responses["rules.select"] = [
+    { data: [rule({ trigger_type: "keyword_match", trigger_config: { keywords: ["hola"] } })], error: null },
+  ];
+  responses["messages.select"] = [{ data: [{ id: "msg_1", body: "hola" }], error: null }];
+  const out = await expandAutomationEvents(FAR());
+  assert.equal(out.runs, 0, "un evento caducado no crea runs");
+  assert.equal(out.events, 1, "pero se marca expandido para no volver a leerse");
+  assert.equal(calls.filter((c) => c.key === "runs.upsert").length, 0);
+});
+
+test("isStale respeta el TTL de cada tipo de evento", () => {
+  const now = Date.parse("2026-10-01T12:00:00Z");
+  const at = (h: number) => new Date(now - h * 3_600_000).toISOString();
+  assert.equal(isStale({ event_type: "inbound_message", occurred_at: at(0.5) }, now), false);
+  assert.equal(isStale({ event_type: "inbound_message", occurred_at: at(1.5) }, now), true);
+  assert.equal(isStale({ event_type: "first_message", occurred_at: at(5) }, now), false);
+  assert.equal(isStale({ event_type: "first_message", occurred_at: at(7) }, now), true);
+  assert.equal(isStale({ event_type: "handoff_requested", occurred_at: at(3) }, now), true);
 });

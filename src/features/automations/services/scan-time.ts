@@ -189,7 +189,10 @@ async function eligibleEventsForRule(
       workspace_id: rule.workspace_id,
       event_type: "appointment_upcoming",
       subject_id: appt.id,
-      occurrence: `${config.hoursBefore}h:${new Date(scheduledMs).toISOString()}`,
+      // The rule id is part of the occurrence: two reminder rules with the same
+      // lead time (e.g. "24 h → template" and "24 h → tag") each get their own
+      // event instead of the second one being absorbed by the UNIQUE.
+      occurrence: `${rule.id}:${config.hoursBefore}h:${new Date(scheduledMs).toISOString()}`,
       contact_id: appt.contact_id,
       conversation_id: appt.conversation_id,
       rule_id: rule.id,

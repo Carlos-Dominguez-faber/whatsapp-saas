@@ -60,6 +60,30 @@ export const EVENT_TO_TRIGGER: Record<AutomationEventType, TriggerType> = {
  * cierra con `expand_error` y deja de leerse: sin esto, un evento venenoso
  * vuelve a encabezar la cola de su workspace en cada tick, para siempre.
  */
+/**
+ * How long after it happened an event may still trigger an action (mirrors
+ * automation_event_ttl() in the migration, which the claim applies again as a
+ * backstop). A backlog — the cron not scheduled yet, or down for a while —
+ * must not send yesterday's greeting today.
+ */
+export const EVENT_TTL_MS: Record<AutomationEventType, number> = {
+  inbound_message: 1 * 3_600_000,
+  handoff_requested: 2 * 3_600_000,
+  first_message: 6 * 3_600_000,
+  lead_qualified: 6 * 3_600_000,
+  appointment_upcoming: 6 * 3_600_000,
+};
+
+/** True when the event is too old to act on (see EVENT_TTL_MS). */
+export function isStale(
+  event: { event_type: AutomationEventType; occurred_at: string },
+  nowMs: number,
+): boolean {
+  const ttl = EVENT_TTL_MS[event.event_type] ?? 3_600_000;
+  const at = Date.parse(event.occurred_at);
+  return Number.isNaN(at) || nowMs - at > ttl;
+}
+
 export const MAX_EXPAND_ATTEMPTS = 3;
 
 /**
@@ -295,7 +319,14 @@ export async function expandAutomationEvents(
       const rules = (ruleData ?? []) as EnabledRule[];
 
       const rows: RunInsert[] = [];
+      const nowMs = new Date().getTime();
+      let stale = 0;
       for (const event of wsEvents) {
+        // Too old to act on: marked expanded below without any run.
+        if (isStale(event, nowMs)) {
+          stale += 1;
+          continue;
+        }
         const wanted = EVENT_TO_TRIGGER[event.event_type];
         for (const rule of rules) {
           if (rule.trigger_type !== wanted) continue;
@@ -355,9 +386,26 @@ export async function expandAutomationEvents(
       const { error: markError } = await db
         .from("automation_events")
         .update({ expanded_at: new Date().toISOString() })
+        .eq("workspace_id", workspaceId)
         .in("id", ids);
       if (markError) throw new Error(markError.message);
       tally.events += ids.length;
+
+      if (stale > 0) {
+        console.warn(`[expand] workspace ${workspaceId}: ${stale} stale event(s) dropped`);
+        await db
+          .from("events")
+          .insert({
+            type: "automation_skipped",
+            level: "info",
+            workspace_id: workspaceId,
+            payload: { reason: "stale", events: stale },
+          })
+          .then(
+            () => {},
+            () => {},
+          );
+      }
     } catch (err) {
       // Un tenant caído no puede dejar a los demás sin expandir, y tampoco
       // puede quedar reintentándose para siempre: se cuenta el intento.
@@ -425,6 +473,7 @@ async function countExpandAttempt(
           expand_attempts: MAX_EXPAND_ATTEMPTS,
           expand_error: EXPAND_ERROR_CODE,
         })
+        .eq("workspace_id", events[0].workspace_id)
         .in("id", giveUp);
       if (error) throw new Error(error.message);
     }
@@ -433,6 +482,7 @@ async function countExpandAttempt(
       const { error } = await db
         .from("automation_events")
         .update({ expand_attempts: current + 1 })
+        .eq("workspace_id", events[0].workspace_id)
         .in("id", ids);
       if (error) throw new Error(error.message);
     }
