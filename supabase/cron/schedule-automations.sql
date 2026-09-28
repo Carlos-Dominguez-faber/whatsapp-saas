@@ -16,11 +16,11 @@
 -- Twin of schedule-buffer-flush.sql: same secret, same minute, different
 -- endpoint. The two jobs are independent.
 --
--- TIMING. The route budgets 50 s, strictly under this job's
--- one-minute interval; maxDuration = 60 EQUALS that interval, on purpose. In
--- normal operation ticks do not overlap; an accidental overlap is harmless
--- (FOR UPDATE SKIP LOCKED in the claim, UNIQUE (rule_id, event_id) in the
--- expansion) -- see route.ts for the full invariant. The explicit
+-- TIMING. The route budgets 50 s, strictly under this job's one-minute
+-- interval; maxDuration = 120 leaves room for a send already in flight to
+-- finish instead of being cut mid-call. In normal operation ticks do not
+-- overlap; an overlap is harmless (FOR UPDATE SKIP LOCKED in the claim,
+-- UNIQUE (rule_id, event_id) in the expansion) -- see route.ts. The explicit
 -- timeout_milliseconds := 55000 replaces pg_net's 2 s default, which
 -- would close Postgres' side of the request almost immediately. (Vercel does
 -- NOT kill the function when pg_net hangs up -- schedule-buffer-flush.sql

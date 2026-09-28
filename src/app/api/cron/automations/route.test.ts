@@ -42,8 +42,10 @@ const drainCalls: Array<{ max: number; deadline: number; at: number }> = [];
 let drainShouldThrow = false;
 /** Código de fase que el drenaje DEVUELVE (sin lanzar): la RPC del claim falló. */
 let drainPhaseError: string | undefined;
+let rulesEnabled = true;
 mock.module("@/features/automations/services/executor.ts", {
   exports: {
+    hasEnabledAutomationRules: async () => rulesEnabled,
     drainAutomationRuns: async (max: number, deadline: number) => {
       drainCalls.push({ max, deadline, at: Date.now() });
       if (drainShouldThrow) throw new Error("connection refused al reclamar runs");
@@ -74,6 +76,7 @@ function reset() {
   expandPhaseError = undefined;
   drainShouldThrow = false;
   drainPhaseError = undefined;
+  rulesEnabled = true;
 }
 
 // ── Camino correcto ──────────────────────────────────────────────────────────
@@ -102,20 +105,27 @@ test("con el bearer correcto escanea, expande y después drena, con la forma exa
   );
 });
 
-test("el presupuesto cabe dentro del intervalo del cron", () => {
-  // Los tres números son un solo invariante: si maxDuration sube por encima del
-  // minuto del job, dos ticks corren a la vez como caso NORMAL. Y si
-  // RUN_BUDGET_MS iguala al maxDuration, la función se corta a mitad de una fila.
-  assert.equal(maxDuration, 60);
+test("el presupuesto deja al último run tiempo para terminar", () => {
+  // RUN_BUDGET_MS decide hasta cuándo se EMPIEZA un run; maxDuration deja que el
+  // último termine (confirmar la cita en HighLevel + el timeout de 20 s del
+  // envío). Un solape con el tick siguiente es inocuo (SKIP LOCKED).
+  assert.equal(maxDuration, 120);
+  assert.ok(RUN_BUDGET_MS <= 50_000, "no se empiezan runs pasados los 50 s");
   assert.ok(
-    RUN_BUDGET_MS < maxDuration * 1000,
-    "el presupuesto tiene que dejar margen dentro del maxDuration",
+    maxDuration * 1000 - RUN_BUDGET_MS >= 45_000,
+    "el último run necesita margen para confirmar la cita y esperar el envío",
   );
-  assert.ok(
-    maxDuration * 1000 <= 60_000,
-    "el job corre cada minuto: un maxDuration mayor garantiza solape",
-  );
-  assert.equal(RUN_BUDGET_MS, 50_000);
+});
+
+test("sin reglas activas no escanea ni expande, pero sí drena lo pendiente", async () => {
+  reset();
+  process.env.CRON_SECRET = "s3cret";
+  rulesEnabled = false;
+  const res = await GET(req("Bearer s3cret"));
+  assert.equal(res.status, 200);
+  assert.equal(scanCalls.length, 0);
+  assert.equal(expandCalls.length, 0);
+  assert.equal(drainCalls.length, 1);
 });
 
 test("el drenaje recibe (20, deadline) con el presupuesto de la corrida", async () => {

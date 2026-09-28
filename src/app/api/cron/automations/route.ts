@@ -1,7 +1,10 @@
 import { NextResponse } from "next/server";
 import { scanTimeTriggers } from "@/features/automations/services/scan-time";
 import { expandAutomationEvents } from "@/features/automations/services/expand";
-import { drainAutomationRuns } from "@/features/automations/services/executor";
+import {
+  drainAutomationRuns,
+  hasEnabledAutomationRules,
+} from "@/features/automations/services/executor";
 import { isAuthorized } from "@/lib/cron-auth";
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -20,16 +23,13 @@ import { isAuthorized } from "@/lib/cron-auth";
 // del scan, y cubre LAS TRES ETAPAS. Si aun así se corta, el reclamo de
 // atascadas de claim_next_automation_run() retoma las filas a los 7 minutos.
 //
-// El trío de tiempos es deliberado y va junto:
-//   RUN_BUDGET_MS 50 s  <  maxDuration 60 s  =  intervalo del cron 60 s
-// Lo único estrictamente menor es el presupuesto de trabajo: el techo de la
-// función IGUALA al intervalo, a propósito. Con un techo de varios minutos
-// contra un cron de un minuto, un tick lento se solaparía con los siguientes.
-// El drenaje corta a los 50 s y deja el resto al tick siguiente, así que en
-// régimen normal no hay solape; y si igual se solapan, es inocuo (FOR UPDATE
-// SKIP LOCKED en el reclamo, UNIQUE (rule_id, event_id) en la expansión). Lo
-// que NO hay que hacer es subir maxDuration por encima del intervalo: eso
-// convierte el solape en el caso normal.
+// Timing: RUN_BUDGET_MS (50 s) bounds when a NEW run may start; maxDuration
+// (120 s) leaves room for the last one to finish. A template run can confirm
+// its appointment in HighLevel and then wait on the provider's 20 s send
+// timeout, so a function capped at the 60 s interval would be killed mid-send
+// and leave an outcome_unknown row for the lease to find 7 minutes later. The
+// price is that a slow tick can overlap the next one, which is harmless: the
+// claim uses FOR UPDATE SKIP LOCKED and the expansion UNIQUE (rule_id, event_id).
 //
 // pg_net es ASÍNCRONO: cron.job_run_details solo dice que el net.http_get se
 // encoló, nunca si esta ruta respondió. El resultado observable está en
@@ -37,7 +37,7 @@ import { isAuthorized } from "@/lib/cron-auth";
 // supabase/cron/schedule-automations.sql.
 // ──────────────────────────────────────────────────────────────────────────────
 
-export const maxDuration = 60;
+export const maxDuration = 120;
 
 /** Tope de filas por tick. Protege del acaparamiento entre tenants junto al
  *  round-robin de la RPC. */
@@ -64,6 +64,10 @@ export async function GET(request: Request): Promise<NextResponse> {
   // restar nada más abajo.
   const deadline = Date.now() + RUN_BUDGET_MS;
 
+  // Nothing enabled anywhere: no time scan, no expansion. The drain still runs
+  // to close whatever is left from rules switched off since.
+  const anyRule = await hasEnabledAutomationRules();
+
   // Fase 0: triggers por TIEMPO. Nunca lanza por
   // contrato (mismo invariante que expand.ts) — el try/catch es la red por si
   // alguna vez lo hace. Si la fase se cae, el resto del tick (expansión +
@@ -75,7 +79,7 @@ export async function GET(request: Request): Promise<NextResponse> {
     errors: 0,
   };
   try {
-    scanned = await scanTimeTriggers(deadline);
+    if (anyRule) scanned = await scanTimeTriggers(deadline);
     if (scanned.error) phaseFailed = true;
   } catch (err) {
     console.error(
@@ -103,7 +107,7 @@ export async function GET(request: Request): Promise<NextResponse> {
     errors: 0,
   };
   try {
-    expanded = await expandAutomationEvents(deadline);
+    if (anyRule) expanded = await expandAutomationEvents(deadline);
     // La expansión no lanza por contrato: cuando su fase se cae (no pudo crear
     // el cliente, no pudo escanear los workspaces pendientes) lo devuelve como
     // código y hay que leerlo, o el tick firma como sano sin haber expandido.
