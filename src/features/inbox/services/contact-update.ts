@@ -16,6 +16,8 @@ import { manualOptInFields } from "./opt-out";
 
 export const OPT_IN_OVERRIDE_DENIED =
   "Este contacto pidió no recibir mensajes. Solo un admin o manager puede volver a darlo de alta.";
+export const CONTACT_CHANGED =
+  "El contacto cambió mientras guardabas (por ejemplo, escribió STOP). Recarga y vuelve a intentar.";
 
 export interface ContactPatch {
   name?: string;
@@ -27,7 +29,7 @@ export interface ContactPatch {
 
 export type ContactUpdateResult =
   | { ok: true; contact: Record<string, unknown> }
-  | { ok: false; status: 403 | 404 | 500; error: string };
+  | { ok: false; status: 403 | 404 | 409 | 500; error: string };
 
 /**
  * Applies `patch` with the caller's session (RLS scopes it to their
@@ -66,20 +68,31 @@ export async function applyContactUpdate(
     optFields = manualOptInFields(opt_in);
   }
 
-  const { data, error } = await supabase
+  let query = supabase
     .from("contacts")
     .update({ ...fields, ...optFields, updated_at: new Date().toISOString() })
     .eq("id", contactId)
-    .eq("workspace_id", row.workspace_id)
-    .select(select)
-    .single();
+    .eq("workspace_id", row.workspace_id);
+  const changesOptIn = Object.keys(optFields).length > 0;
+  if (changesOptIn) {
+    // Only over the opt-in this decision was made on: a STOP that lands while
+    // the request is in flight must not be cleared by it.
+    query = query.eq("opt_in", row.opt_in);
+    query =
+      row.opted_out_at === null
+        ? query.is("opted_out_at", null)
+        : query.eq("opted_out_at", row.opted_out_at);
+  }
+  const { data, error } = await query.select(select).single();
 
   if (error || !data) {
     if (error?.code === "42501") {
       return { ok: false, status: 403, error: OPT_IN_OVERRIDE_DENIED };
     }
     if (error?.code === "PGRST116") {
-      return { ok: false, status: 404, error: "Contacto no encontrado" };
+      return changesOptIn
+        ? { ok: false, status: 409, error: CONTACT_CHANGED }
+        : { ok: false, status: 404, error: "Contacto no encontrado" };
     }
     console.error("[contact-update] update failed:", error?.message);
     return { ok: false, status: 500, error: "Error al actualizar el contacto" };

@@ -17,9 +17,13 @@ mock.module("@/lib/auth/workspace-access.ts", {
   },
 });
 
-const { applyContactUpdate, OPT_IN_OVERRIDE_DENIED } = await import("./contact-update.ts");
+const { applyContactUpdate, OPT_IN_OVERRIDE_DENIED, CONTACT_CHANGED } = await import(
+  "./contact-update.ts"
+);
 
 let stored: Record<string, unknown>;
+/** Written by someone else between our read and our UPDATE. */
+let landedMeanwhile: Record<string, unknown>;
 let writes: Array<Record<string, unknown>>;
 
 function client(): SupabaseClient {
@@ -30,11 +34,20 @@ function client(): SupabaseClient {
         return q;
       },
       update: (row: Record<string, unknown>) => {
-        writes.push(row);
+        const filters: Array<[string, unknown]> = [];
         const q: any = {
-          eq: () => q,
+          eq: (c: string, v: unknown) => (filters.push([c, v]), q),
+          is: (c: string, v: unknown) => (filters.push([c, v]), q),
           select: () => q,
-          single: async () => ({ data: { ...stored, ...row }, error: null }),
+          single: async () => {
+            // What the database holds when the UPDATE runs (a STOP may have landed).
+            const now = { ...stored, ...landedMeanwhile };
+            if (!filters.every(([c, v]) => (now[c] ?? null) === v)) {
+              return { data: null, error: { code: "PGRST116", message: "0 rows" } };
+            }
+            writes.push(row);
+            return { data: { ...now, ...row }, error: null };
+          },
         };
         return q;
       },
@@ -46,6 +59,7 @@ beforeEach(() => {
   role = "agent";
   roleChecks.length = 0;
   writes = [];
+  landedMeanwhile = {};
   stored = { id: "ct_1", workspace_id: "ws_1", opt_in: true, opted_out_at: null };
 });
 
@@ -93,4 +107,13 @@ test("opting in a contact who never opted out needs no manager", async () => {
   const res = await applyContactUpdate(client(), "ct_1", { opt_in: true });
   assert.equal(res.ok, true);
   assert.equal(roleChecks.length, 0);
+});
+
+test("a STOP that lands while a manager's opt-in is in flight is not cleared by it", async () => {
+  role = "manager";
+  stored = { ...stored, opt_in: false, opted_out_at: null }; // never opted in
+  landedMeanwhile = { opted_out_at: "2026-10-01T10:00:00Z" }; // the contact writes STOP
+  const res = await applyContactUpdate(client(), "ct_1", { opt_in: true });
+  assert.deepEqual(res, { ok: false, status: 409, error: CONTACT_CHANGED });
+  assert.equal(writes.length, 0);
 });

@@ -5,6 +5,7 @@
  * Shows contact info, stage, tags, opt-in status with inline editing.
  */
 
+import { useRouter } from "next/navigation";
 import { useState, useTransition, KeyboardEvent } from "react";
 import { User, RefreshCw, Save, ChevronDown, ChevronUp, X } from "lucide-react";
 import { toast } from "sonner";
@@ -83,9 +84,17 @@ export function CrmPanel({
   );
   const [tags, setTags] = useState<string[]>(contact.tags ?? []);
   const [tagInput, setTagInput] = useState("");
+  const router = useRouter();
   // Only what the user toggled: the switch otherwise shows the stored value,
   // so a STOP that arrives while the panel is open isn't undone by a save.
+  // When the stored value changes (a save landed, or a STOP arrived) the local
+  // choice is dropped.
   const [optInChoice, setOptInChoice] = useState<boolean | null>(null);
+  const [storedOptIn, setStoredOptIn] = useState(contact.opt_in);
+  if (storedOptIn !== contact.opt_in) {
+    setStoredOptIn(contact.opt_in);
+    setOptInChoice(null);
+  }
   const optIn = optInChoice ?? contact.opt_in;
 
   // Section collapse
@@ -128,7 +137,8 @@ export function CrmPanel({
       });
 
       if (result.ok) {
-        setOptInChoice(null);
+        // The switch keeps the saved value until the refreshed contact shows it.
+        router.refresh();
         toast.success("Contacto actualizado");
       } else {
         toast.error(result.error ?? "Error al guardar");
