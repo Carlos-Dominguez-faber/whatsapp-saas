@@ -64,3 +64,16 @@ export const AUTH_HEADER_VALUE = z
     /^[^\x00-\x08\x0a-\x1f\x7f]*$/,
     "El valor del header no puede tener saltos de línea ni caracteres de control",
   );
+
+/**
+ * The API's rules for an auth header, for one that didn't come through the
+ * API (a row migrated from custom_webhook, or edited by hand): checked again
+ * before every call.
+ */
+export function isValidAuthHeader(name: string, value: string): boolean {
+  return (
+    /^[A-Za-z0-9-]{1,100}$/.test(name) &&
+    isAllowedAuthHeaderName(name) &&
+    AUTH_HEADER_VALUE.safeParse(value).success
+  );
+}

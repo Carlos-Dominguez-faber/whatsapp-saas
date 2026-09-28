@@ -8,7 +8,7 @@ BEGIN;
 CREATE EXTENSION IF NOT EXISTS pgtap WITH SCHEMA extensions;
 SET search_path = public, extensions;
 
-SELECT plan(137);
+SELECT plan(141);
 
 -- ── public.users: read-only for sessions ────────────────────────────────────
 SELECT ok(NOT has_table_privilege('authenticated', 'public.users', 'UPDATE'),
@@ -607,14 +607,27 @@ INSERT INTO public.tools (key, name, description, schema, sensitivity)
 INSERT INTO public.tool_configs (workspace_id, tool_id, enabled, config)
   SELECT 'b0000000-0000-4000-8000-000000000001', id, true,
          '{"webhook_url": "https://hooks.example/legacy",
-           "payload_fields": [{"key": "nombre", "value": "{{contact.name}}"}],
+           "payload_fields": [{"key": "nombre", "value": "{{contact.name}}"},
+                              {"key": "token", "value": "sk_live_secret123"}],
            "auth_header_name": "X-Token", "auth_header_value": "plain-secret"}'
+    FROM public.tools WHERE key = 'custom_webhook';
+-- Turned off, with a header the API would refuse: migrated, disabled, no header.
+INSERT INTO public.tool_configs (workspace_id, tool_id, enabled, config)
+  SELECT 'a0000000-0000-4000-8000-000000000001', id, false,
+         '{"webhook_url": "https://hooks.example/off",
+           "auth_header_name": "Bad Header!", "auth_header_value": "x"}'
+    FROM public.tools WHERE key = 'custom_webhook';
+-- Never given a URL: nothing to carry.
+INSERT INTO public.workspaces (id, name, slug)
+  VALUES ('d0000000-0000-4000-8000-000000000001', 'D', 'sec-test-d');
+INSERT INTO public.tool_configs (workspace_id, tool_id, enabled, config)
+  SELECT 'd0000000-0000-4000-8000-000000000001', id, true, '{"payload_fields": []}'
     FROM public.tools WHERE key = 'custom_webhook';
 -- The workspace already has an n8n tool by the name the migration would pick.
 INSERT INTO public.n8n_tools (workspace_id, name, description, mode, webhook_url)
   VALUES ('b0000000-0000-4000-8000-000000000001', 'webhook_personalizado', 'ya existía', 'sync',
           'https://hooks.example/x');
-SELECT is(public.retire_custom_webhook(), 1, 'the leftover config is moved to n8n_tools');
+SELECT is(public.retire_custom_webhook(), 2, 'the configs with a URL are moved to n8n_tools');
 SELECT results_eq(
   $$SELECT enabled, webhook_url, mode, sensitivity, auth_header_name, auth_header_value
       FROM public.n8n_tools WHERE name = 'webhook_personalizado_2'$$,
@@ -622,14 +635,28 @@ SELECT results_eq(
             'X-Token'::text, 'plain-secret'::text)$$,
   'as a disabled write tool, under a name the workspace didn''t use, its header left for encrypt-credentials');
 SELECT ok(
-  (SELECT description LIKE '%Migrada desde custom_webhook — revisa antes de activar%nombre={{contact.name}}%'
+  (SELECT description LIKE '%Migrada desde custom_webhook — revisa antes de activar%nombre={{contact.name}}, token (valor fijo, no se copia)%'
      FROM public.n8n_tools WHERE name = 'webhook_personalizado_2'),
-  'its description says it was migrated and lists the old payload fields');
+  'its description says it was migrated and names the old payload fields');
+SELECT ok(
+  (SELECT description NOT LIKE '%sk_live_secret123%'
+     FROM public.n8n_tools WHERE name = 'webhook_personalizado_2'),
+  'a fixed payload value never reaches the description the model reads');
+SELECT results_eq(
+  $$SELECT enabled, auth_header_name, auth_header_value FROM public.n8n_tools
+     WHERE workspace_id = 'a0000000-0000-4000-8000-000000000001' AND name = 'webhook_personalizado'$$,
+  $$VALUES (false, NULL::text, NULL::text)$$,
+  'a config that was off migrates disabled, and a header the API would refuse is dropped');
+SELECT is_empty(
+  $$SELECT id FROM public.n8n_tools WHERE workspace_id = 'd0000000-0000-4000-8000-000000000001'$$,
+  'a config without a URL is skipped');
 SELECT is((SELECT count(*)::int FROM public.tools WHERE key = 'custom_webhook'), 0,
   'and custom_webhook leaves the catalog, its configs with it');
 SELECT is(public.retire_custom_webhook(), 0, 'a second run does nothing');
 SELECT ok(NOT has_function_privilege('authenticated', 'public.retire_custom_webhook()', 'EXECUTE'),
   'sessions cannot run it');
+SELECT ok(NOT has_function_privilege('anon', 'public.retire_custom_webhook()', 'EXECUTE'),
+  'nor anon');
 SET LOCAL ROLE authenticated;
 SELECT set_config('request.jwt.claims',
   '{"sub":"b0000000-0000-4000-8000-0000000000e1","role":"authenticated"}', true);

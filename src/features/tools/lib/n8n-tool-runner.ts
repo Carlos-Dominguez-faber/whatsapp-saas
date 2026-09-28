@@ -7,6 +7,7 @@ import {
   validateWebhookUrl,
 } from "../services/ssrf-guard";
 import type { N8nToolParameter } from "./n8n-params-schema";
+import { isValidAuthHeader } from "./n8n-secrets";
 
 export interface N8nToolRow {
   id: string;
@@ -98,6 +99,15 @@ export function buildN8nToolRun(
 
     const headers: Record<string, string> = { "Content-Type": "application/json" };
     if (row.auth_header_name && row.auth_header_value) {
+      // The API validates it on save; a row written some other way is
+      // checked here, and never sent broken.
+      if (!isValidAuthHeader(row.auth_header_name, row.auth_header_value)) {
+        return {
+          ok: false,
+          output: null,
+          error: "El header de autenticación de esta herramienta no es válido; un admin debe corregirlo en Configuración → n8n.",
+        };
+      }
       headers[row.auth_header_name] = row.auth_header_value;
     }
 

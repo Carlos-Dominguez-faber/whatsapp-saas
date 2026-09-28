@@ -217,6 +217,27 @@ test("adds the configured auth header when present", async () => {
   assert.equal(fetchPinnedCalls[0].opts.headers.Authorization, "Bearer secret-token");
 });
 
+test("an invalid auth header (a migrated or hand-edited row) is never sent: the call is refused", async () => {
+  for (const [name, value] of [
+    ["X Token", "abc"],
+    ["Cookie", "abc"],
+    ["X-Token", "line\nbreak"],
+  ]) {
+    reset();
+    const run = buildN8nToolRun({
+      ...baseRow,
+      mode: "sync",
+      sensitivity: "read",
+      auth_header_name: name,
+      auth_header_value: value,
+    });
+    const result = await run({}, ctx);
+    assert.equal(result.ok, false, name);
+    assert.match(result.error ?? "", /no es válido/);
+    assert.equal(fetchPinnedCalls.length, 0, name);
+  }
+});
+
 test("passes the resolved IP and the full timeout budget through when DNS is instant", async () => {
   reset();
   validateImpl = async () => ({ error: null, resolvedIp: "1.2.3.4" });
