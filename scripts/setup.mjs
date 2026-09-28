@@ -233,7 +233,7 @@ const RETIRED_PR_STACK_MIGRATIONS = [
   "20260906000000", // #9 contacts HL unique index
   "20260906000001", // #9 invoker RPC grants
   "20260830000000", // #11 n8n_tools (on main: 20260930000001)
-  "20260830000001", // #11 retire custom_webhook (not on main)
+  "20260830000001", // #11 retire custom_webhook (on main: 20260930000007)
   "20260906000002", // #14 cancel/reschedule seed (on main: 20260930000000)
   "20260907000000", // #12 handoff_human seed (on main: 20260930000002)
 ];

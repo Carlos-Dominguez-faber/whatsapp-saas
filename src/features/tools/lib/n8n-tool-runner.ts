@@ -68,7 +68,7 @@ export function capForModel(output: unknown): unknown {
 /**
  * Builds the `run` function for a dynamic n8n tool. Every call re-validates
  * the webhook URL (SSRF guard) and pins the request, and each redirect hop,
- * to the address that was checked — the same rules as custom_webhook.
+ * to the address that was checked.
  * `authError` is set when the stored auth header couldn't be decrypted: the
  * tool then refuses to call the workflow without it.
  */

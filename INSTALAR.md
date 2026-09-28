@@ -505,13 +505,27 @@ las migraciones, así que las migraciones van **antes** de `vercel --prod`.
     el agente llama la tool **dos veces con los mismos argumentos** en un mismo
     turno, las dos llamadas llevan la misma clave (tu workflow las tratará como
     una).
-  - Las llamadas siguen redirecciones como `custom_webhook` (máximo 3, cada salto
-    validado, solo HTTPS, sin mandar el header a otro dominio).
+  - Las llamadas siguen redirecciones (máximo 3, cada salto validado, solo HTTPS,
+    sin mandar el header a otro dominio).
   - El agente ve a lo más 16 KB de la respuesta: haz que el workflow devuelva solo
     lo que el agente necesita decirle al cliente.
   - Una tool nueva es de "escritura" salvo que la marques de lectura (las de
     escritura nunca se reintentan). Un nombre igual al de una tool del sistema se
     rechaza.
+- **`custom_webhook` se retiró; las tools de n8n lo reemplazan.** Era una tool
+  "sensible" que esperaba una aprobación que ninguna pantalla daba, así que nunca
+  corría. Al actualizar, la migración `20260930000007` convierte la configuración de
+  cada workspace (si tenía URL) en una tool de n8n **desactivada**, llamada
+  `webhook_personalizado` (o `webhook_personalizado_2`, … si el nombre ya estaba en
+  uso), con la misma URL, modo asíncrono y de escritura. Después borra
+  `custom_webhook` del catálogo y sus configuraciones; el `db push` imprime cuántas
+  movió. **Admins: revisen cada tool migrada en Configuración → n8n antes de
+  activarla.** Su descripción dice "Migrada desde custom_webhook — revisa antes de
+  activar" y lista los campos que enviaba. El workflow ya no recibe
+  `{ workspace_id, payload }`, sino `workspace_id`, `conversation_id`, `contact_id`,
+  `idempotency_key` y `args.note`, así que hay que ajustarlo. Si la configuración
+  traía un header de autenticación, queda en texto plano hasta que corras
+  `node scripts/encrypt-credentials.mjs` (ninguna sesión puede leerlo mientras).
 - **`handoff_human`** (apagada hasta que la actives en Configuración → Tools): el
   agente puede pasar la conversación a una persona cuando el cliente lo pide o
   cuando no tiene cómo resolver. Primero manda su despedida y luego pasa la
@@ -557,7 +571,8 @@ niega a seguir. Eso solo destraba el historial: lo que esas migraciones crearon
 sigue en tu base. Lo que `main` adoptó de ellas vuelve con versiones nuevas que se
 aplican encima (por ejemplo, la tabla `n8n_tools` de #11 se conserva y solo se le
 cambian los permisos). El PR #11 también borraba `custom_webhook` del catálogo de
-tools; `main` no lo vuelve a crear.
+tools (sin migrar sus configuraciones); en `main` lo retira `20260930000007`, que
+no hace nada si ya no está.
 
 **Si aplicaste ramas de otros PRs de la comunidad (#13, #15, #16 o #17)**, traen
 versiones que ni `main` ni esa lista conocen, y `supabase db push` se va a negar a

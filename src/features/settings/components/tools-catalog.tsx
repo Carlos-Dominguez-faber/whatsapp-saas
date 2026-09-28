@@ -8,7 +8,6 @@ import {
   CalendarClock,
   CalendarPlus,
   CalendarSearch,
-  Webhook,
   FlaskConical,
   Wrench,
 } from "lucide-react";
@@ -40,7 +39,6 @@ const TOOL_ICONS: Record<string, React.ElementType> = {
   schedule_link: CalendarClock,
   schedule_highlevel: CalendarPlus,
   check_availability: CalendarSearch,
-  custom_webhook: Webhook,
   echo: FlaskConical,
 };
 

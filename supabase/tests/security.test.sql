@@ -8,7 +8,7 @@ BEGIN;
 CREATE EXTENSION IF NOT EXISTS pgtap WITH SCHEMA extensions;
 SET search_path = public, extensions;
 
-SELECT plan(128);
+SELECT plan(137);
 
 -- ── public.users: read-only for sessions ────────────────────────────────────
 SELECT ok(NOT has_table_privilege('authenticated', 'public.users', 'UPDATE'),
@@ -597,6 +597,47 @@ SELECT is(
 SELECT ok(
   (SELECT schema #> '{properties,timezone}' IS NULL FROM public.tools WHERE key = 'check_availability'),
   'check_availability no longer takes a time zone from the model');
+
+-- ── custom_webhook retired: its config becomes a disabled n8n tool ───────────
+SELECT is((SELECT count(*)::int FROM public.tools WHERE key = 'custom_webhook'), 0,
+  'custom_webhook is no longer in the catalog');
+-- An install that still has it: the migration's function moves the config.
+INSERT INTO public.tools (key, name, description, schema, sensitivity)
+  VALUES ('custom_webhook', 'Webhook personalizado', 'x', '{}', 'sensitive');
+INSERT INTO public.tool_configs (workspace_id, tool_id, enabled, config)
+  SELECT 'b0000000-0000-4000-8000-000000000001', id, true,
+         '{"webhook_url": "https://hooks.example/legacy",
+           "payload_fields": [{"key": "nombre", "value": "{{contact.name}}"}],
+           "auth_header_name": "X-Token", "auth_header_value": "plain-secret"}'
+    FROM public.tools WHERE key = 'custom_webhook';
+-- The workspace already has an n8n tool by the name the migration would pick.
+INSERT INTO public.n8n_tools (workspace_id, name, description, mode, webhook_url)
+  VALUES ('b0000000-0000-4000-8000-000000000001', 'webhook_personalizado', 'ya existía', 'sync',
+          'https://hooks.example/x');
+SELECT is(public.retire_custom_webhook(), 1, 'the leftover config is moved to n8n_tools');
+SELECT results_eq(
+  $$SELECT enabled, webhook_url, mode, sensitivity, auth_header_name, auth_header_value
+      FROM public.n8n_tools WHERE name = 'webhook_personalizado_2'$$,
+  $$VALUES (false, 'https://hooks.example/legacy'::text, 'async'::text, 'write'::text,
+            'X-Token'::text, 'plain-secret'::text)$$,
+  'as a disabled write tool, under a name the workspace didn''t use, its header left for encrypt-credentials');
+SELECT ok(
+  (SELECT description LIKE '%Migrada desde custom_webhook — revisa antes de activar%nombre={{contact.name}}%'
+     FROM public.n8n_tools WHERE name = 'webhook_personalizado_2'),
+  'its description says it was migrated and lists the old payload fields');
+SELECT is((SELECT count(*)::int FROM public.tools WHERE key = 'custom_webhook'), 0,
+  'and custom_webhook leaves the catalog, its configs with it');
+SELECT is(public.retire_custom_webhook(), 0, 'a second run does nothing');
+SELECT ok(NOT has_function_privilege('authenticated', 'public.retire_custom_webhook()', 'EXECUTE'),
+  'sessions cannot run it');
+SET LOCAL ROLE authenticated;
+SELECT set_config('request.jwt.claims',
+  '{"sub":"b0000000-0000-4000-8000-0000000000e1","role":"authenticated"}', true);
+SELECT results_eq($$SELECT enabled FROM public.n8n_tools WHERE name = 'webhook_personalizado_2'$$,
+  $$VALUES (false)$$, 'the workspace admin sees the migrated tool, disabled');
+SELECT throws_ok($$SELECT auth_header_value FROM public.n8n_tools WHERE name = 'webhook_personalizado_2'$$,
+  '42501', NULL, 'and cannot read its header');
+RESET ROLE;
 
 -- ── password-reset audit: append-only, server-only ──────────────────────────
 SELECT ok(NOT has_table_privilege('authenticated', 'public.member_password_resets', 'SELECT'),

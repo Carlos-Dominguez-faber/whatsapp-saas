@@ -337,7 +337,7 @@ export class RedirectRefusedError extends Error {
 /**
  * The status of the first response, attached to any error thrown after it
  * arrived: the target already received the request even though a later hop
- * failed (see custom_webhook).
+ * failed (see n8n-tool-runner.ts).
  */
 export function firstStatusOf(err: unknown): number | undefined {
   const status = (err as { firstStatus?: unknown } | null)?.firstStatus;
