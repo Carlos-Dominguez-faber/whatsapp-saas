@@ -54,7 +54,7 @@ mock.module("@/features/automations/lib/workspace-timezone.ts", {
   },
 });
 
-const { resolveVariables, buildTemplateComponents, loadVariableContext } =
+const { resolveVariables, buildTemplateComponents, loadVariableContext, missingVariable } =
   await import("./variables.ts");
 
 const ctx = {
@@ -186,15 +186,14 @@ test("con appointmentId y cita legible, la fecha y hora salen formateadas en la 
   });
 });
 
-test("sin zona confiable NO se formatea en UTC: appointment queda null y el run no despacha", async () => {
+test("si la zona no se pudo leer, NO se formatea en UTC: ok:false y el run reintenta", async () => {
   businessInfoRow = { structured: { name: "Veterinaria Demo" } };
   contactRow = { name: "María", phone: "+15550000001" };
   appointmentRow = { status: "confirmed", scheduled_at: "2026-09-08T23:00:00.000Z" };
-  // "Santiago" en vez de "America/Santiago": zona escrita pero inválida, así
-  // que `resolveWorkspaceTimezone` devuelve null. Degradar a UTC formatearía
-  // "miércoles 9 de septiembre, 23:00" para una cita que es el martes a las
-  // 20:00 — el cliente llegaría un día tarde por culpa nuestra. Sin cita
-  // resuelta el ejecutor cierra `missing_appointment` y no manda nada.
+  // resolveWorkspaceTimezone devuelve null solo cuando la lectura falló.
+  // Degradar a UTC formatearía "miércoles 9 de septiembre, 23:00" para una cita
+  // que es el martes a las 20:00; tratarlo como cita ausente mataba un
+  // recordatorio legítimo por un hipo de la base.
   workspaceZone = null;
   errorTables = [];
 
@@ -203,12 +202,20 @@ test("sin zona confiable NO se formatea en UTC: appointment queda null y el run 
     contactId: "contact_1",
     appointmentId: "appt_1",
   });
-  assert.equal(loaded.ok, true);
-  assert.equal(
-    loaded.ok && loaded.ctx.appointment,
-    null,
-    "el ?? \"UTC\" está prohibido por contrato: sin zona confiable no se resuelve la cita",
-  );
+  assert.equal(loaded.ok, false);
+});
+
+test("missingVariable nombra la primera variable conocida sin dato; los literales no cuentan", () => {
+  const ctx = {
+    contactName: null,
+    contactPhone: "+15550000001",
+    businessName: "Vet",
+    appointment: null,
+  };
+  assert.equal(missingVariable(["{{contact.phone}}", "{{contact.name}}"], ctx), "contact.name");
+  assert.equal(missingVariable(["{{appointment.date}}"], ctx), "appointment.date");
+  assert.equal(missingVariable(["hola", "{{contact.phone}}", "{{algo.raro}}"], ctx), null);
+  assert.equal(missingVariable([], ctx), null);
 });
 
 test("con appointmentId pero la cita no existe (borrada o cross-workspace), appointment queda null", async () => {

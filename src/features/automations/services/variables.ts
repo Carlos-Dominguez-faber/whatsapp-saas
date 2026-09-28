@@ -71,6 +71,25 @@ export type VariableContextResult =
   | { ok: true; ctx: VariableContext }
   | { ok: false; error: string };
 
+/**
+ * The first known variable the context has no value for, by name
+ * ("contact.name"), or null. A template must not go out with a blank where
+ * the contact's name should be.
+ */
+export function missingVariable(
+  variables: string[],
+  ctx: VariableContext,
+): string | null {
+  const values = resolveVariables(variables, ctx);
+  for (let i = 0; i < variables.length; i++) {
+    const raw = variables[i];
+    if (/^\{\{[a-z]+\.[a-z]+\}\}$/.test(raw) && raw !== values[i] && !values[i].trim()) {
+      return raw.slice(2, -2);
+    }
+  }
+  return null;
+}
+
 /** Los marcadores conocidos. Cualquier otro string sale idéntico. */
 export function resolveVariables(
   variables: string[],
@@ -244,26 +263,25 @@ export async function loadVariableContext(params: {
     | null;
   if (params.appointmentId && appointmentRow) {
     const tz = await resolveWorkspaceTimezone(supabase, params.workspaceId);
-    // `null` significa "no sé la zona con certeza" (config inválida o lectura
-    // caída), y acá NO se degrada a UTC — el `?? "UTC"` está prohibido por
-    // contrato. Una hora corrida en el WhatsApp hace que el cliente llegue
-    // tarde por culpa nuestra; sin cita resuelta el run cierra
-    // `missing_appointment` y no despacha, que es el resultado correcto.
-    if (tz !== null) {
-      const date = formatAppointmentDate(appointmentRow.scheduled_at, tz);
-      const time = formatAppointmentTime(appointmentRow.scheduled_at, tz);
-      // Si el formateo falla (fecha inválida en la fila) `appointment` queda
-      // `null`: el ejecutor lo trata igual que "cita ausente", nunca manda la
-      // plantilla con la fecha vacía.
-      if (date && time) {
-        appointment = {
-          status: appointmentRow.status,
-          date,
-          time,
-          scheduledAt: appointmentRow.scheduled_at,
-          hlAppointmentId: appointmentRow.hl_appointment_id ?? null,
-        };
-      }
+    // `null` = the zone couldn't be read. It is NOT degraded to UTC (a shifted
+    // time makes the customer late because of us), and it is not a missing
+    // appointment either: a read that failed is retried.
+    if (tz === null) {
+      return { ok: false, error: "no pude leer la zona horaria del negocio" };
+    }
+    const date = formatAppointmentDate(appointmentRow.scheduled_at, tz);
+    const time = formatAppointmentTime(appointmentRow.scheduled_at, tz);
+    // Si el formateo falla (fecha inválida en la fila) `appointment` queda
+    // `null`: el ejecutor lo trata igual que "cita ausente", nunca manda la
+    // plantilla con la fecha vacía.
+    if (date && time) {
+      appointment = {
+        status: appointmentRow.status,
+        date,
+        time,
+        scheduledAt: appointmentRow.scheduled_at,
+        hlAppointmentId: appointmentRow.hl_appointment_id ?? null,
+      };
     }
   }
 

@@ -43,6 +43,8 @@ let leaseHeld = true;
  * `leaseHeld = false`, que devuelve 0 filas SIN error.
  */
 let runUpdateError: string | null = null;
+/** Only the write that persists a resolved conversation on the run fails. */
+let persistUpdateError: string | null = null;
 /**
  * Cuántas filas devuelve el UPDATE de conversations con `assigned_to IS NULL`.
  * 1 = se asignó; 0 = ya tenía dueño (o no existe) y el ejecutor relee.
@@ -104,6 +106,9 @@ function rowFor(table: string): Row {
 
 function updateResponse(table: string, row: Record<string, unknown>) {
   if (table === "automation_runs") {
+    if (persistUpdateError && "conversation_id" in row) {
+      return { data: null, error: { message: persistUpdateError }, wrote: false };
+    }
     if (runUpdateError) {
       return { data: null, error: { message: runUpdateError }, wrote: false };
     }
@@ -349,6 +354,17 @@ mock.module("./variables.ts", {
       return loadVariableContextImpl();
     },
     resolveVariables: (vars: string[]) => vars.map((v) => `<${v}>`),
+    missingVariable: (vars: string[], ctx: Record<string, any>) => {
+      const values: Record<string, unknown> = {
+        "{{contact.name}}": ctx.contactName,
+        "{{contact.phone}}": ctx.contactPhone,
+        "{{business.name}}": ctx.businessName,
+        "{{appointment.date}}": ctx.appointment?.date,
+        "{{appointment.time}}": ctx.appointment?.time,
+      };
+      const missing = vars.find((v) => v in values && !values[v]);
+      return missing ? missing.slice(2, -2) : null;
+    },
     buildTemplateComponents: (values: string[]) =>
       values.length
         ? [{ type: "body", parameters: values.map((text) => ({ type: "text", text })) }]
@@ -358,11 +374,17 @@ mock.module("./variables.ts", {
 
 // HighLevel is the source of truth for a reminder's appointment.
 let hlConfig: unknown = null;
+let hlConfigThrows = false;
 let hlEvent: unknown = null;
 let hlEventThrows = false;
 const hlEventCalls: unknown[] = [];
 mock.module("@/features/inbox/services/highlevel-client.ts", {
-  exports: { getHLConfig: async () => hlConfig },
+  exports: {
+    loadHLConfig: async () => {
+      if (hlConfigThrows) throw new Error("could not read the HighLevel integration");
+      return hlConfig;
+    },
+  },
 });
 mock.module("@/features/tools/lib/hl-appointment.ts", {
   exports: {
@@ -374,8 +396,14 @@ mock.module("@/features/tools/lib/hl-appointment.ts", {
     },
   },
 });
+/** A fixed-offset zone where it is noon right now: sending hours never depend on when the suite runs. */
+function noonZone(): string {
+  const off = 12 - new Date().getUTCHours();
+  return off === 0 ? "Etc/GMT" : off > 0 ? `Etc/GMT-${off}` : `Etc/GMT+${-off}`;
+}
+let workspaceZone: string | null = noonZone();
 mock.module("@/features/automations/lib/workspace-timezone.ts", {
-  exports: { resolveWorkspaceTimezone: async () => "America/Mexico_City" },
+  exports: { resolveWorkspaceTimezone: async () => workspaceZone },
 });
 
 const { executeRun, drainAutomationRuns, SEND_COOLDOWN_HOURS, DAILY_TEMPLATE_CAP } =
@@ -448,6 +476,7 @@ const APPOINTMENT_RULE = {
   id: "rule_1",
   workspace_id: "ws_1",
   name: "Recordatorio de cita",
+  trigger_config: { hours_before: 2 },
   action_type: "send_template",
   action_config: {
     template_name: "recordatorio",
@@ -481,6 +510,7 @@ function reset() {
   insertErrorTables = new Set();
   leaseHeld = true;
   runUpdateError = null;
+  persistUpdateError = null;
   assignUpdateRows = 1;
   deleteConversationOnAssign = false;
   disableRuleUpdateRows = 1;
@@ -490,6 +520,8 @@ function reset() {
   releaseResult = true;
   releaseRpcError = null;
   hlConfig = null;
+  hlConfigThrows = false;
+  workspaceZone = noonZone();
   hlEvent = null;
   hlEventThrows = false;
   hlEventCalls.length = 0;
@@ -1936,7 +1968,7 @@ function reminderContext(over: Record<string, unknown> = {}) {
         status: "booked",
         date: "martes 8 de septiembre",
         time: "20:00",
-        scheduledAt: new Date(Date.now() + 3_600_000).toISOString(),
+        scheduledAt: new Date(Date.now() + 90 * 60_000).toISOString(),
         hlAppointmentId: "hl_1",
         ...over,
       },
@@ -1964,7 +1996,7 @@ test("recordatorio de una cita que HighLevel canceló → skipped, sin envío", 
   eventRow = REMINDER_EVENT;
   loadVariableContextImpl = reminderContext();
   hlConfig = { token: "t", locationId: "l", calendarId: "c" };
-  hlEvent = { state: "cancelled", startMs: Date.now() + 3_600_000 };
+  hlEvent = { state: "cancelled", startMs: Date.now() + 90 * 60_000 };
   assert.equal(await executeRun(makeRun({ trigger_type: "appointment_upcoming" })), "skipped");
   assert.equal(lastRunUpdate().error, "appointment_not_active");
   assert.deepEqual(hlEventCalls, ["hl_1"]);
@@ -2002,10 +2034,137 @@ test("recordatorio con la cita activa y a la misma hora en HighLevel → sí se 
   ruleRow = { ...APPOINTMENT_RULE };
   withLiveConversation();
   eventRow = REMINDER_EVENT;
-  const at = Date.now() + 3_600_000;
+  const at = Date.now() + 90 * 60_000;
   loadVariableContextImpl = reminderContext({ scheduledAt: new Date(at).toISOString() });
   hlConfig = { token: "t", locationId: "l", calendarId: "c" };
   hlEvent = { state: "active", startMs: at };
   assert.equal(await executeRun(makeRun({ trigger_type: "appointment_upcoming" })), "done");
   assert.equal(sendCalls.length, 1);
+});
+
+// ── Review fixes: fail closed, never write what HighLevel didn't say ────────
+
+test("si no se puede leer la integración de HighLevel, el recordatorio se reintenta (no se manda)", async () => {
+  reset();
+  ruleRow = { ...APPOINTMENT_RULE };
+  withLiveConversation();
+  eventRow = REMINDER_EVENT;
+  loadVariableContextImpl = reminderContext();
+  hlConfigThrows = true;
+  assert.equal(await executeRun(makeRun({ trigger_type: "appointment_upcoming" })), "retry");
+  assert.equal(lastRunUpdate().error, "hl_read_failed");
+  assert.equal(sendCalls.length, 0);
+});
+
+test("un 404 de HighLevel no cancela la cita local: se reintenta", async () => {
+  reset();
+  ruleRow = { ...APPOINTMENT_RULE };
+  withLiveConversation();
+  eventRow = REMINDER_EVENT;
+  loadVariableContextImpl = reminderContext();
+  hlConfig = { token: "t", locationId: "l", calendarId: "c" };
+  hlEvent = null;
+  assert.equal(await executeRun(makeRun({ trigger_type: "appointment_upcoming" })), "retry");
+  assert.equal(lastRunUpdate().error, "hl_appointment_unknown");
+  assert.equal(
+    updates.some((u) => u.table === "appointments"),
+    false,
+    "only a definite 'cancelled' from HighLevel is written back",
+  );
+  assert.equal(sendCalls.length, 0);
+});
+
+test("un estado de HighLevel que no conocemos tampoco se escribe como cancelada", async () => {
+  reset();
+  ruleRow = { ...APPOINTMENT_RULE };
+  withLiveConversation();
+  eventRow = REMINDER_EVENT;
+  loadVariableContextImpl = reminderContext();
+  hlConfig = { token: "t", locationId: "l", calendarId: "c" };
+  hlEvent = { state: "other", startMs: Date.now() + 90 * 60_000 };
+  assert.equal(await executeRun(makeRun({ trigger_type: "appointment_upcoming" })), "retry");
+  assert.equal(updates.some((u) => u.table === "appointments"), false);
+});
+
+test("una cancelación definitiva en HighLevel sí se escribe en la cita local", async () => {
+  reset();
+  ruleRow = { ...APPOINTMENT_RULE };
+  withLiveConversation();
+  eventRow = REMINDER_EVENT;
+  loadVariableContextImpl = reminderContext();
+  hlConfig = { token: "t", locationId: "l", calendarId: "c" };
+  hlEvent = { state: "cancelled", startMs: Date.now() + 90 * 60_000 };
+  assert.equal(await executeRun(makeRun({ trigger_type: "appointment_upcoming" })), "skipped");
+  const write = updates.find((u) => u.table === "appointments");
+  assert.equal(write?.row.status, "cancelled");
+});
+
+test("un recordatorio demasiado cerca de la cita (menos de la mitad de su anticipación) se omite", async () => {
+  reset();
+  ruleRow = { ...APPOINTMENT_RULE }; // 2 h antes: el piso es 1 h
+  withLiveConversation();
+  eventRow = REMINDER_EVENT;
+  loadVariableContextImpl = reminderContext({
+    scheduledAt: new Date(Date.now() + 40 * 60_000).toISOString(),
+  });
+  assert.equal(await executeRun(makeRun({ trigger_type: "appointment_upcoming" })), "skipped");
+  assert.equal(lastRunUpdate().error, "reminder_too_late");
+  assert.equal(sendCalls.length, 0);
+});
+
+test("fuera del horario de envío de la regla, un recordatorio atrasado no sale", async () => {
+  reset();
+  // Mediodía local, y la regla solo manda de 13 a 20.
+  ruleRow = { ...APPOINTMENT_RULE, trigger_config: { hours_before: 2, quiet_start: 13, quiet_end: 20 } };
+  withLiveConversation();
+  eventRow = REMINDER_EVENT;
+  loadVariableContextImpl = reminderContext();
+  assert.equal(await executeRun(makeRun({ trigger_type: "appointment_upcoming" })), "skipped");
+  assert.equal(lastRunUpdate().error, "outside_send_window");
+  assert.equal(sendCalls.length, 0);
+});
+
+test("si la zona del negocio no se puede leer al ejecutar, el recordatorio se reintenta", async () => {
+  reset();
+  ruleRow = { ...APPOINTMENT_RULE };
+  withLiveConversation();
+  eventRow = REMINDER_EVENT;
+  loadVariableContextImpl = reminderContext();
+  workspaceZone = null;
+  assert.equal(await executeRun(makeRun({ trigger_type: "appointment_upcoming" })), "retry");
+  assert.equal(lastRunUpdate().error, "db_read_failed");
+});
+
+test("una regla apagada después del claim no envía: la RPC devuelve rule_disabled", async () => {
+  reset();
+  ruleRow = { ...TEMPLATE_RULE };
+  withLiveConversation();
+  dispatchClaim = "rule_disabled";
+  assert.equal(await executeRun(makeRun()), "skipped");
+  assert.equal(lastRunUpdate().error, "rule_disabled");
+  assert.equal(sendCalls.length, 0);
+});
+
+test("una variable sin dato (contacto sin nombre) falla con su nombre, no manda un hueco", async () => {
+  reset();
+  ruleRow = { ...TEMPLATE_RULE }; // variables: {{contact.name}}
+  withLiveConversation();
+  loadVariableContextImpl = async () => ({ ok: true, ctx: { ...OK_CONTEXT.ctx, contactName: null } });
+  assert.equal(await executeRun(makeRun()), "failed");
+  assert.equal(lastRunUpdate().error, "missing_variable:contact.name");
+  assert.equal(prepareCalls.length, 0);
+});
+
+test("si no se puede persistir la conversación resuelta, el run se reintenta (no queda conversation_gone)", async () => {
+  reset();
+  ruleRow = { ...TEMPLATE_RULE };
+  conversationRow = { id: "conv_9", workspace_id: "ws_1", contact_id: "contact_1" };
+  contactRow = { id: "contact_1", workspace_id: "ws_1", opt_in: true };
+  persistUpdateError = "connection refused";
+  assert.equal(
+    await executeRun(makeRun({ trigger_type: "lead_qualified", conversation_id: null })),
+    "retry",
+  );
+  assert.equal(lastRunUpdate().error, "db_write_failed");
+  assert.equal(sendCalls.length, 0);
 });

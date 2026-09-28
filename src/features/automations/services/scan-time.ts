@@ -22,6 +22,11 @@
 
 import { createClient as createSbClient } from "@supabase/supabase-js";
 import { resolveWorkspaceTimezone } from "@/features/automations/lib/workspace-timezone";
+import {
+  parseReminderConfig,
+  withinSendWindow,
+  type ReminderConfig,
+} from "@/features/automations/lib/reminder-window";
 
 function svc() {
   return createSbClient(
@@ -37,20 +42,12 @@ function msg(err: unknown): string {
 /** Cupo de citas evaluadas por regla y por tick (misma cota que la expansión). */
 const APPOINTMENTS_PER_RULE = 50;
 
-const DEFAULT_QUIET_START = 8;
-const DEFAULT_QUIET_END = 22;
-
 interface TimeRule {
   id: string;
   workspace_id: string;
   trigger_config: unknown;
 }
 
-interface TimeTriggerConfig {
-  hoursBefore: number;
-  quietStart: number;
-  quietEnd: number;
-}
 
 interface AppointmentRow {
   id: string;
@@ -72,43 +69,6 @@ interface EventInsert {
   // esto, dos reglas appointment_upcoming del mismo workspace con distinto
   // hours_before matchearían las dos por trigger_type.
   rule_id: string;
-}
-
-/**
- * Valida `trigger_config` de una regla `appointment_upcoming`. El schema de
- * creación (rule-schema.ts, fuera del alcance de este archivo) ya rechaza un
- * `hours_before` inválido con 422 antes de guardar, pero una fila legacy o
- * corrupta no puede tumbar el tick: se descarta la regla acá, sin lanzar.
- */
-function parseTriggerConfig(raw: unknown): TimeTriggerConfig | null {
-  const cfg = raw as
-    | { hours_before?: unknown; quiet_start?: unknown; quiet_end?: unknown }
-    | null;
-
-  const hoursBefore = Number(cfg?.hours_before);
-  if (!Number.isFinite(hoursBefore) || hoursBefore < 1 || hoursBefore > 168) {
-    return null;
-  }
-
-  const quietStart =
-    cfg?.quiet_start === undefined ? DEFAULT_QUIET_START : Number(cfg.quiet_start);
-  const quietEnd =
-    cfg?.quiet_end === undefined ? DEFAULT_QUIET_END : Number(cfg.quiet_end);
-  if (!Number.isInteger(quietStart) || quietStart < 0 || quietStart > 23) return null;
-  if (!Number.isInteger(quietEnd) || quietEnd < 0 || quietEnd > 23) return null;
-
-  return { hoursBefore, quietStart, quietEnd };
-}
-
-/** Hora local (0–23) de `now` en `tz`. `tz` inválida hace que Intl lance; el caller decide. */
-function localHour(tz: string, now: Date): number {
-  return Number(
-    new Intl.DateTimeFormat("en-US", {
-      timeZone: tz,
-      hour: "2-digit",
-      hourCycle: "h23",
-    }).format(now),
-  );
 }
 
 /**
@@ -142,7 +102,7 @@ function localHour(tz: string, now: Date): number {
 async function eligibleEventsForRule(
   db: ReturnType<typeof svc>,
   rule: TimeRule,
-  config: TimeTriggerConfig,
+  config: ReminderConfig,
   now: Date,
 ): Promise<EventInsert[]> {
   const windowEnd = new Date(now.getTime() + config.hoursBefore * 3_600_000);
@@ -261,7 +221,7 @@ export async function scanTimeTriggers(
       break;
     }
 
-    const config = parseTriggerConfig(rule.trigger_config);
+    const config = parseReminderConfig(rule.trigger_config);
     if (!config) {
       console.error(`[scan-time] rule ${rule.id}: invalid trigger_config, skipping`);
       tally.errors += 1;
@@ -296,8 +256,7 @@ export async function scanTimeTriggers(
       // Fuera de la ventana horaria el evaluador no inserta nada. No hay que
       // retener ni reprogramar — el próximo tick que caiga dentro la vuelve a
       // ver, porque el evaluador es sin estado.
-      const hour = localHour(tz, now);
-      if (hour < config.quietStart || hour >= config.quietEnd) continue;
+      if (!withinSendWindow(config, tz, now)) continue;
 
       const rows = await eligibleEventsForRule(db, rule, config, now);
       if (rows.length === 0) continue;
