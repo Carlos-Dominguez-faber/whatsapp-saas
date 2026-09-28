@@ -18,7 +18,7 @@
 
 import { randomBytes } from "node:crypto";
 import { execSync } from "node:child_process";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -259,6 +259,19 @@ const RETIRED_PR_STACK_MIGRATIONS = [
 ];
 
 function repairRetiredMigrations() {
+  // A version still shipped in supabase/migrations must never be marked as
+  // reverted: db push would then apply it again over what it already created.
+  const shipped = new Set(
+    readdirSync(resolve(ROOT, "supabase/migrations")).map((f) => f.split("_")[0]),
+  );
+  const clash = [...RETIRED_KAPSO_BRANCH_MIGRATIONS, ...RETIRED_PR_STACK_MIGRATIONS].filter(
+    (v) => shipped.has(v),
+  );
+  if (clash.length > 0) {
+    fail(
+      `Estas versiones están en la lista de revertidas y también en supabase/migrations: ${clash.join(", ")}. Corrige la lista antes de correr db-push.`,
+    );
+  }
   log("Historial de migraciones: marco como revertidas las de la antigua rama provider/kapso y las de los PRs de la comunidad que main no tiene (no-op si nunca se aplicaron).");
   run(
     `supabase migration repair --status reverted ${[
