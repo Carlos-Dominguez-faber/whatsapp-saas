@@ -26,6 +26,7 @@ import {
 } from "@/features/settings/lib/template-form";
 import { AiTemplateGenerator } from "./ai-template-generator";
 import { WhatsAppPreview } from "./whatsapp-preview";
+import { STANDARD_OPT_OUT_FOOTER } from "@/features/inbox/services/opt-out-footer";
 
 // ── Prefill (used by the Biblioteca tab) ────────────────────────────────────────
 
@@ -40,7 +41,7 @@ export interface TemplatePrefill {
   buttons?: TemplateButton[];
 }
 
-const STANDARD_OPT_OUT = "Responde STOP para no recibir más mensajes";
+const STANDARD_OPT_OUT = STANDARD_OPT_OUT_FOOTER;
 
 const CATEGORY_HINT: Record<TemplateCategory, string> = {
   utility: "Aprobación rápida",

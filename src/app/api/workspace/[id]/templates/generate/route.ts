@@ -6,6 +6,7 @@ import { requireWorkspaceMember } from "@/lib/auth/workspace-access";
 import { generateReply } from "@/features/inbox/services/openrouter";
 import { guardWorkspaceLlmCall } from "@/features/inbox/services/llm-call-guard";
 import { recordWorkspaceLlmCall } from "@/features/inbox/services/cost-tracker";
+import { STANDARD_OPT_OUT_FOOTER } from "@/features/inbox/services/opt-out-footer";
 
 // Drafts are created by whoever manages templates; the model the route uses
 // is the env default (generateReply without a model).
@@ -29,7 +30,7 @@ const SYSTEM_PROMPT = `Eres un experto en plantillas de WhatsApp Business. Gener
 
 Reglas estrictas:
 - El texto debe ser claro, profesional y directo.
-- Para categoría "marketing": incluir footer de opt-out sugerido al final entre paréntesis.
+- Para categoría "marketing": termina con este pie de baja, exacto y entre paréntesis: "(${STANDARD_OPT_OUT_FOOTER})". No uses otra palabra para darse de baja (ni BAJA ni ALTO): solo STOP funciona.
 - Máximo 1024 caracteres en el cuerpo.
 - Las variables deben estar numeradas en orden: {{1}}, {{2}}, etc.
 - No incluyas explicaciones, solo el texto de la plantilla.
