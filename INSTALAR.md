@@ -594,30 +594,53 @@ Sin el paso 3 no corre nada: las reglas se guardan, pero ningún job las ejecuta
   agente, etiquetar, cerrar y pasar a humano. Hasta 20 reglas activas por workspace.
 - **Nada se manda tarde:** cada evento vence si no se ejecutó a tiempo (palabra
   clave 1 h, pide humano 2 h, primer mensaje, lead calificado y recordatorio 6 h).
-  Un recordatorio de una cita que ya pasó se descarta.
+  Un recordatorio de una cita que ya pasó se descarta, y también uno que llegaría
+  con menos de la mitad de su anticipación (mínimo 30 minutos): por ejemplo, un
+  recordatorio de 24 h no sale si la cita ya está a menos de 12 h (pasa al
+  encender una regla nueva o si el cron estuvo caído). Al ejecutarse se vuelve a
+  revisar el horario de envío de la regla.
 - **Recordatorios con la hora local del negocio:** la zona sale de la misma
   configuración que la agenda de la Fase 3 (Business info o HighLevel; si no hay
   ninguna, `America/Mexico_City`). Antes de mandarlo, la app confirma la cita en
   HighLevel: si la cancelaron o la movieron, no manda el recordatorio y actualiza la
-  cita local. Si HighLevel no responde, reintenta en vez de mandarlo a ciegas.
+  cita local. Si HighLevel no responde, no encuentra la cita o devuelve un estado
+  desconocido, reintenta en vez de mandarlo a ciegas (y no marca la cita como
+  cancelada).
 - **Límites de envío:** una misma regla no le manda plantilla al mismo contacto más
-  de una vez cada 24 horas, y un workspace no manda más de 300 plantillas
-  automáticas en 24 horas. Lo que se salta queda registrado como evento
-  `automation_skipped` (con el motivo); todavía no hay un panel para verlo.
+  de una vez cada 24 horas (en los recordatorios, el límite es por cita: dos citas
+  del mismo contacto reciben cada una el suyo), y un workspace no manda más de 300
+  plantillas automáticas en 24 horas.
+- **Qué pasó con cada regla:** la pestaña muestra la última ejecución de cada regla
+  (y su motivo si se omitió o falló) y cuántas fallas tuvo en 24 horas. Un aviso
+  rojo aparece si se alcanzó el tope diario o si algún envío quedó con resultado
+  desconocido. Cuando se agotan los intentos, el motivo dice por qué
+  (`max_attempts:<causa>`). Todavía no hay un historial completo de ejecuciones.
 - **Sin duplicados:** cada envío se marca antes de salir. Si no se sabe si salió
   (por ejemplo, WhatsApp no contestó a tiempo), el intento queda como fallido con
   "resultado desconocido" en lugar de mandarse otra vez. Solo se reintenta lo que
   WhatsApp rechazó sin enviarlo (límites de envío). Si Meta pausa la plantilla de una
-  regla, la regla se apaga y la pestaña lo explica.
+  regla, la regla se apaga y la pestaña lo explica; con YCloud ese aviso llega
+  después por el webhook de estados, y ahí también se apaga la regla y la ejecución
+  queda como fallida. Si una variable no tiene dato (un contacto sin nombre), no se
+  manda con el hueco: la ejecución falla con `missing_variable:<variable>`.
 - **Las plantillas se mandan en el idioma elegido en la regla.** Las reglas
   guardadas antes usan el idioma de la plantilla aprobada (o `es`).
-- **STOP / BAJA:** si un contacto escribe solo `STOP`, `BAJA`, `ALTO`, `DAR DE BAJA`,
-  `NO MÁS MENSAJES` o `UNSUBSCRIBE` (sin importar mayúsculas ni acentos), queda dado
-  de baja: no recibe automatizaciones ni mensajes del agente o del equipo, y escribir
-  de nuevo **no** lo vuelve a dar de alta. Vuelve con `ALTA`, `START` o
-  `SUSCRIBIRME`, o si alguien lo reactiva a mano en el CRM. Una frase que solo
-  contiene la palabra ("quiero darme de baja del plan") no cuenta: la contesta el
-  agente.
+- **Bajas (STOP):** si un contacto escribe solo `STOP`, `UNSUBSCRIBE`, `DARME DE BAJA`,
+  `NO MÁS MENSAJES` o `NO QUIERO RECIBIR MENSAJES`, o toca el botón de Meta
+  "Detener promociones" / "Stop promotions" (sin importar mayúsculas ni acentos),
+  queda dado de baja de las **automatizaciones y plantillas**. El agente y el equipo
+  **sí** pueden seguir respondiéndole mientras su conversación esté abierta (24 h
+  desde su último mensaje). Escribir de nuevo **no** lo vuelve a dar de alta; vuelve
+  con `START`, `SUSCRIBIRME` o `REANUDAR MENSAJES`. Palabras sueltas como "baja",
+  "alta" o "alto" no cuentan (son respuestas normales: "¿planta alta o baja?"), ni
+  una frase que solo contiene la palabra ("quiero darme de baja del plan"). Un STOP
+  que el proveedor reenvía (mismo mensaje) no deshace un START posterior.
+- **Reactivar a mano:** en el panel del contacto, solo un **admin o manager** puede
+  volver a dar de alta a quien pidió la baja; la base lo exige también. Cada cambio
+  manual de opt-in queda como evento `contact_opt_in_changed` con quién lo hizo.
+  Guardar el panel sin tocar el interruptor ya no cambia el opt-in (antes, un panel
+  abierto desde antes del STOP lo deshacía al guardar). Las bajas manuales hechas
+  antes de esta versión cuentan como bajas explícitas.
 - **Permisos:** las reglas, los eventos y la cola de ejecuciones solo los escribe el
   servidor; los miembros solo los leen. Una automatización nunca puede apuntar a un
   contacto o conversación de otro workspace.
