@@ -12,8 +12,10 @@
 --   * Captured events expire (per-type TTL), a reminder for an appointment
 --     that already passed is discarded, sends have a cooldown (per contact, or
 --     per appointment for reminders) and a per-workspace daily cap, and no
---     automation reaches an opted-out contact. Only a manager or admin can
---     opt a contact back in, and every manual change leaves an event.
+--     automation or template reaches a phone that opted out (kept per phone
+--     in contact_opt_outs, applied from the STOP message itself). Only a
+--     manager or admin can opt a contact back in, or delete a contact, and
+--     every manual change leaves an event.
 --   * Every reference is workspace-consistent (composite FKs), and every RPC
 --     is callable by service_role only.
 --
@@ -89,94 +91,273 @@ CREATE TRIGGER trg_conversations_state_version
 -- ──────────────────────────────────────────────────────────
 -- 1b. An explicit opt-out stands
 --
--- opted_out_at records that the contact asked to stop (STOP/BAJA, or a
--- manual opt-out in the CRM). While it's set, opt_in is forced false on every
--- write — including the inbound upsert that sets opt_in = true for anyone who
--- writes to the business. Only a write that clears opted_out_at (ALTA/START,
--- or a manual opt-in) opts the contact back in. A contact that was simply
--- never opted in (e.g. synced from HighLevel) has no opted_out_at and still
--- opts in by writing first.
+-- A contact who asked to stop (an explicit STOP, or a manual opt-out in the
+-- CRM) gets no automation and no template. The suppression lives in its own
+-- table, keyed by the phone, so no edit of the contact row undoes it: not the
+-- inbound upsert that opts writers in, not deleting and re-creating the
+-- contact, not moving the phone to another contact. contacts.opted_out_at /
+-- opt_in mirror it for the inbox. Only a manager or admin clears it from a
+-- user session; the server clears it when the contact sends START. Replies
+-- inside the 24h window the contact opens are not affected.
 -- ──────────────────────────────────────────────────────────
 ALTER TABLE public.contacts
   ADD COLUMN IF NOT EXISTS opted_out_at TIMESTAMPTZ;
 
-CREATE OR REPLACE FUNCTION public.keep_contact_opt_out()
-RETURNS TRIGGER
-LANGUAGE plpgsql
+-- The digits of a phone: the same key however it was written.
+CREATE OR REPLACE FUNCTION public.contact_phone_key(p_phone TEXT)
+RETURNS TEXT
+LANGUAGE sql IMMUTABLE
 SET search_path = ''
 AS $$
+  SELECT nullif(regexp_replace(coalesce(p_phone, ''), '[^0-9]', '', 'g'), '');
+$$;
+
+CREATE TABLE IF NOT EXISTS public.contact_opt_outs (
+  workspace_id UUID NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+  phone_key    TEXT NOT NULL,
+  opted_out_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  -- 'keyword' (the contact wrote STOP), 'manual' (someone in the CRM),
+  -- 'backfill' (opted out by hand before this migration)
+  source       TEXT NOT NULL,
+  PRIMARY KEY (workspace_id, phone_key)
+);
+
+ALTER TABLE public.contact_opt_outs ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "ws members read contact_opt_outs" ON public.contact_opt_outs;
+CREATE POLICY "ws members read contact_opt_outs" ON public.contact_opt_outs
+  FOR SELECT USING (workspace_id IN (SELECT auth_workspace_ids()));
+REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON public.contact_opt_outs FROM anon, authenticated;
+
+-- A contact someone opted out by hand before this migration (opt_in turned
+-- false after it had been true) is an explicit opt-out too. Idempotent: once
+-- stamped, opted_out_at is no longer NULL. Each one is recorded as an event.
+DO $$
+DECLARE
+  v_count INT;
 BEGIN
-  IF NEW.opted_out_at IS NOT NULL THEN
-    NEW.opt_in := false;
+  WITH stamped AS (
+    UPDATE public.contacts
+       SET opted_out_at = updated_at
+     WHERE opt_in = false
+       AND opted_out_at IS NULL
+       AND opt_in_at IS NOT NULL
+    RETURNING id, workspace_id
+  )
+  INSERT INTO public.events (workspace_id, type, level, payload)
+  SELECT workspace_id, 'contact_opt_in_changed', 'info',
+         jsonb_build_object('contact_id', id, 'opt_in', false, 'source', 'backfill')
+    FROM stamped;
+  GET DIAGNOSTICS v_count = ROW_COUNT;
+  RAISE NOTICE 'contacts: % manual opt-out(s) from before the automation engine now count as explicit', v_count;
+END
+$$;
+
+INSERT INTO public.contact_opt_outs (workspace_id, phone_key, opted_out_at, source)
+SELECT DISTINCT ON (c.workspace_id, public.contact_phone_key(c.phone))
+       c.workspace_id, public.contact_phone_key(c.phone), c.opted_out_at, 'backfill'
+  FROM public.contacts c
+ WHERE c.opted_out_at IS NOT NULL
+   AND public.contact_phone_key(c.phone) IS NOT NULL
+ ORDER BY c.workspace_id, public.contact_phone_key(c.phone), c.opted_out_at
+ON CONFLICT (workspace_id, phone_key) DO NOTHING;
+
+-- Keeps contacts in step with the suppression, on every insert and update:
+--   * a suppressed phone makes its contact opted out (a new contact, a
+--     re-created one, or one the phone was moved to);
+--   * a new opted_out_at records the suppression;
+--   * clearing opted_out_at clears it, and from a user session only a manager
+--     or admin may (the role PostgREST switched to; SECURITY DEFINER changes
+--     current_user, not this setting, and server writes pass);
+--   * every opt-in change from a user session leaves an event with the user.
+CREATE OR REPLACE FUNCTION public.sync_contact_opt_out()
+RETURNS TRIGGER
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = ''
+AS $$
+DECLARE
+  v_session    BOOLEAN := coalesce(current_setting('role', true), 'none') IN ('authenticated', 'anon');
+  v_key        TEXT := public.contact_phone_key(NEW.phone);
+  v_suppressed TIMESTAMPTZ;
+  v_clearing   BOOLEAN := TG_OP = 'UPDATE' AND OLD.opted_out_at IS NOT NULL AND NEW.opted_out_at IS NULL;
+BEGIN
+  IF v_clearing THEN
+    IF v_session
+       AND NOT public.auth_has_role(NEW.workspace_id, ARRAY['admin', 'manager']::public.workspace_role[])
+       AND NOT public.is_super_admin()
+    THEN
+      RAISE EXCEPTION 'only a workspace admin or manager can opt a contact back in after an opt-out'
+        USING ERRCODE = '42501';
+    END IF;
+    DELETE FROM public.contact_opt_outs o
+     WHERE o.workspace_id = NEW.workspace_id
+       AND o.phone_key IN (v_key, public.contact_phone_key(OLD.phone));
+  ELSE
+    SELECT o.opted_out_at INTO v_suppressed
+      FROM public.contact_opt_outs o
+     WHERE o.workspace_id = NEW.workspace_id
+       AND o.phone_key = v_key;
+
+    IF NEW.opted_out_at IS NOT NULL AND v_suppressed IS NULL AND v_key IS NOT NULL
+       AND (TG_OP = 'INSERT' OR OLD.opted_out_at IS NULL)
+    THEN
+      INSERT INTO public.contact_opt_outs (workspace_id, phone_key, opted_out_at, source)
+      VALUES (NEW.workspace_id, v_key, NEW.opted_out_at,
+              CASE WHEN v_session THEN 'manual' ELSE 'keyword' END)
+      ON CONFLICT (workspace_id, phone_key) DO NOTHING;
+    END IF;
+
+    IF v_suppressed IS NOT NULL THEN
+      NEW.opted_out_at := coalesce(NEW.opted_out_at, v_suppressed);
+    END IF;
+    IF NEW.opted_out_at IS NOT NULL THEN
+      NEW.opt_in := false;
+    END IF;
+  END IF;
+
+  IF v_session AND TG_OP = 'UPDATE'
+     AND (NEW.opt_in IS DISTINCT FROM OLD.opt_in OR NEW.opted_out_at IS DISTINCT FROM OLD.opted_out_at)
+  THEN
+    INSERT INTO public.events (workspace_id, type, level, payload)
+    VALUES (
+      NEW.workspace_id,
+      'contact_opt_in_changed',
+      'info',
+      jsonb_build_object(
+        'contact_id',      NEW.id,
+        'user_id',         auth.uid(),
+        'opt_in',          NEW.opt_in,
+        'previous_opt_in', OLD.opt_in,
+        'opt_out_cleared', v_clearing,
+        'source',          'manual'
+      )
+    );
   END IF;
   RETURN NEW;
 END;
 $$;
 
 DROP TRIGGER IF EXISTS trg_contacts_keep_opt_out ON public.contacts;
-CREATE TRIGGER trg_contacts_keep_opt_out
+DROP TRIGGER IF EXISTS trg_contacts_opt_in_guard ON public.contacts;
+DROP FUNCTION IF EXISTS public.keep_contact_opt_out();
+DROP FUNCTION IF EXISTS public.guard_contact_opt_in_change();
+DROP TRIGGER IF EXISTS trg_contacts_opt_out ON public.contacts;
+CREATE TRIGGER trg_contacts_opt_out
   BEFORE INSERT OR UPDATE ON public.contacts
-  FOR EACH ROW EXECUTE FUNCTION public.keep_contact_opt_out();
+  FOR EACH ROW EXECUTE FUNCTION public.sync_contact_opt_out();
 
--- A contact someone opted out by hand before this migration (opt_in turned
--- false after it had been true) is an explicit opt-out too. Idempotent: once
--- stamped, opted_out_at is no longer NULL.
-UPDATE public.contacts
-   SET opted_out_at = updated_at
- WHERE opt_in = false
-   AND opted_out_at IS NULL
-   AND opt_in_at IS NOT NULL;
+-- Deleting a contact takes a manager or admin (nothing in the app lets an
+-- agent do it). Agents keep creating and editing contacts.
+DROP POLICY IF EXISTS "ws operators write contacts" ON public.contacts;
+DROP POLICY IF EXISTS "ws operators insert contacts" ON public.contacts;
+DROP POLICY IF EXISTS "ws operators update contacts" ON public.contacts;
+DROP POLICY IF EXISTS "ws managers delete contacts" ON public.contacts;
+CREATE POLICY "ws operators insert contacts" ON public.contacts
+  FOR INSERT WITH CHECK (
+    workspace_id IN (SELECT auth_workspace_ids())
+    AND auth_has_role(workspace_id, ARRAY['admin','manager','agent']::workspace_role[])
+  );
+CREATE POLICY "ws operators update contacts" ON public.contacts
+  FOR UPDATE USING (
+    workspace_id IN (SELECT auth_workspace_ids())
+    AND auth_has_role(workspace_id, ARRAY['admin','manager','agent']::workspace_role[])
+  ) WITH CHECK (
+    workspace_id IN (SELECT auth_workspace_ids())
+    AND auth_has_role(workspace_id, ARRAY['admin','manager','agent']::workspace_role[])
+  );
+CREATE POLICY "ws managers delete contacts" ON public.contacts
+  FOR DELETE USING (
+    workspace_id IN (SELECT auth_workspace_ids())
+    AND auth_has_role(workspace_id, ARRAY['admin','manager']::workspace_role[])
+  );
 
--- Opting a contact back in after an opt-out is a manager's call, and every
--- manual change of a contact's opt-in from a user session leaves an event
--- with who made it. Server writes (the STOP/ALTA keywords, service_role) pass
--- untouched. Named to run after trg_contacts_keep_opt_out (BEFORE triggers
--- fire alphabetically), so it sees the opt_in that will be stored.
-CREATE OR REPLACE FUNCTION public.guard_contact_opt_in_change()
+-- STOP / START from the contact, applied in the same statement that stores
+-- their message: a failure fails the insert, so the webhook answers non-2xx
+-- and the provider delivers it again, and a redelivery (same wamid, not
+-- inserted) never re-applies an old STOP over a later START. Only an
+-- explicit, whole message counts, after lowercasing and dropping accents and
+-- punctuation; bare "baja", "alta" or "alto" are ordinary answers.
+CREATE OR REPLACE FUNCTION public.opt_out_intent(p_text TEXT)
+RETURNS TEXT
+LANGUAGE sql IMMUTABLE
+SET search_path = ''
+AS $$
+  WITH clean AS (
+    SELECT btrim(regexp_replace(
+             regexp_replace(
+               translate(lower(coalesce(p_text, '')), 'áàâäãéèêëíìîïóòôöõúùûüñç', 'aaaaaeeeeiiiiooooouuuunc'),
+               '[^a-z0-9]+', ' ', 'g'),
+             ' +', ' ', 'g')) AS t
+  )
+  SELECT CASE
+           WHEN length(t) > 40 THEN NULL
+           WHEN t IN ('stop', 'unsubscribe', 'darme de baja', 'no mas mensajes',
+                      'no quiero recibir mensajes', 'stop promotions', 'detener promociones')
+             THEN 'stop'
+           WHEN t IN ('start', 'suscribirme', 'reanudar mensajes') THEN 'start'
+         END
+    FROM clean;
+$$;
+
+CREATE OR REPLACE FUNCTION public.apply_inbound_opt_out()
 RETURNS TRIGGER
 LANGUAGE plpgsql SECURITY DEFINER
 SET search_path = ''
 AS $$
+DECLARE
+  v_intent  TEXT := public.opt_out_intent(NEW.body);
+  v_contact public.contacts;
 BEGIN
-  -- The role PostgREST switched to for this request. SECURITY DEFINER changes
-  -- current_user, not this setting; server and migration writes pass.
-  IF coalesce(current_setting('role', true), 'none') NOT IN ('authenticated', 'anon') THEN
-    RETURN NEW;
-  END IF;
-  IF NEW.opt_in IS NOT DISTINCT FROM OLD.opt_in
-     AND NEW.opted_out_at IS NOT DISTINCT FROM OLD.opted_out_at THEN
-    RETURN NEW;
+  IF v_intent IS NULL THEN
+    RETURN NULL;
   END IF;
 
-  IF OLD.opted_out_at IS NOT NULL AND NEW.opted_out_at IS NULL
-     AND NOT public.auth_has_role(NEW.workspace_id, ARRAY['admin', 'manager']::public.workspace_role[])
-     AND NOT public.is_super_admin()
-  THEN
-    RAISE EXCEPTION 'only a workspace admin or manager can opt a contact back in after an opt-out'
-      USING ERRCODE = '42501';
+  SELECT ct.* INTO v_contact
+    FROM public.conversations c
+    JOIN public.contacts ct
+      ON ct.id = c.contact_id
+     AND ct.workspace_id = c.workspace_id
+   WHERE c.id = NEW.conversation_id
+     AND c.workspace_id = NEW.workspace_id;
+  IF v_contact.id IS NULL THEN
+    RETURN NULL;
   END IF;
 
-  INSERT INTO public.events (workspace_id, type, level, payload)
-  VALUES (
-    NEW.workspace_id,
-    'contact_opt_in_changed',
-    'info',
-    jsonb_build_object(
-      'contact_id',      NEW.id,
-      'user_id',         auth.uid(),
-      'opt_in',          NEW.opt_in,
-      'previous_opt_in', OLD.opt_in,
-      'opt_out_cleared', OLD.opted_out_at IS NOT NULL AND NEW.opted_out_at IS NULL
-    )
-  );
-  RETURN NEW;
+  IF v_intent = 'stop' THEN
+    INSERT INTO public.contact_opt_outs (workspace_id, phone_key, opted_out_at, source)
+    SELECT NEW.workspace_id, public.contact_phone_key(v_contact.phone), clock_timestamp(), 'keyword'
+     WHERE public.contact_phone_key(v_contact.phone) IS NOT NULL
+    ON CONFLICT (workspace_id, phone_key) DO NOTHING;
+    UPDATE public.contacts
+       SET opt_in = false,
+           opted_out_at = coalesce(opted_out_at, clock_timestamp())
+     WHERE id = v_contact.id
+       AND workspace_id = NEW.workspace_id;
+  ELSE
+    UPDATE public.contacts
+       SET opt_in = true,
+           opt_in_at = clock_timestamp(),
+           opted_out_at = NULL
+     WHERE id = v_contact.id
+       AND workspace_id = NEW.workspace_id;
+    DELETE FROM public.contact_opt_outs o
+     WHERE o.workspace_id = NEW.workspace_id
+       AND o.phone_key = public.contact_phone_key(v_contact.phone);
+  END IF;
+
+  INSERT INTO public.events (workspace_id, conversation_id, type, level, payload)
+  VALUES (NEW.workspace_id, NEW.conversation_id, 'contact_opt_in_changed', 'info',
+          jsonb_build_object('contact_id', v_contact.id, 'opt_in', v_intent = 'start',
+                             'source', 'keyword', 'message_id', NEW.id));
+  RETURN NULL;
 END;
 $$;
 
-DROP TRIGGER IF EXISTS trg_contacts_opt_in_guard ON public.contacts;
-CREATE TRIGGER trg_contacts_opt_in_guard
-  BEFORE UPDATE ON public.contacts
-  FOR EACH ROW EXECUTE FUNCTION public.guard_contact_opt_in_change();
+DROP TRIGGER IF EXISTS trg_messages_opt_out ON public.messages;
+CREATE TRIGGER trg_messages_opt_out
+  AFTER INSERT ON public.messages
+  FOR EACH ROW
+  WHEN (NEW.direction = 'in' AND NEW.type = 'text')
+  EXECUTE FUNCTION public.apply_inbound_opt_out();
 
 -- ──────────────────────────────────────────────────────────
 -- 2. automation_rules
@@ -645,8 +826,9 @@ CREATE TRIGGER trg_contacts_automation_event
 --
 -- How long after it happened an event may still trigger an action. A backlog
 -- (cron not scheduled yet, or down) must not send yesterday's greeting today.
--- Reminders have their own guard in the executor (the appointment must still
--- be in the future and active in HighLevel); this is a backstop.
+-- Reminders have their own timing guard in the executor (late only when more
+-- than 30 minutes of sending hours passed since they were due), so theirs is a
+-- backstop long enough for one overnight wait for the sending hours.
 -- ──────────────────────────────────────────────────────────
 CREATE OR REPLACE FUNCTION public.automation_event_ttl(p_event_type TEXT)
 RETURNS INTERVAL
@@ -658,7 +840,7 @@ AS $$
            WHEN 'handoff_requested'    THEN INTERVAL '2 hours'
            WHEN 'first_message'        THEN INTERVAL '6 hours'
            WHEN 'lead_qualified'       THEN INTERVAL '6 hours'
-           WHEN 'appointment_upcoming' THEN INTERVAL '6 hours'
+           WHEN 'appointment_upcoming' THEN INTERVAL '26 hours'
            ELSE INTERVAL '1 hour'
          END;
 $$;
@@ -872,6 +1054,7 @@ DECLARE
   v_run        public.automation_runs;
   v_contact_id UUID;
   v_opt_in     BOOLEAN;
+  v_phone      TEXT;
   v_subject_id UUID;
   v_count      INT;
 BEGIN
@@ -896,8 +1079,8 @@ BEGIN
     RETURN 'rule_disabled';
   END IF;
 
-  SELECT ct.id, ct.opt_in
-    INTO v_contact_id, v_opt_in
+  SELECT ct.id, ct.opt_in, ct.phone
+    INTO v_contact_id, v_opt_in, v_phone
     FROM public.conversations c
     JOIN public.contacts ct
       ON ct.id = c.contact_id
@@ -908,7 +1091,11 @@ BEGIN
   IF v_contact_id IS NULL THEN
     RETURN 'not_found';
   END IF;
-  IF v_opt_in IS NOT TRUE THEN
+  IF v_opt_in IS NOT TRUE OR EXISTS (
+    SELECT 1 FROM public.contact_opt_outs o
+     WHERE o.workspace_id = v_run.workspace_id
+       AND o.phone_key = public.contact_phone_key(v_phone)
+  ) THEN
     RETURN 'opted_out';
   END IF;
 
@@ -1048,8 +1235,10 @@ REVOKE ALL ON FUNCTION public.automation_event_ttl(TEXT)                        
 REVOKE ALL ON FUNCTION public.emit_automation_event_on_message()                   FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.emit_automation_event_on_state()                     FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.emit_automation_event_on_stage()                     FROM PUBLIC, anon, authenticated;
-REVOKE ALL ON FUNCTION public.keep_contact_opt_out()                               FROM PUBLIC, anon, authenticated;
-REVOKE ALL ON FUNCTION public.guard_contact_opt_in_change()                        FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.sync_contact_opt_out()                               FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.apply_inbound_opt_out()                              FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.opt_out_intent(TEXT)                                 FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.contact_phone_key(TEXT)                              FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.automation_rule_health(UUID)                         FROM PUBLIC, anon, authenticated;
 
 GRANT EXECUTE ON FUNCTION public.claim_next_automation_run()                       TO service_role;
@@ -1058,6 +1247,8 @@ GRANT EXECUTE ON FUNCTION public.mark_automation_run_dispatched(UUID, INT, INT) 
 GRANT EXECUTE ON FUNCTION public.release_automation_run_dispatch(UUID)             TO service_role;
 GRANT EXECUTE ON FUNCTION public.automation_event_ttl(TEXT)                        TO service_role;
 GRANT EXECUTE ON FUNCTION public.automation_rule_health(UUID)                      TO service_role;
+GRANT EXECUTE ON FUNCTION public.opt_out_intent(TEXT)                              TO service_role;
+GRANT EXECUTE ON FUNCTION public.contact_phone_key(TEXT)                           TO service_role;
 
 -- ============================================================
 -- End of migration: 20261001000000_automation_engine

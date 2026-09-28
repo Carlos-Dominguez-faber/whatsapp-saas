@@ -8,7 +8,7 @@ BEGIN;
 CREATE EXTENSION IF NOT EXISTS pgtap WITH SCHEMA extensions;
 SET search_path = public, extensions;
 
-SELECT plan(196);
+SELECT plan(206);
 
 -- ── public.users: read-only for sessions ────────────────────────────────────
 SELECT ok(NOT has_table_privilege('authenticated', 'public.users', 'UPDATE'),
@@ -860,6 +860,83 @@ SELECT results_eq(
   $$VALUES ('b0000000-0000-4000-8000-0000000000e1'::text, true)$$,
   'the override is recorded with who made it');
 
+-- STOP / START: explicit phrases only, applied with the message itself
+SELECT results_eq(
+  $$SELECT public.opt_out_intent(t) FROM unnest(ARRAY['STOP', 'stop.', 'No más mensajes!', 'Darme de baja',
+      'no quiero recibir mensajes', 'Detener promociones', 'Stop promotions', 'START', 'Reanudar mensajes']) t$$,
+  $$VALUES ('stop'::text), ('stop'), ('stop'), ('stop'), ('stop'), ('stop'), ('stop'), ('start'), ('start')$$,
+  'explicit opt-out and opt-in phrases count, any case, accents or punctuation');
+SELECT is_empty(
+  $$SELECT 1 FROM unnest(ARRAY['baja', 'alta', 'Alto', 'quiero darme de baja del plan', 'stop motion', 'hola', ''])
+      t WHERE public.opt_out_intent(t) IS NOT NULL$$,
+  'one-word answers and sentences that merely contain a phrase do not');
+INSERT INTO public.messages (workspace_id, conversation_id, direction, type, body, wamid) VALUES
+  ('b0000000-0000-4000-8000-000000000001', 'b0000000-0000-4000-8000-0000000000d9', 'in', 'text', 'STOP', 'wamid.stop.1');
+SELECT results_eq(
+  $$SELECT ct.opt_in, (SELECT count(*)::int FROM public.contact_opt_outs o
+                        WHERE o.workspace_id = ct.workspace_id AND o.phone_key = public.contact_phone_key(ct.phone))
+      FROM public.contacts ct WHERE ct.id = 'b0000000-0000-4000-8000-0000000000c9'$$,
+  $$VALUES (false, 1)$$,
+  'a STOP message opts the contact out and suppresses the phone, in the same statement');
+INSERT INTO public.messages (workspace_id, conversation_id, direction, type, body, wamid) VALUES
+  ('b0000000-0000-4000-8000-000000000001', 'b0000000-0000-4000-8000-0000000000d9', 'in', 'text', 'Start', 'wamid.start.1');
+SELECT results_eq(
+  $$SELECT ct.opt_in, (SELECT count(*)::int FROM public.contact_opt_outs o
+                        WHERE o.workspace_id = ct.workspace_id AND o.phone_key = public.contact_phone_key(ct.phone))
+      FROM public.contacts ct WHERE ct.id = 'b0000000-0000-4000-8000-0000000000c9'$$,
+  $$VALUES (true, 0)$$,
+  'START opts them back in');
+INSERT INTO public.messages (workspace_id, conversation_id, direction, type, body, wamid) VALUES
+  ('b0000000-0000-4000-8000-000000000001', 'b0000000-0000-4000-8000-0000000000d9', 'in', 'text', 'STOP', 'wamid.stop.1')
+  ON CONFLICT (workspace_id, wamid) DO NOTHING;
+SELECT is((SELECT opt_in FROM public.contacts WHERE id = 'b0000000-0000-4000-8000-0000000000c9'), true,
+  'a redelivered STOP (same wamid, not inserted) does not undo the later START');
+
+-- the suppression is the phone's: no edit of contact rows lifts it
+INSERT INTO public.contacts (id, workspace_id, phone, opt_in, opted_out_at) VALUES
+  ('b0000000-0000-4000-8000-0000000001c5', 'b0000000-0000-4000-8000-000000000001', '+15551114444', false, now()),
+  ('b0000000-0000-4000-8000-0000000001c3', 'b0000000-0000-4000-8000-000000000001', '+15551113333', true, NULL);
+SELECT ok(NOT has_table_privilege('authenticated', 'public.contact_opt_outs', 'INSERT'),
+  'sessions cannot write the suppression list');
+SET LOCAL ROLE authenticated;
+SELECT set_config('request.jwt.claims',
+  '{"sub":"b0000000-0000-4000-8000-0000000000e2","role":"authenticated"}', true);
+DELETE FROM public.contacts WHERE id = 'b0000000-0000-4000-8000-0000000001c5';
+RESET ROLE;
+SELECT is((SELECT count(*)::int FROM public.contacts WHERE id = 'b0000000-0000-4000-8000-0000000001c5'), 1,
+  'an agent cannot delete a contact');
+DELETE FROM public.contacts WHERE id = 'b0000000-0000-4000-8000-0000000001c5';
+SET LOCAL ROLE authenticated;
+SELECT set_config('request.jwt.claims',
+  '{"sub":"b0000000-0000-4000-8000-0000000000e2","role":"authenticated"}', true);
+INSERT INTO public.contacts (id, workspace_id, phone, opt_in) VALUES
+  ('b0000000-0000-4000-8000-0000000001c4', 'b0000000-0000-4000-8000-000000000001', '+1 555 111 4444', true);
+UPDATE public.contacts SET phone = '+15551112222' WHERE id = 'b0000000-0000-4000-8000-0000000001c4';
+UPDATE public.contacts SET phone = '+15551114444' WHERE id = 'b0000000-0000-4000-8000-0000000001c3';
+RESET ROLE;
+SELECT results_eq(
+  $$SELECT id::text, opt_in FROM public.contacts
+     WHERE id IN ('b0000000-0000-4000-8000-0000000001c4', 'b0000000-0000-4000-8000-0000000001c3') ORDER BY id$$,
+  $$VALUES ('b0000000-0000-4000-8000-0000000001c3'::text, false), ('b0000000-0000-4000-8000-0000000001c4', false)$$,
+  're-creating a deleted opted-out contact, or moving its phone to another contact, keeps it opted out');
+INSERT INTO public.conversations (id, workspace_id, contact_id) VALUES
+  ('b0000000-0000-4000-8000-0000000001d3', 'b0000000-0000-4000-8000-000000000001', 'b0000000-0000-4000-8000-0000000001c3');
+UPDATE public.contacts SET opt_in = true WHERE id = 'b0000000-0000-4000-8000-0000000001c3';
+SELECT is((SELECT opt_in FROM public.contacts WHERE id = 'b0000000-0000-4000-8000-0000000001c3'), false,
+  'even a direct opt_in = true on the suppressed phone does not stick');
+INSERT INTO public.automation_events (id, workspace_id, event_type, subject_id, occurrence, conversation_id)
+  VALUES (900020, 'b0000000-0000-4000-8000-000000000001', 'first_message', 'b0000000-0000-4000-8000-0000000001d3', '1',
+          'b0000000-0000-4000-8000-0000000001d3');
+INSERT INTO public.automation_runs (id, workspace_id, rule_id, event_id, trigger_type, conversation_id, status, claimed_at)
+  VALUES ('b0000000-0000-4000-8000-0000000000f5', 'b0000000-0000-4000-8000-000000000001',
+          'b0000000-0000-4000-8000-0000000000a9', 900020, 'first_message',
+          'b0000000-0000-4000-8000-0000000001d3', 'processing', now());
+ALTER TABLE public.contacts DISABLE TRIGGER trg_contacts_opt_out;
+UPDATE public.contacts SET opt_in = true, opted_out_at = NULL WHERE id = 'b0000000-0000-4000-8000-0000000001c3';
+ALTER TABLE public.contacts ENABLE TRIGGER trg_contacts_opt_out;
+SELECT is(public.mark_automation_run_dispatched('b0000000-0000-4000-8000-0000000000f5', 0, 0), 'opted_out',
+  'the dispatch mark refuses a suppressed phone even when its contact row says opted in');
+
 -- the claim discards what expired instead of sending it late (nothing else queued)
 UPDATE public.automation_runs SET status = 'done', finished_at = now()
  WHERE status IN ('pending', 'processing');
@@ -899,8 +976,8 @@ SELECT is((SELECT error FROM public.automation_runs WHERE id = 'b0000000-0000-40
 -- what the tab shows per rule: server-only, one workspace at a time
 SELECT ok(NOT has_function_privilege('authenticated', 'public.automation_rule_health(uuid)', 'EXECUTE'),
   'sessions cannot call automation_rule_health');
-SELECT ok(NOT has_function_privilege('authenticated', 'public.guard_contact_opt_in_change()', 'EXECUTE'),
-  'nor the opt-in guard');
+SELECT ok(NOT has_function_privilege('authenticated', 'public.sync_contact_opt_out()', 'EXECUTE'),
+  'nor the opt-out trigger function');
 SELECT ok((SELECT failures_24h FROM public.automation_rule_health('b0000000-0000-4000-8000-000000000001')
             WHERE rule_id = 'b0000000-0000-4000-8000-0000000000a9') >= 1,
   'a rule''s failures in the last 24 hours are counted');
