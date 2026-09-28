@@ -26,7 +26,12 @@ mock.module("@/lib/auth/workspace-access.ts", {
   },
 });
 mock.module("@/lib/auth/provision-user.ts", {
-  exports: { provisionWorkspaceUser: () => provisionImpl() },
+  exports: {
+    provisionWorkspaceUser: () => provisionImpl(),
+    // A brand-new email: no existing account to guard.
+    findAuthUserByEmail: async () => null,
+    ExistingAccountError: class ExistingAccountError extends Error {},
+  },
 });
 mock.module("@supabase/supabase-js", {
   exports: {

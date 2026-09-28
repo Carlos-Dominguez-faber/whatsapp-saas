@@ -5,7 +5,11 @@ import {
   requireWorkspaceMember,
   readJsonBody,
 } from "@/lib/auth/workspace-access";
-import { provisionWorkspaceUser } from "@/lib/auth/provision-user";
+import {
+  ExistingAccountError,
+  findAuthUserByEmail,
+  provisionWorkspaceUser,
+} from "@/lib/auth/provision-user";
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Schemas
@@ -54,6 +58,28 @@ function svc() {
 type Role = z.infer<typeof RoleEnum>;
 
 const RANK: Record<Role, number> = { viewer: 0, agent: 1, manager: 2, admin: 3 };
+
+const EXISTING_ACCOUNT = () =>
+  NextResponse.json(
+    {
+      error:
+        "Ese correo ya tiene cuenta; pídele a la agencia que lo agregue a este workspace.",
+    },
+    { status: 409 },
+  );
+
+async function isSuperAdmin(
+  db: ReturnType<typeof svc>,
+  userId: string,
+): Promise<boolean> {
+  const { data, error } = await db
+    .from("users")
+    .select("is_super_admin")
+    .eq("id", userId)
+    .maybeSingle();
+  if (error) throw new Error(`super admin check failed: ${error.message}`);
+  return (data as { is_super_admin?: boolean } | null)?.is_super_admin === true;
+}
 
 function withinCeiling(actor: Role, role: Role): boolean {
   return actor === "admin" || RANK[role] < RANK[actor];
@@ -202,14 +228,38 @@ export async function POST(
   if (!withinCeiling(auth.role, role)) return FORBIDDEN_ROLE();
   const db = svc();
 
+  // An email that already has an account belongs to someone — possibly the
+  // admin of another client. Attaching it here, then resetting its password
+  // from the agency sheet, would hand that account over. Only a super admin
+  // attaches an existing account; anyone else may re-invite someone who is
+  // already a member of THIS workspace, and nothing more.
+  let allowExisting: boolean;
+  try {
+    const existing = await findAuthUserByEmail(db, email);
+    allowExisting = existing
+      ? (await loadMembership(db, workspaceId, existing.id)) !== null ||
+        (await isSuperAdmin(db, auth.userId))
+      : false;
+    if (existing && !allowExisting) return EXISTING_ACCOUNT();
+  } catch (err) {
+    console.error("[POST /api/workspace/[id]/team] account check:", err);
+    return NextResponse.json(
+      { error: "No se pudo verificar el correo. Intenta de nuevo." },
+      { status: 500 },
+    );
+  }
+
   // Provision the account directly — no invite email / SMTP. The agency shares
   // the returned credentials and the user logs in directly.
   let provisioned;
   try {
     provisioned = await provisionWorkspaceUser(db, email, {
       password: password || undefined,
+      allowExisting,
     });
   } catch (err) {
+    // Created by someone else between the check above and this call.
+    if (err instanceof ExistingAccountError) return EXISTING_ACCOUNT();
     console.error(
       "[POST /api/workspace/[id]/team] provision error:",
       err instanceof Error ? err.message : String(err),

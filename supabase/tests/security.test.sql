@@ -8,7 +8,7 @@ BEGIN;
 CREATE EXTENSION IF NOT EXISTS pgtap WITH SCHEMA extensions;
 SET search_path = public, extensions;
 
-SELECT plan(95);
+SELECT plan(141);
 
 -- ── public.users: read-only for sessions ────────────────────────────────────
 SELECT ok(NOT has_table_privilege('authenticated', 'public.users', 'UPDATE'),
@@ -326,10 +326,10 @@ SELECT throws_ok(
   $$INSERT INTO public.events (workspace_id, type, payload)
     VALUES ('b0000000-0000-4000-8000-000000000001', 'model_outside_catalog', '{}')$$,
   '42501', NULL, 'a session cannot pre-empt the daily model_outside_catalog event');
-SELECT lives_ok(
+SELECT throws_ok(
   $$INSERT INTO public.events (workspace_id, type, payload)
     VALUES ('b0000000-0000-4000-8000-000000000001', 'note_viewed', '{}')$$,
-  'a session still inserts other event types in its workspace');
+  '42501', NULL, 'a session inserts no event at all: only the server writes events');
 RESET ROLE;
 
 -- ── the buffer: one batch per conversation, stale leases counted ───────────
@@ -498,6 +498,192 @@ SELECT lives_ok(
   $$UPDATE public.contacts SET hl_contact_id = 'hl-sec-1'
      WHERE id = 'a0000000-0000-4000-8000-0000000000c1'$$,
   'another workspace may link its own contact to the same HighLevel id');
+
+-- ── n8n tools: admins only, and never the auth header ──────────────────────
+SELECT ok(NOT has_column_privilege('authenticated', 'public.n8n_tools', 'auth_header_value', 'SELECT'),
+  'sessions cannot read an n8n tool''s auth header');
+SELECT ok(has_column_privilege('authenticated', 'public.n8n_tools', 'webhook_url', 'SELECT'),
+  'a session may read the rest of an n8n tool (RLS limits it to admins)');
+SELECT ok(NOT has_table_privilege('authenticated', 'public.n8n_tools', 'INSERT'),
+  'sessions cannot insert n8n tools (the admin-only API does)');
+SELECT ok(NOT has_table_privilege('authenticated', 'public.n8n_tools', 'UPDATE'),
+  'sessions cannot update n8n tools');
+SELECT ok(NOT has_table_privilege('authenticated', 'public.n8n_tools', 'DELETE'),
+  'sessions cannot delete n8n tools');
+SELECT ok(NOT has_table_privilege('anon', 'public.n8n_tools', 'SELECT'),
+  'anon cannot read n8n tools');
+INSERT INTO public.n8n_tools (id, workspace_id, name, description, mode, webhook_url, auth_header_name, auth_header_value) VALUES
+  ('a0000000-0000-4000-8000-0000000000a8', 'a0000000-0000-4000-8000-000000000001', 'n8n_a', 'A tool', 'sync',
+   'https://hooks.example/a', 'Authorization', 'enc:v1:iv:ct'),
+  ('b0000000-0000-4000-8000-0000000000a8', 'b0000000-0000-4000-8000-000000000001', 'n8n_b', 'B tool', 'sync',
+   'https://hooks.example/b', NULL, NULL);
+SELECT is((SELECT sensitivity FROM public.n8n_tools WHERE name = 'n8n_b'), 'write',
+  'an n8n tool is a write tool unless marked read');
+
+SET LOCAL ROLE authenticated;
+SELECT set_config('request.jwt.claims',
+  '{"sub":"a0000000-0000-4000-8000-0000000000e1","role":"authenticated"}', true);
+SELECT is_empty($$SELECT id FROM public.n8n_tools$$,
+  'a viewer does not see their workspace''s n8n tools');
+SELECT set_config('request.jwt.claims',
+  '{"sub":"b0000000-0000-4000-8000-0000000000e1","role":"authenticated"}', true);
+SELECT results_eq($$SELECT name FROM public.n8n_tools$$, $$VALUES ('n8n_b'::text)$$,
+  'an admin sees only their own workspace''s n8n tools');
+SELECT throws_ok($$SELECT auth_header_value FROM public.n8n_tools$$, '42501', NULL,
+  'not even an admin session reads the auth header');
+
+-- ── sessions cannot write the events the server audits, dedupes or caps on ──
+SELECT throws_ok(
+  $$INSERT INTO public.events (workspace_id, type, payload)
+    VALUES ('b0000000-0000-4000-8000-000000000001', 'member_password_reset', '{}')$$,
+  '42501', NULL, 'a session cannot fake a password-reset audit entry');
+SELECT throws_ok(
+  $$INSERT INTO public.events (workspace_id, type, payload)
+    VALUES ('b0000000-0000-4000-8000-000000000001', 'Member_Password_Reset', '{}')$$,
+  '42501', NULL, 'nor a variant spelling of it');
+SELECT throws_ok(
+  $$INSERT INTO public.events (workspace_id, type, payload)
+    VALUES ('b0000000-0000-4000-8000-000000000001', 'handoff_ack_sent', '{}')$$,
+  '42501', NULL, 'a session cannot silence the contact''s handoff acknowledgement');
+SELECT throws_ok(
+  $$INSERT INTO public.events (workspace_id, type, payload)
+    VALUES ('b0000000-0000-4000-8000-000000000001', 'handoff_team_notified', '{}')$$,
+  '42501', NULL, 'a session cannot use up the team email cap');
+SELECT throws_ok(
+  $$INSERT INTO public.events (workspace_id, type, payload)
+    VALUES ('b0000000-0000-4000-8000-000000000001', 'jev_judgment', '{}')$$,
+  '42501', NULL, 'a session cannot use up the daily JEV quota');
+RESET ROLE;
+
+-- ── Phase 3 tools are in the catalog ────────────────────────────────────────
+SELECT is((SELECT sensitivity::text FROM public.tools WHERE key = 'handoff_human'), 'read',
+  'handoff_human is read: running it changes nothing, the buffer hands off');
+SELECT is((SELECT sensitivity::text FROM public.tools WHERE key = 'cancel_highlevel'), 'write',
+  'cancel_highlevel is a write tool');
+SELECT ok((SELECT schema::text FROM public.tools WHERE key = 'reschedule_highlevel') LIKE '%appointment_datetime_iso%',
+  'reschedule_highlevel asks for the appointment''s confirmed date');
+SELECT is((SELECT sensitivity::text FROM public.tools WHERE key = 'list_highlevel_appointments'), 'read',
+  'list_highlevel_appointments is a read tool');
+SELECT ok(NOT has_table_privilege('authenticated', 'public.events', 'INSERT'),
+  'sessions have no INSERT on events');
+
+-- ── one local appointment per HighLevel appointment ─────────────────────────
+INSERT INTO public.appointments (workspace_id, scheduled_at, hl_appointment_id)
+  VALUES ('b0000000-0000-4000-8000-000000000001', now() + interval '1 day', 'hl_dup_test');
+SELECT throws_ok(
+  $$INSERT INTO public.appointments (workspace_id, scheduled_at, hl_appointment_id)
+    VALUES ('b0000000-0000-4000-8000-000000000001', now() + interval '2 days', 'hl_dup_test')$$,
+  '23505', NULL, 'a second local row cannot hold the same HighLevel appointment');
+SELECT lives_ok(
+  $$INSERT INTO public.appointments (workspace_id, scheduled_at, hl_appointment_id)
+    VALUES ('a0000000-0000-4000-8000-000000000001', now() + interval '2 days', 'hl_dup_test')$$,
+  'another workspace keeps its own row for that id');
+SELECT lives_ok(
+  $$INSERT INTO public.appointments (workspace_id, scheduled_at) VALUES
+    ('b0000000-0000-4000-8000-000000000001', now() + interval '3 days'),
+    ('b0000000-0000-4000-8000-000000000001', now() + interval '3 days')$$,
+  'rows booked without HighLevel carry no id and never collide');
+SELECT lives_ok(
+  $$INSERT INTO public.appointments (workspace_id, scheduled_at, hl_appointment_id, status)
+    VALUES ('b0000000-0000-4000-8000-000000000001', now() + interval '4 days', 'hl_dup_test', 'cancelled')
+    ON CONFLICT (workspace_id, hl_appointment_id)
+    DO UPDATE SET scheduled_at = EXCLUDED.scheduled_at, status = EXCLUDED.status$$,
+  'the index backs the write-back''s upsert on (workspace_id, hl_appointment_id)');
+SELECT is(
+  (SELECT indexdef ILIKE '% WHERE %' FROM pg_indexes
+    WHERE schemaname = 'public' AND indexname = 'uq_appointments_workspace_hl_appointment_id'),
+  false,
+  'the appointments HighLevel index is total, not partial');
+SELECT ok(
+  (SELECT schema #> '{properties,timezone}' IS NULL FROM public.tools WHERE key = 'check_availability'),
+  'check_availability no longer takes a time zone from the model');
+
+-- ── custom_webhook retired: its config becomes a disabled n8n tool ───────────
+SELECT is((SELECT count(*)::int FROM public.tools WHERE key = 'custom_webhook'), 0,
+  'custom_webhook is no longer in the catalog');
+-- An install that still has it: the migration's function moves the config.
+INSERT INTO public.tools (key, name, description, schema, sensitivity)
+  VALUES ('custom_webhook', 'Webhook personalizado', 'x', '{}', 'sensitive');
+INSERT INTO public.tool_configs (workspace_id, tool_id, enabled, config)
+  SELECT 'b0000000-0000-4000-8000-000000000001', id, true,
+         '{"webhook_url": "https://hooks.example/legacy",
+           "payload_fields": [{"key": "nombre", "value": "{{contact.name}}"},
+                              {"key": "token", "value": "sk_live_secret123"}],
+           "auth_header_name": "X-Token", "auth_header_value": "plain-secret"}'
+    FROM public.tools WHERE key = 'custom_webhook';
+-- Turned off, with a header the API would refuse: migrated, disabled, no header.
+INSERT INTO public.tool_configs (workspace_id, tool_id, enabled, config)
+  SELECT 'a0000000-0000-4000-8000-000000000001', id, false,
+         '{"webhook_url": "https://hooks.example/off",
+           "auth_header_name": "Bad Header!", "auth_header_value": "x"}'
+    FROM public.tools WHERE key = 'custom_webhook';
+-- Never given a URL: nothing to carry.
+INSERT INTO public.workspaces (id, name, slug)
+  VALUES ('d0000000-0000-4000-8000-000000000001', 'D', 'sec-test-d');
+INSERT INTO public.tool_configs (workspace_id, tool_id, enabled, config)
+  SELECT 'd0000000-0000-4000-8000-000000000001', id, true, '{"payload_fields": []}'
+    FROM public.tools WHERE key = 'custom_webhook';
+-- The workspace already has an n8n tool by the name the migration would pick.
+INSERT INTO public.n8n_tools (workspace_id, name, description, mode, webhook_url)
+  VALUES ('b0000000-0000-4000-8000-000000000001', 'webhook_personalizado', 'ya existía', 'sync',
+          'https://hooks.example/x');
+SELECT is(public.retire_custom_webhook(), 2, 'the configs with a URL are moved to n8n_tools');
+SELECT results_eq(
+  $$SELECT enabled, webhook_url, mode, sensitivity, auth_header_name, auth_header_value
+      FROM public.n8n_tools WHERE name = 'webhook_personalizado_2'$$,
+  $$VALUES (false, 'https://hooks.example/legacy'::text, 'async'::text, 'write'::text,
+            'X-Token'::text, 'plain-secret'::text)$$,
+  'as a disabled write tool, under a name the workspace didn''t use, its header left for encrypt-credentials');
+SELECT ok(
+  (SELECT description LIKE '%Migrada desde custom_webhook — revisa antes de activar%nombre={{contact.name}}, token (valor fijo, no se copia)%'
+     FROM public.n8n_tools WHERE name = 'webhook_personalizado_2'),
+  'its description says it was migrated and names the old payload fields');
+SELECT ok(
+  (SELECT description NOT LIKE '%sk_live_secret123%'
+     FROM public.n8n_tools WHERE name = 'webhook_personalizado_2'),
+  'a fixed payload value never reaches the description the model reads');
+SELECT results_eq(
+  $$SELECT enabled, auth_header_name, auth_header_value FROM public.n8n_tools
+     WHERE workspace_id = 'a0000000-0000-4000-8000-000000000001' AND name = 'webhook_personalizado'$$,
+  $$VALUES (false, NULL::text, NULL::text)$$,
+  'a config that was off migrates disabled, and a header the API would refuse is dropped');
+SELECT is_empty(
+  $$SELECT id FROM public.n8n_tools WHERE workspace_id = 'd0000000-0000-4000-8000-000000000001'$$,
+  'a config without a URL is skipped');
+SELECT is((SELECT count(*)::int FROM public.tools WHERE key = 'custom_webhook'), 0,
+  'and custom_webhook leaves the catalog, its configs with it');
+SELECT is(public.retire_custom_webhook(), 0, 'a second run does nothing');
+SELECT ok(NOT has_function_privilege('authenticated', 'public.retire_custom_webhook()', 'EXECUTE'),
+  'sessions cannot run it');
+SELECT ok(NOT has_function_privilege('anon', 'public.retire_custom_webhook()', 'EXECUTE'),
+  'nor anon');
+SET LOCAL ROLE authenticated;
+SELECT set_config('request.jwt.claims',
+  '{"sub":"b0000000-0000-4000-8000-0000000000e1","role":"authenticated"}', true);
+SELECT results_eq($$SELECT enabled FROM public.n8n_tools WHERE name = 'webhook_personalizado_2'$$,
+  $$VALUES (false)$$, 'the workspace admin sees the migrated tool, disabled');
+SELECT throws_ok($$SELECT auth_header_value FROM public.n8n_tools WHERE name = 'webhook_personalizado_2'$$,
+  '42501', NULL, 'and cannot read its header');
+RESET ROLE;
+
+-- ── password-reset audit: append-only, server-only ──────────────────────────
+SELECT ok(NOT has_table_privilege('authenticated', 'public.member_password_resets', 'SELECT'),
+  'sessions cannot read the password-reset audit');
+SELECT ok(NOT has_table_privilege('service_role', 'public.member_password_resets', 'UPDATE'),
+  'not even the service role may UPDATE the audit');
+SELECT ok(NOT has_table_privilege('service_role', 'public.member_password_resets', 'DELETE'),
+  'not even the service role may DELETE the audit');
+INSERT INTO public.member_password_resets (actor_user_id, target_user_id, workspace_id, affected_workspace_ids, outcome)
+  VALUES ('a0000000-0000-4000-8000-0000000000e1', 'b0000000-0000-4000-8000-0000000000e1',
+          'b0000000-0000-4000-8000-000000000001', ARRAY['b0000000-0000-4000-8000-000000000001']::uuid[], 'done');
+SELECT throws_ok($$UPDATE public.member_password_resets SET outcome = 'failed'$$, '42501', NULL,
+  'an audit row cannot be changed, even by the owner');
+SELECT throws_ok($$DELETE FROM public.member_password_resets$$, '42501', NULL,
+  'an audit row cannot be deleted, even by the owner');
+SELECT lives_ok($$DELETE FROM public.workspaces WHERE id = 'a0000000-0000-4000-8000-000000000001'$$,
+  'a workspace can still be deleted: the audit has no foreign keys');
+SELECT is((SELECT count(*)::int FROM public.member_password_resets), 1,
+  'the audit outlives the workspaces it mentions');
 
 SELECT * FROM finish();
 ROLLBACK;

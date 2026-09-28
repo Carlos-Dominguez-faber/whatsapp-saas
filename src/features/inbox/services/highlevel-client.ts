@@ -9,6 +9,7 @@
  */
 
 import { createClient as createSbClient } from "@supabase/supabase-js";
+import { isIanaTimeZone } from "@/shared/lib/timezone";
 import { decryptCredentials } from "@/shared/lib/integration-secrets";
 import { phoneVariants, phoneWithCountryCode } from "./phone";
 import { workspaceCountryCode } from "./country-code";
@@ -39,10 +40,10 @@ export interface HLConfig {
   /** Stage within the pipeline for new opportunities; null when not configured. */
   pipelineStageId: string | null;
   /**
-   * IANA timezone for availability queries when the model does not pass a
-   * valid one. Defaults to "UTC".
+   * The HighLevel location's IANA zone, when the integration has one
+   * configured (null otherwise). See scheduling-timezone.ts for how it's used.
    */
-  timezone: string;
+  timezone: string | null;
 }
 
 export interface HLPipeline {
@@ -133,8 +134,105 @@ export async function getHLConfig(
     calendarId: str(calendarId),
     pipelineId: str(pipelineId),
     pipelineStageId: str(pipelineStageId),
-    timezone: str(config.timezone) ?? "UTC",
+    timezone: hlZoneOf(config),
   };
+}
+
+/**
+ * The zone in a HighLevel integration's config. A "UTC" is what an unset
+ * zone used to look like, so it counts only when the location lookup wrote
+ * it (timezone_source "location", see saveHLLocationTimeZone).
+ */
+function hlZoneOf(config: Record<string, unknown>): string | null {
+  const tz = config.timezone;
+  if (!isIanaTimeZone(tz)) return null;
+  if (tz.trim() === "UTC" && config.timezone_source !== "location") return null;
+  return tz.trim();
+}
+
+/**
+ * The HighLevel integration's configured zone, without loading (or
+ * decrypting) the rest of the integration. Null when there's none, or when
+ * it can't be read (logged: the prompt then uses the next zone in line).
+ */
+export async function hlConfiguredTimeZone(workspaceId: string): Promise<string | null> {
+  const { data, error } = await svc()
+    .from("integrations")
+    .select("config")
+    .eq("workspace_id", workspaceId)
+    .eq("provider", "highlevel")
+    .eq("enabled", true)
+    .maybeSingle();
+  if (error) {
+    console.error("[HL] integration zone lookup failed:", error.message);
+    return null;
+  }
+  return hlZoneOf((data?.config as Record<string, unknown> | null) ?? {});
+}
+
+/** GET /locations/{locationId}, HighLevel's OpenAPI spec. */
+const HL_VERSION_LOCATIONS = "2021-07-28";
+
+/**
+ * Stores the location's zone (GET /locations/{id} → location.timezone) in
+ * the integration's config, marked timezone_source "location": HighLevel's
+ * bare times are read in it, and it's the scheduling zone when the business
+ * has none. Called when the integration is saved or tested; `location` is
+ * that response when the caller already has it. Never throws.
+ */
+export async function saveHLLocationTimeZone(
+  workspaceId: string,
+  location?: { timezone?: unknown },
+): Promise<string | null> {
+  try {
+    const cfg = await getHLConfig(workspaceId);
+    if (!cfg) return null;
+    let loc = location;
+    if (!loc) {
+      const res = await fetch(`${HL_BASE_URL}/locations/${cfg.locationId}`, {
+        headers: { Authorization: `Bearer ${cfg.token}`, Version: HL_VERSION_LOCATIONS },
+        signal: AbortSignal.timeout(5_000),
+      });
+      if (!res.ok) {
+        console.warn("[HL] location lookup for its zone failed:", res.status);
+        return null;
+      }
+      loc = ((await res.json()) as { location?: { timezone?: unknown } }).location;
+    }
+    const tz = loc?.timezone;
+    if (!isIanaTimeZone(tz)) return null;
+
+    const supabase = svc();
+    const { data, error } = await supabase
+      .from("integrations")
+      .select("config, updated_at")
+      .eq("workspace_id", workspaceId)
+      .eq("provider", "highlevel")
+      .maybeSingle();
+    if (error || !data) return null;
+    const config = (data.config as Record<string, unknown> | null) ?? {};
+    if (config.timezone === tz.trim() && config.timezone_source === "location") return tz.trim();
+    // Guarded: only over the config just read, for the location just asked.
+    // A save in between (another location, other settings) wins, and its own
+    // lookup stores the zone.
+    const { data: written, error: updateError } = await supabase
+      .from("integrations")
+      .update({ config: { ...config, timezone: tz.trim(), timezone_source: "location" } })
+      .eq("workspace_id", workspaceId)
+      .eq("provider", "highlevel")
+      .eq("updated_at", (data as { updated_at: string }).updated_at)
+      .eq("config->>location_id", cfg.locationId)
+      .select("workspace_id");
+    if (updateError) {
+      console.error("[HL] saving the location's zone failed:", updateError.message);
+      return null;
+    }
+    if ((written ?? []).length === 0) return null;
+    return tz.trim();
+  } catch (err) {
+    console.warn("[HL] location zone lookup failed:", err instanceof Error ? err.message : err);
+    return null;
+  }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

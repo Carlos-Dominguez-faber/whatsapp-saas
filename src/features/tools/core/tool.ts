@@ -7,6 +7,21 @@ export interface ToolContext {
   conversationId: string;
   contactId: string;
   // SEC-01: identity anchored server-side — LLM cannot override these
+  /**
+   * The inbound batch this turn answers, when there is one (not in the
+   * playground). Stable across retries of the batch, so a tool can derive an
+   * idempotency key from it.
+   */
+  batchId?: string;
+  /**
+   * Set only by the playground (test-chat): who is testing, and what they
+   * typed. A write tool acts only on data the tester wrote there.
+   */
+  playground?: {
+    userId: string;
+    /** The user turns of this request, verbatim. */
+    userMessages: string[];
+  };
 }
 
 export interface ToolResult {
@@ -33,6 +48,8 @@ export interface ToolStart {
  */
 export interface ToolExecution extends ToolStart {
   ok: boolean | null;
+  /** The tool's output when it answered (not when it threw or timed out). */
+  output?: unknown;
 }
 
 export interface ToolRunOptions {
@@ -59,4 +76,10 @@ export interface Tool<TArgs = unknown> {
     ctx: ToolContext,
     opts?: ToolRunOptions,
   ): Promise<ToolResult>;
+  /** Per-tool timeout preference, read by the caller before invoking
+   *  registry.runTool (n8n dynamic tools only — see getEnabledTools). */
+  preferredTimeoutMs?: number;
+  /** Extra arg keys to redact in tool_call logs, beyond the generic
+   *  secret-name regex in registry.ts (n8n dynamic tools only). */
+  sensitiveArgKeys?: string[];
 }

@@ -361,11 +361,12 @@ las migraciones, así que las migraciones van **antes** de `vercel --prod`.
 - Si al revisar el presupuesto la base no responde, el lote se reintenta (y tras 3
   reintentos queda como `batch_dead_letter` en `events`) en vez de perderse sin
   aviso. El reintento no gasta otro turno del tope por hora.
-- El tool **Webhook personalizado** sigue hasta 3 redirects, siempre por HTTPS y
-  revisando cada destino. Así funcionan, por ejemplo, las web apps de Google Apps
-  Script, que responden a cada POST con un redirect después de ejecutarlo. Si el
-  webhook respondió al POST con un redirect y un salto posterior falla, la llamada
-  cuenta como entregada: el webhook ya la recibió, y el agente no la repite.
+- Las **tools de n8n** (que reemplazan al antiguo "Webhook personalizado", ver
+  abajo) siguen hasta 3 redirects, siempre por HTTPS y revisando cada destino. Así
+  funcionan, por ejemplo, las web apps de Google Apps Script, que responden a cada
+  POST con un redirect después de ejecutarlo. Si el webhook respondió al POST con un
+  redirect y un salto posterior falla, la llamada cuenta como entregada: el webhook
+  ya la recibió, y el agente no la repite.
 
 **Cambios en el buffer y los envíos (Fase 2, finales de sep-2026):**
 
@@ -449,6 +450,123 @@ las migraciones, así que las migraciones van **antes** de `vercel --prod`.
   permite en el plan Hobby con **Fluid Compute**, que viene activo en proyectos
   nuevos; en uno viejo, actívalo en Vercel → Settings → Functions.
 
+**Novedades de la Fase 3 (finales de sep-2026):**
+
+- **Agencia → Miembros:** el super admin ve quién tiene acceso a cada workspace y
+  puede generar una clave nueva para un miembro activo, que se muestra una sola vez.
+  - No resetea la de otro super admin ni la tuya.
+  - La clave es de la persona, no del workspace. Si también está activa en otros
+    workspaces, la hoja los nombra y pide una segunda confirmación: la clave nueva
+    aplica en todos.
+  - Al cambiar la clave, Supabase cierra sus sesiones y tokens de refresco. Un
+    token de acceso que ya tenía puede seguir funcionando hasta que expire (a lo
+    más una hora).
+  - Cada reseteo queda en una tabla de auditoría que nadie puede editar ni borrar
+    (`member_password_resets`, ni siquiera desde el service role) y como evento en
+    cada workspace donde la persona está. Si el registro no se puede escribir, la
+    clave no cambia.
+  - Al dar de alta un cliente con un email que ya tiene cuenta, la app pide
+    confirmar antes de usar esa cuenta (conserva su contraseña).
+- **Equipo:** invitar un correo que **ya tiene cuenta** responde "Ese correo ya tiene
+  cuenta; pídele a la agencia que lo agregue", salvo que esa persona ya esté en
+  este workspace. Solo el super admin agrega cuentas existentes.
+- **Citas en HighLevel, beta** (apagadas hasta que las actives en Configuración →
+  Tools, donde llevan la etiqueta "Beta"; pruébalas primero en una sub-cuenta de
+  HighLevel):
+  - `list_highlevel_appointments` (lectura): las próximas citas del contacto, con la
+    fecha y hora exactas que el agente debe copiar.
+  - `cancel_highlevel` y `reschedule_highlevel`: el agente pasa la fecha y hora de
+    la cita que el cliente confirmó, y la tool solo actúa sobre la cita del
+    contacto a esa hora. Las fechas van en la zona de agenda (la del negocio, o la
+    de la ubicación de HighLevel); una fecha con el offset de otra zona o que no
+    existe se rechaza.
+  - Si la cita ya estaba cancelada, o ya está en el horario nuevo por un cambio
+    anterior, lo dice y no cambia nada: un reintento nunca cancela ni mueve otra
+    cita. Tampoco actúa sobre citas pasadas ni cuando hay dos citas a la misma hora.
+  - Reagendar conserva la duración de la cita.
+  - Si HighLevel no confirma el cambio (error 5xx, tiempo agotado), el agente no le
+    dice al cliente que se hizo ni que falló: dice que una persona lo confirmará.
+    Cada vez que la consulta o el cambio fallan, queda una **nota interna** en la
+    conversación para el equipo.
+  - **HighLevel manda:** con un calendario configurado, las citas del contacto se
+    leen de HighLevel (su hora, estado y duración), y la tabla local solo guarda una
+    copia. Si el equipo mueve o cancela una cita en HighLevel, el agente ve el
+    cambio. Sin calendario, la tabla local solo dice qué citas leer.
+  - Usan los encabezados `Version` que documenta HighLevel (`2021-04-15` para las
+    citas, `2021-07-28` para las citas de un contacto).
+  - `schedule_highlevel` agenda siempre al contacto de la conversación; en el chat
+    de prueba, ver abajo.
+- **Chat de prueba de agentes:**
+  - Un **manager** solo corre las tools de **lectura** (consultar disponibilidad,
+    una tool de n8n de lectura).
+  - Un **admin** corre también las de **escritura** activas: agenda de verdad en
+    HighLevel y dispara los workflows de n8n que escriben. Cancelar y reagendar no
+    aplican (la prueba no tiene contacto).
+  - Para agendar en la prueba, escribe en el chat el teléfono de prueba: solo se
+    usa un número que tú escribiste (nunca uno que invente el agente), leído con el
+    código de país del workspace, y es ese número el que va a HighLevel. La cita
+    aparece en HighLevel como "[Prueba]", y si ese número ya era un contacto, no se
+    le cambia el nombre. Antes de tocar HighLevel queda un evento
+    `playground_write` con quién la hizo y el teléfono (si no se puede registrar,
+    no se agenda), y después se anota cómo terminó.
+  - Si la respuesta falla después de ejecutar una acción (o se corta la conexión
+    en la prueba de un admin), la pantalla lo dice y el agente recibe una nota
+    para no repetirla: revisa qué quedó hecho antes de reintentar.
+- **Tools de n8n por workspace** (Configuración → n8n, solo admins): cada fila es una
+  tool que llama a un webhook de n8n.
+  - El header de autenticación se guarda **cifrado** y nunca se vuelve a mostrar;
+    ninguna sesión puede leerlo (ni un admin). No acepta saltos de línea ni
+    caracteres de control. Si venías de la rama del PR #11, corre
+    `node scripts/encrypt-credentials.mjs` para cifrar los que tengas en texto plano.
+  - Cada llamada manda un `idempotency_key`: el mismo para la misma tool con los
+    mismos argumentos al contestar el mismo mensaje del cliente, también si ese
+    mensaje se reintenta. Úsalo en tu workflow para no escribir dos veces. Ojo: si
+    el agente llama la tool **dos veces con los mismos argumentos** en un mismo
+    turno, las dos llamadas llevan la misma clave (tu workflow las tratará como
+    una).
+  - Las llamadas siguen redirecciones (máximo 3, cada salto validado, solo HTTPS,
+    sin mandar el header a otro dominio).
+  - El agente ve a lo más 16 KB de la respuesta: haz que el workflow devuelva solo
+    lo que el agente necesita decirle al cliente.
+  - Las llamadas desde el chat de prueba (solo las de un admin corren tools de
+    escritura) llevan `playground: true` en el cuerpo, para que tu workflow pueda
+    distinguirlas de una conversación real.
+  - Una tool nueva es de "escritura" salvo que la marques de lectura (las de
+    escritura nunca se reintentan). Un nombre igual al de una tool del sistema se
+    rechaza.
+- **`custom_webhook` se retiró; las tools de n8n lo reemplazan.** Era una tool
+  "sensible" que esperaba una aprobación que ninguna pantalla daba, así que nunca
+  corría. Al actualizar, la migración `20260930000007` convierte la configuración de
+  cada workspace (si tenía URL) en una tool de n8n **desactivada**, llamada
+  `webhook_personalizado` (o `webhook_personalizado_2`, … si el nombre ya estaba en
+  uso), con la misma URL, modo asíncrono y de escritura. Después borra
+  `custom_webhook` del catálogo y sus configuraciones; el `db push` imprime cuántas
+  movió y cuántos headers descartó por inválidos. **Admins: revisen cada tool
+  migrada en Configuración → n8n antes de activarla.** Su descripción dice "Migrada desde custom_webhook — revisa antes de
+  activar" y lista los campos que enviaba. El workflow ya no recibe
+  `{ workspace_id, payload }`, sino `workspace_id`, `conversation_id`, `contact_id`,
+  `idempotency_key` y `args.note`, así que hay que ajustarlo. Si la configuración
+  traía un header de autenticación, queda en texto plano hasta que corras
+  `node scripts/encrypt-credentials.mjs` (ninguna sesión puede leerlo mientras).
+- **`handoff_human`** (apagada hasta que la actives en Configuración → Tools): el
+  agente puede pasar la conversación a una persona cuando el cliente lo pide o
+  cuando no tiene cómo resolver. Primero manda su despedida y luego pasa la
+  conversación; si no escribió despedida, o el turno falla después de pedirlo, pasa
+  de inmediato y el contacto recibe el aviso de siempre. Si el traspaso falla, se
+  reintenta; si vuelve a fallar, queda un evento `handoff_failed`, una nota interna
+  y, si el aviso por correo está activo, un correo al equipo.
+- **Aviso al equipo por correo** (apagado por defecto: Configuración →
+  Integraciones → WhatsApp → "Avisar al equipo por correo…"): cuando una
+  conversación pasa a una persona, cada admin, manager y agente activo recibe su
+  propio correo (hasta 20, los admins primero), con un tope de 10 avisos por hora
+  por workspace. Requiere una cuenta de [Resend](https://resend.com) y dos
+  variables en Vercel: `RESEND_API_KEY` y `HANDOFF_NOTIFY_FROM` (una dirección de un
+  dominio verificado en Resend). Sin ellas no se manda nada, y la pantalla lo avisa.
+- En el inbox, la pestaña muestra cuántas conversaciones esperan a una persona y,
+  si das permiso, el navegador avisa una sola vez por cada conversación que entra.
+- **Eventos:** las sesiones ya no pueden insertar filas en `events` (solo el
+  servidor), así nadie puede falsear un registro ni silenciar un aviso.
+
 **Si instalaste desde la antigua rama `provider/kapso`** (Kapso), cámbiate a `main`,
 donde ahora viven los dos proveedores. Cada workspace sigue con el proveedor que
 tenía **activo**: si tenía Kapso (o Kapso y YCloud a la vez), queda en Kapso; si solo
@@ -468,16 +586,20 @@ vercel --prod
 `db-push` marca como revertidas las dos migraciones que solo existían en esa rama
 (`20260731000000/1`; su contenido ya viene en las de `main`) y aplica las nuevas.
 
-**Si además aplicaste ramas de los PRs #8 o #9 de la comunidad** (Francisco
-Velásquez), `db-push` también marca como revertidas sus versiones que `main` no
-tiene (la lista está en `scripts/setup.mjs`); si no, `supabase db push` se niega a
-seguir. Eso solo destraba el historial: lo que esas migraciones crearon sigue en
-tu base. Lo que `main` adoptó de ellas vuelve con versiones nuevas que se pueden
-aplicar encima.
+**Si además aplicaste ramas de los PRs #8, #9, #11, #12 o #14 de la comunidad**
+(Francisco Velásquez), `db-push` también marca como revertidas sus versiones que
+`main` no tiene (la lista está en `scripts/setup.mjs`); si no, `supabase db push` se
+niega a seguir. Eso solo destraba el historial: lo que esas migraciones crearon
+sigue en tu base. Lo que `main` adoptó de ellas vuelve con versiones nuevas que se
+aplican encima (por ejemplo, la tabla `n8n_tools` de #11 se conserva y solo se le
+cambian los permisos). El PR #11 también borraba `custom_webhook` del catálogo de
+tools (sin migrar sus configuraciones); en `main` lo retira `20260930000007`, que
+no hace nada si ya no está.
 
-**Si aplicaste ramas de otros PRs de la comunidad (#10–#17)**, traen versiones que
-ni `main` ni esa lista conocen, y `supabase db push` se va a negar a seguir. Es a
-propósito: nada se aplica a ciegas sobre una base con cambios desconocidos.
+**Si aplicaste ramas de otros PRs de la comunidad (#13, #15, #16 o #17)**, traen
+versiones que ni `main` ni esa lista conocen, y `supabase db push` se va a negar a
+seguir. Es a propósito: nada se aplica a ciegas sobre una base con cambios
+desconocidos.
 
 1. Corre `supabase migration list` y anota las versiones que solo aparecen del lado
    remoto (tu base).

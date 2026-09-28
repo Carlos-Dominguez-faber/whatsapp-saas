@@ -137,6 +137,9 @@ export default async function SettingsPage() {
       initialTools={toolsWithEnabled}
       initialIntegrations={maskedIntegrations}
       initialAgents={initialAgents}
+      teamEmailReady={Boolean(
+        process.env.RESEND_API_KEY && process.env.HANDOFF_NOTIFY_FROM,
+      )}
       jev={{
         enabled: whatsappConfig.jev_enabled === true,
         uses: readJevUses(whatsappConfig),

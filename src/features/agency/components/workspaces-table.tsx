@@ -10,6 +10,7 @@ import {
   ExternalLink,
   Settings,
   Trash2,
+  Users,
 } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
@@ -17,6 +18,7 @@ import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
 import { Skeleton } from "@/components/ui/skeleton";
 import { CreateWorkspaceSheet } from "./create-workspace-sheet";
+import { MembersSheet } from "./members-sheet";
 import { switchWorkspace } from "@/features/workspace/services/actions";
 import { deleteWorkspaceForClient } from "../services/agency-actions";
 import { cn } from "@/lib/utils";
@@ -40,6 +42,9 @@ export function WorkspacesTable({ workspaces }: Props) {
   const [search, setSearch] = useState("");
   const [sheetOpen, setSheetOpen] = useState(false);
   const [confirmId, setConfirmId] = useState<string | null>(null);
+  const [membersWorkspaceId, setMembersWorkspaceId] = useState<string | null>(
+    null,
+  );
   const [refreshing, startRefresh] = useTransition();
 
   const filtered = workspaces.filter(
@@ -259,6 +264,18 @@ export function WorkspacesTable({ workspaces }: Props) {
                   Gestionar
                 </span>
               </Button>
+              <Button
+                size="sm"
+                variant="ghost"
+                className="h-8 px-2.5 text-muted-foreground hover:text-foreground"
+                aria-label={`Ver miembros de ${workspace.name}`}
+                onClick={() => setMembersWorkspaceId(workspace.id)}
+              >
+                <Users className="h-3.5 w-3.5" aria-hidden="true" />
+                <span className="sr-only sm:not-sr-only sm:ml-1.5 text-xs">
+                  Miembros
+                </span>
+              </Button>
 
               {confirmId === workspace.id ? (
                 <div className="flex items-center gap-1">
@@ -309,6 +326,10 @@ export function WorkspacesTable({ workspaces }: Props) {
         open={sheetOpen}
         onClose={() => setSheetOpen(false)}
         onCreated={handleCreated}
+      />
+      <MembersSheet
+        workspaceId={membersWorkspaceId}
+        onClose={() => setMembersWorkspaceId(null)}
       />
     </>
   );

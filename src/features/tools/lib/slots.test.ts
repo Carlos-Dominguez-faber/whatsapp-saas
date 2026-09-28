@@ -23,7 +23,7 @@ function hourlySlotsUtc(days: string[]): string[] {
 function isoDay(day: string): string[] {
   return Array.from(
     { length: 10 },
-    (_, i) => `${day}T${String(i + 9).padStart(2, "0")}:00:00Z`,
+    (_, i) => `${day}T${String(i + 9).padStart(2, "0")}:00:00+00:00`,
   );
 }
 
@@ -41,12 +41,12 @@ test("caso real de producción: un día no pierde horarios del medio del rango",
 
   const { days: grouped } = groupByDay(slots, "UTC");
 
-  assert.ok(grouped["2026-09-17"].includes("2026-09-17T12:00:00Z"));
-  assert.ok(grouped["2026-09-17"].includes("2026-09-17T13:00:00Z"));
-  assert.ok(grouped["2026-09-17"].includes("2026-09-17T15:00:00Z"));
+  assert.ok(grouped["2026-09-17"].includes("2026-09-17T12:00:00+00:00"));
+  assert.ok(grouped["2026-09-17"].includes("2026-09-17T13:00:00+00:00"));
+  assert.ok(grouped["2026-09-17"].includes("2026-09-17T15:00:00+00:00"));
 });
 
-test("el valor es el ISO original del proveedor, no una etiqueta HH:MM", () => {
+test("el valor es un ISO completo, no una etiqueta HH:MM", () => {
   // El modelo copia este string literal a schedule_highlevel; si guardáramos
   // "12:00" tendría que reconstruir el instante haciendo aritmética de fechas.
   const { days } = groupByDay(
@@ -55,6 +55,29 @@ test("el valor es el ISO original del proveedor, no una etiqueta HH:MM", () => {
   );
 
   assert.deepEqual(days["2026-09-17"], ["2026-09-17T12:00:00-03:00"]);
+});
+
+test("cada slot se reescribe con el offset de tz, no con el que mandó el proveedor", () => {
+  // schedule/cancel/reschedule validan el offset contra la zona de agenda: un
+  // slot con el offset de otra zona se rechazaría allá.
+  const { days } = groupByDay(
+    ["2026-09-17T15:00:00Z", "2026-09-17T11:00:00-05:00"],
+    "America/Cancun",
+  );
+
+  assert.deepEqual(days["2026-09-17"], [
+    "2026-09-17T10:00:00-05:00",
+    "2026-09-17T11:00:00-05:00",
+  ]);
+});
+
+test("el mismo instante escrito con dos offsets es un solo horario", () => {
+  const { days } = groupByDay(
+    ["2026-09-17T15:00:00Z", "2026-09-17T10:00:00-05:00"],
+    "America/Cancun",
+  );
+
+  assert.deepEqual(days["2026-09-17"], ["2026-09-17T10:00:00-05:00"]);
 });
 
 test("un día presente aparece completo aunque el total supere cualquier tope", () => {
@@ -97,7 +120,7 @@ test("agrupa por el día LOCAL en tz, no por el día UTC", () => {
   const { days } = groupByDay(["2026-06-13T02:00:00Z"], "America/Santiago");
 
   assert.deepEqual(Object.keys(days), ["2026-06-12"]);
-  assert.deepEqual(days["2026-06-12"], ["2026-06-13T02:00:00Z"]);
+  assert.deepEqual(days["2026-06-12"], ["2026-06-12T22:00:00-04:00"]);
 });
 
 test("el retroceso de horario no colapsa dos cupos distintos en uno", () => {
@@ -109,8 +132,8 @@ test("el retroceso de horario no colapsa dos cupos distintos en uno", () => {
   );
 
   assert.deepEqual(days["2026-04-04"], [
-    "2026-04-05T02:30:00Z",
-    "2026-04-05T03:30:00Z",
+    "2026-04-04T23:30:00-03:00",
+    "2026-04-04T23:30:00-04:00",
   ]);
 });
 
@@ -129,7 +152,7 @@ test("un valor no parseable se cuenta como ilegible, no se descarta en silencio"
     "UTC",
   );
 
-  assert.deepEqual(days, { "2026-06-12": ["2026-06-12T15:00:00Z"] });
+  assert.deepEqual(days, { "2026-06-12": ["2026-06-12T15:00:00+00:00"] });
   assert.equal(unreadable, 3);
 });
 
@@ -140,7 +163,7 @@ test("un objeto en vez de un string se cuenta como ilegible", () => {
   );
 
   assert.equal(unreadable, 1);
-  assert.deepEqual(days["2026-06-12"], ["2026-06-12T16:00:00Z"]);
+  assert.deepEqual(days["2026-06-12"], ["2026-06-12T16:00:00+00:00"]);
 });
 
 test("ordena los días y las horas, y deduplica", () => {
@@ -156,8 +179,8 @@ test("ordena los días y las horas, y deduplica", () => {
 
   assert.deepEqual(Object.keys(days), ["2026-06-12", "2026-06-13"]);
   assert.deepEqual(days["2026-06-12"], [
-    "2026-06-12T15:00:00Z",
-    "2026-06-12T16:00:00Z",
+    "2026-06-12T15:00:00+00:00",
+    "2026-06-12T16:00:00+00:00",
   ]);
 });
 
@@ -221,26 +244,14 @@ test("el output dice hasta qué día se sabe cuando hay recorte por maxDays", ()
   assert.match(out.message, /2026-09-15/);
 });
 
-test("el output declara la zona realmente usada cuando la pedida no sirve", () => {
+test("el output dice en qué zona están los horarios", () => {
   const out = buildAvailabilityOutput(
-    { days: {}, omittedDays: 0, unreadable: 0, partialDay: null },
+    { days: { "2026-06-12": ["2026-06-12T10:00:00-05:00"] }, omittedDays: 0, unreadable: 0, partialDay: null },
     "America/Bogota",
-    "America/Santiagoo",
   );
 
   assert.equal(out.timezone, "America/Bogota");
-  assert.match(out.message, /America\/Santiagoo/);
   assert.match(out.message, /America\/Bogota/);
-});
-
-test("el output no menciona la zona pedida cuando sí se pudo usar", () => {
-  const out = buildAvailabilityOutput(
-    { days: {}, omittedDays: 0, unreadable: 0, partialDay: null },
-    "America/Bogota",
-    "America/Bogota",
-  );
-
-  assert.doesNotMatch(out.message, /no es válida/);
 });
 
 test("zonedDayRange arranca en la medianoche local, no en la UTC", () => {
@@ -293,7 +304,7 @@ test("ordena por instante, no alfabéticamente por el texto del ISO", () => {
 
   assert.deepEqual(days["2026-06-12"], [
     "2026-06-12T14:00:00+00:00",
-    "2026-06-12T10:00:00-05:00",
+    "2026-06-12T15:00:00+00:00",
   ]);
 });
 

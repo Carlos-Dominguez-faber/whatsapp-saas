@@ -3,7 +3,11 @@
 import { useEffect, useRef } from "react";
 import { useRouter } from "next/navigation";
 import { createClient } from "@/lib/supabase/client";
-import type { RealtimeChannel } from "@supabase/supabase-js";
+import type {
+  RealtimeChannel,
+  RealtimePostgresChangesPayload,
+} from "@supabase/supabase-js";
+import type { ConversationRow } from "@/features/inbox/types";
 
 /**
  * Keeps the inbox conversation list fresh in real time.
@@ -15,9 +19,19 @@ import type { RealtimeChannel } from "@supabase/supabase-js";
  * component to re-run via router.refresh(). Refreshes are debounced so a burst
  * of inbound messages collapses into a single re-fetch.
  */
-export function useRealtimeConversations(workspaceId: string | null): void {
+export function useRealtimeConversations(
+  workspaceId: string | null,
+  onConversationChange?: (
+    payload: RealtimePostgresChangesPayload<ConversationRow>,
+  ) => void,
+): void {
   const router = useRouter();
   const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Ref para no re-suscribirse cada vez que el caller pasa una función nueva.
+  const onConversationChangeRef = useRef(onConversationChange);
+  useEffect(() => {
+    onConversationChangeRef.current = onConversationChange;
+  }, [onConversationChange]);
 
   useEffect(() => {
     if (!workspaceId) return;
@@ -33,7 +47,7 @@ export function useRealtimeConversations(workspaceId: string | null): void {
 
     const channel: RealtimeChannel = supabase
       .channel(`inbox:conversations:${workspaceId}`)
-      .on(
+      .on<ConversationRow>(
         "postgres_changes",
         {
           event: "*",
@@ -41,7 +55,10 @@ export function useRealtimeConversations(workspaceId: string | null): void {
           table: "conversations",
           filter: `workspace_id=eq.${workspaceId}`,
         },
-        scheduleRefresh,
+        (payload) => {
+          scheduleRefresh();
+          onConversationChangeRef.current?.(payload);
+        },
       )
       .on(
         "postgres_changes",

@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
 import { createClient } from "@/lib/supabase/server";
@@ -22,6 +23,7 @@ import {
   buildBusinessInfoContext,
   buildNowContext,
 } from "@/features/inbox/services/business-info";
+import { workspaceSchedulingTimeZone } from "@/features/inbox/services/scheduling-timezone";
 import { getEnabledTools } from "@/features/tools/services/tool-configs";
 import type { AgentConfig } from "@/features/agents/types";
 import { isCatalogModel } from "@/features/agents/lib/model-catalog";
@@ -170,9 +172,7 @@ export async function POST(
     ((info?.structured as { name?: string } | null)?.name as string) ??
     "tu negocio";
   const bizContext = buildBusinessInfoContext(info);
-  const timeZone =
-    ((info?.structured as { timezone?: string } | null)?.timezone as string) ??
-    "America/Mexico_City";
+  const timeZone = await workspaceSchedulingTimeZone(workspaceId, info);
 
   // KB: search with the latest user message, just like buffer.ts.
   const lastUserMessage =
@@ -205,11 +205,17 @@ export async function POST(
   });
 
   try {
-    // Enable the workspace's tools in the playground so the agent can actually
-    // check availability / book (e.g. GHL). The playground has no live
-    // conversation, so the tool context carries only the workspace; tools that
-    // need a contact (booking) take an explicit contact_phone arg instead.
-    const tools = await getEnabledTools(workspaceId);
+    // An admin tests with every tool the workspace has on, writes included
+    // (booking — the playground has no contact to cancel or reschedule for —
+    // and the n8n write workflows): they are the ones who turned them on. A
+    // manager gets only the read-only ones (checking availability, an n8n
+    // lookup): they must not book or fire the admin's write workflows from
+    // here, with a draft prompt of their own. The role comes from the
+    // membership read above, never from the request. The seed gives every
+    // call of this request the same idempotency key base, and
+    // generateChatReply doesn't retry a turn after a write.
+    const enabled = await getEnabledTools(workspaceId);
+    const tools = role === "admin" ? enabled : enabled.filter((t) => t.sensitivity === "read");
     const reply = await generateChatReply({
       model,
       systemPrompt,
@@ -221,6 +227,15 @@ export async function POST(
         workspaceId,
         conversationId: "",
         contactId: "",
+        batchId: `playground:${randomUUID()}`,
+        // A write acts only on what the tester typed (schedule_highlevel's
+        // phone), and leaves a trace with who ran it.
+        playground: {
+          userId: user.id,
+          userMessages: parsed.data.messages
+            .filter((m) => m.role === "user")
+            .map((m) => m.content),
+        },
       },
     });
 
@@ -241,10 +256,23 @@ export async function POST(
       inputTokens: reply.promptTokens,
       outputTokens: reply.completionTokens,
       model,
+      writeTools: role === "admin",
     });
   } catch (err) {
     console.error("[agents/test-chat]", err);
-    // Admin-only playground — surface the real reason so it's diagnosable
+    // A turn that already ran a write (a booking, an n8n write) must not be
+    // sent again blindly: it would run it again.
+    if ((err as { wroteSomething?: unknown } | null)?.wroteSomething === true) {
+      return NextResponse.json(
+        {
+          error:
+            "La respuesta falló después de que se ejecutó una acción (por ejemplo, agendar). Revisa en el calendario o en n8n qué quedó hecho antes de reintentar.",
+          wroteSomething: true,
+        },
+        { status: 502 },
+      );
+    }
+    // Admin/manager playground — surface the real reason so it's diagnosable
     // (model id, rate limit, upstream 502…) instead of a generic message.
     const detail = err instanceof Error ? err.message : String(err);
     return NextResponse.json(

@@ -1,9 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import {
-  buildNowContext,
-  buildUpcomingDaysTable,
-} from "./business-info.ts";
+import { buildNowContext, buildUpcomingDaysTable } from "./business-info.ts";
 
 test("advances by calendar days in the target timezone across a DST transition (no skipped/duplicate dates)", () => {
   // America/New_York springs forward on 2026-03-08 at 02:00 local (EST -05:00 -> EDT -04:00).

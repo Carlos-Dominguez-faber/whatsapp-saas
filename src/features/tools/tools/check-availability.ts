@@ -1,21 +1,13 @@
 import { z } from "zod";
 import type { Tool, ToolContext, ToolResult } from "../core/tool";
-import {
-  buildAvailabilityOutput,
-  groupByDay,
-  resolveTimeZone,
-  zonedDayRange,
-} from "../lib/slots";
+import { resolveCalendarId } from "../lib/calendar-id";
+import { buildAvailabilityOutput, groupByDay, zonedDayRange } from "../lib/slots";
 
 const schema = z.object({
   date_from: z
     .string()
     .describe("Fecha inicial del rango a consultar (ISO, ej: 2026-06-12)"),
   date_to: z.string().describe("Fecha final del rango (ISO, ej: 2026-06-19)"),
-  timezone: z
-    .string()
-    .optional()
-    .describe("Zona horaria IANA, ej: America/Mexico_City"),
   calendar_id: z
     .string()
     .optional()
@@ -67,6 +59,7 @@ function readSlots(data: unknown): unknown[] | null {
 async function run(args: Args, ctx: ToolContext): Promise<ToolResult> {
   const { getHLConfig } = await import("../../inbox/services/highlevel-client");
   const { getBusinessInfo } = await import("../../inbox/services/business-info");
+  const { schedulingTimeZone } = await import("../../inbox/services/scheduling-timezone");
 
   const cfg = await getHLConfig(ctx.workspaceId);
   if (!cfg) {
@@ -77,7 +70,7 @@ async function run(args: Args, ctx: ToolContext): Promise<ToolResult> {
     };
   }
 
-  const calendarId = args.calendar_id ?? cfg.calendarId;
+  const calendarId = resolveCalendarId(cfg.calendarId, args.calendar_id);
   if (!calendarId) {
     return {
       ok: false,
@@ -86,17 +79,12 @@ async function run(args: Args, ctx: ToolContext): Promise<ToolResult> {
     };
   }
 
-  // El rango se interpreta en la zona que pida el LLM, o la del negocio, o la
-  // de la integración de HighLevel, o UTC — la primera que sea IANA válida.
+  // El rango y los horarios van en la zona de agenda del workspace (la del
+  // negocio, la de HighLevel o la por defecto): la misma con la que schedule,
+  // cancel y reschedule leen la fecha que el modelo copia de acá. Una zona
+  // que pida el modelo ya no se acepta: sus slots se rechazarían allá.
   // `date_to` queda inclusivo hasta el final de ese día, en hora local.
-  // La zona del LLM es texto libre: si no es válida se cae a la siguiente y el
-  // output lo declara, en vez de etiquetar una zona que no se usó (el bot
-  // ofrecía "12:00" que en Santiago eran las 09:00). La del negocio va antes
-  // que la de HighLevel porque esa vale "UTC" cuando nadie la configuró.
-  const businessInfo = await getBusinessInfo(ctx.workspaceId);
-  const businessTz = (businessInfo?.structured as { timezone?: string } | null)
-    ?.timezone;
-  const tz = resolveTimeZone(args.timezone, businessTz, cfg.timezone);
+  const tz = schedulingTimeZone(await getBusinessInfo(ctx.workspaceId), cfg.timezone);
   const range = zonedDayRange(args.date_from, args.date_to, tz);
   if (!range) {
     return { ok: false, output: null, error: "Fechas inválidas" };
@@ -115,7 +103,8 @@ async function run(args: Args, ctx: ToolContext): Promise<ToolResult> {
       method: "GET",
       headers: {
         Authorization: `Bearer ${cfg.token}`,
-        Version: "2021-07-28",
+        // GET /calendars/{calendarId}/free-slots, HighLevel's OpenAPI spec.
+        Version: "2021-04-15",
       },
     },
   );
@@ -149,7 +138,7 @@ async function run(args: Args, ctx: ToolContext): Promise<ToolResult> {
   const grouped = groupByDay(all, tz);
   return {
     ok: true,
-    output: buildAvailabilityOutput(grouped, tz, args.timezone),
+    output: buildAvailabilityOutput(grouped, tz),
   };
 }
 

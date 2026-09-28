@@ -19,7 +19,8 @@ async function withTransientRetry<T>(
   {
     retries = 2,
     baseDelayMs = 400,
-  }: { retries?: number; baseDelayMs?: number } = {},
+    canRetry = () => true,
+  }: { retries?: number; baseDelayMs?: number; canRetry?: () => boolean } = {},
 ): Promise<T> {
   let lastErr: unknown;
   for (let attempt = 0; attempt <= retries; attempt++) {
@@ -27,7 +28,7 @@ async function withTransientRetry<T>(
       return await fn();
     } catch (err) {
       lastErr = err;
-      if (attempt === retries || !isTransientError(err)) throw err;
+      if (attempt === retries || !isTransientError(err) || !canRetry()) throw err;
       await new Promise((r) => setTimeout(r, baseDelayMs * (attempt + 1)));
     }
   }
@@ -239,6 +240,13 @@ export async function generateChatReply(params: {
   });
 
   // Bridge Forge tools → AI SDK ToolSet (same shape as generateWithTools).
+  // Once a tool that isn't read-only has run, a failed call is not retried:
+  // the whole turn would run, and repeat, that tool. "Has run" is what the
+  // registry reports: a write the tool refused or reported as failed changed
+  // nothing (like the buffer's write record), and one that never started
+  // (bad arguments, a sensitive tool) doesn't count; one that threw or timed
+  // out (ok null) may have written, so it does.
+  let wroteSomething = false;
   const aiTools: ToolSet = {};
   if (params.tools && params.toolContext) {
     const ctx = params.toolContext;
@@ -247,27 +255,48 @@ export async function generateChatReply(params: {
         description: forgeTool.description,
         inputSchema: zodSchema(forgeTool.schema),
         execute: async (args: unknown): Promise<unknown> =>
-          registry.run(forgeTool.name, args, ctx),
+          registry.runTool(forgeTool, args, ctx, {
+            ...(forgeTool.preferredTimeoutMs !== undefined
+              ? { timeoutMs: forgeTool.preferredTimeoutMs }
+              : {}),
+            onExecuted: (execution) => {
+              if (execution.sensitivity !== "read" && execution.ok !== false) {
+                wroteSomething = true;
+              }
+            },
+          }),
       });
     }
   }
   const hasTools = Object.keys(aiTools).length > 0;
 
-  const result = await withTransientRetry(() =>
-    generateText({
-      model: openrouter.chat(modelId),
-      messages: [
-        { role: "system", content: params.systemPrompt },
-        ...params.messages,
-      ],
-      tools: hasTools ? aiTools : undefined,
-      stopWhen: hasTools ? stepCountIs(5) : undefined,
-      maxOutputTokens: params.maxOutputTokens ?? 512,
-      abortSignal: AbortSignal.timeout(
-        hasTools ? LLM_TOOL_TURN_TIMEOUT_MS : LLM_TIMEOUT_MS,
-      ),
-    }),
-  );
+  let result;
+  try {
+    result = await withTransientRetry(
+      () =>
+      generateText({
+        model: openrouter.chat(modelId),
+        messages: [
+          { role: "system", content: params.systemPrompt },
+          ...params.messages,
+        ],
+        tools: hasTools ? aiTools : undefined,
+        stopWhen: hasTools ? stepCountIs(5) : undefined,
+        maxOutputTokens: params.maxOutputTokens ?? 512,
+        abortSignal: AbortSignal.timeout(
+          hasTools ? LLM_TOOL_TURN_TIMEOUT_MS : LLM_TIMEOUT_MS,
+        ),
+      }),
+      { canRetry: () => !wroteSomething },
+    );
+  } catch (err) {
+    // The caller must know a write ran before the failure: sending the
+    // same turn again would run it again.
+    if (wroteSomething && err && typeof err === "object") {
+      Object.assign(err, { wroteSomething: true });
+    }
+    throw err;
+  }
 
   // totalUsage, not usage: with tools the model runs up to 5 steps, and usage
   // only reports the last one.
@@ -308,6 +337,22 @@ export interface GenerateWithToolsResult {
   inputTokens: number;
   outputTokens: number;
   toolCallsExecuted: number;
+  /**
+   * Qué herramienta se ejecutó y qué devolvió, para cada tool-call del turno,
+   * en orden.
+   *
+   * `output` es el `ToolResult` que `registry.runTool` entregó como `output`
+   * del `tool-result` del step (AI SDK v6: `StepResult.toolResults[]` =
+   * `{ type: "tool-result", toolCallId, toolName, input, output }`); `toolName`
+   * es el mismo metadato genérico del AI SDK, sin decoración.
+   *
+   * Canal deliberadamente genérico: este módulo no sabe —ni tiene que saber—
+   * qué herramienta dejó qué marca. Quien llama (hoy `buffer.ts`, para el
+   * traspaso diferido de `handoff_human`) es el que interpreta el contenido,
+   * y necesita `toolName` para no confiar en cualquier tool dinámica que
+   * imite la forma de la marca (n8n).
+   */
+  toolResults: { toolName: string; output: unknown }[];
 }
 
 /**
@@ -340,6 +385,9 @@ export async function generateWithTools(
   // Build AI SDK v6 ToolSet from available Forge tools.
   // Each entry uses inputSchema (zodSchema wrapper) + execute — the correct v6 shape.
   // execute returns Promise<unknown> to satisfy ToolSet's output constraint.
+  // runTool (not run by name) so dynamic n8n tools — resolved per-workspace
+  // by getEnabledTools, never registered in the shared registry Map — work
+  // the same way static tools do.
   const aiTools: ToolSet = {};
   // A start hook that fails (the caller couldn't record a write) aborts the
   // turn: the model must not carry on as if the tool had run.
@@ -355,7 +403,10 @@ export async function generateWithTools(
       description: forgeTool.description,
       inputSchema: zodSchema(forgeTool.schema),
       execute: async (args: unknown): Promise<unknown> => {
-        const run = registry.run(forgeTool.name, args, ctx, {
+        const run = registry.runTool(forgeTool, args, ctx, {
+          ...(forgeTool.preferredTimeoutMs !== undefined
+            ? { timeoutMs: forgeTool.preferredTimeoutMs }
+            : {}),
           onStart: async (start) => {
             try {
               await params.onToolStart?.(start);
@@ -415,6 +466,9 @@ export async function generateWithTools(
     toolCallsExecuted: (result.steps ?? []).reduce(
       (n, step) => n + (step.toolCalls?.length ?? 0),
       0,
+    ),
+    toolResults: (result.steps ?? []).flatMap((step) =>
+      (step.toolResults ?? []).map((r) => ({ toolName: r.toolName, output: r.output })),
     ),
   };
 }

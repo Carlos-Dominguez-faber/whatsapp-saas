@@ -131,12 +131,15 @@ function WhatsAppSection({
   kapso,
   canEdit,
   onSaved,
+  teamEmailReady,
 }: {
   workspaceId: string;
   ycloud: IntegrationData | undefined;
   kapso: IntegrationData | undefined;
   canEdit: boolean;
   onSaved: () => void;
+  /** The server has RESEND_API_KEY and HANDOFF_NOTIFY_FROM. */
+  teamEmailReady: boolean;
 }) {
   // The provider this workspace talks through today (at most one is enabled).
   const active: WhatsAppProviderId | null = kapso?.enabled
@@ -198,6 +201,10 @@ function WhatsAppSection({
   // daily budget resets.
   const [costCutHandoff, setCostCutHandoff] = useState<boolean>(
     (settings.cost_cut_handoff as boolean | undefined) === true,
+  );
+  // Off by default: emailing the team needs a Resend account (INSTALAR).
+  const [handoffTeamEmail, setHandoffTeamEmail] = useState<boolean>(
+    (settings.handoff_team_email as boolean | undefined) === true,
   );
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
@@ -323,6 +330,7 @@ function WhatsAppSection({
       handoff_ack_enabled: handoffAckEnabled,
       handoff_ack_message: handoffAckMessage.trim(),
       cost_cut_handoff: costCutHandoff,
+      handoff_team_email: handoffTeamEmail,
     };
     const payload =
       selected === "kapso"
@@ -637,6 +645,32 @@ function WhatsAppSection({
             (y recibe el aviso de arriba). Esas conversaciones no regresan solas
             a la IA: devuélvelas desde el inbox.
           </p>
+        </div>
+
+        <div className="space-y-2 border-t border-border/60 pt-4">
+          <div className="flex items-center justify-between gap-4">
+            <Label htmlFor="whatsapp-handoff-team-email">
+              Avisar al equipo por correo cuando una conversación pase a una persona
+            </Label>
+            <Switch
+              id="whatsapp-handoff-team-email"
+              checked={handoffTeamEmail}
+              onCheckedChange={setHandoffTeamEmail}
+            />
+          </div>
+          <p className="text-xs text-muted-foreground">
+            Cada admin, manager y agente activo recibe su propio correo, con un
+            tope por hora por workspace. Requiere configurar Resend en la
+            instalación (RESEND_API_KEY y HANDOFF_NOTIFY_FROM); sin eso no se
+            manda nada.
+          </p>
+          {handoffTeamEmail && !teamEmailReady && (
+            <p className="text-xs text-warning" role="status">
+              Está activado, pero esta instalación no tiene RESEND_API_KEY y
+              HANDOFF_NOTIFY_FROM configuradas: no se mandará ningún correo hasta
+              que las agregues en Vercel.
+            </p>
+          )}
         </div>
 
         <div className="flex items-center gap-2 pt-2">
@@ -1131,9 +1165,16 @@ interface Props {
   /** The viewer's role in this workspace. */
   role: string;
   initialIntegrations: unknown[];
+  /** The server can send the team's handoff emails (Resend configured). */
+  teamEmailReady?: boolean;
 }
 
-export function IntegrationsTab({ workspaceId, role, initialIntegrations }: Props) {
+export function IntegrationsTab({
+  workspaceId,
+  role,
+  initialIntegrations,
+  teamEmailReady = false,
+}: Props) {
   const [integrations, setIntegrations] = useState<IntegrationData[]>(
     initialIntegrations as IntegrationData[],
   );
@@ -1175,6 +1216,7 @@ export function IntegrationsTab({ workspaceId, role, initialIntegrations }: Prop
         kapso={kapso}
         canEdit={canEdit}
         onSaved={refresh}
+        teamEmailReady={teamEmailReady}
       />
       <Separator />
       <OpenRouterSection

@@ -212,8 +212,8 @@ function cmdEnv() {
 // no parsing of the CLI's table output.
 const RETIRED_KAPSO_BRANCH_MIGRATIONS = ["20260731000000", "20260731000001"];
 
-// Versions from the community PR stack (#8 and #9, on provider/kapso) that
-// main does not have. main re-lands what it adopts under new versions, so an
+// Versions from the community PR stack (#8, #9, #11, #12 and #14, on
+// provider/kapso) that main does not have. main re-lands what it adopts under new versions, so an
 // install that ran those PR branches needs these marked as reverted too, or
 // `db push` refuses. This only fixes the history: whatever those versions
 // created stays in the database.
@@ -232,10 +232,14 @@ const RETIRED_PR_STACK_MIGRATIONS = [
   "20260902000000", // #9 claim_next_batch stale retries
   "20260906000000", // #9 contacts HL unique index
   "20260906000001", // #9 invoker RPC grants
+  "20260830000000", // #11 n8n_tools (on main: 20260930000001)
+  "20260830000001", // #11 retire custom_webhook (on main: 20260930000007)
+  "20260906000002", // #14 cancel/reschedule seed (on main: 20260930000000)
+  "20260907000000", // #12 handoff_human seed (on main: 20260930000002)
 ];
 
 function repairRetiredMigrations() {
-  log("Historial de migraciones: marco como revertidas las de la antigua rama provider/kapso y las de los PRs #8/#9 que main no tiene (no-op si nunca se aplicaron).");
+  log("Historial de migraciones: marco como revertidas las de la antigua rama provider/kapso y las de los PRs de la comunidad que main no tiene (no-op si nunca se aplicaron).");
   run(
     `supabase migration repair --status reverted ${[
       ...RETIRED_KAPSO_BRANCH_MIGRATIONS,

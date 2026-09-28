@@ -118,3 +118,36 @@ test("PUT also checks the legacy `model` key the workspace default can come from
   assert.equal(res.status, 400);
   assert.equal(upserts.length, 0);
 });
+
+test("PUT with another HighLevel location drops the zone read from the old one", async () => {
+  memberResult = { ok: true, userId: "user_1", role: "admin" };
+  existingRow = {
+    credentials: {},
+    config: { location_id: "loc_old", timezone: "America/Cancun", timezone_source: "location" },
+    oauth_tokens: {},
+  };
+  upserts.length = 0;
+  const res = await PUT(
+    new NextRequest("http://localhost/api/workspace/ws_1/integrations", {
+      method: "PUT",
+      body: JSON.stringify({ provider: "highlevel", config: { location_id: "loc_new" } }),
+    }),
+    params,
+  );
+  assert.equal(res.status, 200);
+  const config = (upserts[0] as { config: Record<string, unknown> }).config;
+  assert.equal(config.location_id, "loc_new");
+  assert.equal(config.timezone, undefined);
+  assert.equal(config.timezone_source, undefined);
+
+  // The same location keeps it.
+  upserts.length = 0;
+  await PUT(
+    new NextRequest("http://localhost/api/workspace/ws_1/integrations", {
+      method: "PUT",
+      body: JSON.stringify({ provider: "highlevel", config: { location_id: "loc_old", calendar_id: "cal_1" } }),
+    }),
+    params,
+  );
+  assert.equal((upserts[0] as { config: Record<string, unknown> }).config.timezone, "America/Cancun");
+});

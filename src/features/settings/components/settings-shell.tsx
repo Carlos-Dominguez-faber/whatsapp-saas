@@ -7,6 +7,7 @@ import { IntegrationsTab } from "./integrations-tab";
 import { TeamTab } from "./team-tab";
 import { TemplatesTab } from "./templates-tab";
 import { AutomationsTab } from "./automations-tab";
+import { N8nToolsTab } from "./n8n-tools-tab";
 import { KbTab } from "./kb-tab";
 import { AgentsTab } from "@/features/agents/components/agents-tab";
 import type { AgentDto } from "@/features/agents/types";
@@ -31,6 +32,8 @@ interface Props {
   initialTemplates?: unknown[];
   initialAgents?: AgentDto[];
   jev: JevSettings;
+  /** The server can send the team's handoff emails (Resend configured). */
+  teamEmailReady?: boolean;
 }
 
 export function SettingsShell({
@@ -42,6 +45,7 @@ export function SettingsShell({
   initialTemplates = [],
   initialAgents = [],
   jev,
+  teamEmailReady = false,
 }: Props) {
   const biForForm = initialBusinessInfo as {
     structured: Record<string, unknown>;
@@ -63,6 +67,7 @@ export function SettingsShell({
             <TabsTrigger value="integraciones">Integraciones</TabsTrigger>
             <TabsTrigger value="negocio">Negocio</TabsTrigger>
             <TabsTrigger value="tools">Tools</TabsTrigger>
+            {role === "admin" && <TabsTrigger value="n8n">n8n</TabsTrigger>}
             <TabsTrigger value="templates">Templates</TabsTrigger>
             <TabsTrigger value="knowledge-base">Knowledge Base</TabsTrigger>
             <TabsTrigger value="equipo">Equipo</TabsTrigger>
@@ -77,6 +82,7 @@ export function SettingsShell({
               initialAgents={initialAgents}
               jev={jev}
               canManage={role === "admin" || role === "manager"}
+              isAdmin={role === "admin"}
             />
           </div>
         </TabsContent>
@@ -87,6 +93,7 @@ export function SettingsShell({
               workspaceId={workspaceId}
               role={role}
               initialIntegrations={initialIntegrations}
+              teamEmailReady={teamEmailReady}
             />
           </div>
         </TabsContent>
@@ -106,6 +113,15 @@ export function SettingsShell({
             />
           </div>
         </TabsContent>
+
+        {/* n8n tools hold a webhook secret: admins only, like the API. */}
+        {role === "admin" && (
+          <TabsContent value="n8n">
+            <div className="p-6 space-y-6 rounded-lg border border-border/60 bg-card">
+              <N8nToolsTab workspaceId={workspaceId} />
+            </div>
+          </TabsContent>
+        )}
 
         <TabsContent value="templates">
           <div className="p-6 rounded-lg border border-border/60 bg-card">

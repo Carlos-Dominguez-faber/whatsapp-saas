@@ -8,11 +8,11 @@ import {
   CalendarClock,
   CalendarPlus,
   CalendarSearch,
-  Webhook,
   FlaskConical,
   Wrench,
 } from "lucide-react";
 import { Switch } from "@/components/ui/switch";
+import { BETA_NOTE, BETA_TOOLS } from "@/features/tools/lib/beta-tools";
 import { Badge } from "@/components/ui/badge";
 import { cn } from "@/lib/utils";
 import { toast } from "sonner";
@@ -40,7 +40,6 @@ const TOOL_ICONS: Record<string, React.ElementType> = {
   schedule_link: CalendarClock,
   schedule_highlevel: CalendarPlus,
   check_availability: CalendarSearch,
-  custom_webhook: Webhook,
   echo: FlaskConical,
 };
 
@@ -188,11 +187,22 @@ export function ToolsCatalog({ workspaceId, role, initialTools }: Props) {
                       )}
                       {config.label}
                     </Badge>
+                    {BETA_TOOLS.has(tool.key) && (
+                      <Badge
+                        variant="outline"
+                        className="text-xs font-normal text-purple-400 border-purple-400/30"
+                      >
+                        Beta
+                      </Badge>
+                    )}
                   </div>
                   {tool.description && (
                     <p className="text-xs text-muted-foreground line-clamp-2">
                       {tool.description}
                     </p>
+                  )}
+                  {BETA_TOOLS.has(tool.key) && (
+                    <p className="text-xs text-purple-400/90">{BETA_NOTE}</p>
                   )}
                   {configurable && (
                     <button
