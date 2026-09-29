@@ -603,8 +603,13 @@ Sin el paso 3 no corre nada: las reglas se guardan, pero ningún job las ejecuta
   - pasaron más de 30 minutos de horario de envío desde que le tocaba (el cron
     estuvo caído).
 
-  Si al ejecutarse está fuera del horario, espera a que abra. Los cambios de horario
-  de verano pueden correr esa apertura una hora.
+  Si al ejecutarse está fuera del horario, espera a que abra (esa espera no cuenta
+  como intento fallido). El horario se calcula con la hora local del negocio,
+  incluidos los cambios de horario de verano. Aunque haya muchas citas dentro de la
+  anticipación de una regla, cada una sale cuando le toca: las que ya se avisaron no
+  ocupan el lote de 50 del escaneo. Si una cita se movió después de que su
+  recordatorio quedó en cola, ese recordatorio no sale; sale el de la hora nueva
+  cuando le toque.
 - **Recordatorios con la hora local del negocio:** la zona sale de la misma
   configuración que la agenda de la Fase 3 (Business info o HighLevel; si no hay
   ninguna, `America/Mexico_City`). Antes de mandarlo, la app confirma la cita en
@@ -644,10 +649,13 @@ Sin el paso 3 no corre nada: las reglas se guardan, pero ningún job las ejecuta
   no cuentan (son respuestas normales: "¿planta alta o baja?"), ni una frase que solo
   contiene la palabra ("quiero darme de baja del plan"). La base de datos aplica la
   baja junto con el mensaje, así que no se pierde ni la deshace un reenvío del mismo
-  mensaje.
+  mensaje, y decide por la hora en que el cliente lo mandó: un STOP que llega tarde no
+  deshace un START posterior.
 - **La baja es del número:** queda en `contact_opt_outs` por teléfono, así que borrar
   y volver a crear el contacto, o pasarle ese número a otro contacto, no la quita.
-  Solo un admin o manager puede borrar contactos.
+  Cuenta como el mismo número con o sin el 1 de los celulares de México (`+52 1 …`) o
+  el 9 de Argentina (`+54 9 …`), y un STOP o START aplica a todos los contactos con
+  ese número. Solo un admin o manager puede borrar contactos.
 - **Reactivar a mano:** en el panel del contacto, solo un **admin o manager** puede
   volver a dar de alta a quien pidió la baja; la base lo exige también. Cada cambio
   manual de opt-in queda como evento `contact_opt_in_changed` con quién lo hizo.
