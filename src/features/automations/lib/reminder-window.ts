@@ -10,8 +10,11 @@
  *     not send yesterday's reminders);
  *   - more than 30 minutes of sending hours passed since it was due (a
  *     backlog after an outage).
- * Outside the sending hours it waits for them to open.
+ * Outside the sending hours it waits for them to open. Openings and closes are
+ * wall-clock times in the business's zone, DST included.
  */
+
+import { wallClockOf, wallClockToInstant, type WallClock } from "@/shared/lib/timezone";
 
 const DEFAULT_QUIET_START = 8;
 const DEFAULT_QUIET_END = 22;
@@ -89,20 +92,39 @@ export function withinSendWindow(config: ReminderConfig, tz: string, now: Date):
   return hour >= config.quietStart && hour < config.quietEnd;
 }
 
+/**
+ * The instant the clock in `tz` reads `hour`:00 on the local date of `wall`
+ * plus `dayOffset` days. Computed from the wall clock, not by adding hours,
+ * so a DST change overnight doesn't move it. An hour a DST change skips
+ * starts when the clock jumps past it.
+ */
+function localHourInstant(wall: WallClock, dayOffset: number, hour: number, tz: string): number {
+  const date = new Date(Date.UTC(wall.year, wall.month - 1, wall.day + dayOffset));
+  const target = {
+    year: date.getUTCFullYear(),
+    month: date.getUTCMonth() + 1,
+    day: date.getUTCDate(),
+    minute: 0,
+    second: 0,
+  };
+  for (let h = hour; h <= 23; h++) {
+    const at = wallClockToInstant({ ...target, hour: h }, tz);
+    if (at !== null) return at;
+  }
+  // Unreachable for real zones; a day later is always a valid answer to wait for.
+  return Date.UTC(target.year, target.month - 1, target.day + 1);
+}
+
 /** `ms` itself when it is inside the sending hours, else when they next open. */
 export function nextWindowOpening(config: ReminderConfig, tz: string, ms: number): number {
-  const { hour, minute } = localClock(tz, ms);
-  if (hour >= config.quietStart && hour < config.quietEnd) return ms;
-  const minuteStart = ms - (ms % 60_000);
-  const hoursAhead = hour < config.quietStart ? config.quietStart - hour : 24 - hour + config.quietStart;
-  return minuteStart + (hoursAhead * 60 - minute) * 60_000;
+  const wall = wallClockOf(ms, tz);
+  if (wall.hour >= config.quietStart && wall.hour < config.quietEnd) return ms;
+  return localHourInstant(wall, wall.hour < config.quietStart ? 0 : 1, config.quietStart, tz);
 }
 
 /** When the sending hours that contain `ms` close. */
 function windowClose(config: ReminderConfig, tz: string, ms: number): number {
-  const { hour, minute } = localClock(tz, ms);
-  const minuteStart = ms - (ms % 60_000);
-  return minuteStart + ((config.quietEnd - hour) * 60 - minute) * 60_000;
+  return localHourInstant(wallClockOf(ms, tz), 0, config.quietEnd, tz);
 }
 
 /** How much of the sending hours lies between `fromMs` and `toMs`. */

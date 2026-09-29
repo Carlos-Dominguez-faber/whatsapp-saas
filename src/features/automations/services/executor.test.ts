@@ -411,8 +411,13 @@ mock.module("@/features/automations/lib/workspace-timezone.ts", {
   exports: { resolveWorkspaceTimezone: async () => workspaceZone },
 });
 
-const { executeRun, drainAutomationRuns, SEND_COOLDOWN_HOURS, DAILY_TEMPLATE_CAP } =
-  await import("./executor.ts");
+const {
+  executeRun,
+  drainAutomationRuns,
+  occurrenceInstant,
+  SEND_COOLDOWN_HOURS,
+  DAILY_TEMPLATE_CAP,
+} = await import("./executor.ts");
 
 // ── Fixtures ─────────────────────────────────────────────────────────────────
 
@@ -2237,4 +2242,57 @@ test("si no se puede persistir la conversación resuelta, el run se reintenta (n
   );
   assert.equal(lastRunUpdate().error, "db_write_failed");
   assert.equal(sendCalls.length, 0);
+});
+
+// ── The time a reminder was emitted for, and waits that aren't attempts ────
+
+test("occurrenceInstant reads the appointment time at the end of a reminder's key", () => {
+  assert.equal(
+    occurrenceInstant("rule_1:24h:2026-10-20T15:00:00.000Z"),
+    Date.parse("2026-10-20T15:00:00.000Z"),
+  );
+  assert.equal(occurrenceInstant("rule_1:1.5h:2026-10-20T15:00:00.000Z"), Date.parse("2026-10-20T15:00:00.000Z"));
+  assert.equal(occurrenceInstant("1"), null);
+  assert.equal(occurrenceInstant(null), null);
+});
+
+test("a pending reminder for a time the appointment no longer has is skipped as moved", async () => {
+  reset();
+  ruleRow = { ...APPOINTMENT_RULE };
+  withLiveConversation();
+  const current = dueNow();
+  // Emitted for yesterday's time; the appointment was moved overnight.
+  eventRow = {
+    ...REMINDER_EVENT,
+    occurrence: `rule_1:2h:${new Date(Date.parse(current) - 24 * 3_600_000).toISOString()}`,
+  };
+  loadVariableContextImpl = reminderContext({ scheduledAt: current });
+  assert.equal(await executeRun(makeRun({ trigger_type: "appointment_upcoming" })), "skipped");
+  assert.equal(lastRunUpdate().error, "appointment_moved");
+  assert.equal(sendCalls.length, 0);
+});
+
+test("a reminder emitted for the time the appointment still has goes out", async () => {
+  reset();
+  ruleRow = { ...APPOINTMENT_RULE };
+  withLiveConversation();
+  const current = dueNow();
+  eventRow = { ...REMINDER_EVENT, occurrence: `rule_1:2h:${new Date(Date.parse(current)).toISOString()}` };
+  loadVariableContextImpl = reminderContext({ scheduledAt: current });
+  assert.equal(await executeRun(makeRun({ trigger_type: "appointment_upcoming" })), "done");
+  assert.equal(sendCalls.length, 1);
+});
+
+test("waiting for the sending hours gives back the attempt and doesn't ask HighLevel yet", async () => {
+  reset();
+  ruleRow = { ...APPOINTMENT_RULE, trigger_config: { hours_before: 2, quiet_start: 13, quiet_end: 20 } };
+  withLiveConversation();
+  eventRow = REMINDER_EVENT;
+  hlConfig = { token: "t", locationId: "l", calendarId: "c" };
+  loadVariableContextImpl = reminderContext({
+    scheduledAt: new Date(Date.now() + 3 * 3_600_000).toISOString(),
+  });
+  assert.equal(await executeRun(makeRun({ trigger_type: "appointment_upcoming", attempts: 2 })), "retry");
+  assert.equal(lastRunUpdate().attempts, 1, "a wait is not a failed attempt");
+  assert.deepEqual(hlEventCalls, [], "HighLevel is asked when the reminder can actually go out");
 });

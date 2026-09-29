@@ -106,6 +106,8 @@ interface ActionResult {
   error?: string;
   /** Only for a retry: when to try again, instead of the usual backoff. */
   notBefore?: string;
+  /** Only for a retry: this claim doesn't count as an attempt (a wait, not a failure). */
+  refundAttempt?: boolean;
 }
 
 /**
@@ -192,11 +194,15 @@ const fail = (error: string): ActionResult => ({ outcome: "failed", error });
  * que acompaña a cada uno, server-side.
  */
 const retry = (error: string): ActionResult => ({ outcome: "retry", error });
-/** A retry at a given time (a reminder waiting for the sending hours). */
+/**
+ * A wait until a given time (a reminder waiting for the sending hours). It
+ * isn't a failure, so it gives back the attempt the claim counted.
+ */
 const retryAt = (error: string, atMs: number): ActionResult => ({
   outcome: "retry",
   error,
   notBefore: new Date(atMs).toISOString(),
+  refundAttempt: true,
 });
 
 /** El UPDATE terminal devolvió error. NO es "no afectó filas" (eso es `lost`). */
@@ -342,10 +348,10 @@ async function persistResolvedConversation(
  */
 async function resolveAppointmentSubjectId(
   run: AutomationRun,
-): Promise<{ id: string | null; dbError: boolean }> {
+): Promise<{ id: string | null; occurrence: string | null; dbError: boolean }> {
   const { data, error } = await svc()
     .from("automation_events")
-    .select("subject_id")
+    .select("subject_id, occurrence")
     .eq("id", run.event_id)
     .eq("workspace_id", run.workspace_id)
     .eq("event_type", "appointment_upcoming")
@@ -356,12 +362,20 @@ async function resolveAppointmentSubjectId(
       runId: run.id,
       message: error.message,
     });
-    return { id: null, dbError: true };
+    return { id: null, occurrence: null, dbError: true };
   }
-  return {
-    id: (data as { subject_id: string } | null)?.subject_id ?? null,
-    dbError: false,
-  };
+  const row = data as { subject_id: string; occurrence?: string | null } | null;
+  return { id: row?.subject_id ?? null, occurrence: row?.occurrence ?? null, dbError: false };
+}
+
+/**
+ * The appointment time a reminder event was emitted for: the instant at the
+ * end of its occurrence ('<rule>:<h>h:<ISO>'), or null when it has none.
+ */
+export function occurrenceInstant(occurrence: string | null): number | null {
+  const match = occurrence ? /^[^:]+:\d+(?:\.\d+)?h:(.+)$/.exec(occurrence) : null;
+  const ms = match ? Date.parse(match[1]) : NaN;
+  return Number.isFinite(ms) ? ms : null;
 }
 
 /** Los desenlaces de `mark_automation_run_dispatched`. */
@@ -627,11 +641,13 @@ async function actSendTemplate(
   // Se resuelve el id ANTES de cargar las variables porque loadVariableContext
   // lo necesita para consultar `appointments`.
   let appointmentId: string | null = null;
+  let emittedForMs: number | null = null;
   if (run.trigger_type === "appointment_upcoming") {
     const subject = await resolveAppointmentSubjectId(run);
     if (subject.dbError) return retry("db_read_failed");
     if (!subject.id) return fail("missing_appointment");
     appointmentId = subject.id;
+    emittedForMs = occurrenceInstant(subject.occurrence);
   }
 
   // Las variables se resuelven ANTES del despacho: si falta un dato o no se
@@ -669,9 +685,22 @@ async function actSendTemplate(
     if (!reminder) return fail("invalid_config");
     const zone = await resolveWorkspaceTimezone(svc(), run.workspace_id);
     if (!zone) return retry("db_read_failed");
+    const scheduledMs = Date.parse(load.ctx.appointment.scheduledAt);
+    if (!Number.isFinite(scheduledMs)) return fail("missing_appointment");
 
-    // HighLevel first, before any timing decision: a move or a cancellation
-    // is written back to the local row whatever happens to this reminder.
+    const timing = reminderTiming({
+      config: reminder,
+      tz: zone,
+      scheduledMs,
+      nowMs: Date.now(),
+      enabledSinceMs: rule.enabled_since ? Date.parse(rule.enabled_since) : null,
+    });
+    // Outside the sending hours it waits for them to open, never at 3 am, and
+    // without asking HighLevel yet: nothing is sent or skipped now.
+    if (timing.action === "wait") return retryAt("outside_send_window", timing.untilMs);
+
+    // HighLevel before any send or skip: a move or a cancellation is written
+    // back to the local row whatever happens to this reminder.
     const confirmed = await confirmAppointmentWithHL(
       run,
       appointmentId,
@@ -685,17 +714,16 @@ async function actSendTemplate(
     if (confirmed === "cancelled") return skip("appointment_not_active");
     if (confirmed === "moved") return skip("appointment_moved");
 
-    const scheduledMs = Date.parse(load.ctx.appointment.scheduledAt);
-    if (!Number.isFinite(scheduledMs)) return fail("missing_appointment");
-    const timing = reminderTiming({
-      config: reminder,
-      tz: zone,
-      scheduledMs,
-      nowMs: Date.now(),
-      enabledSinceMs: rule.enabled_since ? Date.parse(rule.enabled_since) : null,
-    });
-    // Outside the sending hours it waits for them to open, never at 3 am.
-    if (timing.action === "wait") return retryAt("outside_send_window", timing.untilMs);
+    // The event was emitted for the appointment's time back then. If it has
+    // moved since, this reminder is for a time that no longer holds; the scan
+    // emits the new time when that one is due.
+    if (
+      emittedForMs !== null &&
+      Math.abs(emittedForMs - scheduledMs) > APPOINTMENT_MATCH_TOLERANCE_MS
+    ) {
+      return skip("appointment_moved");
+    }
+
     if (timing.action === "skip") return skip(timing.reason);
   }
 
@@ -1028,6 +1056,7 @@ async function finish(
             error: result.error ?? null,
             claimed_at: null,
             not_before: result.notBefore ?? backoffFrom(run.attempts),
+            ...(result.refundAttempt ? { attempts: Math.max(run.attempts - 1, 0) } : {}),
           }
         : {
             status: result.outcome,

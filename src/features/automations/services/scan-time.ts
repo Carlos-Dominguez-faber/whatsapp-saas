@@ -15,9 +15,9 @@
  *
  * Dedup: el UNIQUE (event_type, subject_id, occurrence) de
  * `automation_events` es toda la idempotencia. `occurrence` lleva
- * `<hours_before>h:<scheduled_at ISO-8601 UTC>`, así que una cita reagendada
- * saca una clave nueva a propósito — no achicar el string "para no
- * duplicar".
+ * `<rule_id>:<hours_before>h:<scheduled_at ISO-8601 UTC>` (lo arma
+ * automation_reminder_candidates), así que una cita reagendada saca una clave
+ * nueva a propósito — no achicar el string "para no duplicar".
  */
 
 import { createClient as createSbClient } from "@supabase/supabase-js";
@@ -25,7 +25,6 @@ import { resolveWorkspaceTimezone } from "@/features/automations/lib/workspace-t
 import {
   parseReminderConfig,
   withinSendWindow,
-  type ReminderConfig,
 } from "@/features/automations/lib/reminder-window";
 
 function svc() {
@@ -49,12 +48,13 @@ interface TimeRule {
 }
 
 
-interface AppointmentRow {
-  id: string;
-  scheduled_at: string;
-  created_at: string;
+/** One row of automation_reminder_candidates(). */
+interface CandidateRow {
+  subject_id: string;
+  occurrence: string;
   contact_id: string | null;
   conversation_id: string | null;
+  scheduled_at: string;
 }
 
 interface EventInsert {
@@ -72,89 +72,51 @@ interface EventInsert {
 }
 
 /**
- * Las 6 condiciones de elegibilidad, cita por cita: estado activo, dentro de
- * la ventana, con contacto, con conversación, orden por cercanía y agendada
- * con al menos `hours_before` de anticipación.
- *
- * `created_at <= scheduled_at - hours_before` es una comparación entre
- * DOS columnas de la misma fila: PostgREST no la expresa como filtro (los
- * operadores comparan una columna contra un valor, no contra otra columna), así
- * que las primeras 5 filas van al `select` y esta se aplica en JS sobre el lote
- * ya acotado por `LIMIT 50` — el mismo patrón que `ruleMatches`/`ruleAppliesTo`
- * en expand.ts, que tampoco son SQL. Que algunas de las 50 caigan acá no
- * incumple la cota: es un techo de trabajo, no una promesa de 50 envíos.
- *
- * El techo que sí importa: como el descarte ocurre DESPUÉS del `LIMIT`, una
- * regla cuya ventana contenga más de 50 citas descartadas por esa
- * anticipación no llega a ver las que vienen detrás en ese
- * tick, y los ticks siguientes traen el mismo lote hasta que las de adelante
- * vencen. Las de atrás tienen `scheduled_at` mayor —o sea, su ventana termina
- * después—, así que en la práctica las alcanza; el caso que sí perdería el
- * recordatorio es una ventana corta (`hours_before` de 2 h) con más de 50 citas
- * agendadas tarde dentro de esas mismas 2 h. Si eso llega a pasar, el arreglo
- * NO es subir el `LIMIT`: es bajar el filtro a SQL con una RPC o una columna generada, o sea una migración.
- *
- * Y el llenado del lote **no es al azar, es adverso**: `ORDER BY scheduled_at
- * ASC` trae las más próximas, que son justamente las más propensas a haberse
- * agendado tarde y a caer en este filtro. Por eso el lote lleno se avisa por
- * `console.warn` — un techo sin señal se descubre cuando reclama un cliente.
+ * The appointments this rule has to emit now, from
+ * `automation_reminder_candidates()` (service role only). The database does the
+ * whole selection: active, ahead within hours_before, with contact and
+ * conversation, booked with at least that much lead, not due long before the
+ * rule was enabled, and NOT already emitted for this rule at this time —
+ * earliest due first, at most APPOINTMENTS_PER_RULE. Already-emitted
+ * appointments never take a slot, so a calendar with more than a batch of
+ * appointments inside hours_before still surfaces each one when it is due;
+ * a full batch only means the next tick continues where this one stopped. The
+ * occurrence comes from the same query, so the key the scan stores is the one
+ * it checks.
  */
 async function eligibleEventsForRule(
   db: ReturnType<typeof svc>,
   rule: TimeRule,
-  config: ReminderConfig,
   now: Date,
 ): Promise<EventInsert[]> {
-  const windowEnd = new Date(now.getTime() + config.hoursBefore * 3_600_000);
-
-  const { data, error } = await db
-    .from("appointments")
-    .select("id, scheduled_at, created_at, contact_id, conversation_id")
-    .eq("workspace_id", rule.workspace_id)
-    .in("status", ["booked", "confirmed"])
-    .gt("scheduled_at", now.toISOString())
-    .lte("scheduled_at", windowEnd.toISOString())
-    .not("contact_id", "is", null)
-    .not("conversation_id", "is", null)
-    .order("scheduled_at", { ascending: true })
-    .limit(APPOINTMENTS_PER_RULE);
+  const { data, error } = await db.rpc("automation_reminder_candidates", {
+    p_rule_id: rule.id,
+    p_now: now.toISOString(),
+    p_limit: APPOINTMENTS_PER_RULE,
+  });
   if (error) throw new Error(error.message);
 
-  const batch = (data ?? []) as AppointmentRow[];
+  const batch = (data ?? []) as CandidateRow[];
   if (batch.length === APPOINTMENTS_PER_RULE) {
-    // La señal del techo del JSDoc: con el lote lleno hay citas de esta ventana
-    // que este tick no llegó a mirar. No cambia comportamiento — el tick
-    // siguiente las toma —, pero si esto aparece seguido para la misma regla,
-    // el filtro de anticipación tiene que bajar a SQL.
     console.warn(
-      `[scan-time] workspace ${rule.workspace_id} rule ${rule.id}: batch full (${APPOINTMENTS_PER_RULE}); appointments in this window were not scanned this tick`,
+      `[scan-time] workspace ${rule.workspace_id} rule ${rule.id}: ${APPOINTMENTS_PER_RULE} reminders due at once; the next tick continues`,
     );
   }
 
-  const hoursMs = config.hoursBefore * 3_600_000;
   const rows: EventInsert[] = [];
-  for (const appt of batch) {
-    // Cinturón además del filtro SQL `.not(...)`: PostgREST no
-    // garantiza que `select` recorte los tipos, y estos dos son NOT NULL
-    // en el evento — sin ellos se quema la clave de dedup para siempre.
-    if (!appt.contact_id || !appt.conversation_id) continue;
-
-    const scheduledMs = Date.parse(appt.scheduled_at);
-    const createdMs = Date.parse(appt.created_at);
-    if (Number.isNaN(scheduledMs) || Number.isNaN(createdMs)) continue;
-    // La cita tiene que haber existido ANTES de entrar en la ventana.
-    if (!(createdMs <= scheduledMs - hoursMs)) continue;
-
+  for (const candidate of batch) {
+    // Belt on top of the query's NOT NULLs: both are NOT NULL on the event,
+    // and a missing one would burn the dedup key for good.
+    if (!candidate.contact_id || !candidate.conversation_id) continue;
     rows.push({
       workspace_id: rule.workspace_id,
       event_type: "appointment_upcoming",
-      subject_id: appt.id,
-      // The rule id is part of the occurrence: two reminder rules with the same
-      // lead time (e.g. "24 h → template" and "24 h → tag") each get their own
-      // event instead of the second one being absorbed by the UNIQUE.
-      occurrence: `${rule.id}:${config.hoursBefore}h:${new Date(scheduledMs).toISOString()}`,
-      contact_id: appt.contact_id,
-      conversation_id: appt.conversation_id,
+      subject_id: candidate.subject_id,
+      // '<rule>:<h>h:<ISO>': the rule id lets two reminder rules with the
+      // same lead time each get their event.
+      occurrence: candidate.occurrence,
+      contact_id: candidate.contact_id,
+      conversation_id: candidate.conversation_id,
       rule_id: rule.id,
     });
   }
@@ -258,7 +220,7 @@ export async function scanTimeTriggers(
       // ver, porque el evaluador es sin estado.
       if (!withinSendWindow(config, tz, now)) continue;
 
-      const rows = await eligibleEventsForRule(db, rule, config, now);
+      const rows = await eligibleEventsForRule(db, rule, now);
       if (rows.length === 0) continue;
 
       // ignoreDuplicates, NUNCA upsert con update: un choque contra
