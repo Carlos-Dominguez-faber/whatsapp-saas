@@ -8,7 +8,7 @@ BEGIN;
 CREATE EXTENSION IF NOT EXISTS pgtap WITH SCHEMA extensions;
 SET search_path = public, extensions;
 
-SELECT plan(215);
+SELECT plan(221);
 
 -- ── public.users: read-only for sessions ────────────────────────────────────
 SELECT ok(NOT has_table_privilege('authenticated', 'public.users', 'UPDATE'),
@@ -872,7 +872,7 @@ SELECT is_empty(
   'one-word answers and sentences that merely contain a phrase do not');
 INSERT INTO public.messages (workspace_id, conversation_id, direction, type, body, wamid, meta) VALUES
   ('b0000000-0000-4000-8000-000000000001', 'b0000000-0000-4000-8000-0000000000d9', 'in', 'text', 'STOP', 'wamid.stop.1',
-   '{"sent_at": "2026-10-01T10:00:00Z"}');
+   jsonb_build_object('sent_at', now() - interval '30 minutes'));
 SELECT results_eq(
   $$SELECT ct.opt_in, (SELECT count(*)::int FROM public.contact_opt_outs o
                         WHERE o.workspace_id = ct.workspace_id AND o.phone_key = public.contact_phone_key(ct.phone))
@@ -881,7 +881,7 @@ SELECT results_eq(
   'a STOP message opts the contact out and suppresses the phone, in the same statement');
 INSERT INTO public.messages (workspace_id, conversation_id, direction, type, body, wamid, meta) VALUES
   ('b0000000-0000-4000-8000-000000000001', 'b0000000-0000-4000-8000-0000000000d9', 'in', 'text', 'Start', 'wamid.start.1',
-   '{"sent_at": "2026-10-01T10:05:00Z"}');
+   jsonb_build_object('sent_at', now() - interval '25 minutes'));
 SELECT results_eq(
   $$SELECT ct.opt_in, (SELECT count(*)::int FROM public.contact_opt_outs o
                         WHERE o.workspace_id = ct.workspace_id AND o.phone_key = public.contact_phone_key(ct.phone))
@@ -890,13 +890,13 @@ SELECT results_eq(
   'START opts them back in');
 INSERT INTO public.messages (workspace_id, conversation_id, direction, type, body, wamid, meta) VALUES
   ('b0000000-0000-4000-8000-000000000001', 'b0000000-0000-4000-8000-0000000000d9', 'in', 'text', 'STOP', 'wamid.stop.1',
-   '{"sent_at": "2026-10-01T10:00:00Z"}')
+   jsonb_build_object('sent_at', now() - interval '30 minutes'))
   ON CONFLICT (workspace_id, wamid) DO NOTHING;
 SELECT is((SELECT opt_in FROM public.contacts WHERE id = 'b0000000-0000-4000-8000-0000000000c9'), true,
   'a redelivered STOP (same wamid, not inserted) does not undo the later START');
 INSERT INTO public.messages (workspace_id, conversation_id, direction, type, body, wamid, meta) VALUES
   ('b0000000-0000-4000-8000-000000000001', 'b0000000-0000-4000-8000-0000000000d9', 'in', 'text', 'stop', 'wamid.stop.late',
-   '{"sent_at": "2026-10-01T09:00:00Z"}');
+   jsonb_build_object('sent_at', now() - interval '40 minutes'));
 SELECT is((SELECT opt_in FROM public.contacts WHERE id = 'b0000000-0000-4000-8000-0000000000c9'), true,
   'a STOP sent before the START but delivered after it does not undo it (settled by send time)');
 
@@ -912,19 +912,56 @@ INSERT INTO public.conversations (id, workspace_id, contact_id) VALUES
   ('b0000000-0000-4000-8000-0000000002d1', 'b0000000-0000-4000-8000-000000000001', 'b0000000-0000-4000-8000-0000000002c1');
 INSERT INTO public.messages (workspace_id, conversation_id, direction, type, body, wamid, meta) VALUES
   ('b0000000-0000-4000-8000-000000000001', 'b0000000-0000-4000-8000-0000000002d1', 'in', 'text', 'STOP', 'wamid.mx.stop',
-   '{"sent_at": "2026-10-01T11:00:00Z"}');
+   jsonb_build_object('sent_at', now() - interval '20 minutes'));
 INSERT INTO public.contacts (id, workspace_id, phone, opt_in) VALUES
   ('b0000000-0000-4000-8000-0000000002c2', 'b0000000-0000-4000-8000-000000000001', '+529983333333', true);
 SELECT is((SELECT opt_in FROM public.contacts WHERE id = 'b0000000-0000-4000-8000-0000000002c2'), false,
   'a STOP from +52 1 998… also blocks +52 998…');
 INSERT INTO public.messages (workspace_id, conversation_id, direction, type, body, wamid, meta) VALUES
   ('b0000000-0000-4000-8000-000000000001', 'b0000000-0000-4000-8000-0000000002d1', 'in', 'text', 'START', 'wamid.mx.start',
-   '{"sent_at": "2026-10-01T11:05:00Z"}');
+   jsonb_build_object('sent_at', now() - interval '15 minutes'));
 SELECT results_eq(
   $$SELECT opt_in FROM public.contacts
      WHERE id IN ('b0000000-0000-4000-8000-0000000002c1', 'b0000000-0000-4000-8000-0000000002c2') ORDER BY id$$,
   $$VALUES (true), (true)$$,
   'START opts in every contact row of the line, not just the one that wrote');
+SELECT is(
+  (SELECT count(*)::int FROM public.events
+    WHERE type = 'contact_opt_in_changed'
+      AND payload->>'message_id' = (SELECT id::text FROM public.messages WHERE wamid = 'wamid.mx.start')),
+  2, 'with one event per contact row it changed');
+
+-- a START sent before a later manual opt-out does not lift it
+UPDATE public.contacts SET opt_in = false, opted_out_at = now() WHERE id = 'b0000000-0000-4000-8000-0000000000c9';
+INSERT INTO public.messages (workspace_id, conversation_id, direction, type, body, wamid, meta) VALUES
+  ('b0000000-0000-4000-8000-000000000001', 'b0000000-0000-4000-8000-0000000000d9', 'in', 'text', 'START', 'wamid.start.old',
+   jsonb_build_object('sent_at', now() - interval '10 minutes'));
+SELECT results_eq(
+  $$SELECT ct.opt_in, (SELECT count(*)::int FROM public.contact_opt_outs o
+                        WHERE o.workspace_id = ct.workspace_id AND o.phone_key = public.contact_phone_key(ct.phone))
+      FROM public.contacts ct WHERE ct.id = 'b0000000-0000-4000-8000-0000000000c9'$$,
+  $$VALUES (false, 1)$$,
+  'a START older than a manual opt-out keeps the contact opted out');
+
+-- the send time is only a hint: never in the future, and a broken one never fails the message
+INSERT INTO public.contacts (id, workspace_id, phone, opt_in) VALUES
+  ('b0000000-0000-4000-8000-0000000002c3', 'b0000000-0000-4000-8000-000000000001', '+15551119999', true);
+INSERT INTO public.conversations (id, workspace_id, contact_id) VALUES
+  ('b0000000-0000-4000-8000-0000000002d3', 'b0000000-0000-4000-8000-000000000001', 'b0000000-0000-4000-8000-0000000002c3');
+SELECT lives_ok(
+  $$INSERT INTO public.messages (workspace_id, conversation_id, direction, type, body, wamid, meta) VALUES
+      ('b0000000-0000-4000-8000-000000000001', 'b0000000-0000-4000-8000-0000000002d3', 'in', 'text', 'STOP',
+       'wamid.bad.time', '{"sent_at": "0000-01-01T00:00:00Z"}')$$,
+  'a malformed send time does not fail the message');
+SELECT is((SELECT opt_in FROM public.contacts WHERE id = 'b0000000-0000-4000-8000-0000000002c3'), false,
+  'and its STOP still applies, by the time it was stored');
+INSERT INTO public.messages (workspace_id, conversation_id, direction, type, body, wamid, meta) VALUES
+  ('b0000000-0000-4000-8000-000000000001', 'b0000000-0000-4000-8000-0000000002d3', 'in', 'text', 'START',
+   'wamid.future.start', '{"sent_at": "2999-01-01T00:00:00Z"}');
+SELECT ok((SELECT intent_at <= now() FROM public.contact_opt_intents WHERE phone_key = '15551119999'),
+  'a send time in the future counts as the time it was stored');
+SELECT is((SELECT opt_in FROM public.contacts WHERE id = 'b0000000-0000-4000-8000-0000000002c3'), false,
+  'so a START "from the future" ties with the STOP, and on a tie STOP wins');
 
 -- the suppression is the phone's: no edit of contact rows lifts it
 INSERT INTO public.contacts (id, workspace_id, phone, opt_in, opted_out_at) VALUES

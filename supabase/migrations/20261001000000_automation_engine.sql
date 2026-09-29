@@ -156,6 +156,25 @@ CREATE TABLE IF NOT EXISTS public.contact_opt_intents (
 ALTER TABLE public.contact_opt_intents ENABLE ROW LEVEL SECURITY;
 REVOKE ALL ON public.contact_opt_intents FROM anon, authenticated;
 
+-- Rows keyed before contact_phone_key folded the mobile digit move to the
+-- folded key (idempotent: folded keys fold to themselves).
+INSERT INTO public.contact_opt_outs (workspace_id, phone_key, opted_out_at, source)
+SELECT workspace_id, public.contact_phone_key(phone_key), opted_out_at, source
+  FROM public.contact_opt_outs
+ WHERE phone_key IS DISTINCT FROM public.contact_phone_key(phone_key)
+   AND public.contact_phone_key(phone_key) IS NOT NULL
+ON CONFLICT (workspace_id, phone_key) DO NOTHING;
+DELETE FROM public.contact_opt_outs
+ WHERE phone_key IS DISTINCT FROM public.contact_phone_key(phone_key);
+INSERT INTO public.contact_opt_intents (workspace_id, phone_key, intent, intent_at)
+SELECT workspace_id, public.contact_phone_key(phone_key), intent, intent_at
+  FROM public.contact_opt_intents
+ WHERE phone_key IS DISTINCT FROM public.contact_phone_key(phone_key)
+   AND public.contact_phone_key(phone_key) IS NOT NULL
+ON CONFLICT (workspace_id, phone_key) DO NOTHING;
+DELETE FROM public.contact_opt_intents
+ WHERE phone_key IS DISTINCT FROM public.contact_phone_key(phone_key);
+
 -- A contact someone opted out by hand before this migration (opt_in turned
 -- false after it had been true) is an explicit opt-out too. Idempotent: once
 -- stamped, opted_out_at is no longer NULL. Each one is recorded as an event.
@@ -219,9 +238,12 @@ BEGIN
       RAISE EXCEPTION 'only a workspace admin or manager can opt a contact back in after an opt-out'
         USING ERRCODE = '42501';
     END IF;
+    -- Not a suppression newer than this row's own opt-out (a START sent
+    -- before a later manual opt-out must not lift it).
     DELETE FROM public.contact_opt_outs o
      WHERE o.workspace_id = NEW.workspace_id
-       AND o.phone_key IN (v_key, public.contact_phone_key(OLD.phone));
+       AND o.phone_key IN (v_key, public.contact_phone_key(OLD.phone))
+       AND o.opted_out_at <= OLD.opted_out_at;
   ELSE
     SELECT o.opted_out_at INTO v_suppressed
       FROM public.contact_opt_outs o
@@ -339,6 +361,7 @@ DECLARE
   v_intent  TEXT := public.opt_out_intent(NEW.body);
   v_contact public.contacts;
   v_key     TEXT;
+  v_sent    TIMESTAMPTZ;
   v_at      TIMESTAMPTZ;
   v_applied INT;
 BEGIN
@@ -359,47 +382,73 @@ BEGIN
   END IF;
 
   -- When the contact sent it (the provider's time, kept in meta.sent_at by
-  -- the normalizer), else when we stored it. Only newer than the last one
-  -- applied to this line counts: a STOP delivered late can't undo a START.
-  v_at := coalesce(
-    CASE WHEN NEW.meta->>'sent_at' ~ '^\d{4}-\d{2}-\d{2}T' THEN (NEW.meta->>'sent_at')::timestamptz END,
-    NEW.created_at);
+  -- the normalizer), never later than when we stored it; a time that doesn't
+  -- parse is ignored rather than failing the message. Only newer than the
+  -- last one applied to this line counts: a STOP delivered late can't undo a
+  -- START. On a tie, STOP wins.
+  BEGIN
+    v_sent := (NEW.meta->>'sent_at')::timestamptz;
+  EXCEPTION WHEN OTHERS THEN
+    v_sent := NULL;
+  END;
+  v_at := least(coalesce(v_sent, NEW.created_at), NEW.created_at);
   INSERT INTO public.contact_opt_intents AS i (workspace_id, phone_key, intent, intent_at)
   VALUES (NEW.workspace_id, v_key, v_intent, v_at)
   ON CONFLICT (workspace_id, phone_key) DO UPDATE
      SET intent = EXCLUDED.intent, intent_at = EXCLUDED.intent_at
-   WHERE i.intent_at <= EXCLUDED.intent_at;
+   WHERE i.intent_at < EXCLUDED.intent_at
+      OR (i.intent_at = EXCLUDED.intent_at AND EXCLUDED.intent = 'stop');
   GET DIAGNOSTICS v_applied = ROW_COUNT;
   IF v_applied = 0 THEN
     RETURN NULL;
   END IF;
 
-  -- Every contact row of the line, so two rows with one number can't disagree.
+  -- Every contact row of the line, so two rows with one number can't disagree,
+  -- with one event per row changed.
   IF v_intent = 'stop' THEN
     INSERT INTO public.contact_opt_outs (workspace_id, phone_key, opted_out_at, source)
     VALUES (NEW.workspace_id, v_key, v_at, 'keyword')
     ON CONFLICT (workspace_id, phone_key) DO NOTHING;
-    UPDATE public.contacts
-       SET opt_in = false,
-           opted_out_at = coalesce(opted_out_at, v_at)
-     WHERE workspace_id = NEW.workspace_id
-       AND public.contact_phone_key(phone) = v_key;
+    WITH changed AS (
+      UPDATE public.contacts
+         SET opt_in = false,
+             opted_out_at = coalesce(opted_out_at, v_at)
+       WHERE workspace_id = NEW.workspace_id
+         AND public.contact_phone_key(phone) = v_key
+      RETURNING id
+    )
+    INSERT INTO public.events (workspace_id, conversation_id, type, level, payload)
+    SELECT NEW.workspace_id,
+           CASE WHEN changed.id = v_contact.id THEN NEW.conversation_id END,
+           'contact_opt_in_changed', 'info',
+           jsonb_build_object('contact_id', changed.id, 'opt_in', false, 'source', 'keyword',
+                              'message_id', NEW.id, 'sent_at', v_at)
+      FROM changed;
   ELSE
+    -- A START lifts only what is not newer than it: a manual opt-out made
+    -- after the contact sent START stands.
     DELETE FROM public.contact_opt_outs o
      WHERE o.workspace_id = NEW.workspace_id
-       AND o.phone_key = v_key;
-    UPDATE public.contacts
-       SET opt_in = true,
-           opt_in_at = v_at,
-           opted_out_at = NULL
-     WHERE workspace_id = NEW.workspace_id
-       AND public.contact_phone_key(phone) = v_key;
+       AND o.phone_key = v_key
+       AND o.opted_out_at <= v_at;
+    WITH changed AS (
+      UPDATE public.contacts
+         SET opt_in = true,
+             opt_in_at = v_at,
+             opted_out_at = NULL
+       WHERE workspace_id = NEW.workspace_id
+         AND public.contact_phone_key(phone) = v_key
+         AND (opted_out_at IS NULL OR opted_out_at <= v_at)
+      RETURNING id
+    )
+    INSERT INTO public.events (workspace_id, conversation_id, type, level, payload)
+    SELECT NEW.workspace_id,
+           CASE WHEN changed.id = v_contact.id THEN NEW.conversation_id END,
+           'contact_opt_in_changed', 'info',
+           jsonb_build_object('contact_id', changed.id, 'opt_in', true, 'source', 'keyword',
+                              'message_id', NEW.id, 'sent_at', v_at)
+      FROM changed;
   END IF;
-
-  INSERT INTO public.events (workspace_id, conversation_id, type, level, payload)
-  VALUES (NEW.workspace_id, NEW.conversation_id, 'contact_opt_in_changed', 'info',
-          jsonb_build_object('contact_id', v_contact.id, 'opt_in', v_intent = 'start',
-                             'source', 'keyword', 'message_id', NEW.id, 'sent_at', v_at));
   RETURN NULL;
 END;
 $$;
@@ -945,6 +994,8 @@ AS $$
     ) o
    WHERE a.status IN ('booked', 'confirmed')
      AND a.scheduled_at > p_now
+     -- The same bound as due_at <= p_now, on the column the index covers.
+     AND a.scheduled_at <= p_now + make_interval(secs => (rule.h * 3600)::double precision)
      AND o.due_at <= p_now
      AND a.contact_id IS NOT NULL
      AND a.conversation_id IS NOT NULL
