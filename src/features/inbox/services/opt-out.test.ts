@@ -2,13 +2,23 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { SupabaseClient } from "@supabase/supabase-js";
 
-import { isPhoneOptedOut, manualOptInFields, phoneKey } from "./opt-out.ts";
+import { isPhoneOptedOut, manualOptInFields, optOutKey } from "./opt-out.ts";
 
-test("a phone's key is its digits, however it was written", () => {
-  assert.equal(phoneKey("+52 1 (998) 123-4567"), "5219981234567");
-  assert.equal(phoneKey("5219981234567"), "5219981234567");
-  assert.equal(phoneKey(""), null);
-  assert.equal(phoneKey(null), null);
+test("a line's opt-out key is the same however its number was written", () => {
+  assert.equal(optOutKey("+52 998 123 4567"), "529981234567");
+  assert.equal(optOutKey("+52 1 998 123 4567"), "529981234567", "Mexico's old mobile digit folds");
+  assert.equal(optOutKey("0052 1 998 123 4567"), "529981234567");
+  assert.equal(optOutKey("+54 9 11 2345 6789"), "541123456789", "and Argentina's");
+  assert.equal(optOutKey("+1 555 000 1111"), "15550001111");
+  assert.equal(optOutKey(""), null);
+  assert.equal(optOutKey(null), null);
+});
+
+test("the key agrees with phone.ts on every number that carries its country code", async () => {
+  const { phoneKey } = await import("./phone.ts");
+  for (const n of ["+5219981234567", "+529981234567", "+5491123456789", "+15550001111", "+34612345678"]) {
+    assert.equal(optOutKey(n), phoneKey(n), n);
+  }
 });
 
 function suppressions(rows: Array<{ workspace_id: string; phone_key: string }>, error?: { code?: string; message: string }) {
@@ -30,19 +40,21 @@ function suppressions(rows: Array<{ workspace_id: string; phone_key: string }>, 
 }
 
 test("a suppressed phone is opted out in its workspace only, whatever its format", async () => {
-  const db = suppressions([{ workspace_id: "ws_1", phone_key: "5215550001111" }]);
+  const db = suppressions([{ workspace_id: "ws_1", phone_key: "525550001111" }]);
   assert.equal(await isPhoneOptedOut(db, "ws_1", "+52 1 555 000 1111"), true);
+  assert.equal(await isPhoneOptedOut(db, "ws_1", "+525550001111"), true);
   assert.equal(await isPhoneOptedOut(db, "ws_2", "+5215550001111"), false);
   assert.equal(await isPhoneOptedOut(db, "ws_1", "+5215550002222"), false);
 });
 
-test("a failed lookup throws (callers fail closed); a missing table reads as not suppressed", async () => {
+test("a failed lookup throws (callers fail closed); only a table not created yet reads as not suppressed", async () => {
   await assert.rejects(() => isPhoneOptedOut(suppressions([], { message: "connection refused" }), "ws_1", "+1555"));
   const errorMock = (await import("node:test")).mock.method(console, "error", () => {});
   try {
     assert.equal(
-      await isPhoneOptedOut(suppressions([], { code: "42P01", message: "missing" }), "ws_1", "+1555"),
+      await isPhoneOptedOut(suppressions([], { code: "PGRST205", message: "missing" }), "ws_1", "+1555"),
       false,
+      "PostgREST's code for a table it doesn't know",
     );
   } finally {
     errorMock.mock.restore();

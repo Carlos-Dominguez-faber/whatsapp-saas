@@ -95,3 +95,15 @@ test("STOP is left to the database: the app writes no opt-out of its own", async
   assert.equal(updates.filter((u) => u.table === "contacts").length, 0);
   assert.ok(upserts.some((u) => u.table === "messages"), "the STOP message is stored, and its trigger applies it");
 });
+
+test("the provider's send time is kept on the message: STOP and START are settled by it", async () => {
+  reset();
+  await processInbound("ws_1", { ...textInbound("hola"), createTime: "2026-10-01T10:00:00+00:00" });
+  const message = upserts.find((u) => u.table === "messages")!.row;
+  assert.equal((message.meta as Record<string, unknown>).sent_at, "2026-10-01T10:00:00.000Z");
+
+  reset();
+  await processInbound("ws_1", { ...textInbound("hola"), createTime: "not a time" });
+  const other = upserts.find((u) => u.table === "messages")!.row;
+  assert.equal("sent_at" in (other.meta as Record<string, unknown>), false);
+});

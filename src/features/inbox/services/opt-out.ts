@@ -9,23 +9,33 @@ import type { SupabaseClient } from "@supabase/supabase-js";
  * lift it.
  */
 
-/** The digits of a phone: the key contact_opt_outs uses (contact_phone_key in SQL). */
-export function phoneKey(phone: string | null | undefined): string | null {
-  const digits = (phone ?? "").replace(/[^0-9]/g, "");
+/**
+ * The key contact_opt_outs uses for a line — the TypeScript twin of
+ * contact_phone_key() in SQL: its digits, without an international "00", and
+ * without the mobile digit Mexico ("+52 1 …") and Argentina ("+54 9 …") add,
+ * like phoneKey in phone.ts. Unlike that one it never adds a country code: the
+ * database can't know the workspace's.
+ */
+export function optOutKey(phone: string | null | undefined): string | null {
+  let digits = (phone ?? "").replace(/[^0-9]/g, "").replace(/^00/, "");
+  if (digits.length === 13 && (digits.startsWith("521") || digits.startsWith("549"))) {
+    digits = digits.slice(0, 2) + digits.slice(3);
+  }
   return digits || null;
 }
 
 /**
- * Whether the phone opted out in this workspace. Throws on a read error (the
- * caller retries); before the migration that creates the table it answers
- * false, as the contact's own opt_in still applies.
+ * Whether the phone opted out in this workspace. Throws on a read error, so
+ * callers fail closed. The one exception is a table PostgREST doesn't know
+ * (PGRST205, or 42P01 from Postgres): code deployed before `db push` — the
+ * contact's own opt_in still applies, and the log says to run the migration.
  */
 export async function isPhoneOptedOut(
   db: SupabaseClient,
   workspaceId: string,
   phone: string | null | undefined,
 ): Promise<boolean> {
-  const key = phoneKey(phone);
+  const key = optOutKey(phone);
   if (!key) return false;
   const { data, error } = await db
     .from("contact_opt_outs")
@@ -34,7 +44,7 @@ export async function isPhoneOptedOut(
     .eq("phone_key", key)
     .limit(1);
   if (error) {
-    if (error.code === "42P01") {
+    if (error.code === "PGRST205" || error.code === "42P01") {
       console.error("[opt-out] contact_opt_outs is missing: run `setup.mjs db-push`");
       return false;
     }

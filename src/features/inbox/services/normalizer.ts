@@ -16,6 +16,8 @@ export interface InboundMessage {
   customerName: string | null;
   /** The provider's own type, before clamping (e.g. "reaction"). */
   rawType?: string;
+  /** When the contact sent it (ISO), per the provider. */
+  createTime?: string | null;
 }
 
 function svc() {
@@ -23,6 +25,13 @@ function svc() {
     process.env.NEXT_PUBLIC_SUPABASE_URL!,
     process.env.SUPABASE_SERVICE_ROLE_KEY!,
   );
+}
+
+/** The provider's send time as ISO, or null when it isn't a valid time. */
+function sentAt(value: string | null | undefined): string | null {
+  if (!value) return null;
+  const ms = Date.parse(value);
+  return Number.isFinite(ms) ? new Date(ms).toISOString() : null;
 }
 
 // Kept here too: callers import them from the normalizer.
@@ -139,6 +148,8 @@ export async function processInbound(
         status: "delivered",
         meta: {
           from_name: normalized.customerName,
+          // When the contact sent it: STOP/START are settled by this time.
+          ...(sentAt(normalized.createTime) ? { sent_at: sentAt(normalized.createTime) } : {}),
           // Kept in the thread, never answered: the webhook doesn't batch it,
           // and this keeps the orphan reconciler from batching it either.
           ...(normalized.rawType === "reaction" ? { no_reply: true } : {}),
