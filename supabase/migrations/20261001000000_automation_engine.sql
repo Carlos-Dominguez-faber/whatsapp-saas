@@ -103,14 +103,30 @@ CREATE TRIGGER trg_conversations_state_version
 ALTER TABLE public.contacts
   ADD COLUMN IF NOT EXISTS opted_out_at TIMESTAMPTZ;
 
--- The digits of a phone: the same key however it was written.
+-- The same key for the same line however it was written: its digits, without
+-- an international '00', and without the mobile digit Mexico ('+52 1 …') and
+-- Argentina ('+54 9 …') add (phone.ts phoneKey, and optOutKey in opt-out.ts).
 CREATE OR REPLACE FUNCTION public.contact_phone_key(p_phone TEXT)
 RETURNS TEXT
 LANGUAGE sql IMMUTABLE
 SET search_path = ''
 AS $$
-  SELECT nullif(regexp_replace(coalesce(p_phone, ''), '[^0-9]', '', 'g'), '');
+  WITH d AS (
+    SELECT regexp_replace(
+             regexp_replace(coalesce(p_phone, ''), '[^0-9]', '', 'g'),
+             '^00', '') AS digits
+  )
+  SELECT nullif(
+           CASE WHEN length(digits) = 13 AND (digits LIKE '521%' OR digits LIKE '549%')
+                THEN left(digits, 2) || substr(digits, 4)
+                ELSE digits
+           END, '')
+    FROM d;
 $$;
+
+-- STOP/START touch every contact row of a line.
+CREATE INDEX IF NOT EXISTS idx_contacts_workspace_phone_key
+  ON public.contacts (workspace_id, public.contact_phone_key(phone));
 
 CREATE TABLE IF NOT EXISTS public.contact_opt_outs (
   workspace_id UUID NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
@@ -128,6 +144,18 @@ CREATE POLICY "ws members read contact_opt_outs" ON public.contact_opt_outs
   FOR SELECT USING (workspace_id IN (SELECT auth_workspace_ids()));
 REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON public.contact_opt_outs FROM anon, authenticated;
 
+-- The last STOP/START each line sent, by the time the contact sent it: a
+-- message that arrives late never overrides a newer one.
+CREATE TABLE IF NOT EXISTS public.contact_opt_intents (
+  workspace_id UUID NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+  phone_key    TEXT NOT NULL,
+  intent       TEXT NOT NULL CHECK (intent IN ('stop', 'start')),
+  intent_at    TIMESTAMPTZ NOT NULL,
+  PRIMARY KEY (workspace_id, phone_key)
+);
+ALTER TABLE public.contact_opt_intents ENABLE ROW LEVEL SECURITY;
+REVOKE ALL ON public.contact_opt_intents FROM anon, authenticated;
+
 -- A contact someone opted out by hand before this migration (opt_in turned
 -- false after it had been true) is an explicit opt-out too. Idempotent: once
 -- stamped, opted_out_at is no longer NULL. Each one is recorded as an event.
@@ -135,6 +163,8 @@ DO $$
 DECLARE
   v_count INT;
 BEGIN
+  -- Suppressions the trigger records during this backfill say so.
+  PERFORM set_config('app.opt_out_source', 'backfill', true);
   WITH stamped AS (
     UPDATE public.contacts
        SET opted_out_at = updated_at
@@ -148,6 +178,7 @@ BEGIN
          jsonb_build_object('contact_id', id, 'opt_in', false, 'source', 'backfill')
     FROM stamped;
   GET DIAGNOSTICS v_count = ROW_COUNT;
+  PERFORM set_config('app.opt_out_source', '', true);
   RAISE NOTICE 'contacts: % manual opt-out(s) from before the automation engine now count as explicit', v_count;
 END
 $$;
@@ -202,7 +233,8 @@ BEGIN
     THEN
       INSERT INTO public.contact_opt_outs (workspace_id, phone_key, opted_out_at, source)
       VALUES (NEW.workspace_id, v_key, NEW.opted_out_at,
-              CASE WHEN v_session THEN 'manual' ELSE 'keyword' END)
+              CASE WHEN v_session THEN 'manual'
+                   ELSE coalesce(nullif(current_setting('app.opt_out_source', true), ''), 'keyword') END)
       ON CONFLICT (workspace_id, phone_key) DO NOTHING;
     END IF;
 
@@ -306,6 +338,9 @@ AS $$
 DECLARE
   v_intent  TEXT := public.opt_out_intent(NEW.body);
   v_contact public.contacts;
+  v_key     TEXT;
+  v_at      TIMESTAMPTZ;
+  v_applied INT;
 BEGIN
   IF v_intent IS NULL THEN
     RETURN NULL;
@@ -318,36 +353,53 @@ BEGIN
      AND ct.workspace_id = c.workspace_id
    WHERE c.id = NEW.conversation_id
      AND c.workspace_id = NEW.workspace_id;
-  IF v_contact.id IS NULL THEN
+  v_key := public.contact_phone_key(v_contact.phone);
+  IF v_contact.id IS NULL OR v_key IS NULL THEN
     RETURN NULL;
   END IF;
 
+  -- When the contact sent it (the provider's time, kept in meta.sent_at by
+  -- the normalizer), else when we stored it. Only newer than the last one
+  -- applied to this line counts: a STOP delivered late can't undo a START.
+  v_at := coalesce(
+    CASE WHEN NEW.meta->>'sent_at' ~ '^\d{4}-\d{2}-\d{2}T' THEN (NEW.meta->>'sent_at')::timestamptz END,
+    NEW.created_at);
+  INSERT INTO public.contact_opt_intents AS i (workspace_id, phone_key, intent, intent_at)
+  VALUES (NEW.workspace_id, v_key, v_intent, v_at)
+  ON CONFLICT (workspace_id, phone_key) DO UPDATE
+     SET intent = EXCLUDED.intent, intent_at = EXCLUDED.intent_at
+   WHERE i.intent_at <= EXCLUDED.intent_at;
+  GET DIAGNOSTICS v_applied = ROW_COUNT;
+  IF v_applied = 0 THEN
+    RETURN NULL;
+  END IF;
+
+  -- Every contact row of the line, so two rows with one number can't disagree.
   IF v_intent = 'stop' THEN
     INSERT INTO public.contact_opt_outs (workspace_id, phone_key, opted_out_at, source)
-    SELECT NEW.workspace_id, public.contact_phone_key(v_contact.phone), clock_timestamp(), 'keyword'
-     WHERE public.contact_phone_key(v_contact.phone) IS NOT NULL
+    VALUES (NEW.workspace_id, v_key, v_at, 'keyword')
     ON CONFLICT (workspace_id, phone_key) DO NOTHING;
     UPDATE public.contacts
        SET opt_in = false,
-           opted_out_at = coalesce(opted_out_at, clock_timestamp())
-     WHERE id = v_contact.id
-       AND workspace_id = NEW.workspace_id;
+           opted_out_at = coalesce(opted_out_at, v_at)
+     WHERE workspace_id = NEW.workspace_id
+       AND public.contact_phone_key(phone) = v_key;
   ELSE
-    UPDATE public.contacts
-       SET opt_in = true,
-           opt_in_at = clock_timestamp(),
-           opted_out_at = NULL
-     WHERE id = v_contact.id
-       AND workspace_id = NEW.workspace_id;
     DELETE FROM public.contact_opt_outs o
      WHERE o.workspace_id = NEW.workspace_id
-       AND o.phone_key = public.contact_phone_key(v_contact.phone);
+       AND o.phone_key = v_key;
+    UPDATE public.contacts
+       SET opt_in = true,
+           opt_in_at = v_at,
+           opted_out_at = NULL
+     WHERE workspace_id = NEW.workspace_id
+       AND public.contact_phone_key(phone) = v_key;
   END IF;
 
   INSERT INTO public.events (workspace_id, conversation_id, type, level, payload)
   VALUES (NEW.workspace_id, NEW.conversation_id, 'contact_opt_in_changed', 'info',
           jsonb_build_object('contact_id', v_contact.id, 'opt_in', v_intent = 'start',
-                             'source', 'keyword', 'message_id', NEW.id));
+                             'source', 'keyword', 'message_id', NEW.id, 'sent_at', v_at));
   RETURN NULL;
 END;
 $$;
@@ -846,6 +898,71 @@ AS $$
 $$;
 
 -- ──────────────────────────────────────────────────────────
+-- 7b. automation_reminder_candidates(rule, now, limit)
+--
+-- The appointments a reminder rule has to emit now: active, ahead within its
+-- hours_before, with contact and conversation, booked with at least that much
+-- lead, not due long before the rule was enabled, and NOT already emitted for
+-- this rule at this time. Ordered by due time. Emitted appointments never
+-- take a slot of the batch, so a busy calendar can't push a due reminder
+-- past its grace. The occurrence is built here, the one format the scan
+-- stores and this query checks.
+-- ──────────────────────────────────────────────────────────
+CREATE OR REPLACE FUNCTION public.automation_reminder_candidates(
+  p_rule_id UUID,
+  p_now     TIMESTAMPTZ DEFAULT NOW(),
+  p_limit   INT DEFAULT 50
+)
+RETURNS TABLE (
+  subject_id      UUID,
+  occurrence      TEXT,
+  contact_id      UUID,
+  conversation_id UUID,
+  scheduled_at    TIMESTAMPTZ
+)
+LANGUAGE sql STABLE SECURITY DEFINER
+SET search_path = ''
+AS $$
+  WITH rule AS (
+    SELECT ru.id,
+           ru.workspace_id,
+           ru.enabled_since,
+           trim_scale((ru.trigger_config->>'hours_before')::numeric) AS h
+      FROM public.automation_rules ru
+     WHERE ru.id = p_rule_id
+       AND ru.enabled
+       AND ru.trigger_type = 'appointment_upcoming'
+       AND (ru.trigger_config->>'hours_before') ~ '^[0-9]+(\.[0-9]+)?$'
+  )
+  SELECT a.id, o.occurrence, a.contact_id, a.conversation_id, a.scheduled_at
+    FROM rule
+    JOIN public.appointments a
+      ON a.workspace_id = rule.workspace_id
+    CROSS JOIN LATERAL (
+      SELECT rule.id::text || ':' || rule.h::text || 'h:'
+             || to_char(a.scheduled_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS occurrence,
+             a.scheduled_at - make_interval(secs => (rule.h * 3600)::double precision) AS due_at
+    ) o
+   WHERE a.status IN ('booked', 'confirmed')
+     AND a.scheduled_at > p_now
+     AND o.due_at <= p_now
+     AND a.contact_id IS NOT NULL
+     AND a.conversation_id IS NOT NULL
+     AND a.created_at <= o.due_at
+     -- Due (plus at most a night of quiet hours) before the rule was enabled:
+     -- the executor would skip it as late, so it takes no slot.
+     AND (rule.enabled_since IS NULL OR o.due_at > rule.enabled_since - INTERVAL '24 hours')
+     AND NOT EXISTS (
+       SELECT 1 FROM public.automation_events e
+        WHERE e.event_type = 'appointment_upcoming'
+          AND e.subject_id = a.id
+          AND e.occurrence = o.occurrence
+     )
+   ORDER BY o.due_at, a.id
+   LIMIT greatest(p_limit, 0);
+$$;
+
+-- ──────────────────────────────────────────────────────────
 -- 8. claim_next_automation_run() — claim with a lease
 --
 -- FOR UPDATE SKIP LOCKED, round-robin across workspaces by the data itself
@@ -1240,6 +1357,7 @@ REVOKE ALL ON FUNCTION public.apply_inbound_opt_out()                           
 REVOKE ALL ON FUNCTION public.opt_out_intent(TEXT)                                 FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.contact_phone_key(TEXT)                              FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.automation_rule_health(UUID)                         FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.automation_reminder_candidates(UUID, TIMESTAMPTZ, INT) FROM PUBLIC, anon, authenticated;
 
 GRANT EXECUTE ON FUNCTION public.claim_next_automation_run()                       TO service_role;
 GRANT EXECUTE ON FUNCTION public.append_contact_tags(UUID, UUID, TEXT[])           TO service_role;
@@ -1247,8 +1365,11 @@ GRANT EXECUTE ON FUNCTION public.mark_automation_run_dispatched(UUID, INT, INT) 
 GRANT EXECUTE ON FUNCTION public.release_automation_run_dispatch(UUID)             TO service_role;
 GRANT EXECUTE ON FUNCTION public.automation_event_ttl(TEXT)                        TO service_role;
 GRANT EXECUTE ON FUNCTION public.automation_rule_health(UUID)                      TO service_role;
+GRANT EXECUTE ON FUNCTION public.automation_reminder_candidates(UUID, TIMESTAMPTZ, INT) TO service_role;
 GRANT EXECUTE ON FUNCTION public.opt_out_intent(TEXT)                              TO service_role;
-GRANT EXECUTE ON FUNCTION public.contact_phone_key(TEXT)                           TO service_role;
+-- A pure function of the phone; sessions need it because idx_contacts_workspace_phone_key
+-- evaluates it whenever they write a contact.
+GRANT EXECUTE ON FUNCTION public.contact_phone_key(TEXT)                           TO authenticated, service_role;
 
 -- ============================================================
 -- End of migration: 20261001000000_automation_engine

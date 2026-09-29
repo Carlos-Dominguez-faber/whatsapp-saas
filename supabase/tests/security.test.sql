@@ -8,7 +8,7 @@ BEGIN;
 CREATE EXTENSION IF NOT EXISTS pgtap WITH SCHEMA extensions;
 SET search_path = public, extensions;
 
-SELECT plan(206);
+SELECT plan(215);
 
 -- ── public.users: read-only for sessions ────────────────────────────────────
 SELECT ok(NOT has_table_privilege('authenticated', 'public.users', 'UPDATE'),
@@ -870,27 +870,61 @@ SELECT is_empty(
   $$SELECT 1 FROM unnest(ARRAY['baja', 'alta', 'Alto', 'quiero darme de baja del plan', 'stop motion', 'hola', ''])
       t WHERE public.opt_out_intent(t) IS NOT NULL$$,
   'one-word answers and sentences that merely contain a phrase do not');
-INSERT INTO public.messages (workspace_id, conversation_id, direction, type, body, wamid) VALUES
-  ('b0000000-0000-4000-8000-000000000001', 'b0000000-0000-4000-8000-0000000000d9', 'in', 'text', 'STOP', 'wamid.stop.1');
+INSERT INTO public.messages (workspace_id, conversation_id, direction, type, body, wamid, meta) VALUES
+  ('b0000000-0000-4000-8000-000000000001', 'b0000000-0000-4000-8000-0000000000d9', 'in', 'text', 'STOP', 'wamid.stop.1',
+   '{"sent_at": "2026-10-01T10:00:00Z"}');
 SELECT results_eq(
   $$SELECT ct.opt_in, (SELECT count(*)::int FROM public.contact_opt_outs o
                         WHERE o.workspace_id = ct.workspace_id AND o.phone_key = public.contact_phone_key(ct.phone))
       FROM public.contacts ct WHERE ct.id = 'b0000000-0000-4000-8000-0000000000c9'$$,
   $$VALUES (false, 1)$$,
   'a STOP message opts the contact out and suppresses the phone, in the same statement');
-INSERT INTO public.messages (workspace_id, conversation_id, direction, type, body, wamid) VALUES
-  ('b0000000-0000-4000-8000-000000000001', 'b0000000-0000-4000-8000-0000000000d9', 'in', 'text', 'Start', 'wamid.start.1');
+INSERT INTO public.messages (workspace_id, conversation_id, direction, type, body, wamid, meta) VALUES
+  ('b0000000-0000-4000-8000-000000000001', 'b0000000-0000-4000-8000-0000000000d9', 'in', 'text', 'Start', 'wamid.start.1',
+   '{"sent_at": "2026-10-01T10:05:00Z"}');
 SELECT results_eq(
   $$SELECT ct.opt_in, (SELECT count(*)::int FROM public.contact_opt_outs o
                         WHERE o.workspace_id = ct.workspace_id AND o.phone_key = public.contact_phone_key(ct.phone))
       FROM public.contacts ct WHERE ct.id = 'b0000000-0000-4000-8000-0000000000c9'$$,
   $$VALUES (true, 0)$$,
   'START opts them back in');
-INSERT INTO public.messages (workspace_id, conversation_id, direction, type, body, wamid) VALUES
-  ('b0000000-0000-4000-8000-000000000001', 'b0000000-0000-4000-8000-0000000000d9', 'in', 'text', 'STOP', 'wamid.stop.1')
+INSERT INTO public.messages (workspace_id, conversation_id, direction, type, body, wamid, meta) VALUES
+  ('b0000000-0000-4000-8000-000000000001', 'b0000000-0000-4000-8000-0000000000d9', 'in', 'text', 'STOP', 'wamid.stop.1',
+   '{"sent_at": "2026-10-01T10:00:00Z"}')
   ON CONFLICT (workspace_id, wamid) DO NOTHING;
 SELECT is((SELECT opt_in FROM public.contacts WHERE id = 'b0000000-0000-4000-8000-0000000000c9'), true,
   'a redelivered STOP (same wamid, not inserted) does not undo the later START');
+INSERT INTO public.messages (workspace_id, conversation_id, direction, type, body, wamid, meta) VALUES
+  ('b0000000-0000-4000-8000-000000000001', 'b0000000-0000-4000-8000-0000000000d9', 'in', 'text', 'stop', 'wamid.stop.late',
+   '{"sent_at": "2026-10-01T09:00:00Z"}');
+SELECT is((SELECT opt_in FROM public.contacts WHERE id = 'b0000000-0000-4000-8000-0000000000c9'), true,
+  'a STOP sent before the START but delivered after it does not undo it (settled by send time)');
+
+-- one line, however the number was written
+SELECT results_eq(
+  $$SELECT public.contact_phone_key(p) FROM unnest(ARRAY['+5219983333333', '+529983333333', '0052 1 998 333 3333',
+      '+5491123456789', '+541123456789']) p$$,
+  $$VALUES ('529983333333'::text), ('529983333333'), ('529983333333'), ('541123456789'), ('541123456789')$$,
+  'the opt-out key folds the Mexican and Argentine mobile digit');
+INSERT INTO public.contacts (id, workspace_id, phone, opt_in) VALUES
+  ('b0000000-0000-4000-8000-0000000002c1', 'b0000000-0000-4000-8000-000000000001', '+5219983333333', true);
+INSERT INTO public.conversations (id, workspace_id, contact_id) VALUES
+  ('b0000000-0000-4000-8000-0000000002d1', 'b0000000-0000-4000-8000-000000000001', 'b0000000-0000-4000-8000-0000000002c1');
+INSERT INTO public.messages (workspace_id, conversation_id, direction, type, body, wamid, meta) VALUES
+  ('b0000000-0000-4000-8000-000000000001', 'b0000000-0000-4000-8000-0000000002d1', 'in', 'text', 'STOP', 'wamid.mx.stop',
+   '{"sent_at": "2026-10-01T11:00:00Z"}');
+INSERT INTO public.contacts (id, workspace_id, phone, opt_in) VALUES
+  ('b0000000-0000-4000-8000-0000000002c2', 'b0000000-0000-4000-8000-000000000001', '+529983333333', true);
+SELECT is((SELECT opt_in FROM public.contacts WHERE id = 'b0000000-0000-4000-8000-0000000002c2'), false,
+  'a STOP from +52 1 998… also blocks +52 998…');
+INSERT INTO public.messages (workspace_id, conversation_id, direction, type, body, wamid, meta) VALUES
+  ('b0000000-0000-4000-8000-000000000001', 'b0000000-0000-4000-8000-0000000002d1', 'in', 'text', 'START', 'wamid.mx.start',
+   '{"sent_at": "2026-10-01T11:05:00Z"}');
+SELECT results_eq(
+  $$SELECT opt_in FROM public.contacts
+     WHERE id IN ('b0000000-0000-4000-8000-0000000002c1', 'b0000000-0000-4000-8000-0000000002c2') ORDER BY id$$,
+  $$VALUES (true), (true)$$,
+  'START opts in every contact row of the line, not just the one that wrote');
 
 -- the suppression is the phone's: no edit of contact rows lifts it
 INSERT INTO public.contacts (id, workspace_id, phone, opt_in, opted_out_at) VALUES
@@ -936,6 +970,52 @@ UPDATE public.contacts SET opt_in = true, opted_out_at = NULL WHERE id = 'b00000
 ALTER TABLE public.contacts ENABLE TRIGGER trg_contacts_opt_out;
 SELECT is(public.mark_automation_run_dispatched('b0000000-0000-4000-8000-0000000000f5', 0, 0), 'opted_out',
   'the dispatch mark refuses a suppressed phone even when its contact row says opted in');
+
+-- the reminder scan: due, not yet emitted appointments only, earliest first
+SELECT ok(NOT has_function_privilege('authenticated',
+  'public.automation_reminder_candidates(uuid, timestamptz, integer)', 'EXECUTE'),
+  'sessions cannot call automation_reminder_candidates');
+INSERT INTO public.automation_rules (id, workspace_id, name, trigger_type, trigger_config, action_type, action_config, enabled) VALUES
+  ('b0000000-0000-4000-8000-0000000000a7', 'b0000000-0000-4000-8000-000000000001', 'Recordatorio 24 h',
+   'appointment_upcoming', '{"hours_before": 24}', 'add_tag', '{"tag": "recordada"}', true);
+INSERT INTO public.appointments (workspace_id, contact_id, conversation_id, scheduled_at, status, created_at)
+SELECT 'b0000000-0000-4000-8000-000000000001', 'b0000000-0000-4000-8000-0000000000c9',
+       'b0000000-0000-4000-8000-0000000000d9', date_trunc('minute', now()) + interval '1 hour' + make_interval(mins => i),
+       'booked', now() - interval '3 days'
+  FROM generate_series(1, 60) i;
+-- Booked too late for a 24 h reminder, and cancelled: never candidates.
+INSERT INTO public.appointments (workspace_id, contact_id, conversation_id, scheduled_at, status, created_at) VALUES
+  ('b0000000-0000-4000-8000-000000000001', 'b0000000-0000-4000-8000-0000000000c9', 'b0000000-0000-4000-8000-0000000000d9',
+   date_trunc('minute', now()) + interval '30 minutes', 'booked', now()),
+  ('b0000000-0000-4000-8000-000000000001', 'b0000000-0000-4000-8000-0000000000c9', 'b0000000-0000-4000-8000-0000000000d9',
+   date_trunc('minute', now()) + interval '40 minutes', 'cancelled', now() - interval '3 days');
+CREATE TEMP TABLE reminder_batch AS
+  SELECT * FROM public.automation_reminder_candidates('b0000000-0000-4000-8000-0000000000a7', now(), 50);
+SELECT is((SELECT count(*)::int FROM reminder_batch), 50, 'a busy calendar gives a full batch of 50');
+SELECT ok(
+  (SELECT bool_and(occurrence = 'b0000000-0000-4000-8000-0000000000a7:24h:'
+                   || to_char(scheduled_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'))
+     FROM reminder_batch)
+  AND (SELECT max(scheduled_at) FROM reminder_batch)
+      < (SELECT min(a.scheduled_at) FROM public.appointments a
+          WHERE a.workspace_id = 'b0000000-0000-4000-8000-000000000001'
+            AND a.status = 'booked' AND a.created_at < now() - interval '1 day'
+            AND a.scheduled_at > now() + interval '1 hour'
+            AND a.id NOT IN (SELECT subject_id FROM reminder_batch)),
+  'earliest due first, each with the rule''s occurrence key');
+INSERT INTO public.automation_events (workspace_id, event_type, subject_id, occurrence, contact_id, conversation_id, rule_id)
+SELECT 'b0000000-0000-4000-8000-000000000001', 'appointment_upcoming', subject_id, occurrence, contact_id,
+       conversation_id, 'b0000000-0000-4000-8000-0000000000a7'
+  FROM reminder_batch;
+SELECT is(
+  (SELECT count(*)::int FROM public.automation_reminder_candidates('b0000000-0000-4000-8000-0000000000a7', now(), 50)),
+  10, 'the next tick gets the other 10: emitted appointments never take a slot');
+SELECT is_empty(
+  $$SELECT 1 FROM public.automation_reminder_candidates('b0000000-0000-4000-8000-0000000000a7', now(), 500) c
+      JOIN public.appointments a ON a.id = c.subject_id
+     WHERE a.status <> 'booked' OR a.created_at > now() - interval '1 day'$$,
+  'an appointment booked with less lead than the rule, or cancelled, is never a candidate');
+UPDATE public.automation_rules SET enabled = false WHERE id = 'b0000000-0000-4000-8000-0000000000a7';
 
 -- the claim discards what expired instead of sending it late (nothing else queued)
 UPDATE public.automation_runs SET status = 'done', finished_at = now()
