@@ -2,13 +2,12 @@ import { NextRequest, NextResponse } from "next/server";
 import { requireWorkspaceMember } from "@/lib/auth/workspace-access";
 import {
   getCalComConfig,
-  calcomHeaders,
-  CALCOM_BASE_URL,
-  CALCOM_API_VERSION,
+  listCalComEventTypes,
 } from "@/features/inbox/services/calcom-client";
 
 // POST /api/workspace/[id]/integrations/calcom/test
-// Verifies the saved API key by listing event types.
+// Verifies the saved API key by listing its event types. Manager+, like
+// reading the integrations: it uses the stored key and returns only a count.
 export async function POST(
   _req: NextRequest,
   { params }: { params: Promise<{ id: string }> },
@@ -24,39 +23,16 @@ export async function POST(
   if (!cfg) {
     return NextResponse.json({
       ok: false,
-      error: "Falta la API key de Cal.com",
+      error: "Falta la API key de Cal.com, o la integración está desactivada.",
     });
   }
 
-  try {
-    const res = await fetch(`${CALCOM_BASE_URL}/v2/event-types`, {
-      headers: calcomHeaders(cfg.apiKey, CALCOM_API_VERSION.eventTypes),
-    });
-
-    if (!res.ok) {
-      return NextResponse.json({
-        ok: false,
-        error: `Cal.com respondió ${res.status}. Revisa la API key.`,
-      });
-    }
-
-    const data = (await res.json()) as {
-      data?: { id: number; title: string }[];
-    };
-    const count = data.data?.length ?? 0;
-
-    return NextResponse.json({
-      ok: true,
-      eventTypeCount: count,
-    });
-  } catch (err) {
-    console.error(
-      "[integrations/calcom/test] error:",
-      err instanceof Error ? err.message : "unknown",
-    );
+  const eventTypes = await listCalComEventTypes(cfg.apiKey);
+  if (!eventTypes) {
     return NextResponse.json({
       ok: false,
-      error: "No se pudo conectar con Cal.com",
+      error: "Cal.com no respondió o rechazó la API key. Revísala.",
     });
   }
+  return NextResponse.json({ ok: true, eventTypeCount: eventTypes.length });
 }

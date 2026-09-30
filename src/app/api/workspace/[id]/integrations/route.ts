@@ -305,6 +305,11 @@ export async function PUT(
     delete mergedConfig.timezone;
     delete mergedConfig.timezone_source;
   }
+  // Cal.com has no zone of its own: its tools use the workspace's scheduling
+  // zone (scheduling-timezone.ts). A zone an earlier version saved goes away.
+  if (provider === "caldotcom") {
+    for (const key of Object.keys(mergedConfig)) delete mergedConfig[key];
+  }
 
   const { error } = await svc.from("integrations").upsert(
     {

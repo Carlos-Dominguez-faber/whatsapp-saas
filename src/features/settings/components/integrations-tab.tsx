@@ -16,7 +16,6 @@ import { Separator } from "@/components/ui/separator";
 import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
 import { DEFAULT_HANDOFF_ACK } from "@/features/inbox/types/handoff";
-import { DEFAULT_TIMEZONE } from "@/shared/lib/timezone";
 import { ModelPicker } from "@/features/agents/components/model-picker";
 import {
   describeKapsoNumber,
@@ -1164,22 +1163,24 @@ function HighLevelSection({
 function CalDotComSection({
   workspaceId,
   initial,
+  canEdit,
   onSaved,
 }: {
   workspaceId: string;
   initial: IntegrationData | undefined;
+  canEdit: boolean;
   onSaved: () => void;
 }) {
+  // The GET masks the stored key ("••••••"); the PUT keeps the stored one when
+  // it comes back masked.
   const [apiKey, setApiKey] = useState(
     initial?.credentials?.calcom_api_key ?? "",
   );
-  const [timezone, setTimezone] = useState(
-    (initial?.config?.timezone as string | undefined) ?? DEFAULT_TIMEZONE,
-  );
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
+  const connected = Boolean(initial?.enabled && initial?.credentials?.calcom_api_key);
 
-  async function handleSave() {
+  async function save(enabled: boolean) {
     setSaving(true);
     try {
       const res = await fetch(`/api/workspace/${workspaceId}/integrations`, {
@@ -1187,14 +1188,13 @@ function CalDotComSection({
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           provider: "caldotcom",
-          enabled: true,
+          enabled,
           credentials: { calcom_api_key: apiKey },
-          config: { timezone },
         }),
       });
       const json = (await res.json()) as { ok?: boolean; error?: string };
       if (json.ok) {
-        toast.success("Configuración de Cal.com guardada");
+        toast.success(enabled ? "Configuración de Cal.com guardada" : "Cal.com desactivado");
         onSaved();
       } else {
         toast.error(json.error ?? "Error al guardar");
@@ -1234,8 +1234,8 @@ function CalDotComSection({
 
   return (
     <Section
-      title="Cal.com"
-      description="Conecta tu cuenta de Cal.com con una API key para agendar citas."
+      title="Cal.com (beta)"
+      description="Conecta tu cuenta de Cal.com con una API key para que el agente consulte horarios y agende, cancele o mueva citas. Las herramientas se activan en Configuración → Herramientas."
     >
       <div className="grid gap-4">
         <div className="space-y-2">
@@ -1247,26 +1247,18 @@ function CalDotComSection({
             value={apiKey}
             onChange={(e) => setApiKey(e.target.value)}
             autoComplete="off"
+            disabled={!canEdit}
           />
           <p className="text-xs text-muted-foreground">
             Cal.com → Settings → Security → API Keys.
           </p>
         </div>
 
-        <div className="space-y-2">
-          <Label htmlFor="calcom-timezone">Zona horaria</Label>
-          <Input
-            id="calcom-timezone"
-            placeholder={DEFAULT_TIMEZONE}
-            value={timezone}
-            onChange={(e) => setTimezone(e.target.value)}
-            className="font-mono text-sm"
-          />
-          <p className="text-xs text-muted-foreground">
-            Zona IANA usada para consultar disponibilidad y agendar (ej.
-            America/Santiago, America/Mexico_City).
-          </p>
-        </div>
+        <p className="text-xs text-muted-foreground">
+          Las citas se ofrecen y se agendan en la zona horaria del negocio
+          (Configuración → Negocio), la misma que usa el agente para hablar de
+          fechas.
+        </p>
 
         <div className="flex items-center gap-2 pt-2">
           <Button
@@ -1274,7 +1266,7 @@ function CalDotComSection({
             variant="outline"
             size="sm"
             onClick={handleTest}
-            disabled={testing}
+            disabled={testing || !connected}
             aria-busy={testing}
           >
             {testing && (
@@ -1285,16 +1277,29 @@ function CalDotComSection({
           <Button
             type="button"
             size="sm"
-            onClick={handleSave}
-            disabled={saving}
+            onClick={() => save(true)}
+            disabled={!canEdit || saving || !apiKey}
             aria-busy={saving}
+            aria-describedby={!canEdit ? "calcom-admin-only" : undefined}
           >
             {saving && (
               <Loader2 className="h-4 w-4 mr-2 animate-spin" aria-hidden />
             )}
             Guardar
           </Button>
+          {connected && (
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              onClick={() => save(false)}
+              disabled={!canEdit || saving}
+            >
+              Desactivar
+            </Button>
+          )}
         </div>
+        {!canEdit && <AdminOnlyNote id="calcom-admin-only" />}
       </div>
     </Section>
   );
@@ -1379,6 +1384,7 @@ export function IntegrationsTab({
       <CalDotComSection
         workspaceId={workspaceId}
         initial={caldotcom}
+        canEdit={canEdit}
         onSaved={refresh}
       />
     </div>
