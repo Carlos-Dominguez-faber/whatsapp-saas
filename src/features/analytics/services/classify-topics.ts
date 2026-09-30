@@ -89,10 +89,10 @@ import { resolveOpenRouterKey } from "@/features/inbox/services/openrouter-key";
  * backfill didn't use: a backfill with nothing it can do (no topic pending,
  * over the cap, a key down) returns at once. In both phases workspaces take
  * turns by the one served longest ago (classification_workspace_state.
- * last_served_at, stamped when the run takes a workspace's conversations or a
- * batch of its backfill): every workspace's first conversation (or oldest
- * pending topic) before anyone's second, and among those the longest waiting
- * first. The backfill gives each topic one batch per round. Inside a
+ * last_served_at, stamped by the reservation of each call: a row claimed and
+ * then not called — out of time, its key down — is not a turn): every
+ * workspace's first conversation (or oldest pending topic) before anyone's
+ * second, and among those the longest waiting first. The backfill gives each topic one batch per round. Inside a
  * workspace, the nightly phase reads customers of the last 48 h oldest first,
  * then the rest newest first.
  * ════════════════════════════════════════════════════════════════════════════

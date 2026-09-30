@@ -57,8 +57,10 @@ BEGIN
   -- ORDER (the turn model of classify-topics.ts): workspaces take turns —
   -- every workspace's first conversation before anyone's second (row_number
   -- per workspace), and among those, the workspace served longest ago first
-  -- (classification_workspace_state.last_served_at, stamped below when this
-  -- takes its conversations; never served goes first). Ordering by rn and
+  -- (classification_workspace_state.last_served_at; never served goes first).
+  -- It is stamped by reserve_classification_tokens, when a call is really
+  -- made for the workspace, not here: a row claimed that the run then can't
+  -- process (out of time, its key down) is not a turn. Ordering by rn and
   -- then a random id, as before, let one workspace take 126 turns while
   -- another got 2. Inside each workspace two tiers:
   --   1. customers who wrote in the last 48 hours, oldest first: yesterday is
@@ -168,11 +170,6 @@ BEGIN
       FROM claimable k
      WHERE cc2.conversation_id = k.id
     RETURNING cc2.conversation_id AS id
-  ),
-  served AS (
-    INSERT INTO public.classification_workspace_state AS s (workspace_id, last_served_at, updated_at)
-    SELECT DISTINCT k.ws, v_now, now() FROM claimable k
-    ON CONFLICT (workspace_id) DO UPDATE SET last_served_at = EXCLUDED.last_served_at, updated_at = now()
   )
   -- last_inbound_at is what the caller passes back as classified_until: the
   -- run covers the customer's messages up to it.
@@ -410,21 +407,10 @@ CREATE OR REPLACE FUNCTION public.next_backfill_batch(
 )
 RETURNS TABLE (conversation_id UUID, workspace_id UUID, contact_id UUID, last_inbound_at TIMESTAMPTZ,
                waits_until TIMESTAMPTZ)
-LANGUAGE plpgsql
-VOLATILE
+LANGUAGE sql
+STABLE
 SET search_path = ''
 AS $$
-#variable_conflict use_column
-BEGIN
-  -- Taking a batch is serving the workspace: it goes to the back of the turns
-  -- (last_served_at, see select_conversations_to_classify).
-  INSERT INTO public.classification_workspace_state AS s (workspace_id, last_served_at, updated_at)
-  SELECT t.workspace_id, COALESCE(p_now, now()), now()
-    FROM public.insight_topics t
-   WHERE t.id = p_topic_id AND t.status = 'active' AND t.backfill_status = 'pending'
-  ON CONFLICT (workspace_id) DO UPDATE SET last_served_at = EXCLUDED.last_served_at, updated_at = now();
-
-  RETURN QUERY
   SELECT c.id, c.workspace_id, c.contact_id, li.at,
          CASE WHEN cc.transient_failures > 0 AND cc.claimed_until > COALESCE(p_now, now())
               THEN cc.claimed_until END
@@ -465,7 +451,6 @@ BEGIN
     )
   ORDER BY li.at DESC, c.id DESC
   LIMIT LEAST(GREATEST(COALESCE(p_limit, 1), 1), 100);
-END;
 $$;
 
 -- The backfill's turns: the topics it may take now, in the same order as the
@@ -708,6 +693,12 @@ BEGIN
             'total_tokens', p_estimate),
           v_now)
   RETURNING id INTO v_id;
+
+  -- A call goes out for this workspace: that is its turn, in both phases
+  -- (last_served_at, see select_conversations_to_classify).
+  INSERT INTO public.classification_workspace_state AS s (workspace_id, last_served_at, updated_at)
+  VALUES (p_workspace_id, v_now, now())
+  ON CONFLICT (workspace_id) DO UPDATE SET last_served_at = EXCLUDED.last_served_at, updated_at = now();
   RETURN v_id;
 END;
 $$;

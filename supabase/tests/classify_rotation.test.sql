@@ -6,7 +6,7 @@ BEGIN;
 CREATE EXTENSION IF NOT EXISTS pgtap WITH SCHEMA extensions;
 SET search_path = public, extensions;
 
-SELECT plan(7);
+SELECT plan(8);
 
 -- W workspaces with 30 customers each who wrote yesterday; `sel` selects of 5
 -- a second apart, each claimed row read at once. Reads per workspace.
@@ -36,6 +36,9 @@ BEGIN
     FOR r IN SELECT * FROM public.select_conversations_to_classify(5, '{}', 180, now0 + s * interval '1 second')
               WHERE workspace_id IN (SELECT rw.ws FROM rot_ws rw WHERE rw.tag = p_tag) LOOP
       INSERT INTO rot_reads VALUES (p_tag, r.workspace_id);
+      -- The call: its reservation is the workspace's turn.
+      PERFORM public.reserve_classification_tokens(r.workspace_id, r.conversation_id, 1, 300000,
+        now0 + s * interval '1 second');
       UPDATE public.conversation_classification SET classified_until = r.last_inbound_at, claimed_until = NULL
        WHERE conversation_id = r.conversation_id;
     END LOOP;
@@ -54,7 +57,39 @@ SELECT is((SELECT min(reads) || '/' || max(reads) FROM r20), '9/9',
   '20 workspaces, 36 selects of 5: each gets its fair 9 (it was 0 to 26)');
 SELECT ok((SELECT count(*) FROM public.classification_workspace_state s JOIN rot_ws w ON w.ws = s.workspace_id
             WHERE s.last_served_at IS NOT NULL) = 30,
-  'taking a workspace''s conversations stamps when it was served');
+  'a call for a workspace (its reservation) stamps when it was served');
+
+-- ── A row claimed but never called is not a turn ─────────────────────────────
+UPDATE public.conversation_classification SET classified_until = now() WHERE classified_until IS NULL;
+DO $nc$
+DECLARE ws UUID; k UUID; c UUID; i INT; j INT; now0 TIMESTAMPTZ := '2027-01-15 12:00Z';
+BEGIN
+  FOR i IN 1..3 LOOP
+    ws := ('e7100000-0000-4000-8000-00000000000' || i)::uuid;
+    INSERT INTO public.workspaces (id, name, slug) VALUES (ws, 'NC ' || i, 'nc-' || i);
+    INSERT INTO public.insight_topics (workspace_id, name, description, created_at, covered_from, backfill_status)
+      VALUES (ws, 'Precio', 'x', now0 - interval '60 days', now0 - interval '60 days', 'done');
+    FOR j IN 1..2 LOOP
+      k := gen_random_uuid(); c := gen_random_uuid();
+      INSERT INTO public.contacts (id, workspace_id, phone) VALUES (k, ws, '+1557' || i || j);
+      INSERT INTO public.conversations (id, workspace_id, contact_id, last_message_at) VALUES (c, ws, k, now0 - interval '5 hours');
+      INSERT INTO public.messages (workspace_id, conversation_id, direction, body, created_at) VALUES (ws, c, 'in', 'x', now0 - interval '5 hours');
+    END LOOP;
+  END LOOP;
+END
+$nc$;
+CREATE TEMP TABLE nc_first AS
+  SELECT * FROM public.select_conversations_to_classify(3, ARRAY(SELECT ws FROM rot_ws), 180, '2027-01-15 12:01Z');
+-- Only the first one is called; the other two run out of time (their lease lapses).
+SELECT public.reserve_classification_tokens(n.workspace_id, n.conversation_id, 1, 300000, '2027-01-15 12:01Z')
+  FROM (SELECT * FROM nc_first LIMIT 1) n;
+UPDATE public.conversation_classification SET claimed_until = NULL
+ WHERE conversation_id IN (SELECT conversation_id FROM nc_first OFFSET 1);
+UPDATE public.conversation_classification SET classified_until = now()
+ WHERE conversation_id IN (SELECT conversation_id FROM nc_first LIMIT 1);
+SELECT is((SELECT count(*)::int FROM public.select_conversations_to_classify(2, ARRAY(SELECT ws FROM rot_ws), 180, '2027-01-15 12:02Z') x
+            WHERE x.workspace_id = (SELECT workspace_id FROM nc_first LIMIT 1)), 0,
+  'the two claimed but never called go before the one that was');
 
 -- ── The backfill takes turns the same way ────────────────────────────────────
 DO $bf$
@@ -69,9 +104,16 @@ END
 $bf$;
 SELECT is((SELECT array_agg(name) FROM public.pending_backfill_topics(10, ARRAY(SELECT ws FROM rot_ws))),
   ARRAY['A1', 'B1', 'A2'], 'each workspace''s oldest topic before anyone''s second');
-SELECT public.next_backfill_batch('e7000000-0000-4000-8000-0000000000a1', 5);
+DO $st$
+DECLARE k UUID := gen_random_uuid(); c UUID := gen_random_uuid();
+BEGIN
+  INSERT INTO public.contacts (id, workspace_id, phone) VALUES (k, 'e7000000-0000-4000-8000-00000000000a', '+15559700001');
+  INSERT INTO public.conversations (id, workspace_id, contact_id) VALUES (c, 'e7000000-0000-4000-8000-00000000000a', k);
+  PERFORM public.reserve_classification_tokens('e7000000-0000-4000-8000-00000000000a', c, 1, 300000);
+END
+$st$;
 SELECT is((SELECT array_agg(name) FROM public.pending_backfill_topics(10, ARRAY(SELECT ws FROM rot_ws))),
-  ARRAY['B1', 'A1', 'A2'], 'taking a batch sends the workspace to the back');
+  ARRAY['B1', 'A1', 'A2'], 'a call for the workspace sends it to the back');
 SELECT is((SELECT array_agg(name) FROM public.pending_backfill_topics(10,
             ARRAY(SELECT ws FROM rot_ws) || 'e7000000-0000-4000-8000-00000000000b'::uuid)),
   ARRAY['A1', 'A2'], 'a workspace skipped this run is left out');
