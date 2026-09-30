@@ -8,7 +8,7 @@ BEGIN;
 CREATE EXTENSION IF NOT EXISTS pgtap WITH SCHEMA extensions;
 SET search_path = public, extensions;
 
-SELECT plan(26);
+SELECT plan(28);
 
 -- ── privileges: service role only ───────────────────────────────────────────
 SELECT ok(NOT has_function_privilege('anon',
@@ -171,14 +171,32 @@ SELECT lives_ok($$
   DELETE FROM public.contacts WHERE id IN ('c0000000-0000-4000-8000-0000000000d1', 'c0000000-0000-4000-8000-0000000000d2',
                                            'c0000000-0000-4000-8000-0000000000d3', 'c0000000-0000-4000-8000-0000000000d4')
 $$, 'two contacts with live bookings (and two with open claims) at one instant can be deleted');
-SELECT is((SELECT count(*)::INT FROM public.appointments WHERE calcom_booking_uid IN ('bk_d1', 'bk_d2') AND contact_id IS NULL AND status = 'booked'),
-  2, 'their linked bookings stay, as history');
+SELECT is((SELECT count(*)::INT FROM public.appointments WHERE calcom_booking_uid IN ('bk_d1', 'bk_d2') AND contact_id IS NULL
+            AND status = 'booked' AND meta ? 'contact_deleted_from'),
+  2, 'their linked bookings stay, as history, marked');
 SELECT is((SELECT string_agg(status || ':' || (meta->>'calcom_claim'), ',') FROM public.appointments
             WHERE scheduled_at = '2030-08-01T16:00:00Z' AND calcom_booking_uid IS NULL),
   'cancelled:contact_deleted,cancelled:contact_deleted', 'their open claims are closed');
 CREATE TEMP TABLE r13 AS SELECT * FROM public.claim_calcom_slot(
   'c0000000-0000-4000-8000-000000000001', NULL, NULL, '2030-08-01T16:00:00Z', 7, 120);
 SELECT ok((SELECT claim_id IS NOT NULL FROM r13), 'the orphaned rows don''t take the playground''s place');
+
+-- A playground booking (contactless from the start, linked) still holds its slot.
+INSERT INTO public.appointments (workspace_id, contact_id, scheduled_at, status, calcom_event_type_id, calcom_booking_uid, meta)
+VALUES ('c0000000-0000-4000-8000-000000000001', NULL, '2030-09-01T16:00:00Z', 'booked', 7, 'bk_play', '{}');
+CREATE TEMP TABLE r14 AS SELECT * FROM public.claim_calcom_slot(
+  'c0000000-0000-4000-8000-000000000001', NULL, NULL, '2030-09-01T16:00:00Z', 7, 120);
+SELECT ok((SELECT claim_id IS NULL AND holder_uid = 'bk_play' FROM r14),
+  'a second playground booking at that instant finds the first one');
+
+-- Deleting the workspace (its contacts cascade) never fails on the trigger.
+INSERT INTO public.workspaces (id, name, slug) VALUES ('c0000000-0000-4000-8000-000000000009', 'Gone', 'cal-gone');
+INSERT INTO public.contacts (id, workspace_id, phone) VALUES
+  ('c0000000-0000-4000-8000-0000000000f1', 'c0000000-0000-4000-8000-000000000009', '+15550001201');
+SELECT * FROM public.claim_calcom_slot('c0000000-0000-4000-8000-000000000009', 'c0000000-0000-4000-8000-0000000000f1', NULL,
+  '2030-08-01T16:00:00Z', 7, 120);
+SELECT lives_ok($$ DELETE FROM public.workspaces WHERE id = 'c0000000-0000-4000-8000-000000000009' $$,
+  'a workspace with open claims (from this same transaction) can be deleted');
 
 SELECT * FROM finish();
 ROLLBACK;

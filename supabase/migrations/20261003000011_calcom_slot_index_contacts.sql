@@ -10,20 +10,20 @@
 -- <nobody> at that instant and the DELETE failed with 23505 (and a single
 -- orphaned row took the playground's place at that time).
 --
--- Two parts, because each covers what the other can't:
---   1. The index leaves out rows with no contact that are linked to a
---      booking: (contact_id IS NOT NULL OR calcom_booking_uid IS NULL). A
---      deleted contact's linked bookings stay as history, outside the slot
---      index; a contactless claim (no uid yet) still collides as before.
---   2. BEFORE DELETE on contacts: the contact's Cal.com claims that never got
---      a uid are closed (status 'cancelled', meta.calcom_claim
---      'contact_deleted'). With no contact they can't be resolved, reminded or
---      handed to anyone; left open, two of them at one instant would still
---      collide once their contact_id went NULL. A booking one of them may have
---      made stays in Cal.com.
--- A predicate alone leaves that last case; a trigger alone would have to
--- rewrite the linked bookings too. claim_calcom_slot()'s holder lookup uses
--- the same predicate as the index.
+-- A BEFORE DELETE trigger on contacts, with the index keyed on what it marks:
+--   * the contact's Cal.com claims that never got a uid are closed (status
+--     'cancelled', meta.calcom_claim 'contact_deleted'): with no contact they
+--     can't be resolved, reminded or handed to anyone. A booking one of them
+--     may have made stays in Cal.com;
+--   * its linked bookings are marked meta.contact_deleted_from (the contact's
+--     id) and stay as history;
+--   * the index (and claim_calcom_slot()'s holder lookup) leaves out rows
+--     marked contact_deleted_from.
+-- Only the rows the trigger marked leave the index: a playground booking
+-- (contactless from the start, linked) still collides with a second test at
+-- that instant. The trigger does nothing when the workspace itself is being
+-- deleted (its rows go with it), so it never turns a workspace delete into
+-- an error.
 -- ============================================================================
 
 SET lock_timeout = '10s';
@@ -36,7 +36,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_appointments_calcom_slot_claim_v2
   )
   WHERE status IN ('booked', 'confirmed')
     AND calcom_event_type_id IS NOT NULL
-    AND (contact_id IS NOT NULL OR calcom_booking_uid IS NULL);
+    AND NOT (meta ? 'contact_deleted_from');
 DROP INDEX IF EXISTS public.idx_appointments_calcom_slot_claim;
 ALTER INDEX public.idx_appointments_calcom_slot_claim_v2 RENAME TO idx_appointments_calcom_slot_claim;
 
@@ -107,7 +107,7 @@ BEGIN
        AND a.status IN ('booked', 'confirmed')
        AND a.calcom_event_type_id IS NOT NULL
        -- The index's own predicate (20261003000011).
-       AND (a.contact_id IS NOT NULL OR a.calcom_booking_uid IS NULL)
+       AND NOT (a.meta ? 'contact_deleted_from')
      LIMIT 1
      FOR UPDATE;
     IF NOT FOUND THEN
@@ -152,13 +152,20 @@ LANGUAGE plpgsql SECURITY DEFINER
 SET search_path = ''
 AS $$
 BEGIN
+  -- A workspace being deleted takes its rows with it: nothing to mark.
+  IF NOT EXISTS (SELECT 1 FROM public.workspaces w WHERE w.id = OLD.workspace_id) THEN
+    RETURN OLD;
+  END IF;
   UPDATE public.appointments a
-     SET status = 'cancelled',
-         meta = a.meta || jsonb_build_object('calcom_claim', 'contact_deleted')
+     SET status = CASE WHEN a.calcom_booking_uid IS NULL THEN 'cancelled' ELSE a.status END,
+         meta = a.meta
+                || jsonb_build_object('contact_deleted_from', OLD.id)
+                || CASE WHEN a.calcom_booking_uid IS NULL
+                        THEN jsonb_build_object('calcom_claim', 'contact_deleted')
+                        ELSE '{}'::jsonb END
    WHERE a.contact_id = OLD.id
      AND a.workspace_id = OLD.workspace_id
      AND a.calcom_event_type_id IS NOT NULL
-     AND a.calcom_booking_uid IS NULL
      AND a.status IN ('booked', 'confirmed');
   RETURN OLD;
 END;
