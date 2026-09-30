@@ -350,8 +350,10 @@ test("schedule: another account's event type, or an unreadable list, books nothi
   assert.equal(d.ok, false);
   assert.match(d.error ?? "", /con cupos/);
   assert.equal(calPosts(seated.calls).length, 0);
-  const noSeats = calFetch({ eventTypes: [{ id: 7, title: "Consulta", seats: { disabled: true } }] });
-  assert.equal((await schedule(noSeats)).ok, true);
+  for (const seats of [{ disabled: true }, { seatsPerTimeSlot: null }, null]) {
+    const noSeats = calFetch({ eventTypes: [{ id: 7, title: "Consulta", seats, seatsPerTimeSlot: null }] });
+    assert.equal((await schedule(noSeats)).ok, true, JSON.stringify(seats));
+  }
 });
 
 test("schedule: without an email given or saved, it asks for one", async () => {
@@ -885,6 +887,7 @@ test("a taken slot is recognized by Cal.com's error code too", async () => {
   assert.equal(isSlotTaken('{"code":"no_available_users_found_error"}'), true);
   assert.equal(isSlotTaken("User either already has booking at this time or is not available"), true);
   assert.equal(isSlotTaken("invalid api key"), false);
+  assert.equal(isSlotTaken('{"code":"slot_reservation_expired_error"}'), false, "other slot_* codes aren't a taken slot");
   const fake = calFetch({ create: { status: 400, body: { error: { code: "no_available_users_found_error" } } } });
   const result = await schedule(fake);
   assert.match(result.error ?? "", /ya no está disponible/);

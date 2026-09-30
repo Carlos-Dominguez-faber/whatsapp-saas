@@ -169,7 +169,7 @@ interface CalComEventTypesResponse {
     title?: string;
     lengthInMinutes?: number;
     recurrence?: { disabled?: boolean } | null;
-    seats?: { seatsPerTimeSlot?: number; disabled?: boolean } | null;
+    seats?: { seatsPerTimeSlot?: number | null; disabled?: boolean } | null;
     seatsPerTimeSlot?: number | null;
   }>;
 }
@@ -195,9 +195,16 @@ export interface CalComEventTypeInfo {
   seated: boolean;
 }
 
-function isSeated(et: { seats?: { seatsPerTimeSlot?: number; disabled?: boolean } | null; seatsPerTimeSlot?: number | null }): boolean {
-  if (et.seats && et.seats.disabled !== true && (et.seats.seatsPerTimeSlot ?? 1) > 0) return true;
-  return typeof et.seatsPerTimeSlot === "number" && et.seatsPerTimeSlot > 0;
+/** A number of seats per slot, in either place Cal.com has put it. */
+function isSeated(et: {
+  seats?: { seatsPerTimeSlot?: number | null; disabled?: boolean } | null;
+  seatsPerTimeSlot?: number | null;
+}): boolean {
+  const perSlot = et.seats?.disabled === true ? null : et.seats?.seatsPerTimeSlot;
+  return (
+    (typeof perSlot === "number" && perSlot > 0) ||
+    (typeof et.seatsPerTimeSlot === "number" && et.seatsPerTimeSlot > 0)
+  );
 }
 
 /**
@@ -329,15 +336,17 @@ export async function fetchCalComBooking(
 }
 
 /**
- * Cal.com's answer when the slot can't be booked, in words or as an error
- * code ("no_available_users_found_error"): underscores are read as spaces.
+ * Cal.com's answer when the slot can't be booked: in words, or as the error
+ * code no_available_users_found_error (matched as a whole: reading every
+ * underscore as a space would also catch unrelated slot_* codes).
  * Unverified against every Cal.com wording: see the PR's smoke test.
  */
 const SLOT_TAKEN =
   /\b(?:no longer available|not available|no available users|already (?:has|have) (?:a )?booking|booking conflict|slot)\b/i;
+const SLOT_TAKEN_CODES = /\bno_available_users_found_error\b/;
 
 export function isSlotTaken(detail: string): boolean {
-  return SLOT_TAKEN.test(detail.replace(/_/g, " "));
+  return SLOT_TAKEN_CODES.test(detail) || SLOT_TAKEN.test(detail);
 }
 
 export type CalComLookupAt =
