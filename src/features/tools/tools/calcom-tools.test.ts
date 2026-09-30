@@ -70,7 +70,7 @@ function filterRows(url: string, rows: LocalRow[]) {
 function booking(
   uid: string,
   startIso: string,
-  extra: { status?: string; rescheduledToUid?: string; eventTypeId?: number } = {},
+  extra: { status?: string; rescheduledToUid?: string; eventTypeId?: number; attendees?: string[] } = {},
 ) {
   return {
     uid,
@@ -79,6 +79,7 @@ function booking(
     status: extra.status ?? "accepted",
     eventType: { id: extra.eventTypeId ?? 7, slug: "consulta" },
     createdAt: "2030-01-01T00:00:00.000Z",
+    attendees: (extra.attendees ?? ["Ana@Example.com"]).map((email) => ({ email, name: "Ana" })),
     ...(extra.rescheduledToUid ? { rescheduledToUid: extra.rescheduledToUid } : {}),
   };
 }
@@ -95,6 +96,8 @@ function calFetch(opts: {
   /** Answers of successive claims, then `claim`. */
   claims?: Array<Record<string, unknown>>;
   claimError?: boolean;
+  /** The link/release of a holder row affects no row (or fails). */
+  holderWriteFails?: boolean;
   /** GET /v2/bookings (the list by attendee). */
   list?: { status: number; body: unknown } | { throws: true };
   create?: { status: number; body?: unknown } | { throws: true };
@@ -144,6 +147,11 @@ function calFetch(opts: {
     if (url.includes("/rest/v1/appointments")) {
       if (method === "GET") return json(200, filterRows(url, opts.local ?? []));
       if (method === "PATCH" && url.includes("id=eq.claim_1")) return json(200, [{ id: "claim_1" }]);
+      if (method === "PATCH" && url.includes("id=eq.row_x")) {
+        return opts.holderWriteFails
+          ? json(409, { code: "23505", message: "duplicate key value" })
+          : json(200, [{ id: "row_x" }]);
+      }
       return new Response(null, { status: 201 });
     }
     if (url.includes("/rest/v1/contacts")) {
@@ -408,7 +416,7 @@ test("schedule: a claim that may have booked is asked in Cal.com, by attendee, s
   assert.deepEqual(a.output, { booking_uid: "bk_9", datetime: CONFIRMED, already_booked: true });
   const q = found.calls.find((c) => c.method === "GET" && new URL(c.url).pathname === "/v2/bookings")!;
   const params = new URL(q.url).searchParams;
-  assert.equal(params.get("attendeeEmail"), "ana@example.com");
+  assert.equal(params.get("attendeeEmail"), "ana@example.com", "lowercased");
   assert.equal(params.get("eventTypeId"), "7");
   assert.equal(q.headers["cal-api-version"], "2026-05-01");
   const link = localWrites(found.calls).find((c) => c.method === "PATCH")!;
@@ -945,4 +953,37 @@ test("the list's note: accepted, mixed and none", async () => {
 
   const none = await noteOf(calFetch({ local: [] }));
   assert.match(none, /no tiene citas próximas/);
+});
+
+test("the lookup by attendee checks Cal.com's filters itself: another service or person is not concluyente", async () => {
+  // REVIEW2: Cal.com (filters ignored or loose) answers with a booking of
+  // event type 99 at that instant, for someone else.
+  const other = booking("bk_other", CONFIRMED_UTC, { eventTypeId: 99, attendees: ["zoe@other.com"] });
+  const fake = calFetch({
+    claim: holder("sending", 300),
+    list: { status: 200, body: { status: "success", data: [other], pagination: { hasNextPage: false } } },
+  });
+  const r = await schedule(fake);
+  assert.equal(r.ok, false, "never answered with another person's or service's booking");
+  assert.deepEqual(r.output, { needs_human: true });
+  assert.equal(localWrites(fake.calls).filter((c) => c.url.includes("id=eq.row_x")).length, 0, "nothing linked or freed");
+  assert.equal(calPosts(fake.calls).length, 0);
+
+  // Same service, another attendee at that time: also not this customer's.
+  const sameServiceOtherPerson = calFetch({
+    claim: holder("sending", 300),
+    list: { status: 200, body: { status: "success", data: [booking("bk_c", CONFIRMED_UTC, { attendees: ["carlos@x.com"] })] } },
+  });
+  assert.deepEqual((await schedule(sameServiceOtherPerson)).output, { needs_human: true });
+});
+
+test("a found booking whose link can't be written is never answered ok", async () => {
+  const fake = calFetch({
+    claim: holder("unknown", 300),
+    holderWriteFails: true,
+    list: { status: 200, body: { status: "success", data: [booking("bk_9", CONFIRMED_UTC)], pagination: { hasMore: false } } },
+  });
+  const r = await schedule(fake);
+  assert.equal(r.ok, false);
+  assert.deepEqual(r.output, { needs_human: true });
 });

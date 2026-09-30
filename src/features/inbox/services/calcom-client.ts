@@ -249,6 +249,8 @@ export interface CalComBooking {
   eventTypeId: number | null;
   /** Where Cal.com says it was moved to, when it was rescheduled. */
   rescheduledToUid: string | null;
+  /** The attendees' emails, lowercased; null when the body had no readable list. */
+  attendeeEmails: string[] | null;
 }
 
 function stateOf(status: string): CalComBookingState {
@@ -282,6 +284,11 @@ export function parseCalComBooking(data: unknown): CalComBooking | null {
       : typeof b.eventTypeId === "number"
         ? b.eventTypeId
         : null;
+  const attendeeEmails = Array.isArray(b.attendees)
+    ? (b.attendees as Array<{ email?: unknown }>)
+        .map((a) => (typeof a?.email === "string" ? a.email.trim().toLowerCase() : null))
+        .filter((e): e is string => Boolean(e))
+    : null;
   return {
     uid,
     startMs,
@@ -293,6 +300,7 @@ export function parseCalComBooking(data: unknown): CalComBooking | null {
     eventTypeId,
     rescheduledToUid:
       typeof b.rescheduledToUid === "string" && b.rescheduledToUid ? b.rescheduledToUid : null,
+    attendeeEmails,
   };
 }
 
@@ -342,15 +350,23 @@ export type CalComLookupAt =
 /**
  * Whether Cal.com has a booking of `eventTypeId` for `email` starting at
  * `startMs` (within a minute): GET /v2/bookings filtered by attendee, event
- * type and a window around that start. "none" only when Cal.com answered with
- * the whole list; anything else is "unknown", never "none". Never throws.
+ * type and a window around that start.
+ *
+ * Cal.com's filters are checked here, not trusted: every booking in the
+ * answer must be of that event type and have that attendee. One that isn't
+ * means the filters weren't applied, so the answer can't tell whose booking
+ * is whose: "unknown". "none" only when Cal.com answered with the whole,
+ * filtered list and nothing is at that start; anything else is "unknown",
+ * never "none". Never throws.
  */
 export async function findCalComBookingAt(
   apiKey: string,
   q: { email: string; eventTypeId: number; startMs: number },
 ): Promise<CalComLookupAt> {
+  const email = q.email.trim().toLowerCase();
+  if (!email) return { kind: "unknown" };
   const params = new URLSearchParams({
-    attendeeEmail: q.email,
+    attendeeEmail: email,
     eventTypeId: String(q.eventTypeId),
     afterStart: new Date(q.startMs - 60_000).toISOString(),
     beforeEnd: new Date(q.startMs + 24 * 60 * 60_000).toISOString(),
@@ -372,6 +388,12 @@ export async function findCalComBookingAt(
   const bookings = body.data.map(parseCalComBooking);
   // A booking that can't be read could be the one.
   if (bookings.some((b) => b === null)) return { kind: "unknown" };
+  // Another event type or another person in the answer: the filters weren't
+  // applied, and nothing here can be linked to this customer.
+  const filtered = (bookings as CalComBooking[]).every(
+    (b) => b.eventTypeId === q.eventTypeId && (b.attendeeEmails ?? []).includes(email),
+  );
+  if (!filtered) return { kind: "unknown" };
   const match = (bookings as CalComBooking[]).find(
     (b) => b.state === "active" && Math.abs(b.startMs - q.startMs) <= 60_000,
   );

@@ -358,8 +358,9 @@ async function run(args: Args, ctx: ToolContext, opts?: ToolRunOptions): Promise
       }
       // Its call is over and never learned whether Cal.com booked: Cal.com
       // says, by attendee, service and start. Only a complete "no" frees it.
-      const lookupEmail = row.holder_email || email;
-      if (row.holder_event_type_id === null || !hasTimeToLookUp(startedAt, budgetMs)) {
+      const lookupEmail = (row.holder_email || email || "").trim();
+      // Without an email nothing can say whose booking it is.
+      if (!lookupEmail || row.holder_event_type_id === null || !hasTimeToLookUp(startedAt, budgetMs)) {
         return heldUnconfirmed("no se pudo consultar");
       }
       const found = await findCalComBookingAt(cfg.apiKey, {
@@ -369,8 +370,10 @@ async function run(args: Args, ctx: ToolContext, opts?: ToolRunOptions): Promise
       });
       if (found.kind === "unknown") return heldUnconfirmed("Cal.com no dio una respuesta completa");
       if (found.kind === "found") {
-        // The booking exists: the claim becomes its cache row.
-        await supabase
+        // The booking exists: the claim becomes its cache row. If that link
+        // can't be written (the uid is already cached elsewhere, the row
+        // changed), nothing here is sure: a person looks.
+        const { data: linked, error: linkError } = await supabase
           .from("appointments")
           .update({
             calcom_booking_uid: found.booking.uid,
@@ -379,7 +382,12 @@ async function run(args: Args, ctx: ToolContext, opts?: ToolRunOptions): Promise
           })
           .eq("id", row.holder_id as string)
           .eq("workspace_id", ctx.workspaceId)
-          .is("calcom_booking_uid", null);
+          .is("calcom_booking_uid", null)
+          .select("id");
+        if (linkError || ((linked as unknown[] | null) ?? []).length === 0) {
+          console.error("[schedule_calcom] could not link the found booking:", linkError?.message ?? "0 rows");
+          return heldUnconfirmed("no se pudo vincular la reserva encontrada");
+        }
         await traceOutcome("not_sent", { reason: "already_booked" });
         return sameService
           ? { ok: true, output: { ...bookedOutput(found.booking), already_booked: true } }
