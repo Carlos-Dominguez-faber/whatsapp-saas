@@ -33,6 +33,8 @@ const rawInsights = {
 let rpcResults: Record<string, { data: unknown; error: { code: string } | null }> = {};
 let rpcCalls: Array<{ fn: string; args: Record<string, unknown> }> = [];
 let topicsResult: { data: unknown; error: { code: string } | null } = { data: [], error: null };
+/** The key the workspace ran on at its last turn (classification_workspace_state). */
+let stateRow: unknown = null;
 
 mock.module("@supabase/supabase-js", {
   exports: {
@@ -41,8 +43,14 @@ mock.module("@supabase/supabase-js", {
         rpcCalls.push({ fn, args });
         return rpcResults[fn];
       },
-      from: () => {
-        const q = { select: () => q, eq: () => q, order: async () => topicsResult };
+      from: (table: string) => {
+        const q: Record<string, unknown> = {
+          select: () => q,
+          eq: () => q,
+          order: async () => topicsResult,
+          // integrations: none, so the workspace runs on the platform key.
+          maybeSingle: async () => ({ data: table === "classification_workspace_state" ? stateRow : null, error: null }),
+        };
         return q;
       },
     }),
@@ -54,6 +62,7 @@ const WS = "11111111-1111-4111-8111-111111111111";
 const NOW = new Date("2026-09-15T15:00:00Z");
 
 function reset() {
+  stateRow = null;
   member = { ok: true, userId: "u1", role: "viewer" };
   tz = "America/Santiago";
   rpcCalls = [];
@@ -142,4 +151,18 @@ test("error al leer temas → mismo mensaje natural", async () => {
   const r = await loadInsights(WS, {}, NOW);
   assert.equal(r.ok, false);
   if (!r.ok) assert.equal(r.kind, "error");
+});
+
+test("REVIEW r4 L3: a key notice for a key the workspace no longer runs on is dropped", async () => {
+  const { createHash } = await import("node:crypto");
+  const idOf = (k: string) => `sha256:${createHash("sha256").update(k).digest("hex")}`;
+  process.env.OPENROUTER_API_KEY = "sk-new";
+  for (const [ranOn, want] of [["sk-old", null], ["sk-new", "platform_key"]] as const) {
+    reset();
+    rpcResults.get_insights = { data: { ...rawInsights, blocked: "platform_key" }, error: null };
+    stateRow = { key_id: idOf(ranOn) };
+    const r = await loadInsights(WS, { range: "7" }, NOW);
+    assert.equal(r.ok, true);
+    assert.equal(r.ok && r.view.analysis.blocked, want, `last turn on ${ranOn}`);
+  }
 });

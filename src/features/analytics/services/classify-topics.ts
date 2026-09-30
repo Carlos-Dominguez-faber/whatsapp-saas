@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import { createClient as createSbClient, type SupabaseClient } from "@supabase/supabase-js";
 import { isBodyTruncated, MAX_PROMPT_MESSAGES, type PromptMessage, type PromptTopic } from "../lib/classify-prompt";
 import {
@@ -8,7 +7,7 @@ import {
   type KeyScope,
   type LlmUsage,
 } from "./classifier";
-import { resolveOpenRouterKey } from "@/features/inbox/services/openrouter-key";
+import { openRouterKeyId, resolveOpenRouterKey } from "@/features/inbox/services/openrouter-key";
 
 /*
  * ════════════════════════════════════════════════════════════════════════════
@@ -249,7 +248,6 @@ export function newRunGuards(): RunGuards {
   return { workspaces: new Map(), keys: new Map(), lanes: new Map(), skipped: new Set(), platformDown: false };
 }
 
-const hashKey = (key: string) => `sha256:${createHash("sha256").update(key).digest("hex")}`;
 
 /** The outcome of one conversation, in the model's classes. */
 type Outcome =
@@ -387,14 +385,11 @@ async function workspaceKey(
   } catch {
     return { kind: "infra", code: "key_lookup_failed" };
   }
-  if (resolution.scope === null) {
+  const keyId = openRouterKeyId(resolution, workspaceId);
+  if (resolution.scope === null || keyId === null) {
     return remainingMs(deadline) <= 0 ? { kind: "no_time" } : { kind: "infra", code: "key_lookup_failed" };
   }
-  const wk: WorkspaceKey = resolution.key
-    ? { keyId: hashKey(resolution.key), scope: resolution.scope, key: resolution.key }
-    : resolution.scope === "own"
-      ? { keyId: `unreadable:${workspaceId}`, scope: "own", key: null }
-      : { keyId: "missing:platform", scope: "platform", key: null };
+  const wk: WorkspaceKey = { keyId, scope: resolution.scope, key: resolution.key || null };
 
   const { data, error } = await db
     .rpc("classification_key_gate", {

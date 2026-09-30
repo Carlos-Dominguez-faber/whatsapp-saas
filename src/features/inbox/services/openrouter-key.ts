@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { createClient as svcClient, type SupabaseClient } from "@supabase/supabase-js";
 import { decryptCredentials } from "@/shared/lib/integration-secrets";
 
@@ -18,6 +19,17 @@ export type OpenRouterKeyResolution =
   | { scope: "platform"; key: string }
   | { scope: "own"; key: null; problem: "unreadable" }
   | { scope: null; key: null; problem: "lookup_failed" };
+
+/**
+ * The id the classifier keeps a key's health under
+ * (classification_key_health): a hash of the key, never the key; for a key
+ * that can't be used, what it is. null when the lookup failed.
+ */
+export function openRouterKeyId(resolution: OpenRouterKeyResolution, workspaceId: string): string | null {
+  if (resolution.scope === null) return null;
+  if (resolution.key) return `sha256:${createHash("sha256").update(resolution.key).digest("hex")}`;
+  return resolution.scope === "own" ? `unreadable:${workspaceId}` : "missing:platform";
+}
 
 export async function resolveOpenRouterKey(
   workspaceId: string,

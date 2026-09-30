@@ -4,6 +4,7 @@ import { resolveWorkspaceTimezone } from "@/features/automations/lib/workspace-t
 import { parseInsightsParams, type InsightsRange } from "../lib/schemas";
 import { toInsightsView, type InsightsView, type RawInsights } from "../lib/insights-view";
 import type { InsightTopic } from "./topic-actions";
+import { openRouterKeyId, resolveOpenRouterKey } from "@/features/inbox/services/openrouter-key";
 
 export type LoadInsightsResult =
   | {
@@ -22,6 +23,27 @@ const MSG_ERROR = "No se pudo cargar el análisis, intenta de nuevo en unos minu
 
 function svc() {
   return createSbClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!);
+}
+
+/**
+ * get_insights says a key (or the workspace's lane on it) is down for the key
+ * the workspace ran on at its last turn. If the workspace has another key
+ * since (it pasted a new one, or the agency rotated the platform's), that is
+ * stale until the next run reaches it: the new key hasn't failed. Only asked
+ * when the dashboard would show it; any doubt keeps the notice.
+ */
+async function keyChangedSince(db: ReturnType<typeof svc>, workspaceId: string): Promise<boolean> {
+  try {
+    const [current, state] = await Promise.all([
+      resolveOpenRouterKey(workspaceId, db),
+      db.from("classification_workspace_state").select("key_id").eq("workspace_id", workspaceId).maybeSingle(),
+    ]);
+    const now = openRouterKeyId(current, workspaceId);
+    const then = (state.data as { key_id?: string | null } | null)?.key_id ?? null;
+    return now !== null && then !== null && !state.error && now !== then;
+  } catch {
+    return false;
+  }
 }
 
 export async function loadInsights(
@@ -72,9 +94,17 @@ export async function loadInsights(
     return { ok: false, kind: "error", message: MSG_ERROR };
   }
 
+  const raw = insights.data as RawInsights;
+  if (
+    (raw.blocked === "key" || raw.blocked === "platform_key" || raw.blocked === "workspace") &&
+    (await keyChangedSince(db, workspaceId))
+  ) {
+    raw.blocked = null;
+  }
+
   return {
     ok: true,
-    view: toInsightsView(insights.data as RawInsights, tz, now, range),
+    view: toInsightsView(raw, tz, now, range),
     range,
     availableTags: ((tags.data ?? []) as Array<{ tag: string }>).map((t) => t.tag),
     topics: (topics.data ?? []) as InsightTopic[],
