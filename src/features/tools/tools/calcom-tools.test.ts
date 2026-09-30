@@ -266,7 +266,12 @@ test("schedule: claims, books at the confirmed instant in the business zone, and
   // The claim becomes the booking's row.
   const link = localWrites(fake.calls).find((c) => c.method === "PATCH")!;
   assert.ok(link.url.includes("id=eq.claim_1"));
-  assert.deepEqual(link.body, { calcom_booking_uid: "new_1", scheduled_at: CONFIRMED_UTC, meta: {} });
+  assert.deepEqual(link.body, {
+    calcom_booking_uid: "new_1",
+    scheduled_at: CONFIRMED_UTC,
+    status: "booked",
+    meta: {},
+  });
 });
 
 test("schedule: a time copied from another zone is refused before anything is claimed", async () => {

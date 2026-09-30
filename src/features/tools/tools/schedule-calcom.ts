@@ -441,8 +441,11 @@ async function run(args: Args, ctx: ToolContext, opts?: ToolRunOptions): Promise
     };
   }
 
-  // The claim becomes the booking's cache row. A local failure can't undo
-  // the booking: it's surfaced, and the answer is still success.
+  // The claim becomes the booking's cache row. `status` too: a claim that
+  // expired while this call was slow is live again (or, if another call took
+  // the slot meanwhile, the unique index refuses it and a person is told). A
+  // local failure can't undo the booking: it's surfaced, and the answer is
+  // still success.
   let persistError: string | null = null;
   for (let attempt = 0; attempt < 3; attempt++) {
     const { data: updated, error } = await supabase
@@ -450,6 +453,7 @@ async function run(args: Args, ctx: ToolContext, opts?: ToolRunOptions): Promise
       .update({
         calcom_booking_uid: booking.uid,
         scheduled_at: new Date(booking.startMs).toISOString(),
+        status: "booked",
         meta: {},
       })
       .eq("id", claimId)
@@ -460,6 +464,8 @@ async function run(args: Args, ctx: ToolContext, opts?: ToolRunOptions): Promise
       break;
     }
     persistError = error?.message ?? "claim row gone";
+    // Another claim holds the slot now: retrying won't change that.
+    if (error?.code === "23505") break;
     if (attempt < 2) await new Promise((r) => setTimeout(r, 200 * (attempt + 1)));
   }
   if (persistError) {
