@@ -12,7 +12,7 @@ async function run(_args: Args, ctx: ToolContext): Promise<ToolResult> {
   const { getCalComConfig } = await import("../../inbox/services/calcom-client.ts");
   const { getBusinessInfo } = await import("../../inbox/services/business-info.ts");
   const { workspaceSchedulingTimeZone } = await import("../../inbox/services/scheduling-timezone.ts");
-  const { listUpcomingCalComBookings } = await import("../lib/calcom-appointment.ts");
+  const { hasOpenCalComClaim, listUpcomingCalComBookings } = await import("../lib/calcom-appointment.ts");
 
   const cfg = await getCalComConfig(ctx.workspaceId);
   if (!cfg) {
@@ -29,11 +29,18 @@ async function run(_args: Args, ctx: ToolContext): Promise<ToolResult> {
     process.env.SUPABASE_SERVICE_ROLE_KEY!,
   );
   try {
-    const { bookings, unreadable, more } = await listUpcomingCalComBookings({
+    const lookup = {
       supabase,
       apiKey: cfg.apiKey,
       workspaceId: ctx.workspaceId,
       contactId: ctx.contactId,
+    };
+    const { bookings, unreadable, more } = await listUpcomingCalComBookings(lookup);
+    // A booking being made, or one that may exist in Cal.com without its uid
+    // here: not "no appointments". A failed read counts as one.
+    const openClaim = await hasOpenCalComClaim(lookup).catch((err) => {
+      console.error("[list_calcom_appointments] open claims lookup failed:", err);
+      return true;
     });
     const appointments = bookings.map((b) => ({
       datetime_iso: formatWithOffset(b.startMs, zone),
@@ -43,8 +50,13 @@ async function run(_args: Args, ctx: ToolContext): Promise<ToolResult> {
     const notes: string[] = [];
     if (appointments.length > 0) {
       notes.push("Para cancelar o reagendar, copia datetime_iso exactamente como aparece.");
-    } else if (unreadable === 0 && !more) {
+    } else if (unreadable === 0 && !more && !openClaim) {
       notes.push("El cliente no tiene citas próximas agendadas por WhatsApp.");
+    }
+    if (openClaim) {
+      notes.push(
+        "Hay una reserva de Cal.com de este cliente sin confirmar: una persona del equipo la está revisando. No le digas que no tiene citas.",
+      );
     }
     if (appointments.some((a) => "pendiente_de_confirmar" in a)) {
       notes.push("Las marcadas pendiente_de_confirmar son solicitudes que el negocio todavía no confirma.");

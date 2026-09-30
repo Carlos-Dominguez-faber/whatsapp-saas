@@ -376,6 +376,26 @@ export async function listUpcomingCalComBookings(opts: CalComLookup): Promise<{
 }
 
 /**
+ * Whether the contact has a live Cal.com claim with no booking uid from a
+ * day ago on: a booking being made, or one that may exist in Cal.com
+ * without its uid here. Throws when that can't be known.
+ */
+export async function hasOpenCalComClaim(opts: CalComLookup): Promise<boolean> {
+  const { data, error } = await opts.supabase
+    .from("appointments")
+    .select("id")
+    .eq("workspace_id", opts.workspaceId)
+    .eq("contact_id", opts.contactId)
+    .not("calcom_event_type_id", "is", null)
+    .is("calcom_booking_uid", null)
+    .in("status", LOCAL_ACTIVE_STATUSES)
+    .gte("scheduled_at", new Date(Date.now() - DAY_MS).toISOString())
+    .limit(1);
+  if (error) throw new Error(`open claims lookup failed: ${error.message}`);
+  return ((data as unknown[] | null) ?? []).length > 0;
+}
+
+/**
  * For a "not found": the contact's only upcoming booking, so the model can
  * ask whether that's the one; else where to look.
  */

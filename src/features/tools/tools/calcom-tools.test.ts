@@ -56,6 +56,7 @@ function filterRows(url: string, rows: LocalRow[]) {
     if (statusIn && !statusIn.includes(row.status)) return false;
     if (uid !== undefined && row.calcom_booking_uid !== uid) return false;
     if (uidFilter === "not.is.null" && row.calcom_booking_uid === null) return false;
+    if (uidFilter === "is.null" && row.calcom_booking_uid !== null) return false;
     if (contact !== undefined && (row.contact_id ?? "contact_1") !== contact) return false;
     const at = Date.parse(row.scheduled_at);
     return bounds.every((b) => {
@@ -1053,4 +1054,21 @@ test("a #15 claim with no marker is never freed on a 'none': its email's case is
   assert.deepEqual(r.output, { needs_human: true });
   assert.equal(calPosts(fake.calls).length, 0);
   assert.equal(localWrites(fake.calls).filter((c) => c.url.includes("id=eq.row_x")).length, 0);
+});
+
+test("the list says a booking is unconfirmed when a claim without uid is open, never 'no appointments'", async () => {
+  const claim = { ...cached("x", CONFIRMED_UTC), calcom_booking_uid: null };
+  const f = calFetch({ local: [claim] });
+  const out = (await withFetch(f, () => listCalComAppointmentsTool.run({}, ctx))).output as {
+    appointments: unknown[];
+    note: string;
+  };
+  assert.deepEqual(out.appointments, []);
+  assert.doesNotMatch(out.note, /El cliente no tiene citas próximas/);
+  assert.match(out.note, /sin confirmar/);
+
+  // Another contact's claim doesn't count.
+  const other = calFetch({ local: [{ ...claim, contact_id: "contact_2" }] });
+  const note = ((await withFetch(other, () => listCalComAppointmentsTool.run({}, ctx))).output as { note: string }).note;
+  assert.match(note, /no tiene citas próximas/);
 });
