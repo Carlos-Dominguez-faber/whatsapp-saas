@@ -32,6 +32,7 @@ export const BUDGET_EVENT_TYPES = [
   "llm_usage",
   "template_generate",
   "agent_test_chat",
+  "client_test_chat",
 ] as const;
 
 export type CostPolicy = "allow" | "degrade" | "cut";

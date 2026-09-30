@@ -32,7 +32,7 @@ function SubmitButton() {
   );
 }
 
-export function LoginForm({ message }: { message?: string }) {
+export function LoginForm({ message, next }: { message?: string; next?: string }) {
   const [state, formAction] = useActionState(login, null);
 
   return (
@@ -56,6 +56,8 @@ export function LoginForm({ message }: { message?: string }) {
       )}
 
       <form action={formAction} className="space-y-4">
+        {/* The server only honors /probar here (postLoginPath). */}
+        {next && <input type="hidden" name="next" value={next} />}
         <div className="space-y-2">
           <Label htmlFor="email">Email</Label>
           <Input

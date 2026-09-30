@@ -5,6 +5,7 @@ import { headers } from "next/headers";
 import { z } from "zod";
 import { createClient } from "@/lib/supabase/server";
 import { isSignupOpen, markAsSuperAdmin } from "./signup-gate";
+import { postLoginPath } from "../lib/post-login";
 
 // Map Supabase auth error messages (English) to Spanish for the UI.
 // Falls back to the original message when there is no known translation.
@@ -54,7 +55,7 @@ export async function login(
     return { error: localizeAuthError(error.message) };
   }
 
-  redirect("/inbox");
+  redirect(postLoginPath(formData.get("next")));
 }
 
 export async function signup(

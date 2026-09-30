@@ -1,5 +1,6 @@
 import { createServerClient } from "@supabase/ssr";
 import { NextResponse, type NextRequest } from "next/server";
+import { postLoginPath, PROBAR_PATH } from "@/features/auth/lib/post-login";
 
 export async function middleware(request: NextRequest) {
   let supabaseResponse = NextResponse.next({ request });
@@ -52,6 +53,8 @@ export async function middleware(request: NextRequest) {
   if (!user && !isPublicRoute) {
     const url = request.nextUrl.clone();
     url.pathname = "/login";
+    // A shared /probar link comes back to /probar after signing in.
+    if (pathname === PROBAR_PATH) url.search = `?next=${PROBAR_PATH}`;
     return NextResponse.redirect(url);
   }
 
@@ -64,7 +67,8 @@ export async function middleware(request: NextRequest) {
       pathname === "/forgot-password")
   ) {
     const url = request.nextUrl.clone();
-    url.pathname = "/inbox";
+    url.pathname = postLoginPath(request.nextUrl.searchParams.get("next"));
+    if (url.pathname === PROBAR_PATH) url.search = "";
     return NextResponse.redirect(url);
   }
 

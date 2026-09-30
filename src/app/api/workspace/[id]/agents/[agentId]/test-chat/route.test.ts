@@ -111,6 +111,10 @@ mock.module("@/features/inbox/services/llm-call-guard.ts", {
       calls.push("guard");
       return guardResult;
     },
+    guardClientTestChat: async () => {
+      calls.push("client-guard");
+      return guardResult;
+    },
   },
 });
 const recorded: Array<Record<string, unknown>> = [];

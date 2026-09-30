@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useState, useRef, useEffect } from "react";
 import { Send, Loader2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -93,6 +94,14 @@ export function TestChatPanel({
         <span className="font-medium text-foreground">{agent.name}</span> con el
         modelo <span className="font-medium text-foreground">{modelLabel}</span>
         . Usa el prompt publicado. No se envía nada por WhatsApp.
+      </p>
+      <p className="text-xs text-muted-foreground">
+        ¿Quieres que alguien más lo pruebe? Compártele{" "}
+        <Link href="/probar" className="underline underline-offset-2">
+          /probar
+        </Link>
+        : una pantalla con solo el chat, donde corren únicamente las herramientas de
+        consulta. No aísla datos: para gente de fuera, usa un espacio de demostración.
       </p>
       {isAdmin ? (
         <p className="text-xs text-warning">
