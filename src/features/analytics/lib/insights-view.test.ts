@@ -214,3 +214,26 @@ test("a topic created after the range has no share at all", () => {
   assert.equal(view.topics[0].sharePct, null);
   assert.equal(view.topics[0].notCovered, true);
 });
+
+test("REVIEW: every week of the period shows, 0 when nothing was detected, partial ones marked", () => {
+  const v = toInsightsView(
+    raw({ trend: [{ topic_id: "t-price", week: "2026-08-31", conversations: 3 }] }),
+    TZ,
+    NOW,
+    { fromDate: "2026-08-27", toDate: "2026-09-14", prevFromIso: "2026-08-08T04:00:00Z", },
+  );
+  // Thu 27 Aug .. Mon 14 Sep: weeks of 24 Aug, 31 Aug, 7 Sep and 14 Sep.
+  assert.deepEqual(v.weeks, ["2026-08-24", "2026-08-31", "2026-09-07", "2026-09-14"]);
+  assert.deepEqual(v.partialWeeks.sort(), ["2026-08-24", "2026-09-14"]);
+  assert.equal(v.trend["t-price"]["2026-09-07"], undefined, "the table shows ?? 0 for a week without detections");
+});
+
+test("REVIEW: no change vs. a previous period before the first customer message", () => {
+  const period = { fromDate: "2026-09-01", toDate: "2026-09-14", prevFromIso: "2026-08-18T04:00:00Z" };
+  const before = toInsightsView(raw({ data_from: "2026-08-25T15:00:00Z" }), TZ, NOW, period);
+  assert.equal(before.universeChangePct, null, "the previous period started before any data");
+  assert.equal(before.bookedDeltaPts, null);
+  assert.equal(before.handedOffDeltaPts, null);
+  const after = toInsightsView(raw({ data_from: "2026-07-01T15:00:00Z" }), TZ, NOW, period);
+  assert.equal(after.universeChangePct, 25);
+});

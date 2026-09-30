@@ -195,3 +195,10 @@ test("archivar: pone status archived filtrando workspace y activo", async () => 
   assert.deepEqual(ops[0].filters, [["id", TOPIC], ["workspace_id", WS], ["status", "active"]]);
   assert.deepEqual(revalidated, ["/analisis"]);
 });
+
+test("REVIEW: a topic with the name of an active one (any case or accents) → clear message", async () => {
+  reset();
+  nextResult = { data: null, error: { code: "P0001", message: "insight_topics_duplicate" } };
+  const r = await createTopicAction(WS, { name: "Precío", description: "x" });
+  assert.deepEqual(r, { error: "Ya tienes un tema activo con ese nombre (sin contar mayúsculas ni acentos)." });
+});

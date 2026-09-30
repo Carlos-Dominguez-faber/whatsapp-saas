@@ -78,6 +78,8 @@ test("viewer carga el dashboard: exige viewer, pasa rango y zona a la RPC, no pu
     p_to: "2026-09-15T03:00:00.000Z",
     p_tags: ["vip"],
     p_tz: "America/Santiago",
+    // Seven calendar days earlier, before Santiago's DST change (UTC-4 then).
+    p_prev_from: "2026-09-01T04:00:00.000Z",
   });
   assert.equal(r.view.bookedPct, 30);
   assert.deepEqual(r.availableTags, ["frio", "vip"]);

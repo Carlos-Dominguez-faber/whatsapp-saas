@@ -15,6 +15,9 @@ export function TrendTable({ view }: { view: InsightsView }) {
               {view.weeks.map((w) => (
                 <th key={w} scope="col" className="p-3 whitespace-nowrap">
                   Semana del {new Date(`${w}T12:00:00Z`).toLocaleDateString("es-CL", { day: "numeric", month: "short" })}
+                  {view.partialWeeks.includes(w) && (
+                    <span className="block text-xs font-normal text-muted-foreground">parcial</span>
+                  )}
                 </th>
               ))}
             </tr>

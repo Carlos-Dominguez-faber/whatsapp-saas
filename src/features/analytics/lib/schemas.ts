@@ -33,6 +33,12 @@ export interface InsightsRange {
   fromIso: string;
   /** Exclusivo: medianoche del día siguiente a toDate en la zona. */
   toIso: string;
+  /**
+   * Start of the previous period: as many calendar days before fromDate, at
+   * midnight in the zone. Subtracting the range as a duration drifts an hour
+   * when it crosses a DST change.
+   */
+  prevFromIso: string;
   tags: string[];
 }
 
@@ -119,6 +125,10 @@ export function parseInsightsParams(
 
   const range = zonedDayRange(fromDate, toDate, tz);
   if (!range) return { ok: false, error: "Las fechas del filtro no son válidas." };
+  const days = (Date.parse(`${toDate}T00:00:00Z`) - Date.parse(`${fromDate}T00:00:00Z`)) / DAY_MS + 1;
+  const prevFromDate = addDays(fromDate, -days);
+  const prev = zonedDayRange(prevFromDate, prevFromDate, tz);
+  if (!prev) return { ok: false, error: "Las fechas del filtro no son válidas." };
 
   return {
     ok: true,
@@ -128,6 +138,7 @@ export function parseInsightsParams(
       toDate,
       fromIso: new Date(range.startMs).toISOString(),
       toIso: new Date(range.endMs + 1).toISOString(),
+      prevFromIso: new Date(prev.startMs).toISOString(),
       tags,
     },
   };

@@ -67,9 +67,13 @@ CREATE INDEX IF NOT EXISTS idx_insight_topics_ws_status
 -- the table without covered_from. Its topics get the same value they would
 -- have had here: created_at, or the backfill window when it finished.
 ALTER TABLE public.insight_topics ADD COLUMN IF NOT EXISTS covered_from TIMESTAMPTZ;
+-- #13's backfill covered from its window's floor when it finished, which
+-- rose with the clock: GREATEST(created_at, finish) - 30 days. The finish
+-- isn't stored; the topic's updated_at is at or after it (the closing update
+-- set it), so it gives a floor that is never earlier than the truth.
 UPDATE public.insight_topics
    SET covered_from = CASE WHEN backfill_status = 'done'
-                           THEN created_at - INTERVAL '30 days'
+                           THEN LEAST(created_at, GREATEST(created_at, updated_at) - INTERVAL '30 days')
                            ELSE created_at END
  WHERE covered_from IS NULL;
 ALTER TABLE public.insight_topics ALTER COLUMN covered_from SET DEFAULT now();
@@ -80,8 +84,23 @@ CREATE TRIGGER trg_insight_topics_updated_at
   BEFORE UPDATE ON public.insight_topics
   FOR EACH ROW EXECUTE FUNCTION public.update_updated_at();
 
--- Máx. 10 temas activos y un archivado no se reactiva. El advisory lock por workspace
--- serializa dos altas concurrentes: sin él, ambas cuentan 9 y quedan 11.
+-- The name two topics can't share: case, accents and repeated spaces aside
+-- ("Precio", "precio" and "Precío" are one topic). ñ stays: año is not ano.
+CREATE OR REPLACE FUNCTION public.insight_topic_key(p_name TEXT)
+RETURNS TEXT
+LANGUAGE sql
+IMMUTABLE
+SET search_path = ''
+AS $$
+  SELECT lower(translate(btrim(regexp_replace(p_name, '\s+', ' ', 'g')),
+                         'ÁÉÍÓÚÜÀÈÌÒÙáéíóúüàèìòù', 'AEIOUUAEIOUaeiouuaeiou'));
+$$;
+
+-- Máx. 10 temas activos, sin dos activos con el mismo nombre (insight_topic_key),
+-- y un archivado no se reactiva. El advisory lock por workspace serializa dos
+-- altas concurrentes: sin él, ambas cuentan 9 y quedan 11, o ambas ven el nombre
+-- libre. Duplicates an install already has (from #13) stay: only new writes are
+-- checked, so the upgrade never aborts on them.
 CREATE OR REPLACE FUNCTION public.enforce_insight_topics_rules()
 RETURNS TRIGGER
 LANGUAGE plpgsql
@@ -94,21 +113,36 @@ BEGIN
     RAISE EXCEPTION 'insight_topics_no_reactivate' USING ERRCODE = 'P0001';
   END IF;
 
-  -- Un tema que YA estaba activo se salta el conteo, salvo que cambie
-  -- de workspace: mover un activo de A a B suma uno a B sin pasar por el tope.
+  -- Nothing to check for an archived topic, nor for an active one that keeps
+  -- its workspace and its name (the backfill's cursor updates, for one).
   IF NEW.status <> 'active'
-     OR (TG_OP = 'UPDATE' AND OLD.status = 'active' AND NEW.workspace_id = OLD.workspace_id) THEN
+     OR (TG_OP = 'UPDATE' AND OLD.status = 'active' AND NEW.workspace_id = OLD.workspace_id
+         AND public.insight_topic_key(NEW.name) = public.insight_topic_key(OLD.name)) THEN
     RETURN NEW;
   END IF;
 
   PERFORM pg_advisory_xact_lock(hashtextextended('insight_topics:' || NEW.workspace_id::text, 0));
 
-  SELECT count(*) INTO v_active
-    FROM public.insight_topics
-   WHERE workspace_id = NEW.workspace_id AND status = 'active';
+  IF EXISTS (
+    SELECT 1 FROM public.insight_topics t
+     WHERE t.workspace_id = NEW.workspace_id
+       AND t.status = 'active'
+       AND t.id <> NEW.id
+       AND public.insight_topic_key(t.name) = public.insight_topic_key(NEW.name)
+  ) THEN
+    RAISE EXCEPTION 'insight_topics_duplicate' USING ERRCODE = 'P0001';
+  END IF;
 
-  IF v_active >= 10 THEN
-    RAISE EXCEPTION 'insight_topics_cap' USING ERRCODE = 'P0001';
+  -- Un tema que YA estaba activo se salta el conteo, salvo que cambie
+  -- de workspace: mover un activo de A a B suma uno a B sin pasar por el tope.
+  IF TG_OP = 'INSERT' OR OLD.status <> 'active' OR NEW.workspace_id <> OLD.workspace_id THEN
+    SELECT count(*) INTO v_active
+      FROM public.insight_topics
+     WHERE workspace_id = NEW.workspace_id AND status = 'active';
+
+    IF v_active >= 10 THEN
+      RAISE EXCEPTION 'insight_topics_cap' USING ERRCODE = 'P0001';
+    END IF;
   END IF;
 
   RETURN NEW;

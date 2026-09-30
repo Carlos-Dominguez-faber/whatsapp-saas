@@ -97,7 +97,10 @@ export interface InsightsView {
   handedOffDeltaPts: number | null;
   tagPcts: Record<string, number | null>;
   topics: TopicView[];
+  /** Every week of the period (Mondays), with or without detections. */
   weeks: string[];
+  /** Weeks the period only covers part of. */
+  partialWeeks: string[];
   trend: Record<string, Record<string, number>>;
   partialConversations: number;
   analysis: AnalysisView;
@@ -169,9 +172,47 @@ function deltaPts(current: number | null, previous: number | null): number | nul
   return current !== null && previous !== null ? round1(current - previous) : null;
 }
 
-export function toInsightsView(raw: RawInsights, tz: string, now: Date = new Date()): InsightsView {
+const DAY_MS = 86_400_000;
+
+/** Monday (YYYY-MM-DD) of the week a YYYY-MM-DD day falls in. */
+function mondayOf(day: string): string {
+  const d = new Date(`${day}T00:00:00Z`);
+  return new Date(d.getTime() - ((d.getUTCDay() + 6) % 7) * DAY_MS).toISOString().slice(0, 10);
+}
+
+/** The period's weeks, and which of them it covers only in part. */
+function periodWeeks(fromDate: string, toDate: string): { weeks: string[]; partial: string[] } {
+  const weeks: string[] = [];
+  const last = mondayOf(toDate);
+  for (let w = mondayOf(fromDate); w <= last; w = new Date(Date.parse(`${w}T00:00:00Z`) + 7 * DAY_MS).toISOString().slice(0, 10)) {
+    weeks.push(w);
+  }
+  const partial = new Set<string>();
+  if (fromDate !== weeks[0]) partial.add(weeks[0]);
+  const sunday = new Date(Date.parse(`${last}T00:00:00Z`) + 6 * DAY_MS).toISOString().slice(0, 10);
+  if (toDate !== sunday) partial.add(last);
+  return { weeks, partial: [...partial] };
+}
+
+export interface InsightsPeriod {
+  fromDate: string;
+  toDate: string;
+  prevFromIso: string;
+}
+
+export function toInsightsView(
+  raw: RawInsights,
+  tz: string,
+  now: Date = new Date(),
+  period?: InsightsPeriod,
+): InsightsView {
   const universe = Number(raw.base.conversations);
-  const universePrev = Number(raw.prev_conversations);
+  // The summary cards compare with the previous period only if the workspace
+  // already had customers writing when it started; otherwise the "change" is
+  // the install date ("+200 %").
+  const comparable =
+    !period || raw.data_from === undefined || (raw.data_from !== null && Date.parse(raw.data_from) <= Date.parse(period.prevFromIso));
+  const universePrev = comparable ? Number(raw.prev_conversations) : 0;
   const bookedPct = pct(Number(raw.base.booked), universe);
   const handedOffPct = pct(Number(raw.base.handed_off), universe);
 
@@ -226,7 +267,9 @@ export function toInsightsView(raw: RawInsights, tz: string, now: Date = new Dat
     handedOffDeltaPts: deltaPts(handedOffPct, pct(Number(raw.prev_handed_off), universePrev)),
     tagPcts: tagPcts(raw.base.tags, universe),
     topics,
-    weeks: [...new Set(raw.trend.map((r) => r.week))].sort(),
+    ...(period
+      ? (({ weeks, partial }) => ({ weeks, partialWeeks: partial }))(periodWeeks(period.fromDate, period.toDate))
+      : { weeks: [...new Set(raw.trend.map((r) => r.week))].sort(), partialWeeks: [] }),
     trend,
     // Un payload sin la clave no inventa un aviso.
     partialConversations: Number(raw.partial_conversations) || 0,

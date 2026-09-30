@@ -55,6 +55,7 @@ export async function loadInsights(
       p_to: range.toIso,
       p_tags: range.tags,
       p_tz: tz,
+      p_prev_from: range.prevFromIso,
     }),
     db.rpc("get_workspace_tags", { p_workspace_id: workspaceId }),
     db
@@ -73,7 +74,7 @@ export async function loadInsights(
 
   return {
     ok: true,
-    view: toInsightsView(insights.data as RawInsights, tz, now),
+    view: toInsightsView(insights.data as RawInsights, tz, now, range),
     range,
     availableTags: ((tags.data ?? []) as Array<{ tag: string }>).map((t) => t.tag),
     topics: (topics.data ?? []) as InsightTopic[],

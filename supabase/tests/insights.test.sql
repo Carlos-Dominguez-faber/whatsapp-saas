@@ -9,7 +9,7 @@ BEGIN;
 CREATE EXTENSION IF NOT EXISTS pgtap WITH SCHEMA extensions;
 SET search_path = public, extensions;
 
-SELECT plan(43);
+SELECT plan(45);
 
 -- ── Privileges ───────────────────────────────────────────────────────────────
 SELECT ok(NOT has_function_privilege('anon',
@@ -293,6 +293,17 @@ CREATE TEMP TABLE fair AS
 SELECT is((SELECT array_agg(conversation_id ORDER BY conversation_id) FROM fair),
   ARRAY['e3000000-0000-4000-8000-0000000000a6'::uuid, 'e3000000-0000-4000-8000-0000000000a7'::uuid],
   'workspaces take turns, and each one''s oldest waiting customer goes first');
+
+-- ── One active topic per name, case and accents aside (review) ──────────────
+SELECT throws_ok(
+  $$INSERT INTO public.insight_topics (workspace_id, name, description)
+    VALUES ('e0000000-0000-4000-8000-000000000001', '  PRECÍO ', 'x')$$,
+  'P0001', 'insight_topics_duplicate', '"PRECÍO" is the active "Precio" again');
+UPDATE public.insight_topics SET status = 'archived' WHERE id = 'e0000000-0000-4000-8000-0000000000f4';
+SELECT lives_ok(
+  $$INSERT INTO public.insight_topics (workspace_id, name, description)
+    VALUES ('e0000000-0000-4000-8000-000000000001', 'viejo', 'x')$$,
+  'an archived topic does not hold its name');
 
 SELECT * FROM finish();
 ROLLBACK;

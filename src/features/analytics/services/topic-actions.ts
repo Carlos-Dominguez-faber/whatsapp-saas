@@ -23,6 +23,7 @@ const TOPIC_COLUMNS = "id, name, description, status, backfill_status, created_a
 const MSG_FORBIDDEN = "No tienes permiso para gestionar temas en este espacio.";
 const MSG_SESSION = "Tu sesión expiró. Vuelve a iniciar sesión.";
 const MSG_CAP = "Llegaste al máximo de 10 temas activos. Archiva uno para crear otro.";
+const MSG_DUPLICATE = "Ya tienes un tema activo con ese nombre (sin contar mayúsculas ni acentos).";
 const MSG_NOT_FOUND = "Ese tema no existe o ya está archivado.";
 const MSG_GENERIC = "No se pudo guardar el tema. Intenta de nuevo en unos minutos.";
 const MSG_INVALID = "Revisa los datos del tema.";
@@ -53,6 +54,7 @@ function parseInput(input: unknown) {
 
 function dbError(op: string, error: { code?: string; message: string }): { error: string } {
   if (error.message.includes("insight_topics_cap")) return { error: MSG_CAP };
+  if (error.message.includes("insight_topics_duplicate")) return { error: MSG_DUPLICATE };
   console.error(`[topic-actions] ${op} failed`, error.code ?? "unknown");
   return { error: MSG_GENERIC };
 }

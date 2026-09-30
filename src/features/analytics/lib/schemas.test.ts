@@ -168,3 +168,13 @@ test("EvidenceInputSchema: rechaza topicId no uuid, página con letras, outcome 
   );
   assert.equal(EvidenceInputSchema.safeParse({ ...validEvidence, fromIso: "ayer" }).success, false);
 });
+
+test("REVIEW: the previous period starts the same number of calendar days before, across DST", () => {
+  // Santiago moves its clocks on 6 Sep 2026 (UTC-4 → UTC-3).
+  const r = parseInsightsParams({ from: "2026-09-10", to: "2026-09-16" }, "America/Santiago", new Date("2026-09-20T15:00:00Z"));
+  assert.ok(r.ok);
+  if (!r.ok) return;
+  // 7 days before 10 Sep is 3 Sep, at midnight in Santiago (still UTC-4 then).
+  assert.equal(r.value.prevFromIso, "2026-09-03T04:00:00.000Z");
+  assert.equal(r.value.fromIso, "2026-09-10T03:00:00.000Z");
+});
