@@ -8,7 +8,7 @@ BEGIN;
 CREATE EXTENSION IF NOT EXISTS pgtap WITH SCHEMA extensions;
 SET search_path = public, extensions;
 
-SELECT plan(22);
+SELECT plan(26);
 
 -- ── privileges: service role only ───────────────────────────────────────────
 SELECT ok(NOT has_function_privilege('anon',
@@ -155,6 +155,30 @@ $$, 'a HighLevel appointment at a Cal.com-claimed instant is untouched by the cl
 SELECT throws_ok($$
   SELECT * FROM public.claim_calcom_slot('c0000000-0000-4000-8000-000000000001', NULL, NULL, NULL, 7, 120)
 $$, 'P0001', NULL, 'a claim needs an instant');
+
+-- ── deleting contacts never trips the slot index (20261003000011) ─────────
+INSERT INTO public.contacts (id, workspace_id, phone) VALUES
+  ('c0000000-0000-4000-8000-0000000000d1', 'c0000000-0000-4000-8000-000000000001', '+15550001101'),
+  ('c0000000-0000-4000-8000-0000000000d2', 'c0000000-0000-4000-8000-000000000001', '+15550001102'),
+  ('c0000000-0000-4000-8000-0000000000d3', 'c0000000-0000-4000-8000-000000000001', '+15550001103'),
+  ('c0000000-0000-4000-8000-0000000000d4', 'c0000000-0000-4000-8000-000000000001', '+15550001104');
+INSERT INTO public.appointments (workspace_id, contact_id, scheduled_at, status, calcom_event_type_id, calcom_booking_uid, meta) VALUES
+  ('c0000000-0000-4000-8000-000000000001', 'c0000000-0000-4000-8000-0000000000d1', '2030-08-01T16:00:00Z', 'booked', 7, 'bk_d1', '{}'),
+  ('c0000000-0000-4000-8000-000000000001', 'c0000000-0000-4000-8000-0000000000d2', '2030-08-01T16:00:00Z', 'booked', 7, 'bk_d2', '{}'),
+  ('c0000000-0000-4000-8000-000000000001', 'c0000000-0000-4000-8000-0000000000d3', '2030-08-01T16:00:00Z', 'booked', 7, NULL, '{"calcom_claim":"unknown"}'),
+  ('c0000000-0000-4000-8000-000000000001', 'c0000000-0000-4000-8000-0000000000d4', '2030-08-01T16:00:00Z', 'booked', 7, NULL, '{"calcom_claim":"sending"}');
+SELECT lives_ok($$
+  DELETE FROM public.contacts WHERE id IN ('c0000000-0000-4000-8000-0000000000d1', 'c0000000-0000-4000-8000-0000000000d2',
+                                           'c0000000-0000-4000-8000-0000000000d3', 'c0000000-0000-4000-8000-0000000000d4')
+$$, 'two contacts with live bookings (and two with open claims) at one instant can be deleted');
+SELECT is((SELECT count(*)::INT FROM public.appointments WHERE calcom_booking_uid IN ('bk_d1', 'bk_d2') AND contact_id IS NULL AND status = 'booked'),
+  2, 'their linked bookings stay, as history');
+SELECT is((SELECT string_agg(status || ':' || (meta->>'calcom_claim'), ',') FROM public.appointments
+            WHERE scheduled_at = '2030-08-01T16:00:00Z' AND calcom_booking_uid IS NULL),
+  'cancelled:contact_deleted,cancelled:contact_deleted', 'their open claims are closed');
+CREATE TEMP TABLE r13 AS SELECT * FROM public.claim_calcom_slot(
+  'c0000000-0000-4000-8000-000000000001', NULL, NULL, '2030-08-01T16:00:00Z', 7, 120);
+SELECT ok((SELECT claim_id IS NOT NULL FROM r13), 'the orphaned rows don''t take the playground''s place');
 
 SELECT * FROM finish();
 ROLLBACK;
