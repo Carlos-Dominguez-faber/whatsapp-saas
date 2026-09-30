@@ -22,6 +22,11 @@ export function TopicRanking({ view }: { view: InsightsView }) {
               {t.coveredFromLabel && (
                 <span className="block text-xs text-muted-foreground">desde el {t.coveredFromLabel}</span>
               )}
+              {t.analyzed < t.inCoverage && (
+                <span className="block text-xs text-muted-foreground">
+                  sobre {t.analyzed.toLocaleString("es-CL")} de {t.inCoverage.toLocaleString("es-CL")} analizadas
+                </span>
+              )}
             </span>
             <div
               className="h-3 rounded-full bg-muted"

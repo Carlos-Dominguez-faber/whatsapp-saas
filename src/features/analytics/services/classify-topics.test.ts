@@ -262,7 +262,7 @@ test("fase 1: reserva, clasifica, liquida con el consumo real y guarda con class
   assert.ok(queries > 0);
   assert.equal(abortSignals, queries, "alguna consulta salió sin abortSignal");
   // Reclama con lease.
-  assert.equal(callsTo("select_conversations_to_classify")[0].args.p_lease_seconds, 120);
+  assert.equal(callsTo("select_conversations_to_classify")[0].args.p_lease_seconds, 180);
 });
 
 test("el guardado declara la ventana que vio el LLM y los cuerpos recortados", async () => {
@@ -812,8 +812,8 @@ test("tema reclamado por otra corrida → se salta sin pedir lote y sigue con el
   assert.deepEqual(
     callsTo("claim_topic_backfill").map((c) => c.args),
     [
-      { p_topic_id: "t-ocupado", p_lease_seconds: 120 },
-      { p_topic_id: "t-libre", p_lease_seconds: 120 },
+      { p_topic_id: "t-ocupado", p_lease_seconds: 180 },
+      { p_topic_id: "t-libre", p_lease_seconds: 180 },
     ],
   );
   assert.ok(

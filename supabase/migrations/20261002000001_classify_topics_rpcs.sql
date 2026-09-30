@@ -54,49 +54,59 @@ DECLARE
   v_skip  UUID[]   := COALESCE(p_skip_workspaces, '{}');
   v_now   TIMESTAMPTZ := COALESCE(p_now, now());
 BEGIN
+  -- ORDER: fair and oldest first. Workspaces take turns (row_number per
+  -- workspace), and inside each the oldest customer message goes first. With
+  -- the newest first (as #13 did), whatever a busy day left over was pushed
+  -- back by every newer day and never read, and one busy workspace could
+  -- take a whole run.
+  --
   -- Paso 1: sembrar la fila de estado de las candidatas. El lease vive en
   -- conversation_classification, y FOR UPDATE necesita una fila que bloquear.
   -- Va en su propio statement: dentro de un solo statement la CTE del UPDATE
   -- no vería las filas insertadas por la CTE del INSERT (mismo snapshot).
   -- CRÍTICA-1: el LIMIT se gasta SOLO en conversaciones sin fila. Sin el
-  -- NOT EXISTS, las v_limit más recientes ya sembradas se volvían a elegir en
-  -- cada corrida, el ON CONFLICT las descartaba y la v_limit+1 nunca entraba.
-  -- Las ya sembradas (reintentos, cuarentena liberada, mensajes nuevos) no
-  -- dependen de este paso: el paso 2 las encuentra leyendo la tabla de estado.
+  -- NOT EXISTS, las más recientes ya sembradas se volvían a elegir en cada
+  -- corrida y el resto nunca entraba. Siembra bastante más de lo que reclama,
+  -- para que el orden justo del paso 2 vea a todos los workspaces.
   INSERT INTO public.conversation_classification (conversation_id, workspace_id, attempts, updated_at)
-  SELECT c.id, c.workspace_id, 0, now()
-    FROM public.conversations c
-    CROSS JOIN LATERAL (
-      SELECT m.created_at AS at
-        FROM public.messages m
-       WHERE m.conversation_id = c.id
-         AND m.direction = 'in'
-       ORDER BY m.created_at DESC
-       LIMIT 1
-    ) li
-   WHERE c.last_message_at >= v_now - INTERVAL '30 days'
-     AND li.at <  v_now - INTERVAL '1 hour'
-     AND li.at >= v_now - INTERVAL '30 days'
-     AND NOT (c.workspace_id = ANY (v_skip))
-     AND NOT EXISTS (SELECT 1 FROM public.conversation_classification cc
-                      WHERE cc.conversation_id = c.id)
-     AND EXISTS (SELECT 1 FROM public.insight_topics t
-                  WHERE t.workspace_id = c.workspace_id AND t.status = 'active')
-   ORDER BY li.at DESC, c.id DESC
-   LIMIT v_limit
+  SELECT x.id, x.workspace_id, 0, now()
+    FROM (
+      SELECT c.id, c.workspace_id, li.at,
+             row_number() OVER (PARTITION BY c.workspace_id ORDER BY li.at, c.id) AS rn
+        FROM public.conversations c
+        CROSS JOIN LATERAL (
+          SELECT m.created_at AS at
+            FROM public.messages m
+           WHERE m.conversation_id = c.id
+             AND m.direction = 'in'
+           ORDER BY m.created_at DESC
+           LIMIT 1
+        ) li
+       WHERE c.last_message_at >= v_now - INTERVAL '30 days'
+         AND li.at <  v_now - INTERVAL '1 hour'
+         AND li.at >= v_now - INTERVAL '30 days'
+         AND NOT (c.workspace_id = ANY (v_skip))
+         AND NOT EXISTS (SELECT 1 FROM public.conversation_classification cc
+                          WHERE cc.conversation_id = c.id)
+         AND EXISTS (SELECT 1 FROM public.insight_topics t
+                      WHERE t.workspace_id = c.workspace_id AND t.status = 'active')
+    ) x
+   ORDER BY x.rn, x.at, x.id
+   LIMIT 20 * v_limit
   ON CONFLICT (conversation_id) DO NOTHING;
 
   -- Paso 2: reclamar. SKIP LOCKED deja que dos corridas simultáneas se
-  -- repartan el trabajo en vez de pelearlo; claimed_until hace que la segunda
-  -- ni siquiera vea lo que la primera está procesando.
+  -- repartan el trabajo en vez de pelearlo; claimed_until (el lease, y el
+  -- backoff de un fallo) hace que la segunda ni siquiera vea lo tomado.
   -- La elegibilidad de abajo (cortes de 1 h y 30 días sobre el último
-  -- ENTRANTE, classified_until y liberación de cuarentena) está DUPLICADA en
-  -- `oldest_pending` de get_insights (20261002000002_get_insights.sql).
+  -- ENTRANTE, classified_until, lease y liberación de cuarentena) es la que
+  -- get_insights cuenta como "pendiente" (20261002000002_get_insights.sql).
   -- Cambiar una sin la otra hace que el dashboard reporte pendientes que el
   -- cron nunca va a tomar.
   RETURN QUERY
-  WITH claimable AS (
-    SELECT cc.conversation_id AS id, li.at AS last_in
+  WITH ranked AS MATERIALIZED (
+    SELECT cc.conversation_id AS id, li.at AS last_in,
+           row_number() OVER (PARTITION BY c.workspace_id ORDER BY li.at, cc.conversation_id) AS rn
       FROM public.conversation_classification cc
       JOIN public.conversations c ON c.id = cc.conversation_id
       CROSS JOIN LATERAL (
@@ -119,7 +129,15 @@ BEGIN
        AND NOT (c.workspace_id = ANY (v_skip))
        AND EXISTS (SELECT 1 FROM public.insight_topics t
                     WHERE t.workspace_id = c.workspace_id AND t.status = 'active')
-     ORDER BY li.at DESC, c.id DESC
+  ),
+  claimable AS (
+    SELECT cc.conversation_id AS id, r.last_in, r.rn
+      FROM public.conversation_classification cc
+      JOIN ranked r ON r.id = cc.conversation_id
+     -- Re-checked on the locked row: another run may have claimed it since
+     -- `ranked` was read.
+     WHERE (cc.claimed_until IS NULL OR cc.claimed_until <= v_now)
+     ORDER BY r.rn, r.last_in, r.id
      LIMIT v_limit
      FOR UPDATE OF cc SKIP LOCKED
   ),
@@ -137,7 +155,7 @@ BEGIN
     FROM claimed cl
     JOIN claimable k ON k.id = cl.id
     JOIN public.conversations c ON c.id = cl.id
-   ORDER BY k.last_in DESC, c.id DESC;
+   ORDER BY k.rn, k.last_in, c.id;
 END;
 $$;
 

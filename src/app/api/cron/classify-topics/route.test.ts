@@ -4,11 +4,17 @@ import { mock, test } from "node:test";
 let phase1: () => Promise<unknown> = async () => ({ classified: 2, failed: 1, skipped_workspaces: 0 });
 let phase2: () => Promise<unknown> = async () => ({ processed: 3, failed: 0, topics_done: 1 });
 let order: string[] = [];
+let backfillWaiting = false;
+const phase1Deadlines: number[] = [];
 
 mock.module("@/features/analytics/services/classify-topics.ts", {
   exports: {
-    runClassificationPhase: () => {
+    BACKFILL_SHARE_MS: 55_000,
+    LEASE_SECONDS: 180,
+    hasPendingBackfill: async () => backfillWaiting,
+    runClassificationPhase: (deadline: number) => {
       order.push("classification");
+      phase1Deadlines.push(deadline);
       return phase1();
     },
     runBackfillPhase: () => {
@@ -28,13 +34,28 @@ const req = (auth?: string) =>
 function reset() {
   process.env.CRON_SECRET = "s3cret";
   order = [];
+  backfillWaiting = false;
+  phase1Deadlines.length = 0;
   phase1 = async () => ({ classified: 2, failed: 1, skipped_workspaces: 0 });
   phase2 = async () => ({ processed: 3, failed: 0, topics_done: 1 });
 }
 
-test("presupuesto de tiempo menor que maxDuration", () => {
-  assert.equal(maxDuration, 60);
+test("presupuesto de tiempo menor que maxDuration, y este menor que el lease", () => {
+  assert.equal(maxDuration, 120);
   assert.ok(RUN_BUDGET_MS < maxDuration * 1000);
+  assert.ok(maxDuration < 180, "a run could outlive its own lease");
+});
+
+test("REVIEW H2: with a backfill waiting, phase 1 leaves it its share of the run", async () => {
+  reset();
+  const t0 = Date.now();
+  await GET(req("Bearer s3cret"));
+  backfillWaiting = true;
+  await GET(req("Bearer s3cret"));
+  const [free, shared] = phase1Deadlines;
+  assert.ok(free - t0 >= RUN_BUDGET_MS - 1_000);
+  assert.ok(Math.abs(free - shared - 55_000) < 1_000, "phase 1 did not stop early for the backfill");
+  assert.deepEqual(order, ["classification", "backfill", "classification", "backfill"]);
 });
 
 test("sin bearer o con bearer incorrecto → 401 sin correr fases", async () => {

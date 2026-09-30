@@ -3,7 +3,11 @@ import { redirect } from "next/navigation";
 import { createClient } from "@/lib/supabase/server";
 import { getActiveWorkspace } from "@/features/workspace/services/active-workspace";
 import { loadInsights } from "@/features/analytics/services/insights";
-import { emptyTopicsMessage, partialCoverageMessage } from "@/features/analytics/lib/insights-view";
+import {
+  analysisNotice,
+  emptyTopicsMessage,
+  partialCoverageMessage,
+} from "@/features/analytics/lib/insights-view";
 import { RangeFilter } from "@/features/analytics/components/range-filter";
 import { SummaryCards } from "@/features/analytics/components/summary-cards";
 import { TopicRanking } from "@/features/analytics/components/topic-ranking";
@@ -50,20 +54,26 @@ export default async function AnalisisPage({
   const { view, range, availableTags, topics, canManage } = result;
   const workspaceId = membership.workspace_id;
   const partialNotice = partialCoverageMessage(view.partialConversations);
+  const analysisText = analysisNotice(view.analysis);
 
   return (
     <main className="mx-auto max-w-5xl space-y-8 p-4 sm:p-6">
       <header className="space-y-3">
         <h1 className="font-display text-2xl font-semibold">Análisis</h1>
         <p className="text-sm text-muted-foreground">
-          Los temas se analizan cada noche; lo de hoy aparece mañana.
+          Cada conversación se analiza una hora después del último mensaje del cliente. El
+          tablero muestra hasta ayer.
         </p>
         <RangeFilter range={range} />
       </header>
 
-      {view.stalePending && (
-        <p role="status" className="rounded-lg border border-amber-500/30 bg-amber-500/10 p-3 text-sm">
-          Hay conversaciones de días anteriores aún sin analizar; los números pueden cambiar.
+      {analysisText && (
+        <p
+          role="status"
+          data-testid="analysis-notice"
+          className="rounded-lg border border-amber-500/30 bg-amber-500/10 p-3 text-sm"
+        >
+          {analysisText}
         </p>
       )}
 

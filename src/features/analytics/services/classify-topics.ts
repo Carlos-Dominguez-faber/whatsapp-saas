@@ -36,12 +36,32 @@ const POST_LLM_WRITES_CLASSIFY = 2;
 const POST_LLM_WRITES_BACKFILL = 3;
 /**
  * Lease de las DOS fases: conversación y tema de reprocesamiento.
- * Invariante: RUN_BUDGET_MS (50 s, route.ts) < maxDuration (60 s) < LEASE_SECONDS.
+ * Invariante: RUN_BUDGET_MS (100 s, route.ts) < maxDuration (120 s) < LEASE_SECONDS.
  * Una corrida nunca sobrevive a su propio lease; por eso los leases no llevan
  * token de propiedad. Subir RUN_BUDGET_MS o maxDuration por encima de esto
  * rompe la exclusión.
  */
-const LEASE_SECONDS = 120;
+export const LEASE_SECONDS = 180;
+
+/**
+ * What a run keeps for the backfill when a topic is waiting for one: its
+ * floor per call (40 s) plus room for a handful of calls. Without it, the
+ * nightly phase used the whole run while it had a queue, and a new topic's
+ * history waited for the queue to empty.
+ */
+export const BACKFILL_SHARE_MS = 55_000;
+
+/** Is any topic waiting for its backfill? Errors read as "no" (phase 2 still runs). */
+export async function hasPendingBackfill(deadline: number, db: SupabaseClient = svc()): Promise<boolean> {
+  const { data, error } = await db
+    .from("insight_topics")
+    .select("id")
+    .eq("status", "active")
+    .eq("backfill_status", "pending")
+    .limit(1)
+    .abortSignal(dbSignal(deadline));
+  return !error && (data ?? []).length > 0;
+}
 
 export interface ClassificationPhaseResult {
   classified: number;

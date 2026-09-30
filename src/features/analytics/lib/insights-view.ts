@@ -14,8 +14,12 @@ interface RawTopic extends RawCounts {
   name: string;
   /** null when the previous period wasn't covered for this topic. */
   prev_conversations: Num | null;
-  /** Conversations whose customer wrote while the topic was covered. */
+  /** Analysed conversations of the previous period (null: not covered). */
+  prev_universe?: Num | null;
+  /** Analysed conversations whose customer wrote while the topic was covered. */
   universe?: Num;
+  /** The same, analysed or not. */
+  in_coverage?: Num;
   /** Set only when the topic's coverage starts inside the range. */
   covered_from?: string | null;
 }
@@ -35,7 +39,27 @@ export interface RawInsights {
   trend: RawTrend[];
   /** Conversaciones del universo con texto que no llegó entero al LLM. */
   partial_conversations: Num;
-  oldest_pending: string | null;
+  /** How many conversations of the period are analysed, and why not the rest. */
+  analysis?: {
+    conversations: Num;
+    analyzed: Num;
+    pending: Num;
+    failed: Num;
+    too_old: Num;
+  };
+  /** The customer's first message ever in the workspace. */
+  data_from?: string | null;
+}
+
+export interface AnalysisView {
+  conversations: number;
+  analyzed: number;
+  /** Waiting for the classifier (it reads them within the next hours). */
+  pending: number;
+  /** Failed three times; set aside until the customer writes again. */
+  failed: number;
+  /** Older than the classifier's 30 days: never read. */
+  tooOld: number;
 }
 
 export interface TopicView {
@@ -51,6 +75,9 @@ export interface TopicView {
   coveredFromWeek: string | null;
   /** The topic has no coverage at all in the range. */
   notCovered: boolean;
+  /** Analysed conversations the share is over, and all of the covered part. */
+  analyzed: number;
+  inCoverage: number;
   conversations: number;
   sharePct: number | null;
   prevSharePct: number | null;
@@ -73,7 +100,7 @@ export interface InsightsView {
   weeks: string[];
   trend: Record<string, Record<string, number>>;
   partialConversations: number;
-  stalePending: boolean;
+  analysis: AnalysisView;
 }
 
 const round1 = (n: number) => Math.round(n * 10) / 10;
@@ -136,15 +163,6 @@ function coveredLabel(iso: string, tz: string): string {
   return new Date(iso).toLocaleDateString("es-CL", { timeZone: tz, day: "numeric", month: "short" });
 }
 
-function todayStartMs(tz: string, now: Date): number {
-  const today = new Intl.DateTimeFormat("en-CA", {
-    timeZone: tz,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-  }).format(now);
-  return zonedDayRange(today, today, tz)?.startMs ?? now.getTime();
-}
 
 /** Diferencia en puntos porcentuales entre dos porcentajes; null si falta uno. */
 function deltaPts(current: number | null, previous: number | null): number | null {
@@ -160,21 +178,25 @@ export function toInsightsView(raw: RawInsights, tz: string, now: Date = new Dat
   const topics = raw.topics
     .map((t) => {
       const conversations = Number(t.conversations);
-      // A topic covered only from mid-range is measured against the customers
-      // who wrote from then on; the rest of the range was never analysed for
-      // it. A payload without `universe` (older SQL) falls back to the range.
+      // A topic is measured over the ANALYSED conversations whose customer
+      // wrote while it was covered: one not read yet is neither a hit nor a
+      // miss. A payload without `universe` (older SQL) falls back to the range.
       const topicUniverse = t.universe == null ? universe : Number(t.universe);
       const coveredFrom = t.covered_from ?? null;
       const sharePct = pct(conversations, topicUniverse);
       // No previous-period coverage → no comparison, not a comparison with 0.
       const prevSharePct =
-        t.prev_conversations == null ? null : pct(Number(t.prev_conversations), universePrev);
+        t.prev_conversations == null
+          ? null
+          : pct(Number(t.prev_conversations), t.prev_universe == null ? universePrev : Number(t.prev_universe));
       return {
         id: t.id,
         name: t.name,
         coveredFromLabel: coveredFrom ? coveredLabel(coveredFrom, tz) : null,
         coveredFromWeek: coveredFrom ? zonedWeekStart(coveredFrom, tz) : null,
-        notCovered: coveredFrom !== null && topicUniverse === 0,
+        notCovered: coveredFrom !== null && (t.in_coverage == null ? topicUniverse : Number(t.in_coverage)) === 0,
+        analyzed: topicUniverse,
+        inCoverage: t.in_coverage == null ? topicUniverse : Number(t.in_coverage),
         conversations,
         sharePct,
         prevSharePct,
@@ -208,7 +230,34 @@ export function toInsightsView(raw: RawInsights, tz: string, now: Date = new Dat
     trend,
     // Un payload sin la clave no inventa un aviso.
     partialConversations: Number(raw.partial_conversations) || 0,
-    stalePending:
-      raw.oldest_pending !== null && Date.parse(raw.oldest_pending) < todayStartMs(tz, now),
+    analysis: {
+      conversations: Number(raw.analysis?.conversations ?? universe) || 0,
+      analyzed: Number(raw.analysis?.analyzed ?? universe) || 0,
+      pending: Number(raw.analysis?.pending) || 0,
+      failed: Number(raw.analysis?.failed) || 0,
+      tooOld: Number(raw.analysis?.too_old) || 0,
+    },
   };
+}
+
+/**
+ * The notice when part of the period isn't analysed yet: how many, and why.
+ * null = everything is analysed.
+ */
+export function analysisNotice(a: AnalysisView): string | null {
+  if (a.conversations === 0 || a.analyzed >= a.conversations) return null;
+  const n = (x: number) => x.toLocaleString("es-CL");
+  const parts = [
+    a.pending > 0 &&
+      `${n(a.pending)} ${a.pending === 1 ? "se analizará" : "se analizarán"} en las próximas horas`,
+    a.failed > 0 &&
+      `${n(a.failed)} no se ${a.failed === 1 ? "pudo" : "pudieron"} analizar (se reintenta si el cliente vuelve a escribir)`,
+    a.tooOld > 0 &&
+      `${n(a.tooOld)} ${a.tooOld === 1 ? "tiene" : "tienen"} más de 30 días y ya no se ${a.tooOld === 1 ? "analizará" : "analizarán"}`,
+  ].filter(Boolean);
+  return (
+    `Se han analizado ${n(a.analyzed)} de ${n(a.conversations)} conversaciones de este período; ` +
+    `los temas se miden solo sobre las analizadas.` +
+    (parts.length > 0 ? ` De las demás: ${parts.join("; ")}.` : "")
+  );
 }

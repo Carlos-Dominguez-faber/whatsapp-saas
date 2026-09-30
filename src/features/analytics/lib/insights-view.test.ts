@@ -6,6 +6,7 @@ import {
   formatPct,
   partialCoverageMessage,
   pct,
+  analysisNotice,
   toInsightsView,
   type RawInsights,
 } from "./insights-view.ts";
@@ -29,7 +30,6 @@ function raw(over: Partial<RawInsights> = {}): RawInsights {
       { topic_id: "t-park", week: "2026-09-07", conversations: 30 },
     ],
     partial_conversations: 0,
-    oldest_pending: null,
     ...over,
   };
 }
@@ -148,10 +148,27 @@ test("tendencia: semanas ordenadas y matriz por tema", () => {
   assert.equal(v.trend["t-park"]["2026-08-31"], undefined);
 });
 
-test("stalePending: pendiente de antes de hoy → true; de hoy → false; sin pendientes → false", () => {
-  assert.equal(toInsightsView(raw({ oldest_pending: "2026-09-15T02:59:00Z" }), TZ, NOW).stalePending, true);
-  assert.equal(toInsightsView(raw({ oldest_pending: "2026-09-15T03:30:00Z" }), TZ, NOW).stalePending, false);
-  assert.equal(toInsightsView(raw({ oldest_pending: null }), TZ, NOW).stalePending, false);
+test("REVIEW H2: a topic's share is over the analysed conversations, and the notice says how many aren't", () => {
+  // 10 customers asked about prices yesterday; the run read 4 of them so far.
+  const v = toInsightsView(
+    raw({
+      base: { conversations: 10, booked: 0, handed_off: 0, tags: {} },
+      topics: [{ id: "t", name: "Precio", universe: 4, in_coverage: 10, conversations: 4, prev_conversations: null, booked: 0, handed_off: 0, tags: {} }],
+      analysis: { conversations: 10, analyzed: 4, pending: 5, failed: 1, too_old: 0 },
+    }),
+    TZ,
+    NOW,
+  );
+  assert.equal(v.topics[0].sharePct, 100, "4 of the 4 read, not 40 % of the 10");
+  assert.equal(v.topics[0].analyzed, 4);
+  assert.equal(v.topics[0].inCoverage, 10);
+  assert.equal(
+    analysisNotice(v.analysis),
+    "Se han analizado 4 de 10 conversaciones de este período; los temas se miden solo sobre las analizadas. " +
+      "De las demás: 5 se analizarán en las próximas horas; 1 no se pudo analizar (se reintenta si el cliente vuelve a escribir).",
+  );
+  assert.equal(analysisNotice({ conversations: 3, analyzed: 3, pending: 0, failed: 0, tooOld: 0 }), null);
+  assert.match(analysisNotice({ conversations: 3, analyzed: 1, pending: 0, failed: 0, tooOld: 2 }) ?? "", /2 tienen más de 30 días/);
 });
 
 test("a topic covered from mid-range is measured over its own universe, without a delta", () => {
