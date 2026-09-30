@@ -707,11 +707,20 @@ conversaciones sin analizar).
   tablero dice cuántas faltan y por qué: pendientes (se leen en las próximas horas),
   que fallaron tres veces (se reintentan si el cliente vuelve a escribir) o de más de
   30 días (ya no se leerán).
-- **Si la clave de OpenRouter de un workspace falla** (sin créditos, revocada), ese
-  workspace se salta y los demás siguen. Solo si la misma falla aparece en dos
-  workspaces la corrida se detiene (es el proveedor o la clave de la agencia). Un
-  mensaje que el modelo rechaza espera una hora (dos, la segunda vez) antes del
-  siguiente intento; al tercer fallo queda apartado.
+- **Si falla una clave de OpenRouter** (sin créditos, revocada, limitada), se deja de
+  usar esa clave el resto de la corrida: si es la propia de un workspace, se salta
+  ese workspace; si es la de la agencia, todos los que no tienen clave propia. Los
+  demás siguen, y el tablero de los afectados dice que la clave está fallando. Una
+  clave propia que no se puede descifrar cuenta como clave caída de ese workspace:
+  nunca se le cobra a la de la agencia.
+- **Si el proveedor falla** (error 5xx, sin red, tiempo agotado), esa conversación
+  espera una hora sin gastar intento y la corrida sigue con las demás; si la misma
+  conversación vuelve a fallar así, espera el doble cada vez (2, 4, 8… hasta 24 horas)
+  y vuelve a una hora en cuanto se lee. Si fallan así tres conversaciones distintas
+  seguidas, la corrida se detiene: es el proveedor, no las conversaciones.
+- **Si el modelo rechaza un mensaje** (contenido, moderación, respuesta inválida),
+  la conversación espera una hora (dos, la segunda vez) antes del siguiente intento;
+  al tercer fallo queda apartada hasta que el cliente vuelva a escribir.
 - **Costo:** usa `openai/gpt-4o-mini` por OpenRouter, con la clave del workspace (o
   la de la agencia), y tiene un tope propio de **300,000 tokens por día** (UTC) por
   workspace, unos USD 0.05 a 0.10. **No cuenta en el presupuesto diario del agente**:
@@ -729,8 +738,9 @@ conversaciones sin analizar).
   tarde el modelo); cada 5 minutos, eso son miles al día en toda la instalación. El
   límite real es el tope de 300,000 tokens diarios de cada workspace: unas 200
   conversaciones al día (a unos 1,500 tokens cada una). Si un workspace recibe más, lo
-  que no cabe espera al día siguiente (lo más antiguo primero) y el tablero muestra
-  cuántas faltan. Para correrlo solo de noche, cambia la línea `'*/5 * * * *'` de
+  que no cabe espera al día siguiente (primero lo de las últimas 48 horas, de lo más
+  antiguo a lo más nuevo; después lo anterior, de lo más reciente hacia atrás) y el
+  tablero muestra cuántas faltan. Para correrlo solo de noche, cambia la línea `'*/5 * * * *'` de
   `supabase/cron/schedule-classify-topics.sql` por `'*/5 4-8 * * *'` y vuelve a correr
   `cron-apply`: gasta algo menos, pero lo de ayer llega incompleto a la mañana y se
   completa la noche siguiente.
@@ -755,6 +765,9 @@ conversaciones sin analizar).
     con el modelo barato.
   - Si el agente no responde nada, la pantalla lo dice y el mensaje vuelve a la caja
     de texto.
+  - Un mensaje que falla antes de que el modelo genere algo (la clave rechazada, la
+    base de conocimiento caída) libera lo que reservó; tras un error del proveedor o
+    un tiempo agotado se queda reservado, porque pudo haber gastado.
   - **No aísla datos.** Solo esconde el menú: con la misma cuenta se pueden abrir el
     inbox, el dashboard y los prompts. Si se la das a alguien de fuera, hazlo en un
     workspace de demostración, sin conversaciones reales.
