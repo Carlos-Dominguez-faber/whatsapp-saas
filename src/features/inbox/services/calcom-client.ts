@@ -407,6 +407,12 @@ export async function findCalComBookingAt(
     (b) => b.state === "active" && Math.abs(b.startMs - q.startMs) <= 60_000,
   );
   if (match) return { kind: "found", booking: match };
+  // A booking at that start that was moved elsewhere: it was made, and lives
+  // on at another time. Not "none".
+  const movedAway = (bookings as CalComBooking[]).some(
+    (b) => b.state === "cancelled" && b.rescheduledToUid !== null && Math.abs(b.startMs - q.startMs) <= 60_000,
+  );
+  if (movedAway) return { kind: "unknown" };
   if (body.pagination?.hasMore === true || body.pagination?.hasNextPage === true) {
     return { kind: "unknown" };
   }

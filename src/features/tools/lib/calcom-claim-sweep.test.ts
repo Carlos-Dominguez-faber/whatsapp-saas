@@ -101,6 +101,22 @@ test("found in Cal.com → linked; a complete 'no' → released", async () => {
   assert.deepEqual(await run(none), { resolved: 0, released: 1, flagged: 0 });
   assert.equal((patches(none.calls)[0].body as { status: string }).status, "cancelled");
   assert.equal(((patches(none.calls)[0].body as { meta: Record<string, unknown> }).meta).calcom_claim, "released");
+  const released = none.calls.find((c) => c.method === "POST" && c.url.includes("/rest/v1/events"))!;
+  assert.equal((released.body as { type: string }).type, "calcom_claim_released");
+
+  // A booking at that start that was moved elsewhere was made: not "none".
+  const moved = fake({
+    rows: [claimRow({ calcom_claim: "unknown", attendee_email: "ana@example.com" })],
+    list: {
+      status: 200,
+      body: {
+        status: "success",
+        data: [{ ...bookingAt("bk_old"), status: "cancelled", rescheduledToUid: "bk_new" }],
+        pagination: { hasMore: false },
+      },
+    },
+  });
+  assert.deepEqual(await run(moved), { resolved: 0, released: 0, flagged: 1 });
 });
 
 test("no complete answer, no email or no Cal.com → a note and an event, once", async () => {

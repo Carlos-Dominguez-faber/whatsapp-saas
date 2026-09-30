@@ -125,7 +125,18 @@ export async function sweepStaleCalComClaims(deadline: number): Promise<CalComSw
         .eq("id", claim.id)
         .eq("workspace_id", claim.workspace_id)
         .is("calcom_booking_uid", null);
-      if (!releaseError) tally.released++;
+      if (!releaseError) {
+        tally.released++;
+        // A trail of what the sweep freed on its own.
+        const { error: eventError } = await db.from("events").insert({
+          type: "calcom_claim_released",
+          level: "info",
+          workspace_id: claim.workspace_id,
+          conversation_id: claim.conversation_id,
+          payload: { appointment_id: claim.id, scheduled_at: claim.scheduled_at },
+        });
+        if (eventError) console.error("[calcom-sweep] event failed:", eventError.message);
+      }
       continue;
     }
     await report("Cal.com no dio una respuesta completa");
