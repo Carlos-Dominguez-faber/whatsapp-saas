@@ -1334,11 +1334,16 @@ function HubSpotSection({
       if (json.ok) {
         toast.success(
           json.portalChanged
-            ? "HubSpot conectado a otra cuenta. Los contactos se volverán a enlazar solos."
+            ? "HubSpot conectado a otra cuenta. Los contactos se volverán a enlazar solos. Elige de nuevo el pipeline y la etapa de negocios: los anteriores eran de la otra cuenta."
             : json.requeued
               ? `HubSpot conectado. ${json.requeued} resumen(es) de conversaciones que esperaban vuelven a enviarse.`
               : "HubSpot conectado. Las propiedades del agente quedaron listas.",
         );
+        // The server dropped the old account's pipeline and stage: so does the form.
+        if (json.portalChanged) {
+          setPipelineId("");
+          setStageId("");
+        }
         onSaved();
         void loadPipelines();
       } else {

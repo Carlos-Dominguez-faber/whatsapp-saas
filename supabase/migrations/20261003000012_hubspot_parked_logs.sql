@@ -14,6 +14,8 @@
 --      contacts they'd link belong to the old account). It returns how many
 --      went back (logs_requeued): DROP + CREATE, the return type changes.
 --   3. The purge keeps parked logs three times as long as finished ones.
+--   4. Another portal also drops the deal pipeline and stage: their ids belong
+--      to the old account, and a deal created with them would fail there.
 -- ============================================================================
 
 SET lock_timeout = '10s';
@@ -72,7 +74,8 @@ BEGIN
   END IF;
 
   UPDATE public.integrations i
-     SET config = i.config || jsonb_build_object('properties_ready', true, 'portal_id', p_portal_id),
+     SET config = CASE WHEN v_changed THEN i.config - 'pipeline_id' - 'deal_stage_id' ELSE i.config END
+                  || jsonb_build_object('properties_ready', true, 'portal_id', p_portal_id),
          updated_at = now()
    WHERE i.workspace_id = p_workspace_id AND i.provider = 'hubspot';
 

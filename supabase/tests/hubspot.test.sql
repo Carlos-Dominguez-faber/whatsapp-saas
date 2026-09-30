@@ -5,7 +5,7 @@ BEGIN;
 CREATE EXTENSION IF NOT EXISTS pgtap WITH SCHEMA extensions;
 SET search_path = public, extensions;
 
-SELECT plan(30);
+SELECT plan(31);
 
 -- ── privileges: the queue and its RPCs are service role only ────────────────
 SELECT ok(NOT has_table_privilege('anon', 'public.hubspot_conversation_logs', 'SELECT'),
@@ -48,7 +48,7 @@ $$, '23505', NULL, 'HubSpot cannot be enabled next to HighLevel');
 SELECT lives_ok($$
   INSERT INTO public.integrations (workspace_id, provider, enabled, credentials, config)
   VALUES ('e0000000-0000-4000-8000-000000000001', 'hubspot', false, '{}',
-          '{"token_fingerprint":"fp_a","properties_ready":true,"portal_id":"111"}')
+          '{"token_fingerprint":"fp_a","properties_ready":true,"portal_id":"111","pipeline_id":"pl_old","deal_stage_id":"st_old"}')
 $$, 'a disabled HubSpot row is allowed next to HighLevel');
 
 -- The queue only takes a log when HubSpot is the enabled CRM.
@@ -114,6 +114,9 @@ SELECT ok((SELECT updated AND portal_changed AND links_cleared = 1 AND logs_canc
   'a new portal clears the links and cancels the pending and parked logs');
 SELECT is((SELECT hs_contact_id FROM public.contacts WHERE id = 'e0000000-0000-4000-8000-0000000000c1'),
   NULL, 'the old portal''s id is gone');
+SELECT ok((SELECT NOT (config ? 'pipeline_id') AND NOT (config ? 'deal_stage_id') AND config->>'portal_id' = '222'
+             FROM public.integrations WHERE workspace_id = 'e0000000-0000-4000-8000-000000000001' AND provider = 'hubspot'),
+  'the old portal''s pipeline and stage are dropped');
 
 -- ── purge: finished rows past the retention, pending ones never ─────────────
 INSERT INTO public.hubspot_conversation_logs (workspace_id, conversation_id, from_state_version, reason, status, updated_at)
