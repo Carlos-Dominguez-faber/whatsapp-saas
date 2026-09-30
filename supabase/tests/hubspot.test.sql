@@ -5,7 +5,7 @@ BEGIN;
 CREATE EXTENSION IF NOT EXISTS pgtap WITH SCHEMA extensions;
 SET search_path = public, extensions;
 
-SELECT plan(31);
+SELECT plan(35);
 
 -- ── privileges: the queue and its RPCs are service role only ────────────────
 SELECT ok(NOT has_table_privilege('anon', 'public.hubspot_conversation_logs', 'SELECT'),
@@ -70,6 +70,33 @@ SELECT is(public.enqueue_hubspot_conversation_log(
 SELECT is(public.enqueue_hubspot_conversation_log(
   'e0000000-0000-4000-8000-000000000002', 'e0000000-0000-4000-8000-0000000000a1', 2, 'closed'),
   false, 'another workspace cannot queue this conversation');
+
+-- ── any handoff or close is queued by the trigger, the dead-letter one too ──
+INSERT INTO public.contacts (id, workspace_id, phone) VALUES
+  ('e0000000-0000-4000-8000-0000000000c2', 'e0000000-0000-4000-8000-000000000001', '+15550002002'),
+  ('e0000000-0000-4000-8000-0000000000c3', 'e0000000-0000-4000-8000-000000000002', '+15550002003');
+INSERT INTO public.conversations (id, workspace_id, contact_id) VALUES
+  ('e0000000-0000-4000-8000-0000000000a2', 'e0000000-0000-4000-8000-000000000001', 'e0000000-0000-4000-8000-0000000000c2'),
+  ('e0000000-0000-4000-8000-0000000000a3', 'e0000000-0000-4000-8000-000000000002', 'e0000000-0000-4000-8000-0000000000c3');
+-- What claim_next_batch()'s dead letter does: a plain UPDATE, not applyTransition.
+UPDATE public.conversations SET state = 'handoff_pending', ai_enabled = false
+ WHERE id = 'e0000000-0000-4000-8000-0000000000a2' AND state = 'ai_active';
+SELECT is((SELECT string_agg(from_state_version || ':' || reason || ':' || status, ',') FROM public.hubspot_conversation_logs
+            WHERE conversation_id = 'e0000000-0000-4000-8000-0000000000a2'),
+  '0:handoff:pending', 'a dead-letter handoff is queued, by the version it moved from');
+UPDATE public.conversations SET state = 'human_active' WHERE id = 'e0000000-0000-4000-8000-0000000000a2';
+UPDATE public.conversations SET state = 'closed' WHERE id = 'e0000000-0000-4000-8000-0000000000a2';
+SELECT is((SELECT string_agg(from_state_version || ':' || reason, ',' ORDER BY from_state_version) FROM public.hubspot_conversation_logs
+            WHERE conversation_id = 'e0000000-0000-4000-8000-0000000000a2'),
+  '0:handoff,2:closed', 'taking it queues nothing; closing it queues once');
+SELECT is(public.enqueue_hubspot_conversation_log('e0000000-0000-4000-8000-000000000001',
+  'e0000000-0000-4000-8000-0000000000a2', 2, 'closed'), false, 'the same transition from the app is not queued twice');
+UPDATE public.conversations SET state = 'handoff_pending' WHERE id = 'e0000000-0000-4000-8000-0000000000a3';
+SELECT is((SELECT count(*)::INT FROM public.hubspot_conversation_logs WHERE conversation_id = 'e0000000-0000-4000-8000-0000000000a3'),
+  0, 'a workspace without HubSpot queues nothing');
+-- Out of the way of the claim and portal tests below.
+UPDATE public.hubspot_conversation_logs SET status = 'done'
+ WHERE conversation_id = 'e0000000-0000-4000-8000-0000000000a2';
 
 -- ── claim: a lease, and attempts go up ──────────────────────────────────────
 CREATE TEMP TABLE c1 AS SELECT * FROM public.claim_hubspot_conversation_log(120);

@@ -376,58 +376,10 @@ test("si el INSERT del evento state_change falla, queda registrado server-side",
   assert.ok(logged.every((a) => !JSON.stringify(a).includes("connection string")));
 });
 
-// ── Handoff and close are queued for the HubSpot timeline, never sent here ──
+// ── The HubSpot timeline queue is fed by a trigger, not from here ───────────
 
-test("a handoff queues its HubSpot timeline entry by the version it moved from", async () => {
+test("a transition never calls the HubSpot queue itself (a trigger does, in the same UPDATE)", async () => {
   reset();
   await applyTransition("conv_1", "handoff_pending", { trigger: "keyword" });
-  assert.deepEqual(rpcCalls, [
-    {
-      fn: "enqueue_hubspot_conversation_log",
-      args: {
-        p_workspace_id: "ws_1",
-        p_conversation_id: "conv_1",
-        p_from_state_version: 3,
-        p_reason: "handoff",
-      },
-    },
-  ]);
-});
-
-test("closing queues 'closed'; other transitions queue nothing", async () => {
-  reset([{ data: { state: "human_active", workspace_id: "ws_1", state_version: 7 }, error: null }, { error: null }, { error: null }]);
-  await applyTransition("conv_1", "closed");
-  assert.equal((rpcCalls[0].args as { p_reason: string }).p_reason, "closed");
-
-  reset();
-  await applyTransition("conv_1", "paused");
-  assert.deepEqual(rpcCalls, []);
-});
-
-test("a failed or missing queue never breaks the transition; without a version nothing is queued", async () => {
-  reset();
-  rpcResult = { data: null, error: { code: "PGRST202", message: "Could not find the function public.enqueue_hubspot_conversation_log" } };
-  const original = console.error;
-  console.error = () => {};
-  try {
-    await applyTransition("conv_1", "handoff_pending", { trigger: "keyword" });
-  } finally {
-    console.error = original;
-  }
-  assert.equal((updates[0].row as { state: string }).state, "handoff_pending");
-
-  reset([
-    { data: null, error: { code: "42703", message: "column conversations.state_version does not exist" } },
-    { data: { state: "ai_active", workspace_id: "ws_1" }, error: null },
-    {},
-    { error: null },
-  ]);
-  const warn = console.error;
-  console.error = () => {};
-  try {
-    await applyTransition("conv_1", "handoff_pending", { trigger: "keyword" });
-  } finally {
-    console.error = warn;
-  }
   assert.deepEqual(rpcCalls, []);
 });
