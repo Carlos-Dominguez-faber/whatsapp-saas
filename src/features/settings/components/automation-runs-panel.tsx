@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { Loader2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -38,9 +38,14 @@ export function AutomationRunsPanel({ workspaceId }: { workspaceId: string }) {
   const [next, setNext] = useState<RunCursor | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  // Only the latest request may write: a "Cargar más" still in flight when the
+  // filter changes would otherwise append the old filter's rows.
+  const latest = useRef(0);
 
   const load = useCallback(
     async (cursor: RunCursor | null) => {
+      const request = ++latest.current;
+      if (!cursor) setRuns([]);
       setLoading(true);
       setError(null);
       const q = new URLSearchParams({ status: filter });
@@ -51,13 +56,15 @@ export function AutomationRunsPanel({ workspaceId }: { workspaceId: string }) {
       try {
         const res = await fetch(`/api/workspace/${workspaceId}/automations/runs?${q}`);
         const json = (await res.json()) as { runs?: RunListItem[]; nextBefore?: RunCursor | null; error?: string };
+        if (request !== latest.current) return;
         if (!res.ok) throw new Error(json.error ?? "No se pudieron cargar las ejecuciones.");
         setRuns((prev) => (cursor ? [...prev, ...(json.runs ?? [])] : (json.runs ?? [])));
         setNext(json.nextBefore ?? null);
       } catch (err) {
+        if (request !== latest.current) return;
         setError(err instanceof Error ? err.message : "No se pudieron cargar las ejecuciones.");
       } finally {
-        setLoading(false);
+        if (request === latest.current) setLoading(false);
       }
     },
     [workspaceId, filter],

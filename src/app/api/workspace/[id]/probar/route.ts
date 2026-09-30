@@ -32,7 +32,8 @@ const Schema = z.object({
     .max(20),
 });
 
-const UNAVAILABLE = "El agente no está disponible para pruebas en este momento.";
+const MODEL_UNAVAILABLE =
+  "Este agente usa un modelo que ya no está disponible para pruebas. Pide a un admin que le elija otro en Configuración → Agentes.";
 
 export async function POST(
   req: NextRequest,
@@ -41,7 +42,12 @@ export async function POST(
   const { id: workspaceId } = await params;
 
   const member = await requireWorkspaceMember(workspaceId, { minRole: "viewer" });
-  if (!member.ok) return member.response;
+  if (!member.ok) {
+    // The shared helper answers 401 in English; the person here may be a client.
+    return member.response.status === 401
+      ? NextResponse.json({ error: "Tu sesión terminó. Vuelve a entrar." }, { status: 401 })
+      : member.response;
+  }
 
   const parsed = Schema.safeParse(await req.json().catch(() => null));
   if (!parsed.success) {
@@ -95,7 +101,7 @@ export async function POST(
       // An admin fixes this in Settings; the person testing only needs to know
       // it isn't available.
       console.warn(`[probar] workspace=${workspaceId} agent model ${result.model} is outside the catalog`);
-      return NextResponse.json({ error: UNAVAILABLE }, { status: 503 });
+      return NextResponse.json({ error: MODEL_UNAVAILABLE }, { status: 503 });
     case "generation_failed":
       return NextResponse.json(
         { error: "No se pudo generar la respuesta. Intenta de nuevo." },

@@ -241,7 +241,17 @@ test("failures don't leak the model or the provider's error", async () => {
   agentRow = { ...agentRow, model: "some/unlisted-model" };
   const off = await post();
   assert.equal(off.status, 503);
-  assert.doesNotMatch((await off.json()).error, /unlisted/);
+  const offError = (await off.json()).error;
+  assert.doesNotMatch(offError, /unlisted/);
+  assert.match(offError, /Pide a un admin/);
+});
+
+test("REVIEW: a session that ended is told so in Spanish", async () => {
+  reset();
+  member = { ok: false, response: NextResponse.json({ error: "Unauthorized" }, { status: 401 }) };
+  const res = await post();
+  assert.equal(res.status, 401);
+  assert.equal((await res.json()).error, "Tu sesión terminó. Vuelve a entrar.");
 });
 
 test("REVIEW M2: at most 2 model steps, and a longer prompt reserves a higher ceiling", async () => {
