@@ -112,10 +112,11 @@ const TOOL_DEFINITION_BYTES = 2_000;
  * The most a /probar call can spend, reserved before it runs, and a real
  * ceiling because everything that goes in is bounded: the prompt (known),
  * the KB excerpts (cut to PROBAR_KB_MAX_BYTES), each tool's definition and
- * one result per tool (cut to PROBAR_TOOL_RESULT_MAX_CHARS, up to 4 bytes a
- * character), one HTTP request per step (no retries, noRetries) and at most
- * PROBAR_MAX_STEPS steps, each writing up to maxOutputTokens. Text runs
- * about 4 bytes per token; counting 3 keeps it a ceiling.
+ * one result per tool (one tool call per turn, oneToolCall; cut to
+ * PROBAR_TOOL_RESULT_MAX_CHARS, up to 4 bytes a character), one HTTP request
+ * per step (no retries, noRetries) and at most PROBAR_MAX_STEPS steps, each
+ * writing up to maxOutputTokens. Text runs about 4 bytes per token; counting
+ * 3 keeps it a ceiling.
  */
 export function probarTokenCeiling(
   systemPrompt: string,
@@ -305,6 +306,7 @@ export async function runAgentPlayground(
         ? {
             maxSteps: PROBAR_MAX_STEPS,
             noRetries: true,
+            oneToolCall: true,
             maxToolResultChars: PROBAR_TOOL_RESULT_MAX_CHARS,
           }
         : {}),

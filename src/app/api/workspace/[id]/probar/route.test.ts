@@ -48,6 +48,7 @@ const generateOpts: Array<{
   maxOutputTokens: number;
   maxSteps?: number;
   noRetries?: boolean;
+  oneToolCall?: boolean;
   maxToolResultChars?: number;
   tools?: Array<{ name: string }>;
   toolContext?: ToolContextSeen;
@@ -290,6 +291,8 @@ test("REVIEW LOW 6: one request per step, and tool results cut to what the ceili
   await post();
   assert.equal(generateOpts[0].noRetries, true);
   assert.equal(generateOpts[0].maxToolResultChars, 2_000);
+  // One result per tool in the ceiling: one tool call per turn.
+  assert.equal(generateOpts[0].oneToolCall, true);
 });
 
 test("REVIEW M5: a failed message doesn't keep its ceiling when nothing was generated", async () => {

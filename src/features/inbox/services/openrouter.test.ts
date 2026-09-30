@@ -461,6 +461,36 @@ test("generateChatReply tells the caller what the finished steps spent when a la
   }
 });
 
+test("generateChatReply with oneToolCall: parallel calls off, and a second call doesn't run", async () => {
+  let ran = 0;
+  registryRun = async () => (ran++, { ok: true, data: "x" });
+  let parallel: unknown;
+  let second: unknown;
+  generateImpl = async (raw) => {
+    const args = raw as StepArgs;
+    parallel = args.providerOptions?.openai?.parallelToolCalls;
+    await args.tools!.lookup.execute({});
+    second = await args.tools!.lookup.execute({});
+    return { text: "ok", usage: LAST_STEP, totalUsage: ALL_STEPS, steps: [{}, {}] };
+  };
+  try {
+    await generateChatReply({
+      systemPrompt: "s",
+      messages: [{ role: "user", content: "u" }],
+      workspaceId: "ws_1",
+      tools: [{ name: "lookup", description: "d", schema: {}, sensitivity: "read" }],
+      toolContext: { workspaceId: "ws_1", conversationId: "", contactId: "", batchId: "b" },
+      oneToolCall: true,
+    } as never);
+    assert.equal(parallel, false);
+    assert.equal(ran, 1, "the second tool call of the turn ran");
+    assert.equal((second as { ok?: boolean }).ok, false);
+  } finally {
+    generateImpl = null;
+    registryRun = async () => null;
+  }
+});
+
 test("generateChatReply without the /probar options sends what it sent before (auto-tagging)", async () => {
   let seen: StepArgs | undefined;
   generateImpl = async (raw) => {

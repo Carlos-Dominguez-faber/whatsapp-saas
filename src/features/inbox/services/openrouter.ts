@@ -232,6 +232,13 @@ export async function generateChatReply(params: {
   noRetries?: boolean;
   /** Cuts each tool result to this many characters before the model reads it. */
   maxToolResultChars?: number;
+  /**
+   * One tool call per step: the model is asked not to call tools in parallel,
+   * and from the second call of the turn on, a call is answered without
+   * running (a provider may ignore the request). For a caller whose ceiling
+   * counts one result per tool.
+   */
+  oneToolCall?: boolean;
 }): Promise<GenerateReplyResult> {
   const modelId =
     params.model ??
@@ -256,6 +263,7 @@ export async function generateChatReply(params: {
   // (bad arguments, a sensitive tool) doesn't count; one that threw or timed
   // out (ok null) may have written, so it does.
   let wroteSomething = false;
+  let toolCalls = 0;
   const aiTools: ToolSet = {};
   if (params.tools && params.toolContext) {
     const ctx = params.toolContext;
@@ -264,6 +272,10 @@ export async function generateChatReply(params: {
         description: forgeTool.description,
         inputSchema: zodSchema(forgeTool.schema),
         execute: async (args: unknown): Promise<unknown> => {
+          toolCalls++;
+          if (params.oneToolCall && toolCalls > 1) {
+            return { ok: false, error: "Solo se puede usar una herramienta por mensaje." };
+          }
           const result = await registry.runTool(forgeTool, args, ctx, {
             ...(forgeTool.preferredTimeoutMs !== undefined
               ? { timeoutMs: forgeTool.preferredTimeoutMs }
@@ -303,6 +315,9 @@ export async function generateChatReply(params: {
         stopWhen: hasTools ? stepCountIs(params.maxSteps ?? 5) : undefined,
         maxOutputTokens: params.maxOutputTokens ?? 512,
         ...(params.noRetries ? { maxRetries: 0 } : {}),
+        ...(params.oneToolCall && hasTools
+          ? { providerOptions: { openai: { parallelToolCalls: false } } }
+          : {}),
         onStepFinish: (step) => {
           stepsDone++;
           usageSoFar.promptTokens += step.usage?.inputTokens ?? 0;

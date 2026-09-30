@@ -771,6 +771,7 @@ conversaciones sin analizar).
     usó una herramienta sigue contando, y los reintentos durante una caída no se
     comen el tope. Tras un tiempo agotado o un corte de red se queda la reserva
     completa, porque no se sabe qué gastó.
+  - Usa una sola herramienta por mensaje.
   - **No aísla datos.** Solo esconde el menú: con la misma cuenta se pueden abrir el
     inbox, el dashboard y los prompts. Si se la das a alguien de fuera, hazlo en un
     workspace de demostración, sin conversaciones reales.
