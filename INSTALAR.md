@@ -830,9 +830,11 @@ sigue haciendo falta si no lo has corrido).
       no se libera solo: cuando el cliente vuelve a pedirlo, o a los 10 minutos en el
       cron `automations`, la app pregunta a Cal.com por su email, servicio y hora
       (y revisa que la respuesta sea de ese cliente y ese servicio): si la reserva
-      existe, la vincula; si Cal.com responde completo que no existe, la libera; si
-      no, deja una nota interna en la conversación (una vez) y un evento
-      `calcom_claim_unresolved`.
+      existe, la vincula; si Cal.com responde completo que no existe, la libera
+      (evento `calcom_claim_released`); si no, deja una nota interna en la
+      conversación (una vez) y un evento `calcom_claim_unresolved`. Las reservas
+      pendientes de una versión anterior (#15) nunca se liberan solas: siempre
+      dejan la nota.
     - Para liberar uno a mano, después de revisar en Cal.com, en Supabase → SQL
       Editor: `update appointments set status = 'cancelled', meta = meta ||
       '{"calcom_claim":"released"}' where id = '<id>' and calcom_booking_uid is
