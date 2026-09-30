@@ -53,8 +53,8 @@ export interface RawInsights {
   blocked?: Blocked | null;
 }
 
-export type Blocked = "key" | "platform_key" | "cap";
-const BLOCKED: readonly Blocked[] = ["key", "platform_key", "cap"];
+export type Blocked = "key" | "platform_key" | "workspace" | "cap";
+const BLOCKED: readonly Blocked[] = ["key", "platform_key", "workspace", "cap"];
 
 export interface AnalysisView {
   conversations: number;
@@ -67,7 +67,8 @@ export interface AnalysisView {
   tooOld: number;
   /**
    * The run can't read this workspace now: its own OpenRouter key is down
-   * ("key"), the platform's is ("platform_key"), or it is over its cap.
+   * ("key"), the platform's is ("platform_key"), the key works but this
+   * workspace's own calls keep failing ("workspace"), or it is over its cap.
    */
   blocked: Blocked | null;
 }
@@ -308,6 +309,8 @@ export function analysisNotice(a: AnalysisView, hasTopics = true): string | null
       ? `${n(a.pending)} ${a.pending === 1 ? "espera" : "esperan"}: la clave de OpenRouter de este espacio está fallando (sin créditos, revocada o con una política de datos que no deja usar el modelo), y se analizarán cuando vuelva a funcionar`
       : a.blocked === "platform_key"
         ? `${n(a.pending)} ${a.pending === 1 ? "espera" : "esperan"}: el servicio de análisis no está respondiendo, y se analizarán cuando vuelva (se reintenta solo)`
+      : a.blocked === "workspace"
+        ? `${n(a.pending)} ${a.pending === 1 ? "espera" : "esperan"}: el análisis de este espacio está fallando (el modelo no responde a tiempo), y se reintenta solo`
       : a.blocked === "cap"
         ? `${n(a.pending)} ${a.pending === 1 ? "espera" : "esperan"}: el análisis llegó a su tope de hoy, y se retoma cuando empiece el día (00:00 UTC)`
         : `${n(a.pending)} ${a.pending === 1 ? "se analizará" : "se analizarán"} en las próximas horas`;

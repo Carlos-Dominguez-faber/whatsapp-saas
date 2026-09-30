@@ -220,6 +220,8 @@ SELECT jsonb_build_object(
   --   on (its own, or the platform's) is down. Read from the key's health,
   --   which the run keeps across runs (classification_key_health), for the
   --   key the workspace ran on at its last turn.
+  -- * 'workspace': the key works, but this workspace's own calls keep failing
+  --   (its lane on the key is down).
   -- * 'cap': it reached its daily cap. Current when noted in the last 2 hours
   --   with no paid classification since (note_classification_blocked writes
   --   at most one an hour while it lasts).
@@ -227,6 +229,12 @@ SELECT jsonb_build_object(
     (SELECT CASE s.key_scope WHEN 'platform' THEN 'platform_key' ELSE 'key' END
        FROM public.classification_workspace_state s
        JOIN public.classification_key_health h ON h.key_id = s.key_id
+      WHERE s.workspace_id = p_workspace_id
+        AND h.down_since IS NOT NULL),
+    (SELECT 'workspace'
+       FROM public.classification_workspace_state s
+       JOIN public.classification_key_health h
+         ON h.key_id = 'lane:' || s.workspace_id::text || ':' || s.key_id
       WHERE s.workspace_id = p_workspace_id
         AND h.down_since IS NOT NULL),
     (SELECT b.payload->>'reason'

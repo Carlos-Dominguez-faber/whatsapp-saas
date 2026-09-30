@@ -803,17 +803,28 @@ END;
 $$;
 
 -- ── Key health (see classification_key_health) ─────────────
+-- Two circuits guard every call, in the same table and with the same rules:
+-- the KEY ('sha256:…'), shared by every workspace on it, and the workspace's
+-- LANE on that key ('lane:<workspace>:<key id>'). A lane catches one
+-- workspace whose own calls keep failing while the key works for the rest
+-- (conversations that hit the timeout, say): only that workspace waits. A
+-- key shared by several workspaces (the platform's, or one pasted into two)
+-- only goes down when the transient streak comes from at least two of them,
+-- so one tenant can't take the others down with it.
+--
 -- The run asks this once per workspace and run, before its first call: it
 -- records which key the workspace runs on (the dashboard's "blocked" reads
--- that key's health) and answers the key's state:
---   {"state": "up", "failures": n}  calls go (n transient failures in a row)
---   {"state": "down"}               no call before down_until
---   {"state": "probe"}              down_until passed: THIS caller makes the one
---                                   call that tests the key. down_until moves a
+-- that key's and that lane's health) and answers their state:
+--   {"state": "up"|"probe", "workspace": "up"|"down"|"probe"}
+--   {"state": "down"}               the key: no call before its down_until
+--   "probe"                         its down_until passed: THIS caller makes the
+--                                   one call that tests it. down_until moves a
 --                                   lease ahead, so no other caller (another
 --                                   workspace on the key, another run) probes
 --                                   too; a probe that never reports lets the
 --                                   lease lapse and the next caller probes.
+DROP FUNCTION IF EXISTS public.classification_key_gate(UUID, TEXT, TEXT, INT, TIMESTAMPTZ);
+
 CREATE OR REPLACE FUNCTION public.classification_key_gate(
   p_workspace_id UUID,
   p_key_id TEXT,
@@ -827,9 +838,13 @@ SET search_path = ''
 AS $$
 DECLARE
   v_now TIMESTAMPTZ := COALESCE(p_now, now());
-  v_key public.classification_key_health%ROWTYPE;
+  v_lease INTERVAL := make_interval(secs => LEAST(GREATEST(COALESCE(p_probe_seconds, 180), 30), 600));
+  v_lane TEXT := 'lane:' || p_workspace_id::text || ':' || p_key_id;
+  v_row public.classification_key_health%ROWTYPE;
+  v_key TEXT;
+  v_ws TEXT;
 BEGIN
-  IF p_scope IS NULL OR p_scope NOT IN ('own', 'platform') OR p_key_id IS NULL THEN
+  IF p_scope IS NULL OR p_scope NOT IN ('own', 'platform') OR p_key_id IS NULL OR p_workspace_id IS NULL THEN
     RAISE EXCEPTION 'classification_key_gate: bad key' USING ERRCODE = '22023';
   END IF;
   INSERT INTO public.classification_workspace_state AS s (workspace_id, key_id, key_scope, updated_at)
@@ -838,34 +853,54 @@ BEGIN
     key_id = EXCLUDED.key_id, key_scope = EXCLUDED.key_scope, updated_at = now()
   WHERE (s.key_id, s.key_scope) IS DISTINCT FROM (EXCLUDED.key_id, EXCLUDED.key_scope);
 
-  SELECT * INTO v_key FROM public.classification_key_health h WHERE h.key_id = p_key_id FOR UPDATE;
-  IF NOT FOUND OR v_key.down_since IS NULL THEN
-    RETURN jsonb_build_object('state', 'up', 'failures', COALESCE(v_key.transient_failures, 0));
-  END IF;
-  IF v_key.down_until > v_now THEN
+  SELECT * INTO v_row FROM public.classification_key_health h WHERE h.key_id = p_key_id FOR UPDATE;
+  IF NOT FOUND OR v_row.down_since IS NULL THEN
+    v_key := 'up';
+  ELSIF v_row.down_until > v_now THEN
     RETURN jsonb_build_object('state', 'down');
+  ELSE
+    UPDATE public.classification_key_health h SET down_until = v_now + v_lease, updated_at = now()
+     WHERE h.key_id = p_key_id;
+    v_key := 'probe';
   END IF;
-  UPDATE public.classification_key_health h
-     SET down_until = v_now + make_interval(secs => LEAST(GREATEST(COALESCE(p_probe_seconds, 180), 30), 600)),
-         updated_at = now()
-   WHERE h.key_id = p_key_id;
-  RETURN jsonb_build_object('state', 'probe');
+
+  SELECT * INTO v_row FROM public.classification_key_health h WHERE h.key_id = v_lane FOR UPDATE;
+  IF NOT FOUND OR v_row.down_since IS NULL THEN
+    v_ws := 'up';
+  ELSIF v_row.down_until > v_now THEN
+    v_ws := 'down';
+  ELSE
+    UPDATE public.classification_key_health h SET down_until = v_now + v_lease, updated_at = now()
+     WHERE h.key_id = v_lane;
+    v_ws := 'probe';
+  END IF;
+  RETURN jsonb_build_object('state', v_key, 'workspace', v_ws);
 END;
 $$;
 
--- What a call on a key got back, in the model's classes:
---   'answered'   a result, or a refusal of THIS text: the key works. Back to up.
+-- What a call of p_workspace_id on a key got back, in the model's classes:
+--   'answered'   a result, or a refusal of THIS text: the key and the lane work.
+--                Both back to up. Written after every answer; it only touches a
+--                row that has something to reset.
 --   'rejected'   the key itself was refused (401/402/403/404/429…), or it can't
---                be used at all: down at once for p_rejected_seconds (flat: a
---                refused request bills nothing, so testing it again is cheap).
---   'transient'  5xx, network, timeout. Up: one more in a row, down at the
---                p_breaker-th. Already down (a probe, or a concurrent call):
---                down again. Each transient down waits twice the last one,
---                from p_base_seconds up to p_max_seconds.
--- Answers on OTHER keys never touch this row. Returns 'up' or 'down'.
+--                be used at all: the key goes down at once for
+--                p_rejected_seconds (flat: a refused request bills nothing, so
+--                testing it again is cheap), never shortening a longer wait
+--                it is already in.
+--   'transient'  5xx, network, timeout. On each circuit: up, one more in a row,
+--                down at the p_breaker-th; already down (a probe, or a
+--                concurrent call), down again. Each transient down waits twice
+--                the last one, from p_base_seconds up to p_max_seconds. A key
+--                several workspaces share needs the streak to come from at
+--                least two of them (streak_workspaces).
+-- Answers on OTHER keys never touch these rows.
+-- Returns {"key": "up"|"down", "workspace": "up"|"down"}.
+DROP FUNCTION IF EXISTS public.record_classification_key_outcome(TEXT, TEXT, TEXT, TEXT, INT, INT, INT, INT, TIMESTAMPTZ);
+
 CREATE OR REPLACE FUNCTION public.record_classification_key_outcome(
   p_key_id TEXT,
   p_scope TEXT,
+  p_workspace_id UUID,
   p_outcome TEXT,
   p_code TEXT DEFAULT NULL,
   p_breaker INT DEFAULT 3,
@@ -874,57 +909,94 @@ CREATE OR REPLACE FUNCTION public.record_classification_key_outcome(
   p_rejected_seconds INT DEFAULT 900,
   p_now TIMESTAMPTZ DEFAULT now()
 )
-RETURNS TEXT
+RETURNS JSONB
 LANGUAGE plpgsql
 SET search_path = ''
 AS $$
 DECLARE
   v_now TIMESTAMPTZ := COALESCE(p_now, now());
+  v_lane TEXT := 'lane:' || p_workspace_id::text || ':' || p_key_id;
+  v_breaker INT := GREATEST(COALESCE(p_breaker, 3), 1);
+  v_base BIGINT := GREATEST(COALESCE(p_base_seconds, 900), 60);
+  v_max BIGINT := GREATEST(COALESCE(p_max_seconds, 21600), 60);
   v_key public.classification_key_health%ROWTYPE;
+  v_ln public.classification_key_health%ROWTYPE;
+  v_streak UUID[];
+  v_shared BOOLEAN;
+  v_key_state TEXT := 'up';
+  v_ws_state TEXT := 'up';
 BEGIN
   IF p_outcome IS NULL OR p_outcome NOT IN ('answered', 'rejected', 'transient')
-     OR p_scope IS NULL OR p_scope NOT IN ('own', 'platform') OR p_key_id IS NULL THEN
+     OR p_scope IS NULL OR p_scope NOT IN ('own', 'platform') OR p_key_id IS NULL OR p_workspace_id IS NULL THEN
     RAISE EXCEPTION 'record_classification_key_outcome: bad outcome' USING ERRCODE = '22023';
   END IF;
-  INSERT INTO public.classification_key_health (key_id, scope) VALUES (p_key_id, p_scope)
-  ON CONFLICT (key_id) DO NOTHING;
-  SELECT * INTO v_key FROM public.classification_key_health h WHERE h.key_id = p_key_id FOR UPDATE;
 
   IF p_outcome = 'answered' THEN
     UPDATE public.classification_key_health h
        SET transient_failures = 0, down_count = 0, down_since = NULL, down_until = NULL,
-           last_error_code = NULL, updated_at = now()
-     WHERE h.key_id = p_key_id;
-    RETURN 'up';
+           last_error_code = NULL, streak_workspaces = '{}', updated_at = now()
+     WHERE h.key_id IN (p_key_id, v_lane)
+       AND (h.down_since IS NOT NULL OR h.transient_failures > 0);
+    RETURN jsonb_build_object('key', 'up', 'workspace', 'up');
   END IF;
+
+  INSERT INTO public.classification_key_health (key_id, scope) VALUES (p_key_id, p_scope), (v_lane, p_scope)
+  ON CONFLICT (key_id) DO NOTHING;
+  -- Both rows locked, always in the same order: two runs can't deadlock.
+  PERFORM 1 FROM public.classification_key_health h
+   WHERE h.key_id IN (p_key_id, v_lane) ORDER BY h.key_id FOR UPDATE;
+  SELECT * INTO v_key FROM public.classification_key_health h WHERE h.key_id = p_key_id;
+  SELECT * INTO v_ln FROM public.classification_key_health h WHERE h.key_id = v_lane;
 
   IF p_outcome = 'rejected' THEN
     UPDATE public.classification_key_health h
-       SET transient_failures = 0,
+       SET transient_failures = 0, streak_workspaces = '{}',
            down_since = COALESCE(h.down_since, v_now),
-           down_until = v_now + make_interval(secs => GREATEST(COALESCE(p_rejected_seconds, 900), 60)),
+           down_until = GREATEST(COALESCE(h.down_until, v_now),
+                                 v_now + make_interval(secs => GREATEST(COALESCE(p_rejected_seconds, 900), 60))),
            last_error_code = p_code, updated_at = now()
      WHERE h.key_id = p_key_id;
-    RETURN 'down';
+    RETURN jsonb_build_object('key', 'down',
+                              'workspace', CASE WHEN v_ln.down_since IS NULL THEN 'up' ELSE 'down' END);
   END IF;
 
-  IF v_key.down_since IS NULL AND v_key.transient_failures + 1 < GREATEST(COALESCE(p_breaker, 3), 1) THEN
+  -- The workspace's lane: its own transients in a row on this key.
+  IF v_ln.down_since IS NOT NULL OR v_ln.transient_failures + 1 >= v_breaker THEN
+    UPDATE public.classification_key_health h
+       SET transient_failures = 0, down_count = h.down_count + 1,
+           down_since = COALESCE(h.down_since, v_now),
+           down_until = v_now + make_interval(secs => LEAST(v_base * (2 ^ LEAST(h.down_count, 16))::bigint, v_max)),
+           last_error_code = p_code, updated_at = now()
+     WHERE h.key_id = v_lane;
+    v_ws_state := 'down';
+  ELSE
     UPDATE public.classification_key_health h
        SET transient_failures = h.transient_failures + 1, last_error_code = p_code, updated_at = now()
-     WHERE h.key_id = p_key_id;
-    RETURN 'up';
+     WHERE h.key_id = v_lane;
   END IF;
 
-  UPDATE public.classification_key_health h
-     SET transient_failures = 0,
-         down_count = h.down_count + 1,
-         down_since = COALESCE(h.down_since, v_now),
-         down_until = v_now + make_interval(secs => LEAST(
-           GREATEST(COALESCE(p_base_seconds, 900), 60)::bigint * (2 ^ LEAST(h.down_count, 16))::bigint,
-           GREATEST(COALESCE(p_max_seconds, 21600), 60))),
-         last_error_code = p_code, updated_at = now()
-   WHERE h.key_id = p_key_id;
-  RETURN 'down';
+  -- The key. Shared by several workspaces, it goes down only when its streak
+  -- comes from at least two of them; one workspace alone is its lane's.
+  v_shared := p_scope = 'platform'
+    OR (SELECT count(*) FROM public.classification_workspace_state s WHERE s.key_id = p_key_id) > 1;
+  v_streak := CASE WHEN p_workspace_id = ANY (v_key.streak_workspaces) THEN v_key.streak_workspaces
+                   ELSE v_key.streak_workspaces || p_workspace_id END;
+  IF v_key.down_since IS NOT NULL
+     OR (v_key.transient_failures + 1 >= v_breaker AND (NOT v_shared OR cardinality(v_streak) >= 2)) THEN
+    UPDATE public.classification_key_health h
+       SET transient_failures = 0, streak_workspaces = '{}', down_count = h.down_count + 1,
+           down_since = COALESCE(h.down_since, v_now),
+           down_until = v_now + make_interval(secs => LEAST(v_base * (2 ^ LEAST(h.down_count, 16))::bigint, v_max)),
+           last_error_code = p_code, updated_at = now()
+     WHERE h.key_id = p_key_id;
+    v_key_state := 'down';
+  ELSE
+    UPDATE public.classification_key_health h
+       SET transient_failures = h.transient_failures + 1, streak_workspaces = v_streak,
+           last_error_code = p_code, updated_at = now()
+     WHERE h.key_id = p_key_id;
+  END IF;
+  RETURN jsonb_build_object('key', v_key_state, 'workspace', v_ws_state);
 END;
 $$;
 
@@ -963,11 +1035,11 @@ $$;
 
 REVOKE ALL ON FUNCTION public.defer_classification(UUID, UUID, TEXT, INT, TIMESTAMPTZ) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.classification_key_gate(UUID, TEXT, TEXT, INT, TIMESTAMPTZ) FROM PUBLIC, anon, authenticated;
-REVOKE ALL ON FUNCTION public.record_classification_key_outcome(TEXT, TEXT, TEXT, TEXT, INT, INT, INT, INT, TIMESTAMPTZ) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.record_classification_key_outcome(TEXT, TEXT, UUID, TEXT, TEXT, INT, INT, INT, INT, TIMESTAMPTZ) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.note_classification_blocked(UUID, TEXT, TIMESTAMPTZ) FROM PUBLIC, anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.defer_classification(UUID, UUID, TEXT, INT, TIMESTAMPTZ) TO service_role;
 GRANT EXECUTE ON FUNCTION public.classification_key_gate(UUID, TEXT, TEXT, INT, TIMESTAMPTZ) TO service_role;
-GRANT EXECUTE ON FUNCTION public.record_classification_key_outcome(TEXT, TEXT, TEXT, TEXT, INT, INT, INT, INT, TIMESTAMPTZ) TO service_role;
+GRANT EXECUTE ON FUNCTION public.record_classification_key_outcome(TEXT, TEXT, UUID, TEXT, TEXT, INT, INT, INT, INT, TIMESTAMPTZ) TO service_role;
 GRANT EXECUTE ON FUNCTION public.note_classification_blocked(UUID, TEXT, TIMESTAMPTZ) TO service_role;
 
 REVOKE ALL ON FUNCTION public.select_conversations_to_classify(INT, UUID[], INT, TIMESTAMPTZ) FROM PUBLIC, anon, authenticated;

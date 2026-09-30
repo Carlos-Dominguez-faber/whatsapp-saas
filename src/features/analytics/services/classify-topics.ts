@@ -21,15 +21,20 @@ import { resolveOpenRouterKey } from "@/features/inbox/services/openrouter-key";
  *   key's data policy), 429, any other 4xx; an own key that can't be
  *   decrypted; no platform key. Owner: the KEY. It goes down at once for
  *   KEY_REJECTED_SECONDS (15 min, flat: a refused request bills nothing, so
- *   testing it again is cheap). No attempt spent.
- * TRANSIENT — 5xx, 408, 409, 425, the network, a timeout. Owners: the KEY
- *   (one more in its streak; the KEY_TRANSIENT_BREAKER-th in a row takes it
- *   down: 15 min, doubling each down in a row up to 6 h) and the CONVERSATION
+ *   testing it again is cheap; a longer wait it is already in stays). No
+ *   attempt spent.
+ * TRANSIENT — 5xx, 408, 409, 425, the network, a timeout; a 200 that carries
+ *   the provider's error (or finish_reason "error") with one of those codes.
+ *   Owners: the workspace's LANE on its key (one more in its streak; the
+ *   KEY_TRANSIENT_BREAKER-th in a row takes it down: 15 min, doubling each
+ *   down in a row up to 6 h), the KEY (the same, except that a key several
+ *   workspaces share only goes down when its streak comes from at least two
+ *   of them: one tenant can't take the others down), and the CONVERSATION
  *   (it waits TRANSIENT_BACKOFF_SECONDS, doubling each time it fails that way
  *   again up to a day; no attempt spent). The run goes on with the next one.
- * CONTENT — 400, 413, 422, a moderation 403, an answer that isn't an HTTP
- *   error and can't be read, output that doesn't parse, a save the database
- *   rejects as data. Owner: the CONVERSATION: an attempt, 1 h per attempt,
+ * CONTENT — 400, 413, 422, a moderation 403, a 200 that can't be read and
+ *   carries no error, output that doesn't parse, a save the database rejects
+ *   as data. Owner: the CONVERSATION: an attempt, 1 h per attempt,
  *   quarantine at the third.
  * BUDGET — the reservation doesn't fit the workspace's daily cap. Owner: the
  *   WORKSPACE: skipped for the rest of the run (note_classification_blocked
@@ -38,28 +43,35 @@ import { resolveOpenRouterKey } from "@/features/inbox/services/openrouter-key";
  *   key, a conversation or the provider does stops the run.
  *
  * STATE, where it lives and what resets it:
- * - The key: classification_key_health, one row per key, across runs. Its id
- *   is a hash of the key (never the key), so every workspace on the platform
- *   key — or one key pasted into two workspaces — shares it.
- *     up    calls go; transient_failures counts transients in a row.
+ * - The key and each workspace's lane on it: classification_key_health, one
+ *   row per circuit, across runs. The key's id is a hash of the key (never
+ *   the key), so every workspace on the platform key — or one key pasted into
+ *   two workspaces — shares it; a lane is 'lane:<workspace>:<key id>'.
+ *     up    calls go; transient_failures counts transients in a row (and, on
+ *           a key, streak_workspaces who they came from).
  *     down  down_since set: no call on it, in this run or the next, before
- *           down_until. Its workspaces are skipped.
+ *           down_until. A key down skips all its workspaces; a lane down,
+ *           only its own.
  *     probe down_until passed: classification_key_gate hands ONE caller the
  *           call that tests it (the others still see it down). Answered: up,
  *           all reset. Transient: down again, twice as long. Refused: down
  *           15 min.
- *   Reset: any answer from the provider ON THIS KEY — a result, invalid
- *   output, a refusal of the text. Answers on other keys never touch it, and
- *   a workspace skipped without a call touches nothing.
- *   The run reads it once per workspace and run (the gate, which also records
- *   which key the workspace runs on) and keeps what it learns in RunGuards;
- *   the dashboard reads it too (get_insights 'blocked': 'key' for an own key,
- *   'platform_key' for the platform's).
+ *   Reset: any answer from the provider ON THIS KEY for that workspace — a
+ *   result, invalid output, a refusal of the text — resets the key and the
+ *   lane (written after every answer; the RPC only touches a row with
+ *   something to reset). Answers on other keys never touch them, and a
+ *   workspace skipped without a call touches nothing.
+ *   The run reads them once per workspace and run (the gate, which also
+ *   records which key the workspace runs on) and keeps what it learns in
+ *   RunGuards; the dashboard reads them too (get_insights 'blocked': 'key'
+ *   for an own key, 'platform_key' for the platform's, 'workspace' for a
+ *   lane).
  * - The conversation: conversation_classification — claimed_until (its lease
  *   and every wait), attempts and quarantined_at (content), transient_failures
  *   (its transient waits). Reset when it is read.
- * - The run: RunGuards — what it learned of each key, and the workspaces out
- *   of it (a key down, over the cap). Shared by both phases; gone at the end.
+ * - The run: RunGuards — what it learned of each key and lane, and the
+ *   workspaces out of it (a key or lane down, over the cap). Shared by both
+ *   phases; gone at the end.
  * A down PLATFORM key skips every workspace on it and the route answers 500,
  * so it shows in net._http_response. Own keys down never make a 500.
  *
@@ -70,9 +82,10 @@ import { resolveOpenRouterKey } from "@/features/inbox/services/openrouter-key";
  *   doubling), and its topic waits with it, without calls. Only its
  *   BACKFILL_TRANSIENT_SKIP-th transient failure in a row steps past it — a
  *   conversation that always times out can't hold a backfill forever. Each of
- *   those failures happened on a key that was up: in an outage the key goes
- *   down at the third transient of any conversation, and a probe's failure is
- *   the key's, never the conversation's, so an outage can't make it skip.
+ *   those failures happened on a key and lane that were up: in an outage the
+ *   lane (or the key) goes down at the third transient, and a probe's failure
+ *   is the circuit's, never the conversation's, so an outage can't make it
+ *   skip.
  *
  * SETTLEMENT of the reservation made before every call:
  *   result with usage ............................ the real count
@@ -212,11 +225,10 @@ interface WorkspaceKey {
   key: string | null;
 }
 
-/** What the run knows of a key: the gate's answer, then every outcome on it. */
+/** A circuit's state as the run knows it: the gate's answer, then every outcome on it. */
+type CircuitState = "up" | "down" | "probe";
 interface KeyView {
-  state: "up" | "down" | "probe";
-  /** Transient failures in a row while up. */
-  failures: number;
+  state: CircuitState;
 }
 
 /** What a run learned; shared by both phases, gone at its end. */
@@ -225,6 +237,8 @@ export interface RunGuards {
   workspaces: Map<string, WorkspaceKey>;
   /** Each key's state, from the gate and from the run's own calls. */
   keys: Map<string, KeyView>;
+  /** Each workspace's lane on its key (its own calls' circuit), the same way. */
+  lanes: Map<string, CircuitState>;
   /** Workspaces out of the rest of the run: their key is down, or over the cap. */
   skipped: Set<string>;
   /** The platform key was down in this run: the route answers 500. */
@@ -232,7 +246,7 @@ export interface RunGuards {
 }
 
 export function newRunGuards(): RunGuards {
-  return { workspaces: new Map(), keys: new Map(), skipped: new Set(), platformDown: false };
+  return { workspaces: new Map(), keys: new Map(), lanes: new Map(), skipped: new Set(), platformDown: false };
 }
 
 const hashKey = (key: string) => `sha256:${createHash("sha256").update(key).digest("hex")}`;
@@ -306,13 +320,16 @@ function learnKey(guards: RunGuards, wk: WorkspaceKey, view: KeyView) {
 }
 
 /**
- * Records what a call on a key got back (record_classification_key_outcome)
- * and what the key is now. `answered` is best effort: a key that stays marked
- * down gets probed again once its probe lease lapses, and answers then.
+ * Records what a call of `workspaceId` on a key got back
+ * (record_classification_key_outcome) and what its key and its lane are now.
+ * `answered` is written after every answer (the RPC only touches a row with
+ * something to reset) and is best effort: a circuit left marked down gets
+ * probed again once its probe lease lapses, and answers then.
  */
 async function recordKeyOutcome(
   db: SupabaseClient,
   guards: RunGuards,
+  workspaceId: string,
   wk: WorkspaceKey,
   outcome: "answered" | "rejected" | "transient",
   code: string | null,
@@ -322,6 +339,7 @@ async function recordKeyOutcome(
     .rpc("record_classification_key_outcome", {
       p_key_id: wk.keyId,
       p_scope: wk.scope,
+      p_workspace_id: workspaceId,
       p_outcome: outcome,
       p_code: code,
       p_breaker: KEY_TRANSIENT_BREAKER,
@@ -330,23 +348,21 @@ async function recordKeyOutcome(
       p_rejected_seconds: KEY_REJECTED_SECONDS,
     })
     .abortSignal(dbSignal(deadline));
-  const before = guards.keys.get(wk.keyId) ?? { state: "up", failures: 0 };
+  const before = guards.keys.get(wk.keyId)?.state ?? "up";
   if (error) {
     console.error("[classify-topics] key health write failed", error.code);
     if (outcome === "answered") {
-      learnKey(guards, wk, { state: "up", failures: 0 });
+      learnKey(guards, wk, { state: "up" });
+      guards.lanes.set(workspaceId, "up");
       return null;
     }
     return dbStop(error, deadline, "key_health_failed");
   }
-  if (data === "down") {
-    if (before.state !== "down") {
-      console.error("[classify-topics] OpenRouter key down", wk.scope, code ?? "");
-    }
-    learnKey(guards, wk, { state: "down", failures: 0 });
-  } else {
-    learnKey(guards, wk, { state: "up", failures: outcome === "transient" ? before.failures + 1 : 0 });
-  }
+  const now = (data ?? {}) as { key?: unknown; workspace?: unknown };
+  const keyDown = now.key === "down";
+  if (keyDown && before !== "down") console.error("[classify-topics] OpenRouter key down", wk.scope, code ?? "");
+  learnKey(guards, wk, { state: keyDown ? "down" : "up" });
+  guards.lanes.set(workspaceId, now.workspace === "down" ? "down" : "up");
   return null;
 }
 
@@ -389,14 +405,13 @@ async function workspaceKey(
     })
     .abortSignal(dbSignal(deadline));
   if (error) return dbStop(error, deadline, "key_gate_failed");
-  if (!guards.keys.has(wk.keyId)) {
-    const gate = (data ?? {}) as { state?: unknown; failures?: unknown };
-    const state = gate.state === "down" || gate.state === "probe" ? gate.state : "up";
-    learnKey(guards, wk, { state, failures: Number(gate.failures ?? 0) || 0 });
-  }
+  const gate = (data ?? {}) as { state?: unknown; workspace?: unknown };
+  const circuit = (x: unknown): CircuitState => (x === "down" || x === "probe" ? x : "up");
+  if (!guards.keys.has(wk.keyId)) learnKey(guards, wk, { state: circuit(gate.state) });
+  guards.lanes.set(workspaceId, circuit(gate.workspace));
   if (!wk.key && guards.keys.get(wk.keyId)?.state !== "down") {
     const stop = await recordKeyOutcome(
-      db, guards, wk, "rejected", wk.scope === "own" ? "key_unreadable" : "key_missing", deadline,
+      db, guards, workspaceId, wk, "rejected", wk.scope === "own" ? "key_unreadable" : "key_missing", deadline,
     );
     if (stop) return stop;
   }
@@ -404,10 +419,10 @@ async function workspaceKey(
   return wk;
 }
 
-/** True when the run already knows this workspace's key is down: skip it, no call. */
+/** True when the run already knows this workspace's key, or its lane, is down: skip it, no call. */
 function keyKnownDown(guards: RunGuards, workspaceId: string): boolean {
   const wk = guards.workspaces.get(workspaceId);
-  return !!wk && guards.keys.get(wk.keyId)?.state === "down";
+  return !!wk && (guards.keys.get(wk.keyId)?.state === "down" || guards.lanes.get(workspaceId) === "down");
 }
 
 /**
@@ -543,6 +558,7 @@ async function classifyOne(
     return { kind: "infra", code: "load_messages_failed" };
   }
 
+  let answered: WorkspaceKey | null = null;
   try {
     let matches: Array<{ topic_id: string; message_id: string }> = [];
 
@@ -555,7 +571,8 @@ async function classifyOne(
       const wk = await workspaceKey(db, guards, row.workspace_id, deadline);
       if ("kind" in wk) return wk;
       const view = guards.keys.get(wk.keyId);
-      if (!wk.key || !view || view.state === "down") return { kind: "key" };
+      const lane = guards.lanes.get(row.workspace_id) ?? "up";
+      if (!wk.key || !view || view.state === "down" || lane === "down") return { kind: "key" };
       // The lookup took time: the floor again, so the LLM still gets all of its own.
       if (remainingMs(deadline) < llmFloor) return { kind: "no_time" };
 
@@ -565,7 +582,8 @@ async function classifyOne(
       if (reservation === "failed") return { kind: "infra", code: "budget_reserve_failed" };
       if (reservation.id === null) return { kind: "budget" };
 
-      const probe = view.state === "probe";
+      // The call that tests a key, or a lane, whose wait just ended.
+      const probe = view.state === "probe" || lane === "probe";
       const result = await classifyConversation({
         workspaceId: row.workspace_id,
         topics,
@@ -578,18 +596,21 @@ async function classifyOne(
 
       // The key's health: its own outcome, never another key's.
       if (!result.ok && result.code === "key_rejected") {
-        const stop = await recordKeyOutcome(db, guards, wk, "rejected", result.code, deadline);
+        const stop = await recordKeyOutcome(db, guards, row.workspace_id, wk, "rejected", result.code, deadline);
         return stop ?? { kind: "key" };
       }
       if (!result.ok && (result.code === "provider_unavailable" || result.code === "timeout")) {
-        const stop = await recordKeyOutcome(db, guards, wk, "transient", result.code, deadline);
+        const stop = await recordKeyOutcome(db, guards, row.workspace_id, wk, "transient", result.code, deadline);
         return stop ?? { kind: "transient", code: result.code, probe };
       }
       // The provider answered (a result, or a refusal of this text): the key
-      // works. Written only when there is something to reset.
-      if (probe || view.failures > 0) await recordKeyOutcome(db, guards, wk, "answered", null, deadline);
-
-      if (!result.ok) return { kind: "content", code: result.code };
+      // and the lane work. Written after every answer, last (best effort, so
+      // it never takes time from the save).
+      answered = wk;
+      if (!result.ok) {
+        await recordKeyOutcome(db, guards, row.workspace_id, wk, "answered", null, deadline);
+        return { kind: "content", code: result.code };
+      }
       matches = result.matches;
     }
 
@@ -612,9 +633,15 @@ async function classifyOne(
         ...(backfillTopic ? { p_backfill_topic: backfillTopic } : { p_catalog: topics.map((t) => t.id) }),
       })
       .abortSignal(dbSignal(deadline));
-    if (!error) return { kind: "ok" };
+    if (!error) {
+      if (answered) await recordKeyOutcome(db, guards, row.workspace_id, answered, "answered", null, deadline);
+      return { kind: "ok" };
+    }
     if (isDeadlineAbort(error, deadline)) return { kind: "no_time" };
-    if (isDataRejection(error)) return { kind: "content", code: "save_failed" };
+    if (isDataRejection(error)) {
+      if (answered) await recordKeyOutcome(db, guards, row.workspace_id, answered, "answered", null, deadline);
+      return { kind: "content", code: "save_failed" };
+    }
     console.error("[classify-topics] save_conversation_topics failed", error.code);
     return { kind: "infra", code: "save_infra_failed" };
   } catch {

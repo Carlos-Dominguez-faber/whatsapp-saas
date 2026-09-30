@@ -26,6 +26,7 @@ let openrouterCalls = 0;
 let selectRounds = 0;
 const rpcs: string[] = [];
 let keyFailures = 0;
+const streak = new Set<string>();
 
 const json = (body: unknown, status = 200) =>
   new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
@@ -54,13 +55,16 @@ globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
     if (rpc === "reserve_classification_tokens") return json("33333333-3333-3333-3333-333333333333");
     // The backfill's turn: no topic pending.
     if (rpc === "pending_backfill_topics") return json([]);
-    // The key's health, as the SQL keeps it (down at the 3rd transient in a row).
-    if (rpc === "classification_key_gate") return json({ state: "up", failures: keyFailures });
+    // The key's health, as the SQL keeps it: the platform key is shared, so
+    // it goes down at the 3rd transient in a row coming from two workspaces.
+    if (rpc === "classification_key_gate") return json({ state: "up", workspace: "up" });
     if (rpc === "record_classification_key_outcome") {
       const args = JSON.parse(String(init?.body ?? "{}"));
       assert.equal(args.p_outcome, "transient");
       assert.match(args.p_key_id, /^sha256:[0-9a-f]{64}$/, "the key's id must not carry the key");
-      return json(++keyFailures >= args.p_breaker ? "down" : "up");
+      streak.add(args.p_workspace_id);
+      const down = ++keyFailures >= args.p_breaker && streak.size >= 2;
+      return json({ key: down ? "down" : "up", workspace: "up" });
     }
     return json(1);
   }

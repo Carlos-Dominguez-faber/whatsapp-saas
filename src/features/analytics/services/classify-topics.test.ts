@@ -265,51 +265,90 @@ function reset(opts: { keepKeys?: boolean } = {}) {
   if (kept) ({ keyHealth, workspaceKeys, convTransients, clock } = kept);
 }
 
-// ── Key health, as the SQL keeps it (record_classification_key_outcome, the gate) ──
-type KeyRow = { scope: string; failures: number; downCount: number; downSince: number | null; downUntil: number | null; code: string | null };
+// ── Key health, as the SQL keeps it (record_classification_key_outcome, the gate):
+// the key, and each workspace's lane on it; a shared key needs two workspaces.
+type KeyRow = {
+  scope: string; failures: number; downCount: number; downSince: number | null; downUntil: number | null;
+  code: string | null; streak: string[];
+};
 let keyHealth = new Map<string, KeyRow>();
 let workspaceKeys = new Map<string, string>();
 let convTransients = new Map<string, number>();
+const laneOf = (ws: string, key: string) => `lane:${ws}:${key}`;
 function keyHealthRpcs(): Record<string, RpcHandler> {
   keyHealth = new Map();
   workspaceKeys = new Map();
   convTransients = new Map();
+  const row = (id: string, scope: string) => {
+    const k = keyHealth.get(id) ?? { scope, failures: 0, downCount: 0, downSince: null, downUntil: null, code: null, streak: [] };
+    keyHealth.set(id, k);
+    return k;
+  };
+  const gateOf = (id: string, lease: number): "up" | "down" | "probe" => {
+    const k = keyHealth.get(id);
+    if (!k || k.downSince === null) return "up";
+    if ((k.downUntil ?? 0) > clock) return "down";
+    k.downUntil = clock + lease;
+    return "probe";
+  };
+  const goDown = (k: KeyRow, a: Record<string, unknown>) => {
+    const wait = Math.min(Number(a.p_base_seconds) * 2 ** k.downCount, Number(a.p_max_seconds));
+    Object.assign(k, { failures: 0, streak: [], downCount: k.downCount + 1, downSince: k.downSince ?? clock, downUntil: clock + wait * 1000 });
+  };
   return {
     classification_key_gate: (a) => {
-      workspaceKeys.set(a.p_workspace_id as string, a.p_key_id as string);
-      const k = keyHealth.get(a.p_key_id as string);
-      if (!k || k.downSince === null) return { data: { state: "up", failures: k?.failures ?? 0 }, error: null };
-      if ((k.downUntil ?? 0) > clock) return { data: { state: "down" }, error: null };
-      k.downUntil = clock + Number(a.p_probe_seconds) * 1000;
-      return { data: { state: "probe" }, error: null };
+      const ws = a.p_workspace_id as string;
+      const key = a.p_key_id as string;
+      workspaceKeys.set(ws, key);
+      const lease = Number(a.p_probe_seconds) * 1000;
+      const state = gateOf(key, lease);
+      if (state === "down") return { data: { state }, error: null };
+      return { data: { state, workspace: gateOf(laneOf(ws, key), lease) }, error: null };
     },
     record_classification_key_outcome: (a) => {
-      const id = a.p_key_id as string;
-      const k = keyHealth.get(id) ?? { scope: a.p_scope as string, failures: 0, downCount: 0, downSince: null, downUntil: null, code: null };
-      keyHealth.set(id, k);
+      const key = a.p_key_id as string;
+      const ws = a.p_workspace_id as string;
       if (a.p_outcome === "answered") {
-        Object.assign(k, { failures: 0, downCount: 0, downSince: null, downUntil: null, code: null });
-        return { data: "up", error: null };
+        for (const id of [key, laneOf(ws, key)]) {
+          const k = keyHealth.get(id);
+          if (k) Object.assign(k, { failures: 0, downCount: 0, downSince: null, downUntil: null, code: null, streak: [] });
+        }
+        return { data: { key: "up", workspace: "up" }, error: null };
       }
-      k.code = a.p_code as string;
+      const k = row(key, a.p_scope as string);
+      const ln = row(laneOf(ws, key), a.p_scope as string);
       if (a.p_outcome === "rejected") {
-        Object.assign(k, { failures: 0, downSince: k.downSince ?? clock, downUntil: clock + Number(a.p_rejected_seconds) * 1000 });
-        return { data: "down", error: null };
+        k.code = a.p_code as string;
+        Object.assign(k, {
+          failures: 0, streak: [], downSince: k.downSince ?? clock,
+          downUntil: Math.max(k.downUntil ?? clock, clock + Number(a.p_rejected_seconds) * 1000),
+        });
+        return { data: { key: "down", workspace: ln.downSince === null ? "up" : "down" }, error: null };
       }
-      if (k.downSince === null && k.failures + 1 < Number(a.p_breaker)) {
-        k.failures++;
-        return { data: "up", error: null };
+      k.code = ln.code = a.p_code as string;
+      const breaker = Number(a.p_breaker);
+      let wsState = "up";
+      if (ln.downSince !== null || ln.failures + 1 >= breaker) {
+        goDown(ln, a);
+        wsState = "down";
+      } else ln.failures++;
+      const shared = a.p_scope === "platform" || [...workspaceKeys.values()].filter((v) => v === key).length > 1;
+      const streak = k.streak.includes(ws) ? k.streak : [...k.streak, ws];
+      if (k.downSince !== null || (k.failures + 1 >= breaker && (!shared || streak.length >= 2))) {
+        goDown(k, a);
+        return { data: { key: "down", workspace: wsState }, error: null };
       }
-      const wait = Math.min(Number(a.p_base_seconds) * 2 ** k.downCount, Number(a.p_max_seconds));
-      Object.assign(k, { failures: 0, downCount: k.downCount + 1, downSince: k.downSince ?? clock, downUntil: clock + wait * 1000 });
-      return { data: "down", error: null };
+      k.failures++;
+      k.streak = streak;
+      return { data: { key: "up", workspace: wsState }, error: null };
     },
   };
 }
 const { createHash } = await import("node:crypto");
 const hashOf = (key: string) => `sha256:${createHash("sha256").update(key).digest("hex")}`;
-/** The key's row for a workspace, as the gate mapped it. */
+/** The key's row for a workspace, as the gate mapped it, and the workspace's lane on it. */
 const healthOf = (ws: string) => keyHealth.get(workspaceKeys.get(ws) ?? "");
+const laneHealthOf = (ws: string) => keyHealth.get(laneOf(ws, workspaceKeys.get(ws) ?? ""));
 
 const later = () => Date.now() + 50_000;
 const callsTo = (fn: string) => rpcCalls.filter((c) => c.fn === fn);
@@ -1098,7 +1137,7 @@ test("fase 2: only a conversation that keeps failing transiently while its key i
 
 test("fase 2: a probe's failure is the key's, never the conversation's", async () => {
   resetBackfill([[conv("d1")]]);
-  keyHealth.set(hashOf("sk-platform-test"), { scope: "platform", failures: 0, downCount: 1, downSince: clock - 900_000, downUntil: clock - 1, code: "timeout" });
+  keyHealth.set(hashOf("sk-platform-test"), { scope: "platform", failures: 0, downCount: 1, downSince: clock - 900_000, downUntil: clock - 1, code: "timeout", streak: [] });
   classifyImpl = async () => ({ ok: false, code: "timeout", usage: null, keyScope: "platform" });
   const r = await runBackfillPhase(later(), db);
   assert.equal(classifyCalls.length, 1, "one probe");
@@ -1525,7 +1564,7 @@ test("RV r3: when a key's wait ends, ONE call probes it; the rest of the run fol
     tables.insight_topics.push(topic("t2", WS_B, "Precio"));
     for (const [id, ws] of [["a1", WS_A], ["b1", WS_B], ["a2", WS_A], ["b2", WS_B]]) tables.messages.push(message(`m-${id}`, id, ws));
     rpcHandlers.select_conversations_to_classify = queueSelect([conv("a1"), conv("b1", WS_B), conv("a2"), conv("b2", WS_B)], 4);
-    keyHealth.set(hashOf("sk-platform-test"), { scope: "platform", failures: 0, downCount: 1, downSince: clock - 900_000, downUntil: clock - 1, code: "provider_unavailable" });
+    keyHealth.set(hashOf("sk-platform-test"), { scope: "platform", failures: 0, downCount: 1, downSince: clock - 900_000, downUntil: clock - 1, code: "provider_unavailable", streak: [] });
     classifyImpl = async () =>
       answers
         ? { ...OK_RESULT, keyScope: "platform" }
@@ -1575,4 +1614,54 @@ test("REVIEW r4 M2: each phase marks its own turn (the reservation's p_phase)", 
   reset();
   await runClassificationPhase(later(), db);
   assert.deepEqual(callsTo("reserve_classification_tokens").map((c) => c.args.p_phase), ["nightly"]);
+});
+
+test("REVIEW r4 L4: one tenant timing out on the SHARED platform key takes down its lane, never the key", async () => {
+  // A and X both on the platform key; every call of X times out. X has work
+  // alone at first (the case that took the key down), then A joins.
+  const n = night(
+    new Map([
+      ["ws-x", Array.from({ length: 300 }, (_, i) => `x${i}`)],
+      [WS_A, Array.from({ length: 1_000 }, (_, i) => `a${i}`)],
+    ]),
+  );
+  const aQueue = n.queues.get(WS_A)!;
+  n.queues.set(WS_A, []);
+  let t = 1_000_000;
+  let halts = 0;
+  let xCalls = 0;
+  let platformDownRuns = 0;
+  for (let run = 0; run < 24; run++) {
+    reset({ keepKeys: run > 0 });
+    clock = t;
+    if (run === 2) n.queues.set(WS_A, aQueue);
+    tables.insight_topics = [WS_A, "ws-x"].map((ws, i) => ({ ...topic(`t${i}`, ws, "Precio"), backfill_status: "done" }));
+    tables.messages = n.messages;
+    nightHandlers(n);
+    classifyImpl = provider((ws) => ws === "ws-x", "timeout");
+    const guards = newRunGuards();
+    const r = await runClassificationPhase(clock + 100_000, db, guards);
+    if (r.halt) halts++;
+    if (guards.platformDown) platformDownRuns++;
+    xCalls += classifyCalls.filter((c) => c.workspaceId === "ws-x").length;
+    t += 300_000;
+  }
+  const key = keyHealth.get(hashOf("sk-platform-test"));
+  assert.equal(halts, 0);
+  assert.equal(platformDownRuns, 0, "one tenant took the shared platform key down");
+  assert.equal(key?.downSince ?? null, null);
+  assert.notEqual(laneHealthOf("ws-x")?.downSince ?? null, null, "X's own lane is what waits");
+  // X's timeouts: 3 to take its lane down, then one probe per wait (15, 30, 60 min).
+  assert.ok(xCalls <= 6, `X kept eating run time: ${xCalls} timeouts`);
+  const aRead = [...n.done].filter((id) => id.startsWith("a")).length;
+  assert.ok(aRead >= 22 * 16, `A read ${aRead} in its 22 runs`);
+});
+
+test("REVIEW r4 L2: every answer is written to the key's health (the RPC only touches what needs a reset)", async () => {
+  reset();
+  await runClassificationPhase(later(), db);
+  const answered = callsTo("record_classification_key_outcome").map((c) => [c.args.p_outcome, c.args.p_workspace_id]);
+  assert.deepEqual(answered, [["answered", WS_A]]);
+  const fns = rpcCalls.map((c) => c.fn);
+  assert.ok(fns.indexOf("save_conversation_topics") < fns.indexOf("record_classification_key_outcome"), "it went before the save");
 });

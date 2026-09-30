@@ -385,21 +385,21 @@ SELECT is((SELECT (x->>'universe')::int FROM jsonb_array_elements(public.get_ins
 SELECT is(public.get_insights('e4000000-0000-4000-8000-000000000001', now() - interval '9 days', now(), '{}', 'UTC')->>'blocked',
   NULL, 'nothing blocks a workspace whose key was never seen failing');
 SELECT public.classification_key_gate('e4000000-0000-4000-8000-000000000001', 'sha256:l9-own', 'own');
-SELECT public.record_classification_key_outcome('sha256:l9-own', 'own', 'rejected', 'key_rejected');
+SELECT public.record_classification_key_outcome('sha256:l9-own', 'own', 'e4000000-0000-4000-8000-000000000001', 'rejected', 'key_rejected');
 SELECT is(public.get_insights('e4000000-0000-4000-8000-000000000001', now() - interval '9 days', now(), '{}', 'UTC')->>'blocked',
   'key', 'the dashboard gets the cause from the key''s health: the workspace''s own key is down');
-SELECT public.record_classification_key_outcome('sha256:l9-own', 'own', 'answered');
+SELECT public.record_classification_key_outcome('sha256:l9-own', 'own', 'e4000000-0000-4000-8000-000000000001', 'answered');
 SELECT is(public.get_insights('e4000000-0000-4000-8000-000000000001', now() - interval '9 days', now(), '{}', 'UTC')->>'blocked',
   NULL, 'the key answering again clears it');
 SELECT public.classification_key_gate('e4000000-0000-4000-8000-000000000001', 'sha256:l9-platform', 'platform');
-SELECT public.record_classification_key_outcome('sha256:l9-platform', 'platform', 'transient', 'provider_unavailable');
-SELECT public.record_classification_key_outcome('sha256:l9-platform', 'platform', 'transient', 'provider_unavailable');
+SELECT public.record_classification_key_outcome('sha256:l9-platform', 'platform', 'e4000000-0000-4000-8000-000000000001', 'transient', 'provider_unavailable');
+SELECT public.record_classification_key_outcome('sha256:l9-platform', 'platform', 'e4000000-0000-4000-8000-000000000001', 'transient', 'provider_unavailable');
 SELECT is(public.get_insights('e4000000-0000-4000-8000-000000000001', now() - interval '9 days', now(), '{}', 'UTC')->>'blocked',
   NULL, 'two transient failures in a row do not make a key down');
-SELECT public.record_classification_key_outcome('sha256:l9-platform', 'platform', 'transient', 'timeout');
+SELECT public.record_classification_key_outcome('sha256:l9-platform', 'platform', 'e4000000-0000-4000-8000-000000000001', 'transient', 'timeout');
 SELECT is(public.get_insights('e4000000-0000-4000-8000-000000000001', now() - interval '9 days', now(), '{}', 'UTC')->>'blocked',
-  'platform_key', 'the third does, and a workspace on the platform key says so');
-SELECT public.record_classification_key_outcome('sha256:l9-platform', 'platform', 'answered');
+  'workspace', 'the third, from this workspace alone, takes down its lane, not the platform key: it says its own calls fail');
+SELECT public.record_classification_key_outcome('sha256:l9-platform', 'platform', 'e4000000-0000-4000-8000-000000000001', 'answered');
 SELECT public.note_classification_blocked('e4000000-0000-4000-8000-000000000001', 'cap');
 SELECT is(public.get_insights('e4000000-0000-4000-8000-000000000001', now() - interval '9 days', now(), '{}', 'UTC')->>'blocked',
   'cap', 'over the cap, from its note');

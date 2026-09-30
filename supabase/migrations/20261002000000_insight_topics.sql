@@ -252,15 +252,21 @@ ALTER TABLE public.conversation_classification ADD COLUMN IF NOT EXISTS transien
 -- row. key_id never carries the secret: 'sha256:<hex>' of the key, or
 -- 'unreadable:<workspace>' for an own key that can't be decrypted and
 -- 'missing:platform' for an unset OPENROUTER_API_KEY.
---   transient_failures  transient failures in a row while the key is up
---   down_since          set while the key is down (the dashboard reads it)
---   down_until          no call on the key before this; then ONE call probes it
+-- The same table holds each workspace's LANE on its key
+-- ('lane:<workspace>:<key id>'): a circuit for that workspace's own calls
+-- (see classification_key_gate).
+--   transient_failures  transient failures in a row while the circuit is up
+--   streak_workspaces   (keys) the workspaces those failures came from: a
+--                       key several workspaces share needs two of them
+--   down_since          set while the circuit is down (the dashboard reads it)
+--   down_until          no call on it before this; then ONE call probes it
 --   down_count          downs in a row from transient failures (the wait doubles)
 -- Only record_classification_key_outcome and classification_key_gate write it.
 CREATE TABLE IF NOT EXISTS public.classification_key_health (
   key_id             TEXT PRIMARY KEY,
   scope              TEXT NOT NULL CHECK (scope IN ('own', 'platform')),
   transient_failures INT NOT NULL DEFAULT 0,
+  streak_workspaces  UUID[] NOT NULL DEFAULT '{}',
   down_count         INT NOT NULL DEFAULT 0,
   down_since         TIMESTAMPTZ,
   down_until         TIMESTAMPTZ,
