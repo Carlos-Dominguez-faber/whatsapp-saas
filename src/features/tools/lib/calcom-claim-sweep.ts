@@ -1,9 +1,10 @@
 import { createClient as createSbClient, type SupabaseClient } from "@supabase/supabase-js";
 import {
   findCalComBookingAt,
-  getCalComConfig,
+  loadCalComConfig,
   type CalComConfig,
 } from "../../inbox/services/calcom-client.ts";
+import { isMissingFunctionError, reportMissingFunctionOnce } from "@/shared/lib/db-errors";
 import { describeInstant, noteForTeam } from "./hl-appointment.ts";
 import { getBusinessInfo } from "../../inbox/services/business-info.ts";
 import { workspaceSchedulingTimeZone } from "../../inbox/services/scheduling-timezone.ts";
@@ -57,30 +58,38 @@ export async function sweepStaleCalComClaims(deadline: number): Promise<CalComSw
   const tally: CalComSweepTally = { resolved: 0, released: 0, flagged: 0 };
   if (deadline - Date.now() < MIN_REMAINING_MS) return tally;
   const db = svc();
-  const cutoff = new Date(Date.now() - SWEEP_AFTER_MS).toISOString();
-  const { data, error } = await db
-    .from("appointments")
-    .select("id, workspace_id, conversation_id, scheduled_at, calcom_event_type_id, meta")
-    .not("calcom_event_type_id", "is", null)
-    .is("calcom_booking_uid", null)
-    .in("status", ["booked", "confirmed"])
-    .lt("created_at", cutoff)
-    .or("meta->>calcom_claim.in.(sending,unknown),meta->>calcom_claim.is.null")
-    .is("meta->>calcom_swept", null)
-    .order("created_at", { ascending: true })
-    .limit(MAX_PER_TICK);
+  // The partial index's own predicate lives in the function (20261003000017).
+  const { data, error } = await db.rpc("stale_calcom_claims", {
+    p_older_than_seconds: SWEEP_AFTER_MS / 1000,
+    p_limit: MAX_PER_TICK,
+  });
   if (error) {
+    // Deployed before db-push: no function, so nothing to sweep yet. Not a
+    // failed phase (it would turn every tick into a 500).
+    if (isMissingFunctionError(error, "stale_calcom_claims")) {
+      reportMissingFunctionOnce("stale_calcom_claims", "stale Cal.com claims are not swept");
+      return tally;
+    }
     console.error("[calcom-sweep] stale claims lookup failed:", error.message);
     return { ...tally, error: "calcom_sweep_lookup_failed" };
   }
 
-  const configs = new Map<string, CalComConfig | null>();
+  // null: Cal.com isn't connected; a read that failed skips the workspace's
+  // claims this tick instead of reading as "not connected".
+  const configs = new Map<string, CalComConfig | null | "unreadable">();
   for (const claim of (data as StaleClaim[] | null) ?? []) {
     if (deadline - Date.now() < MIN_REMAINING_MS) break;
     if (!configs.has(claim.workspace_id)) {
-      configs.set(claim.workspace_id, await getCalComConfig(claim.workspace_id));
+      try {
+        configs.set(claim.workspace_id, await loadCalComConfig(claim.workspace_id));
+      } catch (err) {
+        console.error("[calcom-sweep] could not read the Cal.com integration:", err instanceof Error ? err.message : err);
+        configs.set(claim.workspace_id, "unreadable");
+      }
     }
-    const cfg = configs.get(claim.workspace_id) ?? null;
+    const loaded = configs.get(claim.workspace_id) ?? null;
+    if (loaded === "unreadable") continue;
+    const cfg = loaded;
     const report = async (why: string) => {
       let zone = "UTC";
       try {
@@ -101,13 +110,12 @@ export async function sweepStaleCalComClaims(deadline: number): Promise<CalComSw
       startMs: Date.parse(claim.scheduled_at),
     });
     if (found.kind === "found") {
-      const { data: linked, error: linkError } = await db
-        .from("appointments")
-        .update({ calcom_booking_uid: found.booking.uid, status: "booked", meta: {} })
-        .eq("id", claim.id)
-        .eq("workspace_id", claim.workspace_id)
-        .is("calcom_booking_uid", null)
-        .select("id");
+      const { data: linked, error: linkError } = await asRead(
+        db
+          .from("appointments")
+          .update({ calcom_booking_uid: found.booking.uid, status: "booked", meta: {} }),
+        claim,
+      ).select("id");
       if (!linkError && ((linked as unknown[] | null) ?? []).length === 1) tally.resolved++;
       else await report("no se pudo vincular la reserva que tiene Cal.com");
       continue;
@@ -119,13 +127,13 @@ export async function sweepStaleCalComClaims(deadline: number): Promise<CalComSw
       continue;
     }
     if (found.kind === "none") {
-      const { error: releaseError } = await db
-        .from("appointments")
-        .update({ status: "cancelled", meta: { ...(claim.meta ?? {}), calcom_claim: "released" } })
-        .eq("id", claim.id)
-        .eq("workspace_id", claim.workspace_id)
-        .is("calcom_booking_uid", null);
-      if (!releaseError) {
+      const { data: freed, error: releaseError } = await asRead(
+        db
+          .from("appointments")
+          .update({ status: "cancelled", meta: { ...(claim.meta ?? {}), calcom_claim: "released" } }),
+        claim,
+      ).select("id");
+      if (!releaseError && ((freed as unknown[] | null) ?? []).length === 1) {
         tally.released++;
         // A trail of what the sweep freed on its own.
         const { error: eventError } = await db.from("events").insert({
@@ -145,6 +153,23 @@ export async function sweepStaleCalComClaims(deadline: number): Promise<CalComSw
 }
 
 /**
+ * A write over the claim only as the sweep read it: still live, still
+ * without a uid, and with the same marker (none, for a #15 claim). A claim
+ * that changed meanwhile (its call linked it, a person released it) is left
+ * alone.
+ */
+function asRead<Q extends { eq: any; is: any; in: any }>(query: Q, claim: StaleClaim): Q {
+  const marker = claim.meta?.calcom_claim;
+  let q = query
+    .eq("id", claim.id)
+    .eq("workspace_id", claim.workspace_id)
+    .is("calcom_booking_uid", null)
+    .in("status", ["booked", "confirmed"]);
+  q = typeof marker === "string" ? q.eq("meta->>calcom_claim", marker) : q.is("meta->>calcom_claim", null);
+  return q as Q;
+}
+
+/**
  * Marks the claim as swept (a compare-and-swap, so two ticks never both
  * report it) and, only if this tick marked it, leaves an internal note in
  * its conversation and an event. True when it was reported now.
@@ -155,12 +180,10 @@ async function flag(
   why: string,
   zone: string,
 ): Promise<boolean> {
-  const { data: marked, error } = await db
-    .from("appointments")
-    .update({ meta: { ...(claim.meta ?? {}), calcom_swept: new Date().toISOString() } })
-    .eq("id", claim.id)
-    .eq("workspace_id", claim.workspace_id)
-    .is("calcom_booking_uid", null)
+  const { data: marked, error } = await asRead(
+    db.from("appointments").update({ meta: { ...(claim.meta ?? {}), calcom_swept: new Date().toISOString() } }),
+    claim,
+  )
     .is("meta->>calcom_swept", null)
     .select("id");
   if (error || ((marked as unknown[] | null) ?? []).length === 0) return false;

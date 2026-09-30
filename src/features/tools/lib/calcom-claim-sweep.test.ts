@@ -36,6 +36,8 @@ function fake(opts: {
   rows: Array<Record<string, unknown>>;
   list?: { status: number; body: unknown };
   connected?: boolean;
+  /** The integrations read fails. */
+  configUnreadable?: boolean;
   alreadySwept?: boolean;
 }) {
   const calls: Call[] = [];
@@ -43,12 +45,13 @@ function fake(opts: {
     const url = String(input);
     const method = init?.method ?? "GET";
     calls.push({ url, method, body: init?.body ? JSON.parse(String(init.body)) : null });
+    if (url.includes("/rest/v1/rpc/stale_calcom_claims")) return json(200, opts.rows);
     if (url.includes("/rest/v1/appointments")) {
-      if (method === "GET") return json(200, opts.rows);
       const swept = decodeURIComponent(url).includes("meta->>calcom_swept=is.null");
       return json(200, swept && opts.alreadySwept ? [] : [{ id: "row_1" }]);
     }
     if (url.includes("/rest/v1/integrations")) {
+      if (opts.configUnreadable) return json(500, { message: "db down" });
       return json(200, opts.connected === false ? [] : [{ credentials: { calcom_api_key: "cal_x" }, enabled: true }]);
     }
     if (url.includes("/rest/v1/business_info")) {
@@ -77,16 +80,54 @@ async function run(f: ReturnType<typeof fake>) {
 
 const patches = (calls: Call[]) => calls.filter((c) => c.method === "PATCH" && c.url.includes("/appointments"));
 
-test("the sweep only takes maybe-booked claims older than 10 min, not yet swept", async () => {
+test("the sweep asks stale_calcom_claims() for claims older than 10 min, 20 a tick", async () => {
   const f = fake({ rows: [] });
   await run(f);
-  const q = decodeURIComponent(f.calls[0].url);
-  assert.match(q, /calcom_booking_uid=is\.null/);
-  assert.match(q, /status=in\.\(booked,confirmed\)/);
-  assert.match(q, /or=\(meta->>calcom_claim\.in\.\(sending,unknown\),meta->>calcom_claim\.is\.null\)/);
-  assert.match(q, /meta->>calcom_swept=is\.null/);
-  const cutoff = Date.parse(new URL(f.calls[0].url).searchParams.get("created_at")!.replace(/^lt\./, ""));
-  assert.ok(Math.abs(Date.now() - 10 * 60_000 - cutoff) < 5_000);
+  assert.ok(f.calls[0].url.endsWith("/rest/v1/rpc/stale_calcom_claims"));
+  assert.deepEqual(f.calls[0].body, { p_older_than_seconds: 600, p_limit: 20 });
+});
+
+test("every write goes over the claim as it was read (live, no uid, same marker)", async () => {
+  const f = fake({ rows: [claimRow({ calcom_claim: "unknown", attendee_email: "ana@example.com" })] });
+  await run(f);
+  const url = decodeURIComponent(patches(f.calls)[0].url);
+  assert.match(url, /calcom_booking_uid=is\.null/);
+  assert.match(url, /status=in\.\(booked,confirmed\)/);
+  assert.match(url, /meta->>calcom_claim=eq\.unknown/);
+
+  const legacy = fake({ rows: [claimRow({})] });
+  await run(legacy);
+  assert.match(decodeURIComponent(patches(legacy.calls)[0].url), /meta->>calcom_claim=is\.null/);
+
+  // Changed meanwhile (0 rows): not counted as released.
+  const changed = fake({ rows: [claimRow({ calcom_claim: "unknown", attendee_email: "ana@example.com" })], alreadySwept: false });
+  changed.fn = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = String(input);
+    if (url.includes("/rest/v1/appointments") && (init?.method ?? "GET") === "PATCH") return json(200, []);
+    return fake({ rows: [claimRow({ calcom_claim: "unknown", attendee_email: "ana@example.com" })] }).fn(input, init);
+  }) as typeof changed.fn;
+  assert.deepEqual(await run(changed), { resolved: 0, released: 0, flagged: 0 });
+});
+
+test("an unreadable Cal.com integration skips the claim this tick; it isn't 'not connected'", async () => {
+  const f = fake({ rows: [claimRow({ calcom_claim: "unknown", attendee_email: "ana@example.com" })], configUnreadable: true });
+  assert.deepEqual(await run(f), { resolved: 0, released: 0, flagged: 0 });
+  assert.equal(patches(f.calls).length, 0);
+});
+
+test("before db-push (no stale_calcom_claims) the sweep is skipped, not a failed phase", async () => {
+  const original = globalThis.fetch;
+  globalThis.fetch = (async () =>
+    json(404, {
+      code: "PGRST202",
+      message: "Could not find the function public.stale_calcom_claims(p_limit, p_older_than_seconds)",
+      hint: null,
+    })) as typeof fetch;
+  try {
+    assert.deepEqual(await sweepStaleCalComClaims(Date.now() + 50_000), { resolved: 0, released: 0, flagged: 0 });
+  } finally {
+    globalThis.fetch = original;
+  }
 });
 
 test("found in Cal.com → linked; a complete 'no' → released", async () => {

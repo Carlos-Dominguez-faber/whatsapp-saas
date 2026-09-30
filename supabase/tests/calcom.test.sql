@@ -8,7 +8,7 @@ BEGIN;
 CREATE EXTENSION IF NOT EXISTS pgtap WITH SCHEMA extensions;
 SET search_path = public, extensions;
 
-SELECT plan(28);
+SELECT plan(30);
 
 -- ── privileges: service role only ───────────────────────────────────────────
 SELECT ok(NOT has_function_privilege('anon',
@@ -197,6 +197,19 @@ SELECT * FROM public.claim_calcom_slot('c0000000-0000-4000-8000-000000000009', '
   '2030-08-01T16:00:00Z', 7, 120);
 SELECT lives_ok($$ DELETE FROM public.workspaces WHERE id = 'c0000000-0000-4000-8000-000000000009' $$,
   'a workspace with open claims (from this same transaction) can be deleted');
+
+-- ── stale_calcom_claims(): the sweep's lookup, service role only ─────────
+SELECT ok(NOT has_function_privilege('authenticated', 'public.stale_calcom_claims(integer,integer)', 'EXECUTE'),
+  'authenticated cannot list stale claims');
+INSERT INTO public.appointments (workspace_id, contact_id, scheduled_at, status, calcom_event_type_id, meta, created_at) VALUES
+  ('c0000000-0000-4000-8000-000000000001', 'c0000000-0000-4000-8000-0000000000c1', '2031-01-01T16:00:00Z', 'booked', 7, '{"calcom_claim":"sending"}', now() - INTERVAL '20 minutes'),
+  ('c0000000-0000-4000-8000-000000000001', 'c0000000-0000-4000-8000-0000000000c1', '2031-01-02T16:00:00Z', 'booked', 7, '{"calcom_claim":"pending"}', now() - INTERVAL '20 minutes'),
+  ('c0000000-0000-4000-8000-000000000001', 'c0000000-0000-4000-8000-0000000000c1', '2031-01-03T16:00:00Z', 'booked', 7, '{"calcom_claim":"unknown"}', now() - INTERVAL '1 minute'),
+  ('c0000000-0000-4000-8000-000000000001', 'c0000000-0000-4000-8000-0000000000c1', '2031-01-04T16:00:00Z', 'booked', 7, '{"calcom_claim":"unknown","calcom_swept":"x"}', now() - INTERVAL '20 minutes'),
+  ('c0000000-0000-4000-8000-000000000001', 'c0000000-0000-4000-8000-0000000000c1', '2031-01-05T16:00:00Z', 'booked', 7, '{}', now() - INTERVAL '1 day');
+SELECT is((SELECT string_agg(to_char(scheduled_at AT TIME ZONE 'UTC', 'MM-DD'), ',' ORDER BY scheduled_at)
+             FROM public.stale_calcom_claims(600, 20) WHERE scheduled_at >= '2031-01-01'),
+  '01-01,01-05', 'only stale maybe-booked claims not yet swept (sending, and a #15 claim with no marker)');
 
 SELECT * FROM finish();
 ROLLBACK;
