@@ -1,16 +1,18 @@
 -- ============================================================
 -- Migration: 20261003000001_seed_calcom_tools
--- Agente WhatsApp — seed the 5 Cal.com scheduling tools
+-- Agente WhatsApp — seed the 6 Cal.com scheduling tools
 --
 -- Same reasoning as 20260617000001_seed_check_availability_tool: tools are
 -- implemented and registered in code (src/features/tools/index.ts), but
--- getEnabledTools() only returns tools that have a tool_configs row backed
--- by a public.tools catalog entry. Seed them so they show in Settings and
--- can be enabled per workspace.
+-- getEnabledTools() only returns tools that have a tool_configs row backed by
+-- a public.tools catalog entry. Seed them so they show in Settings and can be
+-- enabled per workspace (they ship off, marked beta).
 --
 -- The schema column is for catalog/display only — the agent builds the LLM
 -- tool schema from the code zod definition.
--- Idempotent via ON CONFLICT, matching the original tools seed.
+-- Idempotent via ON CONFLICT. Installs that ran #15's own seed
+-- (20260820020000, on provider/kapso) get cancel/reschedule updated to the
+-- confirmed-date arguments.
 -- ============================================================
 
 INSERT INTO public.tools (key, name, description, schema, sensitivity) VALUES
@@ -27,13 +29,17 @@ INSERT INTO public.tools (key, name, description, schema, sensitivity) VALUES
    '{"type":"object","properties":{"event_type_id":{"type":"number"},"datetime_iso":{"type":"string"},"attendee_name":{"type":"string"},"attendee_email":{"type":"string"}},"required":["event_type_id","datetime_iso","attendee_name"]}',
    'write'),
   ('cancel_calcom', 'Cal.com — Cancelar cita',
-   'Cancels the contact''s active Cal.com appointment',
-   '{"type":"object","properties":{}}',
+   'Cancels the contact''s Cal.com booking at the date and time the customer confirmed',
+   '{"type":"object","properties":{"appointment_datetime_iso":{"type":"string"}},"required":["appointment_datetime_iso"]}',
    'write'),
   ('reschedule_calcom', 'Cal.com — Reagendar cita',
-   'Reschedules the contact''s active Cal.com appointment to a new time',
-   '{"type":"object","properties":{"new_datetime_iso":{"type":"string"}},"required":["new_datetime_iso"]}',
-   'write')
+   'Moves the contact''s Cal.com booking from the confirmed date and time to a new one',
+   '{"type":"object","properties":{"appointment_datetime_iso":{"type":"string"},"new_datetime_iso":{"type":"string"}},"required":["appointment_datetime_iso","new_datetime_iso"]}',
+   'write'),
+  ('list_calcom_appointments', 'Cal.com — Ver citas',
+   'Lists the conversation contact''s upcoming Cal.com bookings made through WhatsApp, with their exact date and time',
+   '{"type":"object","properties":{}}',
+   'read')
 ON CONFLICT (key) DO UPDATE
   SET name = EXCLUDED.name,
       description = EXCLUDED.description,

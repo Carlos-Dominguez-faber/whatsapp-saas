@@ -544,7 +544,14 @@ const HANDOFF_REASONS = new Set(["customer_request", "agent_stuck"]);
 const TOOL_FAILED = "tool_failed";
 /** The same for a write outside scheduling (an n8n tool): a generic label. */
 const WRITE_UNCONFIRMED = "write_unconfirmed";
-const NEEDS_HUMAN_TOOLS = new Set(["schedule_highlevel", "cancel_highlevel", "reschedule_highlevel"]);
+const NEEDS_HUMAN_TOOLS = new Set([
+  "schedule_highlevel",
+  "cancel_highlevel",
+  "reschedule_highlevel",
+  "schedule_calcom",
+  "cancel_calcom",
+  "reschedule_calcom",
+]);
 
 function needsHuman(execution: { name: string; ok: boolean | null; output?: unknown }): boolean {
   if (!NEEDS_HUMAN_TOOLS.has(execution.name) || execution.ok === true) return false;

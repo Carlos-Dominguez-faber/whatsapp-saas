@@ -164,8 +164,8 @@ test("acepta el formato de objeto de Cal.com ({ start }) además de strings", ()
 
   assert.equal(unreadable, 0);
   assert.deepEqual(days["2026-06-12"], [
-    "2026-06-12T15:00:00Z",
-    "2026-06-12T16:00:00Z",
+    "2026-06-12T15:00:00+00:00",
+    "2026-06-12T16:00:00+00:00",
   ]);
 });
 

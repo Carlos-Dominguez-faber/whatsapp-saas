@@ -12,6 +12,7 @@ import { checkAvailabilityCalComTool } from "./tools/check-availability-calcom";
 import { scheduleCalComTool } from "./tools/schedule-calcom";
 import { cancelCalComTool } from "./tools/cancel-calcom";
 import { rescheduleCalComTool } from "./tools/reschedule-calcom";
+import { listCalComAppointmentsTool } from "./tools/list-calcom-appointments";
 
 registry.register(echoTool);
 registry.register(scheduleLinkTool);
@@ -26,6 +27,7 @@ registry.register(checkAvailabilityCalComTool);
 registry.register(scheduleCalComTool);
 registry.register(cancelCalComTool);
 registry.register(rescheduleCalComTool);
+registry.register(listCalComAppointmentsTool);
 
 export { registry };
 export type {
