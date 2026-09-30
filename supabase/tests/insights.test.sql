@@ -9,7 +9,7 @@ BEGIN;
 CREATE EXTENSION IF NOT EXISTS pgtap WITH SCHEMA extensions;
 SET search_path = public, extensions;
 
-SELECT plan(50);
+SELECT plan(52);
 
 -- ── Privileges ───────────────────────────────────────────────────────────────
 SELECT ok(NOT has_function_privilege('anon',
@@ -313,6 +313,14 @@ SELECT lives_ok(
   $$INSERT INTO public.insight_topics (workspace_id, name, description)
     VALUES ('e0000000-0000-4000-8000-000000000001', 'viejo', 'x')$$,
   'an archived topic does not hold its name');
+SELECT throws_ok(
+  $$INSERT INTO public.insight_topics (workspace_id, name, description)
+    VALUES ('e0000000-0000-4000-8000-000000000001', 'Preci' || 'o' || U&'\0301', 'x')$$,
+  'P0001', 'insight_topics_duplicate', 'an accent typed as a combining mark is the same name');
+SELECT throws_ok(
+  $$INSERT INTO public.insight_topics (workspace_id, name, description)
+    VALUES ('e0000000-0000-4000-8000-000000000001', U&'Viejo\00A0', 'x')$$,
+  'P0001', 'insight_topics_duplicate', 'a non-breaking space counts as a space');
 
 -- ── Transient failures wait without spending an attempt; blocked causes ─────
 SELECT public.defer_classification('e0000000-0000-4000-8000-000000000001',

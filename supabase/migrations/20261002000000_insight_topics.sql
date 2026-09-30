@@ -84,16 +84,22 @@ CREATE TRIGGER trg_insight_topics_updated_at
   BEFORE UPDATE ON public.insight_topics
   FOR EACH ROW EXECUTE FUNCTION public.update_updated_at();
 
--- The name two topics can't share: case, accents and repeated spaces aside
--- ("Precio", "precio" and "Precío" are one topic). ñ stays: año is not ano.
+-- The name two topics can't share: case, accents and spaces aside ("Precio",
+-- "precio", "Precío" — typed with a precomposed í or with i + a combining
+-- accent — are one topic). NFC first, so both spellings of an accent become
+-- the same character; non-breaking and other Unicode spaces count as spaces.
+-- ñ stays: año is not ano.
 CREATE OR REPLACE FUNCTION public.insight_topic_key(p_name TEXT)
 RETURNS TEXT
 LANGUAGE sql
 IMMUTABLE
 SET search_path = ''
 AS $$
-  SELECT lower(translate(btrim(regexp_replace(p_name, '\s+', ' ', 'g')),
-                         'ÁÉÍÓÚÜÀÈÌÒÙáéíóúüàèìòù', 'AEIOUUAEIOUaeiouuaeiou'));
+  SELECT lower(translate(
+           btrim(regexp_replace(
+             translate(normalize(p_name, NFC), U&'\00A0\2007\202F\2009\200A', '     '),
+             '\s+', ' ', 'g')),
+           'ÁÉÍÓÚÜÀÈÌÒÙáéíóúüàèìòù', 'AEIOUUAEIOUaeiouuaeiou'));
 $$;
 
 -- Máx. 10 temas activos, sin dos activos con el mismo nombre (insight_topic_key),
