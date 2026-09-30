@@ -824,13 +824,28 @@ sigue haciendo falta si no lo has corrido).
     su propio campo de zona; al guardar la integración se borra el que hubiera.
   - `schedule_calcom`: agenda con el email del cliente (si no lo tiene, el agente se
     lo pide). Reserva el horario en la base antes de llamar a Cal.com, así que un
-    reintento no agenda dos veces. Una reserva cuya llamada murió libera el horario
-    a los 2 minutos.
+    reintento no agenda dos veces.
+    - Si la llamada murió antes de mandar nada, el horario se libera a los 2 minutos.
+    - Si Cal.com pudo haber agendado (la llamada se cortó a medio envío), el horario
+      no se libera solo: cuando el cliente vuelve a pedirlo, la app pregunta a
+      Cal.com por su email, servicio y hora; si Cal.com responde que no existe, lo
+      libera, y si no da una respuesta completa, pasa la conversación a una persona.
+    - Para liberar uno a mano, después de revisar en Cal.com, en Supabase → SQL
+      Editor: `update appointments set status = 'cancelled', meta = meta ||
+      '{"calcom_claim":"released"}' where id = '<id>' and calcom_booking_uid is
+      null;` (o, si la reserva sí existe: `set calcom_booking_uid = '<uid>', meta =
+      '{}'`).
+  - Los tipos de evento **recurrentes** o **con cupos** (varias personas por
+    horario) no se agendan por WhatsApp.
+  - Una reserva que el negocio tiene que **confirmar** en Cal.com se le presenta al
+    cliente como "solicitada, pendiente de confirmación", y no recibe recordatorio
+    mientras siga pendiente.
   - `list_calcom_appointments`, `cancel_calcom` y `reschedule_calcom`: el agente pasa
     la fecha y hora de la cita que el cliente confirmó, copiada de la lista. Cal.com
     manda: la app lee cada cita en Cal.com antes de actuar (y sigue una cita que
-    alguien movió allá). Solo ve las citas que se agendaron **por WhatsApp**: las
-    que el cliente hizo en la página de Cal.com no aparecen.
+    alguien movió allá; la cita movida conserva su recordatorio). Solo ve las citas
+    que se agendaron **por WhatsApp**: las que el cliente hizo en la página de
+    Cal.com no aparecen.
   - Si Cal.com no responde a tiempo al agendar, cancelar o mover, el agente no le
     dice al cliente ni que sí ni que no: deja una nota interna y pasa la
     conversación a una persona.
@@ -841,17 +856,24 @@ sigue haciendo falta si no lo has corrido).
   alternativa a HighLevel como CRM. **Un solo CRM activo por workspace**: la base no
   deja tener HighLevel y HubSpot encendidos a la vez; para cambiar, desactiva uno.
   - Se conecta con el token de una app privada de HubSpot (permisos de contactos,
-    negocios, propiedades de contactos y comunicaciones). **Probar conexión** crea
-    en tu HubSpot dos propiedades de contacto, `whatsapp_phone` y `whatsapp_tags`, y
-    es obligatorio antes de que sincronice nada. Cambiar el token por el de otra
-    cuenta suelta los enlaces de contactos de la anterior.
+    negocios, propiedades de contactos y comunicaciones). **Probar conexión** revisa
+    esos permisos, crea en tu HubSpot dos propiedades de contacto, `whatsapp_phone` y
+    `whatsapp_tags`, y es obligatorio antes de que sincronice nada. Cambiar el token
+    por el de otra cuenta suelta los enlaces de contactos y el pipeline de la
+    anterior (hay que elegirlo de nuevo).
   - Sincroniza el contacto (nombre, email y etiquetas; una etiqueta que quitas aquí
     se quita en HubSpot) y, cuando una conversación pasa a una persona o se cierra,
-    deja un registro de WhatsApp en la línea de tiempo del contacto (lo manda el
-    cron `automations`, en menos de un minuto).
+    deja un registro de WhatsApp en la línea de tiempo del contacto, fechado cuando
+    pasó (lo manda el cron `automations`, en menos de un minuto; también cuando el
+    traspaso lo hizo el sistema porque la IA no pudo responder).
+  - Si el token deja de servir (revocado, sin un permiso, sin probar), esos
+    registros **esperan**: al volver a **Probar conexión** con la misma cuenta se
+    envían. Si HubSpot no confirmó si recibió uno, no se reenvía (para no
+    duplicarlo) y queda un evento `crm_sync_failed`.
   - En el modo setter hay una acción nueva, "Crear negocio en HubSpot", en el
     pipeline y etapa que elijas.
-  - Los registros ya enviados se borran solos a los 30 días.
+  - Los registros ya enviados se borran solos a los 30 días; los que esperan un token
+    arreglado, a los 90.
 - **HighLevel:** editar un contacto en el panel ahora hace **una sola** subida a
   HighLevel (antes, una por cada etiqueta quitada).
 - **Cron `buffer-flush`:** si una de sus dos fases no puede trabajar (la base no
