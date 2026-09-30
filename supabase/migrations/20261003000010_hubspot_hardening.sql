@@ -16,9 +16,11 @@
 --    partial index keeps that DELETE off the pending rows. Service role only.
 --
 -- The CHECK is added NOT VALID (enforced for every new write at once, with
--- only a brief lock) and validated in its own statement, which scans
--- contacts without blocking writes (as 20260926000002 does). lock_timeout
--- keeps a busy table from queueing every write behind this migration.
+-- only a brief lock) and validated by its own migration,
+-- 20261003000015_validate_hs_contact_id_numeric: db push runs each file in
+-- one transaction, so a VALIDATE here would hold this file's locks while it
+-- scans contacts. lock_timeout keeps a busy table from queueing every write
+-- behind this migration.
 -- ============================================================================
 
 SET lock_timeout = '10s';
@@ -52,7 +54,6 @@ BEGIN
   END IF;
 END $$;
 
-ALTER TABLE public.contacts VALIDATE CONSTRAINT contacts_hs_contact_id_numeric;
 
 CREATE INDEX IF NOT EXISTS idx_hubspot_conversation_logs_finished
   ON public.hubspot_conversation_logs (updated_at)
