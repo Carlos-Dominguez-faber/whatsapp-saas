@@ -127,7 +127,9 @@ BEGIN
 
     -- Who holds it. FOR UPDATE: a concurrent expiry waits for this one.
     SELECT a.id, a.calcom_booking_uid, a.calcom_event_type_id,
-           COALESCE(a.meta->>'calcom_claim', 'legacy') AS claim, a.created_at,
+           COALESCE(a.meta->>'calcom_claim',
+                    CASE WHEN a.calcom_booking_uid IS NULL THEN 'legacy' ELSE 'booked' END) AS claim,
+           a.created_at,
            a.meta->>'attendee_email' AS email
       INTO v_holder
       FROM public.appointments a
