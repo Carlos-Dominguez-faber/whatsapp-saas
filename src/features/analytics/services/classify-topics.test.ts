@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { mock, test } from "node:test";
 
+process.env.OPENROUTER_API_KEY = "sk-platform-test";
+
 type Classify = (p: {
   workspaceId: string;
   topics: Array<{ id: string }>;
@@ -28,7 +30,7 @@ mock.module("./classifier.ts", {
   },
 });
 
-const { runClassificationPhase, runBackfillPhase, CLASSIFY_DAILY_TOKEN_CAP, BACKFILL_SHARE_MS } = await import("./classify-topics.ts");
+const { runClassificationPhase, runBackfillPhase, CLASSIFY_DAILY_TOKEN_CAP, BACKFILL_SHARE_MS, newRunGuards } = await import("./classify-topics.ts");
 const { MAX_PROMPT_CHARS } = await import("../lib/classify-prompt.ts");
 
 // ── Reloj virtual ──────────────────────────────────────────
@@ -150,6 +152,7 @@ function query(table: string) {
     },
     order: () => q,
     limit: (n: number) => thenable(`from:${table}`, async () => ({ data: rows().slice(0, n), error: null })),
+    maybeSingle: async () => ({ data: rows()[0] ?? null, error: null }),
     range: (from: number, to: number) =>
       thenable(`from:${table}`, async () => ({ data: rows().slice(from, to + 1), error: null })),
     insert: (row: Record<string, unknown>) =>
@@ -236,7 +239,7 @@ const callsTo = (fn: string) => rpcCalls.filter((c) => c.fn === fn);
 test("fase 1: reserva, clasifica, liquida con el consumo real y guarda con classified_until", async () => {
   reset();
   const r = await runClassificationPhase(later(), db);
-  assert.deepEqual(r, { classified: 1, failed: 0, skipped_workspaces: 0, unavailable_workspaces: 0, halt: false });
+  assert.deepEqual(r, { classified: 1, failed: 0, deferred: 0, skipped_workspaces: 0, unavailable_workspaces: 0, halt: false });
   assert.deepEqual(callsTo("save_conversation_topics")[0].args, {
     p_workspace_id: WS_A,
     p_conversation_id: "d1",
@@ -335,7 +338,7 @@ test("reserva caída por infraestructura → halt, SIN llamar al LLM y sin gasta
     const r = await runClassificationPhase(later(), db);
     assert.deepEqual(
       r,
-      { classified: 0, failed: 0, skipped_workspaces: 0, unavailable_workspaces: 0, halt: true, error: "budget_reserve_failed" },
+      { classified: 0, failed: 0, deferred: 0, skipped_workspaces: 0, unavailable_workspaces: 0, halt: true, error: "budget_reserve_failed" },
       `code ${code}`,
     );
     assert.equal(classifyCalls.length, 0, `code ${code}: llamó al LLM sin reserva`);
@@ -344,17 +347,19 @@ test("reserva caída por infraestructura → halt, SIN llamar al LLM y sin gasta
   }
 });
 
-test("llamada cortada por el proveedor lento → la reserva NO se liquida (queda la estimación), el workspace se salta sin intento", async () => {
+test("TRANSIENT: timeout → the reservation keeps its estimate, the conversation waits an hour, no attempt", async () => {
   reset();
-  // Presupuesto completo de 20 s (later()) y el LLM igual se corta: el
-  // proveedor no respondió. OpenRouter factura igual, así que liquidar en 0
-  // subcontaría el día.
+  // Full 20 s budget (later()) and the LLM still times out: the provider.
+  // OpenRouter bills anyway, so settling at 0 would undercount the day.
   classifyImpl = llmTaking((budget) => budget + 1);
   const r = await runClassificationPhase(later(), db);
-  assert.deepEqual(r, { classified: 0, failed: 0, skipped_workspaces: 0, unavailable_workspaces: 1, halt: false });
+  assert.deepEqual(r, { classified: 0, failed: 0, deferred: 1, skipped_workspaces: 0, unavailable_workspaces: 0, halt: false });
   assert.equal(callsTo("reserve_classification_tokens").length, 1);
-  assert.equal(callsTo("settle_classification_tokens").length, 0, "liquidó una llamada sin consumo conocido");
+  assert.equal(callsTo("settle_classification_tokens").length, 0, "settled a call with unknown usage");
   assert.equal(callsTo("record_classification_failure").length, 0);
+  assert.deepEqual(callsTo("defer_classification").map((c) => c.args), [
+    { p_workspace_id: WS_A, p_conversation_id: "d1", p_code: "timeout", p_seconds: 3600 },
+  ]);
 });
 
 test("sin tiempo para los 20 s completos del LLM → ni reserva ni llama (fase 1: piso 35 s)", async () => {
@@ -363,7 +368,7 @@ test("sin tiempo para los 20 s completos del LLM → ni reserva ni llama (fase 1
   for (const ms of [25_000, 34_999]) {
     reset();
     const r = await runClassificationPhase(clock + ms, db);
-    assert.deepEqual(r, { classified: 0, failed: 0, skipped_workspaces: 0, unavailable_workspaces: 0, halt: false }, `${ms}`);
+    assert.deepEqual(r, { classified: 0, failed: 0, deferred: 0, skipped_workspaces: 0, unavailable_workspaces: 0, halt: false }, `${ms}`);
     assert.equal(callsTo("reserve_classification_tokens").length, 0, `${ms}: reservó sin tiempo para la llamada`);
     assert.equal(classifyCalls.length, 0, `${ms}: llamó sin tiempo para la llamada`);
     assert.equal(callsTo("record_classification_failure").length, 0);
@@ -380,7 +385,7 @@ test("sin tiempo para los 20 s completos del LLM → ni reserva ni llama (fase 1
 test("fase 2 (backfill) usa el mismo piso, con tres escrituras: 40 s", async () => {
   resetBackfill([[conv("d1")]]);
   const r = await runBackfillPhase(clock + 39_999, db);
-  assert.deepEqual(r, { processed: 0, failed: 0, topics_done: 0, topics_expired: 0, unavailable_workspaces: 0, halt: false });
+  assert.deepEqual(r, { processed: 0, failed: 0, deferred: 0, topics_done: 0, topics_expired: 0, skipped_workspaces: 0, unavailable_workspaces: 0, halt: false });
   assert.equal(callsTo("reserve_classification_tokens").length, 0);
   assert.equal(classifyCalls.length, 0);
   assert.equal(callsTo("advance_topic_backfill").length, 0);
@@ -397,49 +402,132 @@ test("si falla la liquidación, la estimación ya cuenta: se guarda el resultado
     reset();
     rpcHandlers.settle_classification_tokens = () => ({ data: null, error: { code } });
     const r = await runClassificationPhase(later(), db);
-    assert.deepEqual(r, { classified: 1, failed: 0, skipped_workspaces: 0, unavailable_workspaces: 0, halt: false }, `code ${code}`);
+    assert.deepEqual(r, { classified: 1, failed: 0, deferred: 0, skipped_workspaces: 0, unavailable_workspaces: 0, halt: false }, `code ${code}`);
     assert.equal(callsTo("save_conversation_topics").length, 1);
   }
 });
 
-test("proveedor caído en un workspace → se salta ESE workspace, CERO intentos y una sola llamada", async () => {
+test("TRANSIENT: a 5xx defers that conversation only; the run goes on with the next of the SAME workspace", async () => {
   reset();
-  // Si el fallo se registrara, el lease se soltaría y la
-  // misma conversación volvería en la vuelta siguiente, hasta la cuarentena.
   let round = 0;
-  rpcHandlers.select_conversations_to_classify = (args) => ({
-    data: ++round <= 3 && !(args.p_skip_workspaces as string[]).includes(WS_A) ? [conv("d1")] : [],
+  rpcHandlers.select_conversations_to_classify = () => ({
+    data: round++ === 0 ? [conv("d1"), conv("d2")] : [],
     error: null,
   });
-  classifyImpl = async () => ({ ok: false, code: "provider_unavailable", usage: null });
+  classifyImpl = async () =>
+    classifyCalls.length === 1
+      ? { ok: false, code: "provider_unavailable", usage: { promptTokens: 0, completionTokens: 0 }, keyScope: "platform" }
+      : { ok: true, matches: [], usage: { promptTokens: 100, completionTokens: 5 }, keyScope: "platform" };
   const r = await runClassificationPhase(later(), db);
-  assert.deepEqual(r, { classified: 0, failed: 0, skipped_workspaces: 0, unavailable_workspaces: 1, halt: false });
-  assert.equal(callsTo("record_classification_failure").length, 0, "una caída del proveedor quemó un intento");
-  assert.equal(classifyCalls.length, 1);
-  assert.deepEqual(callsTo("select_conversations_to_classify").at(-1)?.args.p_skip_workspaces, [WS_A]);
+  assert.deepEqual(r, { classified: 1, failed: 0, deferred: 1, skipped_workspaces: 0, unavailable_workspaces: 0, halt: false });
+  assert.equal(callsTo("record_classification_failure").length, 0, "a transient failure spent an attempt");
+  assert.deepEqual(callsTo("defer_classification").map((c) => c.args.p_conversation_id), ["d1"]);
+  // An HTTP 5xx answer is settled at 0: nothing was generated.
+  assert.equal(callsTo("settle_classification_tokens")[0].args.p_prompt_tokens, 0);
 });
-
-test("the same failure in a second workspace is the platform: the phase halts", async () => {
-  for (const code of ["provider_unavailable", "workspace_unavailable", "timeout"]) {
+test("BREAKER: 3 transient failures in a row on different conversations stop the run", async () => {
+  for (const code of ["provider_unavailable", "timeout"]) {
     reset();
     tables.insight_topics.push(topic("t2", WS_B, "Precio"));
     let round = 0;
     rpcHandlers.select_conversations_to_classify = () => ({
-      data: [[conv("d1", WS_A)], [conv("d2", WS_B)], [conv("d3", WS_A)]][round++] ?? [],
+      data: [[conv("d1", WS_A)], [conv("d2", WS_B)], [conv("d3", WS_A)], [conv("d4", WS_B)]][round++] ?? [],
       error: null,
     });
-    classifyImpl = async () => ({ ok: false, code, usage: null });
+    classifyImpl = async () => ({ ok: false, code, usage: null, keyScope: "platform" });
     const r = await runClassificationPhase(later(), db);
-    assert.deepEqual(r, { classified: 0, failed: 0, skipped_workspaces: 0, unavailable_workspaces: 1, halt: true, error: code }, code);
-    assert.equal(classifyCalls.length, 2, `${code}: kept calling after two workspaces failed`);
+    assert.deepEqual(r, { classified: 0, failed: 0, deferred: 3, skipped_workspaces: 0, unavailable_workspaces: 0, halt: true, error: code }, code);
+    assert.equal(classifyCalls.length, 3, `${code}: kept calling after the breaker`);
   }
 });
 
+test("BREAKER: any answer from the provider resets the count", async () => {
+  reset();
+  let round = 0;
+  const rows = ["d1", "d2", "d3", "d4", "d5"].map((id) => [conv(id)]);
+  for (const id of ["d4", "d5"]) tables.messages.push(message(`m-${id}`, id, WS_A));
+  rpcHandlers.select_conversations_to_classify = () => ({ data: rows[round++] ?? [], error: null });
+  // transient, transient, a content rejection, transient, transient: never 3 in a row.
+  const codes = ["provider_unavailable", "timeout", "content_rejected", "timeout", "provider_unavailable"];
+  classifyImpl = async () => ({ ok: false, code: codes[classifyCalls.length - 1], usage: null, keyScope: "platform" });
+  const r = await runClassificationPhase(later(), db);
+  assert.equal(r.halt, false);
+  assert.equal(r.deferred, 4);
+  assert.equal(r.failed, 1);
+});
+
+test("KEY: a dead own key never counts toward a halt, however many workspaces have one", async () => {
+  reset();
+  for (const [ws, t] of [[WS_B, "t2"], ["ws-c", "t3"], ["ws-d", "t4"]] as const) tables.insight_topics.push(topic(t, ws, "Precio"));
+  for (const [id, ws] of [["a1", WS_A], ["b1", WS_B], ["c1", "ws-c"], ["d1", "ws-d"]]) tables.messages.push(message(`m-${id}-x`, id, ws));
+  tables.integrations = [WS_A, WS_B, "ws-c"].map((ws) => ({
+    workspace_id: ws, provider: "openrouter", credentials: { openrouter_api_key: `sk-${ws}` },
+  }));
+  rpcHandlers.select_conversations_to_classify = (args) => {
+    const skip = args.p_skip_workspaces as string[];
+    return {
+      data: [conv("a1", WS_A), conv("b1", WS_B), conv("c1", "ws-c"), conv("d1", "ws-d")].filter((r) => !skip.includes(r.workspace_id)),
+      error: null,
+    };
+  };
+  let dCalls = 0;
+  classifyImpl = async (p) => {
+    if (p.workspaceId === "ws-d") {
+      dCalls++;
+      return { ok: true, matches: [], usage: { promptTokens: 100, completionTokens: 5 }, keyScope: "platform" };
+    }
+    return { ok: false, code: "key_rejected", usage: { promptTokens: 0, completionTokens: 0 }, keyScope: "own" };
+  };
+  let n = 0;
+  const base = rpcHandlers.select_conversations_to_classify;
+  rpcHandlers.select_conversations_to_classify = (args) => (n++ < 6 ? base(args) : { data: [], error: null });
+  const r = await runClassificationPhase(later(), db);
+  assert.equal(r.halt, false);
+  assert.equal(r.unavailable_workspaces, 3);
+  assert.ok(dCalls >= 1, "the workspace on the platform key was not classified");
+  assert.deepEqual(
+    callsTo("note_classification_blocked").map((c) => c.args.p_workspace_id).sort(),
+    [WS_A, WS_B, "ws-c"].sort(),
+  );
+});
+
+test("KEY: when the platform key dies, every workspace on it is skipped WITHOUT a call; own keys go on", async () => {
+  reset();
+  tables.insight_topics.push(topic("t2", WS_B, "Precio"), topic("t3", "ws-c", "Precio"));
+  // Only ws-c has its own key.
+  tables.integrations = [{ workspace_id: "ws-c", provider: "openrouter", credentials: { openrouter_api_key: "sk-c" } }];
+  for (const [id, ws] of [["a1", WS_A], ["b1", WS_B], ["c1", "ws-c"], ["a2", WS_A]]) tables.messages.push(message(`m-${id}-x`, id, ws));
+  let round = 0;
+  rpcHandlers.select_conversations_to_classify = () => ({
+    data: round++ === 0 ? [conv("a1", WS_A), conv("b1", WS_B), conv("c1", "ws-c"), conv("a2", WS_A)] : [],
+    error: null,
+  });
+  classifyImpl = async (p) =>
+    p.workspaceId === "ws-c"
+      ? { ok: true, matches: [], usage: { promptTokens: 100, completionTokens: 5 }, keyScope: "own" }
+      : { ok: false, code: "key_rejected", usage: { promptTokens: 0, completionTokens: 0 }, keyScope: "platform" };
+  const r = await runClassificationPhase(later(), db);
+  assert.equal(r.halt, false);
+  assert.equal(r.classified, 1, "the workspace with its own healthy key was not classified");
+  // One call found the platform key dead; B was never called.
+  assert.deepEqual(classifyCalls.map((c) => c.workspaceId), [WS_A, "ws-c"]);
+  assert.deepEqual(callsTo("reserve_classification_tokens").map((c) => c.args.p_workspace_id), [WS_A, "ws-c"]);
+});
+
+test("KEY: an own key that can't be decrypted is that key's error — never charged to the platform key", async () => {
+  reset();
+  tables.integrations = [{ workspace_id: WS_A, provider: "openrouter", credentials: { openrouter_api_key: "enc:broken" } }];
+  const r = await runClassificationPhase(later(), db);
+  assert.equal(classifyCalls.length, 0, "it called with some other key");
+  assert.equal(callsTo("reserve_classification_tokens").length, 0);
+  assert.equal(r.unavailable_workspaces, 1);
+  assert.equal(r.halt, false);
+});
 test("REVIEW H1: one workspace out of OpenRouter credit does not stop the others", async () => {
   reset();
   tables.insight_topics.push(topic("t2", WS_B, "Precio"));
+  tables.integrations = [{ workspace_id: WS_A, provider: "openrouter", credentials: { openrouter_api_key: "sk-a" } }];
   let round = 0;
-  // A's conversation is the newest, so it comes first every time it's eligible.
   rpcHandlers.select_conversations_to_classify = (args) => {
     const skip = args.p_skip_workspaces as string[];
     round++;
@@ -448,8 +536,8 @@ test("REVIEW H1: one workspace out of OpenRouter credit does not stop the others
   };
   classifyImpl = async (p) =>
     p.workspaceId === WS_A
-      ? { ok: false, code: "workspace_unavailable", usage: { promptTokens: 0, completionTokens: 0 } }
-      : { ok: true, matches: [], usage: { promptTokens: 100, completionTokens: 5 } };
+      ? { ok: false, code: "key_rejected", usage: { promptTokens: 0, completionTokens: 0 }, keyScope: "own" }
+      : { ok: true, matches: [], usage: { promptTokens: 100, completionTokens: 5 }, keyScope: "platform" };
   const r = await runClassificationPhase(later(), db);
   assert.equal(r.halt, false);
   assert.equal(r.unavailable_workspaces, 1);
@@ -460,14 +548,13 @@ test("REVIEW H1: one workspace out of OpenRouter credit does not stop the others
   );
   assert.equal(callsTo("record_classification_failure").length, 0);
 });
-
-test("un fallo sin consumo perdido no marca halt, aunque tampoco se pueda registrar", async () => {
+test("INFRA: no poder registrar un fallo es nuestra base caída → la corrida se detiene", async () => {
   reset();
   rpcHandlers.save_conversation_topics = () => ({ data: null, error: { code: "P0001" } });
   rpcHandlers.record_classification_failure = () => ({ data: null, error: { code: "57014" } });
   const r = await runClassificationPhase(later(), db);
   assert.equal(r.error, "record_failure_failed");
-  assert.equal(r.halt, false);
+  assert.equal(r.halt, true);
 });
 
 test("tope: reserva negada → salta el workspace SIN llamar al LLM ni gastar intento", async () => {
@@ -476,7 +563,7 @@ test("tope: reserva negada → salta el workspace SIN llamar al LLM ni gastar in
   reset();
   rpcHandlers.reserve_classification_tokens = () => ({ data: null, error: null });
   const r = await runClassificationPhase(later(), db);
-  assert.deepEqual(r, { classified: 0, failed: 0, skipped_workspaces: 1, unavailable_workspaces: 0, halt: false });
+  assert.deepEqual(r, { classified: 0, failed: 0, deferred: 0, skipped_workspaces: 1, unavailable_workspaces: 0, halt: false });
   assert.equal(classifyCalls.length, 0);
   assert.equal(callsTo("save_conversation_topics").length, 0);
   assert.equal(callsTo("settle_classification_tokens").length, 0);
@@ -498,14 +585,14 @@ test("tope: el workspace saltado va en p_skip_workspaces y otro workspace bajo e
   rpcHandlers.reserve_classification_tokens = (args) => ({ data: args.p_workspace_id === WS_A ? null : "res-b", error: null });
   tables.insight_topics = [topic("t1", WS_A, "Precio"), topic("t1", WS_B, "Precio")];
   const r = await runClassificationPhase(later(), db);
-  assert.deepEqual(r, { classified: 1, failed: 0, skipped_workspaces: 1, unavailable_workspaces: 0, halt: false });
+  assert.deepEqual(r, { classified: 1, failed: 0, deferred: 0, skipped_workspaces: 1, unavailable_workspaces: 0, halt: false });
   assert.deepEqual(classifyCalls.map((c) => c.workspaceId), [WS_B]);
 });
 
 
 test("si no se puede registrar el fallo de una conversación, la fase falla", async () => {
   reset();
-  classifyImpl = async () => ({ ok: false, code: "provider_error", usage: null });
+  classifyImpl = async () => ({ ok: false, code: "content_rejected", usage: null });
   rpcHandlers.record_classification_failure = () => ({ data: null, error: { code: "57014" } });
   const r = await runClassificationPhase(later(), db);
   assert.equal(r.error, "record_failure_failed");
@@ -515,7 +602,7 @@ test("fallo de clasificación → record_classification_failure con el código; 
   reset();
   classifyImpl = async () => ({ ok: false, code: "invalid_output", usage: { promptTokens: 50, completionTokens: 1 } });
   const r = await runClassificationPhase(later(), db);
-  assert.deepEqual(r, { classified: 0, failed: 1, skipped_workspaces: 0, unavailable_workspaces: 0, halt: false });
+  assert.deepEqual(r, { classified: 0, failed: 1, deferred: 0, skipped_workspaces: 0, unavailable_workspaces: 0, halt: false });
   assert.deepEqual(callsTo("record_classification_failure")[0].args, {
     p_workspace_id: WS_A,
     p_conversation_id: "d1",
@@ -549,7 +636,7 @@ test("save caído por infraestructura → halt, sin gastar intento y sin seguir 
     const r = await runClassificationPhase(later(), db);
     assert.deepEqual(
       r,
-      { classified: 0, failed: 0, skipped_workspaces: 0, unavailable_workspaces: 0, halt: true, error: "save_infra_failed" },
+      { classified: 0, failed: 0, deferred: 0, skipped_workspaces: 0, unavailable_workspaces: 0, halt: true, error: "save_infra_failed" },
       `code ${code}`,
     );
     assert.equal(callsTo("record_classification_failure").length, 0, `code ${code}: quemó un intento`);
@@ -561,14 +648,14 @@ test("no poder leer mensajes o temas es infraestructura, no un intento", async (
   reset();
   delays["from:messages"] = 6_000; // vence el techo de 5 s, no el deadline
   const r1 = await runClassificationPhase(later(), db);
-  assert.deepEqual(r1, { classified: 0, failed: 0, skipped_workspaces: 0, unavailable_workspaces: 0, halt: false, error: "load_messages_failed" });
+  assert.deepEqual(r1, { classified: 0, failed: 0, deferred: 0, skipped_workspaces: 0, unavailable_workspaces: 0, halt: true, error: "load_messages_failed" });
   assert.equal(callsTo("record_classification_failure").length, 0);
   assert.equal(classifyCalls.length, 0);
 
   reset();
   delays["from:insight_topics"] = 6_000;
   const r2 = await runClassificationPhase(later(), db);
-  assert.deepEqual(r2, { classified: 0, failed: 0, skipped_workspaces: 0, unavailable_workspaces: 0, halt: false, error: "load_topics_failed" });
+  assert.deepEqual(r2, { classified: 0, failed: 0, deferred: 0, skipped_workspaces: 0, unavailable_workspaces: 0, halt: true, error: "load_topics_failed" });
   assert.equal(callsTo("record_classification_failure").length, 0);
 });
 
@@ -593,12 +680,12 @@ test("error en la selección → la fase devuelve error select_failed", async ()
 test("sin tiempo suficiente no selecciona nada", async () => {
   reset();
   const r = await runClassificationPhase(Date.now() + 5_000, db);
-  assert.deepEqual(r, { classified: 0, failed: 0, skipped_workspaces: 0, unavailable_workspaces: 0, halt: false });
+  assert.deepEqual(r, { classified: 0, failed: 0, deferred: 0, skipped_workspaces: 0, unavailable_workspaces: 0, halt: false });
   assert.equal(rpcCalls.length, 0);
 });
 
 // ── Deadline, con el reloj virtual ───────────────
-const idle = { classified: 0, failed: 0, skipped_workspaces: 0, unavailable_workspaces: 0, halt: false };
+const idle = { classified: 0, failed: 0, deferred: 0, skipped_workspaces: 0, unavailable_workspaces: 0, halt: false };
 
 test("sin margen para la reserva, el LLM y sus dos escrituras → no_time: ni reserva ni llama", async () => {
   reset();
@@ -650,7 +737,7 @@ test("el tiempo se revisa a mitad del lote: la segunda conversación no arranca"
 
 test("registrar el fallo cortado por el deadline es sin tiempo; por su propio techo, infraestructura", async () => {
   reset();
-  const failing = { ok: false, code: "provider_error", usage: null };
+  const failing = { ok: false, code: "content_rejected", usage: null };
   classifyImpl = llmTaking((budget) => budget + 11_000, false, failing); // de 35 s quedan 4
   delays["rpc:record_classification_failure"] = 5_000;
   const r1 = await runClassificationPhase(clock + 35_000, db);
@@ -690,7 +777,7 @@ function resetBackfill(batches: Array<Array<ReturnType<typeof conv>>>) {
 test("fase 2: prompt solo con el tema, sin classified_until, avanza el cursor y cierra", async () => {
   resetBackfill([[conv("d1"), conv("d2")]]);
   const r = await runBackfillPhase(later(), db);
-  assert.deepEqual(r, { processed: 2, failed: 0, topics_done: 1, topics_expired: 0, unavailable_workspaces: 0, halt: false });
+  assert.deepEqual(r, { processed: 2, failed: 0, deferred: 0, topics_done: 1, topics_expired: 0, skipped_workspaces: 0, unavailable_workspaces: 0, halt: false });
   assert.ok(classifyCalls.every((c) => c.topicIds.length === 1 && c.topicIds[0] === "t-new"));
   assert.ok(callsTo("save_conversation_topics").every((c) => c.args.p_classified_until === null));
   const advances = callsTo("advance_topic_backfill").map((c) => c.args);
@@ -702,7 +789,7 @@ test("fase 2: falla la segunda del lote → avanza hasta la primera, registra fa
   resetBackfill([[conv("d1"), conv("d2"), conv("d3")]]);
   classifyImpl = async () => {
     const n = classifyCalls.length;
-    return n === 2 ? { ok: false, code: "provider_error", usage: null } : { ok: true, matches: [], usage: null };
+    return n === 2 ? { ok: false, code: "content_rejected", usage: null } : { ok: true, matches: [], usage: null };
   };
   const r = await runBackfillPhase(later(), db);
   assert.equal(r.failed, 1);
@@ -728,7 +815,8 @@ test("fase 2: reserva negada → no reprocesa, no avanza, no cuenta fallo y suel
   resetBackfill([[conv("d1")]]);
   rpcHandlers.reserve_classification_tokens = () => ({ data: null, error: null });
   const r = await runBackfillPhase(later(), db);
-  assert.deepEqual(r, { processed: 0, failed: 0, topics_done: 0, topics_expired: 0, unavailable_workspaces: 0, halt: false });
+  assert.deepEqual(r, { processed: 0, failed: 0, deferred: 0, topics_done: 0, topics_expired: 0, skipped_workspaces: 1, unavailable_workspaces: 0, halt: false });
+  assert.deepEqual(callsTo("note_classification_blocked").map((c) => c.args), [{ p_workspace_id: WS_A, p_reason: "cap" }]);
   assert.equal(classifyCalls.length, 0);
   assert.equal(callsTo("advance_topic_backfill").length, 0);
   assert.equal(callsTo("record_backfill_failure").length, 0);
@@ -759,7 +847,7 @@ test("lote vacío con la ventana vencida cuenta como expired, no como done", asy
   resetBackfill([[]]);
   rpcHandlers.advance_topic_backfill = () => ({ data: "expired", error: null });
   const r = await runBackfillPhase(later(), db);
-  assert.deepEqual(r, { processed: 0, failed: 0, topics_done: 0, topics_expired: 1, unavailable_workspaces: 0, halt: false });
+  assert.deepEqual(r, { processed: 0, failed: 0, deferred: 0, topics_done: 0, topics_expired: 1, skipped_workspaces: 0, unavailable_workspaces: 0, halt: false });
   assert.equal(callsTo("advance_topic_backfill")[0].args.p_done, true);
 });
 
@@ -797,7 +885,7 @@ test("fase 2: error al pedir el lote → la fase devuelve error", async () => {
   rpcHandlers.next_backfill_batch = () => ({ data: null, error: { code: "XX000" } });
   const r = await runBackfillPhase(later(), db);
   assert.equal(r.error, "backfill_batch_failed");
-  assert.equal(r.halt, false);
+  assert.equal(r.halt, true, "INFRA stops the run");
 });
 
 test("tema reclamado por otra corrida → se salta sin pedir lote y sigue con el siguiente", async () => {
@@ -827,7 +915,7 @@ test("tema reclamado por otra corrida → se salta sin pedir lote y sigue con el
 
 test("el lease se suelta también cuando el tema se corta por un fallo reintentable", async () => {
   resetBackfill([[conv("d1")]]);
-  classifyImpl = async () => ({ ok: false, code: "provider_error", usage: null });
+  classifyImpl = async () => ({ ok: false, code: "content_rejected", usage: null });
   await runBackfillPhase(later(), db);
   assert.deepEqual(callsTo("release_topic_backfill").map((c) => c.args.p_topic_id), ["t-new"]);
 });
@@ -845,27 +933,26 @@ test("fase 2 con la reserva caída → halt, sin llamar ni sumar fallos al tema"
   resetBackfill([[conv("d1")]]);
   rpcHandlers.reserve_classification_tokens = () => ({ data: null, error: { code: "57014" } });
   const r = await runBackfillPhase(later(), db);
-  assert.deepEqual(r, { processed: 0, failed: 0, topics_done: 0, topics_expired: 0, unavailable_workspaces: 0, halt: true, error: "budget_reserve_failed" });
+  assert.deepEqual(r, { processed: 0, failed: 0, deferred: 0, topics_done: 0, topics_expired: 0, skipped_workspaces: 0, unavailable_workspaces: 0, halt: true, error: "budget_reserve_failed" });
   assert.equal(classifyCalls.length, 0);
   assert.equal(callsTo("record_backfill_failure").length, 0);
 });
 
-test("fase 2 con el proveedor caído → salta el workspace, sin sumar fallos al tema ni saltar la conversación", async () => {
+test("fase 2: TRANSIENT counts on the topic (a cursor can't step around it), no halt alone", async () => {
   resetBackfill([[conv("d1")], [conv("d1")], [conv("d1")]]);
-  rpcHandlers.record_backfill_failure = () => ({ data: 3, error: null });
-  classifyImpl = async () => ({ ok: false, code: "provider_unavailable", usage: null });
+  rpcHandlers.record_backfill_failure = () => ({ data: 1, error: null });
+  classifyImpl = async () => ({ ok: false, code: "provider_unavailable", usage: null, keyScope: "platform" });
   const r = await runBackfillPhase(later(), db);
-  assert.deepEqual(r, { processed: 0, failed: 0, topics_done: 0, topics_expired: 0, unavailable_workspaces: 1, halt: false });
-  assert.equal(callsTo("record_backfill_failure").length, 0, "una caída del proveedor sumó un fallo al tema");
-  assert.equal(callsTo("advance_topic_backfill").length, 0, "una caída del proveedor saltó la conversación");
+  assert.deepEqual(r, { processed: 0, failed: 0, deferred: 1, topics_done: 0, topics_expired: 0, skipped_workspaces: 0, unavailable_workspaces: 0, halt: false });
+  assert.equal(callsTo("record_backfill_failure").length, 1);
+  assert.equal(callsTo("advance_topic_backfill").length, 0, "skipped the conversation on the first failure");
   assert.equal(classifyCalls.length, 1);
 });
-
 test("fase 2 con el save caído por infraestructura → halt, sin sumar fallos al tema", async () => {
   resetBackfill([[conv("d1"), conv("d2")]]);
   rpcHandlers.save_conversation_topics = () => ({ data: null, error: { code: "" } });
   const r = await runBackfillPhase(later(), db);
-  assert.deepEqual(r, { processed: 0, failed: 0, topics_done: 0, topics_expired: 0, unavailable_workspaces: 0, halt: true, error: "save_infra_failed" });
+  assert.deepEqual(r, { processed: 0, failed: 0, deferred: 0, topics_done: 0, topics_expired: 0, skipped_workspaces: 0, unavailable_workspaces: 0, halt: true, error: "save_infra_failed" });
   // Al tercer fallo, el tema saltaba esta conversación para siempre.
   assert.equal(callsTo("record_backfill_failure").length, 0);
   assert.equal(classifyCalls.length, 1);
@@ -874,17 +961,17 @@ test("fase 2 con el save caído por infraestructura → halt, sin sumar fallos a
 test("fase 2 cortada por el deadline al registrar el fallo o al avanzar → sin tiempo, no error", async () => {
   resetBackfill([[conv("d1")]]);
   // Fase 2: 40 s es el piso (5 + 20 + 3 × 5); el LLM tiene sus 20 s.
-  classifyImpl = llmTaking((budget) => budget + 16_000, false, { ok: false, code: "provider_error", usage: null });
+  classifyImpl = llmTaking((budget) => budget + 16_000, false, { ok: false, code: "content_rejected", usage: null });
   delays["rpc:record_backfill_failure"] = 5_000; // quedan 4 s
   const r1 = await runBackfillPhase(clock + 40_000, db);
-  assert.deepEqual(r1, { processed: 0, failed: 1, topics_done: 0, topics_expired: 0, unavailable_workspaces: 0, halt: false });
+  assert.deepEqual(r1, { processed: 0, failed: 1, deferred: 0, topics_done: 0, topics_expired: 0, skipped_workspaces: 0, unavailable_workspaces: 0, halt: false });
   assert.equal(callsTo("record_backfill_failure").length, 1);
 
   resetBackfill([[conv("d1")]]);
   classifyImpl = llmTaking((budget) => budget + 17_000, false); // quedan 3 s
   delays["rpc:advance_topic_backfill"] = 4_000;
   const r2 = await runBackfillPhase(clock + 40_000, db);
-  assert.deepEqual(r2, { processed: 1, failed: 0, topics_done: 0, topics_expired: 0, unavailable_workspaces: 0, halt: false });
+  assert.deepEqual(r2, { processed: 1, failed: 0, deferred: 0, topics_done: 0, topics_expired: 0, skipped_workspaces: 0, unavailable_workspaces: 0, halt: false });
   assert.equal(callsTo("advance_topic_backfill").length, 1);
 });
 
@@ -951,26 +1038,119 @@ test("REVIEW M3: the backfill saves without a catalog, the nightly run with its 
   assert.equal("p_catalog" in save, false, "a backfill must not claim the whole catalog read the conversation");
 });
 
-test("REVIEW H2: with a queue in phase 1 and a topic waiting, the run's split leaves the backfill real calls", async () => {
-  // The route's split: 100 s, phase 1 stops BACKFILL_SHARE_MS early. Every LLM
-  // call takes 4 s on the virtual clock, with the real floors (35 s / 40 s).
+
+// ── Round 2: the failure and turn model, run after run ──────────────────────
+const convAt = (id: string, ws: string, at: string) => ({ conversation_id: id, workspace_id: ws, contact_id: `c-${id}`, last_inbound_at: at });
+
+/** The route's order: backfill first with its cut, then phase 1, shared guards. */
+async function routeRun(budgetMs = 100_000) {
+  const start = Date.now();
+  const guards = newRunGuards();
+  const backfill = await runBackfillPhase(Math.min(start + budgetMs, start + BACKFILL_SHARE_MS), db, guards);
+  const classified = backfill.halt ? null : await runClassificationPhase(start + budgetMs, db, guards);
+  return { backfill, classified, idleAtEnd_s: Math.round((start + budgetMs - Date.now()) / 1000) };
+}
+
+test("RV H1: two tenants with dead own keys don't stop the healthy one, in any of 3 runs", async () => {
+  const perRun: number[] = [];
+  for (let run = 0; run < 3; run++) {
+    reset();
+    tables.insight_topics.push(topic("t2", WS_B, "Precio"), topic("t3", "ws-c", "Precio"));
+    tables.integrations = [WS_A, WS_B].map((ws) => ({ workspace_id: ws, provider: "openrouter", credentials: { openrouter_api_key: `sk-${ws}` } }));
+    tables.messages.push(message("m-c1", "c1", "ws-c"), message("m-a9", "d1b", WS_B));
+    let calls = 0;
+    rpcHandlers.select_conversations_to_classify = (args) => {
+      const skip = args.p_skip_workspaces as string[];
+      if (calls++ > 10) return { data: [], error: null };
+      return {
+        data: [convAt("d1", WS_A, "2026-09-14T20:00:00Z"), convAt("d1b", WS_B, "2026-09-14T20:00:00Z"), convAt("c1", "ws-c", "2026-09-14T20:00:00Z")]
+          .filter((r) => !skip.includes(r.workspace_id)),
+        error: null,
+      };
+    };
+    let cCalls = 0;
+    classifyImpl = async (p) => {
+      if (p.workspaceId === "ws-c") {
+        cCalls++;
+        return { ok: true, matches: [], usage: { promptTokens: 100, completionTokens: 5 }, keyScope: "platform" };
+      }
+      return { ok: false, code: "key_rejected", usage: { promptTokens: 0, completionTokens: 0 }, keyScope: "own" };
+    };
+    const r = await runClassificationPhase(later(), db);
+    assert.equal(r.halt, false, `run ${run}`);
+    perRun.push(cCalls);
+  }
+  assert.ok(perRun.every((n) => n >= 1), `the healthy tenant per run: ${perRun}`);
+});
+
+test("RV H1b: a conversation that always times out waits; its workspace's others are read", async () => {
+  reset();
+  tables.insight_topics.push(topic("t3", "ws-c", "Precio"));
+  for (const id of ["a0", "a1", "a2", "a3"]) tables.messages.push(message(`m-${id}`, id, WS_A));
+  tables.messages.push(message("m-c1", "c1", "ws-c"));
+  const deferred = new Set<string>();
+  const classifiedA: string[] = [];
+  let served = 0;
+  rpcHandlers.defer_classification = (args) => {
+    deferred.add(args.p_conversation_id as string);
+    return { data: null, error: null };
+  };
+  rpcHandlers.select_conversations_to_classify = () => {
+    if (served++ > 0) return { data: [], error: null };
+    return {
+      data: ["a0", "c1", "a1", "a2", "a3"]
+        .filter((id) => !deferred.has(id))
+        .map((id) => convAt(id, id === "c1" ? "ws-c" : WS_A, "2026-09-14T20:00:00Z")),
+      error: null,
+    };
+  };
+  classifyImpl = async (p) => {
+    const first = (p.messages as Array<{ id: string }>)[0].id;
+    if (first === "m-a0") return { ok: false, code: "timeout", usage: null, keyScope: "platform" };
+    if (p.workspaceId === WS_A) classifiedA.push(first);
+    return { ok: true, matches: [], usage: { promptTokens: 100, completionTokens: 5 }, keyScope: "platform" };
+  };
+  const r = await runClassificationPhase(later(), db);
+  assert.equal(r.halt, false);
+  assert.deepEqual([...deferred], ["a0"]);
+  assert.deepEqual(classifiedA.sort(), ["m-a1", "m-a2", "m-a3"]);
+});
+
+test("RV H2: a backfill that can't advance (over the cap) gives the whole run back to phase 1", async () => {
+  reset();
+  tables.insight_topics = [{ ...topic("tC", WS_A, "Precio"), backfill_status: "done" }, topic("tX", "ws-x", "Envío")];
+  let n = 0;
+  tables.messages = [message("m-x1", "x1", "ws-x")];
+  rpcHandlers.select_conversations_to_classify = () => {
+    const rows = Array.from({ length: 5 }, () => convAt(`c${++n}`, WS_A, "2026-09-14T20:00:00Z"));
+    for (const r of rows) tables.messages.push(message(`m-${r.conversation_id}`, r.conversation_id, WS_A));
+    return { data: rows, error: null };
+  };
+  rpcHandlers.claim_topic_backfill = () => ({ data: true, error: null });
+  rpcHandlers.release_topic_backfill = () => ({ data: null, error: null });
+  rpcHandlers.next_backfill_batch = () => ({ data: [convAt("x1", "ws-x", "2026-09-14T20:00:00Z")], error: null });
+  rpcHandlers.reserve_classification_tokens = (args) => ({ data: args.p_workspace_id === "ws-x" ? null : "res", error: null });
+  classifyImpl = llmTaking(() => 4_000);
+  const run = await routeRun();
+  assert.equal(run.backfill.skipped_workspaces, 1);
+  // 100 s, 4 s a call, starts while 35 s remain: 17 calls. No share lost to the backfill.
+  assert.ok(run.classified!.classified >= 16, `phase 1 classified ${run.classified!.classified}`);
+  assert.ok(run.idleAtEnd_s <= 35, `idle at the end: ${run.idleAtEnd_s} s`);
+});
+
+test("TURNS: a backfill with work takes its share first; phase 1 gets the rest", async () => {
   resetBackfill(Array.from({ length: 20 }, (_, i) => [conv(`b${i}`)]));
   tables.insight_topics.push(topic("t1", WS_A, "Precio"));
   tables.messages = [
     ...Array.from({ length: 20 }, (_, i) => message(`mb${i}`, `b${i}`, WS_A)),
-    ...Array.from({ length: 51 }, (_, i) => message(`mq${i}`, `q${i}`, WS_A)),
+    ...Array.from({ length: 40 }, (_, i) => message(`mq${i}`, `q${i}`, WS_A)),
   ];
-  const deadline = Date.now() + 100_000;
   let round = 0;
-  rpcHandlers.select_conversations_to_classify = () => ({ data: round++ < 50 ? [conv(`q${round}`)] : [], error: null });
+  rpcHandlers.select_conversations_to_classify = () => ({ data: round < 40 ? [conv(`q${round++}`)] : [], error: null });
   classifyImpl = llmTaking(() => 4_000);
-  const p1 = await runClassificationPhase(deadline - BACKFILL_SHARE_MS, db);
-  const afterPhase1 = classifyCalls.length;
-  const p2 = await runBackfillPhase(deadline, db);
-  assert.equal(p1.halt, false);
-  // Phase 1 has 45 s: it starts calls while 35 s remain, 4 s each.
-  assert.ok(p1.classified >= 2 && afterPhase1 === p1.classified, `phase 1 classified ${p1.classified}`);
-  // The backfill has the other 55 s: starts while 40 s remain.
-  assert.ok(p2.processed >= 3, `the backfill only got ${p2.processed} calls`);
-  assert.equal(classifyCalls.length - afterPhase1, p2.processed);
+  const run = await routeRun();
+  // The backfill: 55 s, starts while 40 s remain → 4 calls; phase 1: the rest.
+  assert.ok(run.backfill.processed >= 3, `backfill ${run.backfill.processed}`);
+  assert.ok(run.classified!.classified >= 3, `phase 1 ${run.classified!.classified}`);
+  assert.ok(run.idleAtEnd_s <= 35);
 });

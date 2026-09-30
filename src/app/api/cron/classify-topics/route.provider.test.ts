@@ -4,8 +4,9 @@ import { mock, test } from "node:test";
 // Proveedor caído de punta a punta: ruta, fases, classifier y SDKs
 // reales (ai, @ai-sdk/openai, supabase-js). Solo se reemplaza `fetch`, que los
 // tres resuelven al momento de la llamada: OpenRouter responde 503 y PostgREST
-// es un fake en memoria. The first workspace that fails is skipped; the same
-// 503 in a second one is the platform, and the run stops there.
+// es un fake en memoria. Each 503 defers its conversation (no attempt spent)
+// and the run goes on; three in a row, on different conversations, trip the
+// breaker and the run stops.
 mock.module("@/features/inbox/services/openrouter.ts", {
   exports: { getOpenRouterApiKey: async () => "test-key" },
 });
@@ -13,11 +14,13 @@ mock.module("@/features/inbox/services/openrouter.ts", {
 process.env.NEXT_PUBLIC_SUPABASE_URL = "http://supabase.test";
 process.env.SUPABASE_SERVICE_ROLE_KEY = "service-role-test";
 process.env.CRON_SECRET = "s3cret";
+process.env.OPENROUTER_API_KEY = "sk-platform-test";
 
 const WS = "11111111-1111-1111-1111-111111111111";
 const WS2 = "44444444-4444-4444-4444-444444444444";
 const CONV = "22222222-2222-2222-2222-222222222222";
 const CONV2 = "55555555-5555-5555-5555-555555555555";
+const CONV3 = "66666666-6666-6666-6666-666666666666";
 let openrouterCalls = 0;
 let selectRounds = 0;
 const rpcs: string[] = [];
@@ -41,6 +44,7 @@ globalThis.fetch = (async (input: RequestInfo | URL) => {
       const rows = [
         [{ conversation_id: CONV, workspace_id: WS, contact_id: "c1", last_inbound_at: "2026-09-14T20:00:00Z" }],
         [{ conversation_id: CONV2, workspace_id: WS2, contact_id: "c2", last_inbound_at: "2026-09-14T20:00:00Z" }],
+        [{ conversation_id: CONV3, workspace_id: WS, contact_id: "c3", last_inbound_at: "2026-09-14T20:00:00Z" }],
         [{ conversation_id: CONV, workspace_id: WS, contact_id: "c1", last_inbound_at: "2026-09-14T20:00:00Z" }],
       ];
       return json(rows[selectRounds++] ?? []);
@@ -48,7 +52,12 @@ globalThis.fetch = (async (input: RequestInfo | URL) => {
     if (rpc === "reserve_classification_tokens") return json("33333333-3333-3333-3333-333333333333");
     return json(1);
   }
-  if (url.pathname.endsWith("/insight_topics")) return json([{ id: "t1", name: "Precio", description: "Objeción de precio" }]);
+  if (url.pathname.endsWith("/insight_topics")) {
+    // The backfill's page of pending topics: none.
+    if (url.searchParams.get("backfill_status")) return json([]);
+    return json([{ id: "t1", name: "Precio", description: "Objeción de precio" }]);
+  }
+  if (url.pathname.endsWith("/integrations")) return json([]);
   if (url.pathname.endsWith("/messages")) {
     return json([{ id: "m1", direction: "in", sender_user_id: null, body: "está caro", created_at: "2026-09-14T19:00:00Z" }]);
   }
@@ -57,7 +66,7 @@ globalThis.fetch = (async (input: RequestInfo | URL) => {
 
 const { GET } = await import("./route.ts");
 
-test("OpenRouter con 503 en dos workspaces → una petición por workspace, cero intentos, halt y 500 ok:false", async () => {
+test("OpenRouter con 503 → cada conversación espera sin gastar intento; a la tercera seguida, el breaker detiene la corrida (500)", async () => {
   const res = await GET(
     new Request("http://localhost:3000/api/cron/classify-topics", { headers: { Authorization: "Bearer s3cret" } }),
   );
@@ -67,15 +76,16 @@ test("OpenRouter con 503 en dos workspaces → una petición por workspace, cero
   assert.deepEqual(body.classified, {
     classified: 0,
     failed: 0,
+    deferred: 3,
     skipped_workspaces: 0,
-    unavailable_workspaces: 1,
+    unavailable_workspaces: 0,
     halt: true,
     error: "provider_unavailable",
   });
-  assert.equal(body.backfill.error, "skipped_after_halt");
-  assert.equal(openrouterCalls, 2, "el SDK reintentó o la fase siguió llamando con el proveedor caído");
+  assert.equal(openrouterCalls, 3, "el SDK reintentó o la fase siguió llamando con el proveedor caído");
+  assert.equal(rpcs.filter((r) => r === "defer_classification").length, 3);
   assert.equal(rpcs.filter((r) => r === "record_classification_failure").length, 0, "la caída quemó intentos");
-  // Sin usage no hay liquidación: la reserva queda con la estimación.
-  assert.equal(rpcs.filter((r) => r === "settle_classification_tokens").length, 0);
+  // A 503 is an HTTP answer: nothing was generated, each reservation settles at 0.
+  assert.equal(rpcs.filter((r) => r === "settle_classification_tokens").length, 3);
   assert.deepEqual(rpcs.slice(0, 2), ["select_conversations_to_classify", "reserve_classification_tokens"]);
 });

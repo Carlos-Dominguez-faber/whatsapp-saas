@@ -54,11 +54,16 @@ DECLARE
   v_skip  UUID[]   := COALESCE(p_skip_workspaces, '{}');
   v_now   TIMESTAMPTZ := COALESCE(p_now, now());
 BEGIN
-  -- ORDER: fair and oldest first. Workspaces take turns (row_number per
-  -- workspace), and inside each the oldest customer message goes first. With
-  -- the newest first (as #13 did), whatever a busy day left over was pushed
-  -- back by every newer day and never read, and one busy workspace could
-  -- take a whole run.
+  -- ORDER (the turn model of classify-topics.ts): workspaces take turns
+  -- (row_number per workspace), and inside each one two tiers:
+  --   1. customers who wrote in the last 48 hours, oldest first: yesterday is
+  --      complete before today, and a busy day's leftover isn't pushed back by
+  --      every newer one (newest first, as #13 did, never read it);
+  --   2. the rest, newest first: a workspace's first topic reads its 30 days
+  --      of history from yesterday backwards, not from 30 days ago forwards.
+  -- A dead key or an exhausted cap keeps its workspace out of the whole run
+  -- (p_skip_workspaces); a conversation backing off after a failure is out
+  -- until its claimed_until.
   --
   -- Paso 1: sembrar la fila de estado de las candidatas. El lease vive en
   -- conversation_classification, y FOR UPDATE necesita una fila que bloquear.
@@ -72,7 +77,11 @@ BEGIN
   SELECT x.id, x.workspace_id, 0, now()
     FROM (
       SELECT c.id, c.workspace_id, li.at,
-             row_number() OVER (PARTITION BY c.workspace_id ORDER BY li.at, c.id) AS rn
+             row_number() OVER (
+               PARTITION BY c.workspace_id
+               ORDER BY li.at < v_now - INTERVAL '48 hours',
+                        CASE WHEN li.at >= v_now - INTERVAL '48 hours' THEN li.at END,
+                        li.at DESC, c.id) AS rn
         FROM public.conversations c
         CROSS JOIN LATERAL (
           SELECT m.created_at AS at
@@ -91,7 +100,7 @@ BEGIN
          AND EXISTS (SELECT 1 FROM public.insight_topics t
                       WHERE t.workspace_id = c.workspace_id AND t.status = 'active')
     ) x
-   ORDER BY x.rn, x.at, x.id
+   ORDER BY x.rn, x.id
    LIMIT 20 * v_limit
   ON CONFLICT (conversation_id) DO NOTHING;
 
@@ -106,7 +115,11 @@ BEGIN
   RETURN QUERY
   WITH ranked AS MATERIALIZED (
     SELECT cc.conversation_id AS id, li.at AS last_in,
-           row_number() OVER (PARTITION BY c.workspace_id ORDER BY li.at, cc.conversation_id) AS rn
+           row_number() OVER (
+             PARTITION BY c.workspace_id
+             ORDER BY li.at < v_now - INTERVAL '48 hours',
+                      CASE WHEN li.at >= v_now - INTERVAL '48 hours' THEN li.at END,
+                      li.at DESC, cc.conversation_id) AS rn
       FROM public.conversation_classification cc
       JOIN public.conversations c ON c.id = cc.conversation_id
       CROSS JOIN LATERAL (
@@ -137,7 +150,7 @@ BEGIN
      -- Re-checked on the locked row: another run may have claimed it since
      -- `ranked` was read.
      WHERE (cc.claimed_until IS NULL OR cc.claimed_until <= v_now)
-     ORDER BY r.rn, r.last_in, r.id
+     ORDER BY r.rn, r.id
      LIMIT v_limit
      FOR UPDATE OF cc SKIP LOCKED
   ),
@@ -155,14 +168,15 @@ BEGIN
     FROM claimed cl
     JOIN claimable k ON k.id = cl.id
     JOIN public.conversations c ON c.id = cl.id
-   ORDER BY k.rn, k.last_in, c.id;
+   ORDER BY k.rn, c.id;
 END;
 $$;
 
 -- p_window_from = created_at del mensaje más viejo que vio el LLM;
 -- p_truncated_at = created_at de los mensajes cuyo cuerpo se recortó;
--- p_catalog = the topic ids the nightly run sent (catalog_at, below). The
--- backfill passes none. #13 shipped the version without p_catalog.
+-- p_catalog = the topic ids the nightly run sent (catalog_at, below);
+-- p_backfill_topic = the topic a backfill read the conversation for
+-- (backfill_topics). #13 shipped the version without either.
 DROP FUNCTION IF EXISTS public.save_conversation_topics(UUID, UUID, JSONB, TIMESTAMPTZ, TIMESTAMPTZ, TIMESTAMPTZ[]);
 
 CREATE OR REPLACE FUNCTION public.save_conversation_topics(
@@ -172,7 +186,8 @@ CREATE OR REPLACE FUNCTION public.save_conversation_topics(
   p_classified_until TIMESTAMPTZ,
   p_window_from TIMESTAMPTZ DEFAULT NULL,
   p_truncated_at TIMESTAMPTZ[] DEFAULT NULL,
-  p_catalog UUID[] DEFAULT NULL
+  p_catalog UUID[] DEFAULT NULL,
+  p_backfill_topic UUID DEFAULT NULL
 )
 RETURNS INT
 LANGUAGE plpgsql
@@ -267,15 +282,19 @@ BEGIN
       claimed_until = NULL,
       last_attempt_at = now(),
       updated_at = now();
-  ELSIF v_pfrom IS NOT NULL THEN
-    -- Reprocesamiento: solo la marca de cobertura; el estado de la fase 1
-    -- (classified_until, intentos, lease) no es suyo.
+  ELSIF v_pfrom IS NOT NULL OR p_backfill_topic IS NOT NULL THEN
+    -- Reprocesamiento: la marca de cobertura y el tema que lo leyó; el estado
+    -- de la fase 1 (classified_until, intentos, lease) no es suyo.
     INSERT INTO public.conversation_classification AS cc
-      (conversation_id, workspace_id, partial_from, partial_until, updated_at)
-    VALUES (p_conversation_id, p_workspace_id, v_pfrom, v_puntil, now())
+      (conversation_id, workspace_id, partial_from, partial_until, backfill_topics, updated_at)
+    VALUES (p_conversation_id, p_workspace_id, v_pfrom, v_puntil,
+            CASE WHEN p_backfill_topic IS NULL THEN '{}'::uuid[] ELSE ARRAY[p_backfill_topic] END, now())
     ON CONFLICT (conversation_id) DO UPDATE SET
       partial_from = LEAST(cc.partial_from, EXCLUDED.partial_from),
       partial_until = GREATEST(cc.partial_until, EXCLUDED.partial_until),
+      backfill_topics = CASE
+        WHEN p_backfill_topic IS NULL OR p_backfill_topic = ANY (cc.backfill_topics) THEN cc.backfill_topics
+        ELSE cc.backfill_topics || p_backfill_topic END,
       updated_at = now();
   END IF;
 
@@ -665,8 +684,80 @@ AS $$
   SELECT EXISTS (SELECT 1 FROM settled);
 $$;
 
+-- A transient failure (5xx, network, timeout) is nobody's fault that the
+-- conversation should pay for: it spends no attempt, and waits p_seconds
+-- (claimed_until, the same column the lease and the failure backoff use)
+-- while the run goes on with the next one.
+CREATE OR REPLACE FUNCTION public.defer_classification(
+  p_workspace_id UUID,
+  p_conversation_id UUID,
+  p_code TEXT,
+  p_seconds INT,
+  p_now TIMESTAMPTZ DEFAULT now()
+)
+RETURNS VOID
+LANGUAGE plpgsql
+SET search_path = ''
+AS $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM public.conversations
+     WHERE id = p_conversation_id AND workspace_id = p_workspace_id
+  ) THEN
+    RAISE EXCEPTION 'conversation_not_in_workspace' USING ERRCODE = 'P0001';
+  END IF;
+  INSERT INTO public.conversation_classification AS cc
+    (conversation_id, workspace_id, attempts, error, claimed_until, updated_at)
+  VALUES (p_conversation_id, p_workspace_id, 0, p_code,
+          COALESCE(p_now, now()) + make_interval(secs => LEAST(GREATEST(COALESCE(p_seconds, 3600), 60), 86400)),
+          now())
+  ON CONFLICT (conversation_id) DO UPDATE SET
+    error = EXCLUDED.error,
+    claimed_until = EXCLUDED.claimed_until,
+    updated_at = now();
+END;
+$$;
+
+-- Why a workspace isn't being analysed, for the dashboard: its OpenRouter key
+-- fails ('key') or it reached its daily cap ('cap'). At most one row per
+-- workspace, reason and hour, so a run every 5 minutes doesn't flood events.
+CREATE OR REPLACE FUNCTION public.note_classification_blocked(
+  p_workspace_id UUID,
+  p_reason TEXT,
+  p_now TIMESTAMPTZ DEFAULT now()
+)
+RETURNS VOID
+LANGUAGE plpgsql
+SET search_path = ''
+AS $$
+DECLARE
+  v_now TIMESTAMPTZ := COALESCE(p_now, now());
+BEGIN
+  IF p_reason NOT IN ('key', 'cap') THEN
+    RAISE EXCEPTION 'note_classification_blocked: unknown reason %', p_reason USING ERRCODE = '22023';
+  END IF;
+  PERFORM pg_advisory_xact_lock(hashtextextended('classify_blocked:' || p_workspace_id::text, 0));
+  IF NOT EXISTS (
+    SELECT 1 FROM public.events e
+     WHERE e.workspace_id = p_workspace_id
+       AND e.type = 'topic_classification_blocked'
+       AND e.payload->>'reason' = p_reason
+       AND e.created_at > v_now - INTERVAL '1 hour'
+  ) THEN
+    INSERT INTO public.events (type, level, workspace_id, payload, created_at)
+    VALUES ('topic_classification_blocked', 'warn', p_workspace_id,
+            jsonb_build_object('reason', p_reason), v_now);
+  END IF;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION public.defer_classification(UUID, UUID, TEXT, INT, TIMESTAMPTZ) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.note_classification_blocked(UUID, TEXT, TIMESTAMPTZ) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.defer_classification(UUID, UUID, TEXT, INT, TIMESTAMPTZ) TO service_role;
+GRANT EXECUTE ON FUNCTION public.note_classification_blocked(UUID, TEXT, TIMESTAMPTZ) TO service_role;
+
 REVOKE ALL ON FUNCTION public.select_conversations_to_classify(INT, UUID[], INT, TIMESTAMPTZ) FROM PUBLIC, anon, authenticated;
-REVOKE ALL ON FUNCTION public.save_conversation_topics(UUID, UUID, JSONB, TIMESTAMPTZ, TIMESTAMPTZ, TIMESTAMPTZ[], UUID[]) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.save_conversation_topics(UUID, UUID, JSONB, TIMESTAMPTZ, TIMESTAMPTZ, TIMESTAMPTZ[], UUID[], UUID) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.record_classification_failure(UUID, UUID, TEXT, TIMESTAMPTZ) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.next_backfill_batch(UUID, INT, TIMESTAMPTZ) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.advance_topic_backfill(UUID, TIMESTAMPTZ, UUID, BOOLEAN, TIMESTAMPTZ) FROM PUBLIC, anon, authenticated;
@@ -677,7 +768,7 @@ REVOKE ALL ON FUNCTION public.reserve_classification_tokens(UUID, UUID, INT, BIG
 REVOKE ALL ON FUNCTION public.settle_classification_tokens(UUID, UUID, TEXT, INT, INT) FROM PUBLIC, anon, authenticated;
 
 GRANT EXECUTE ON FUNCTION public.select_conversations_to_classify(INT, UUID[], INT, TIMESTAMPTZ) TO service_role;
-GRANT EXECUTE ON FUNCTION public.save_conversation_topics(UUID, UUID, JSONB, TIMESTAMPTZ, TIMESTAMPTZ, TIMESTAMPTZ[], UUID[]) TO service_role;
+GRANT EXECUTE ON FUNCTION public.save_conversation_topics(UUID, UUID, JSONB, TIMESTAMPTZ, TIMESTAMPTZ, TIMESTAMPTZ[], UUID[], UUID) TO service_role;
 GRANT EXECUTE ON FUNCTION public.record_classification_failure(UUID, UUID, TEXT, TIMESTAMPTZ) TO service_role;
 GRANT EXECUTE ON FUNCTION public.next_backfill_batch(UUID, INT, TIMESTAMPTZ) TO service_role;
 GRANT EXECUTE ON FUNCTION public.advance_topic_backfill(UUID, TIMESTAMPTZ, UUID, BOOLEAN, TIMESTAMPTZ) TO service_role;

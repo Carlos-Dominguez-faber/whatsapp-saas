@@ -56,11 +56,6 @@ mock.module("@ai-sdk/openai", {
   exports: { createOpenAI: () => ({ chat: (id: string) => ({ modelId: id }) }) },
 });
 
-let keyImpl: () => Promise<string> = async () => "sk-test";
-mock.module("@/features/inbox/services/openrouter.ts", {
-  exports: { getOpenRouterApiKey: () => keyImpl() },
-});
-
 const { classifyConversation, classificationTokenCeiling, CLASSIFY_MODEL, MAX_OUTPUT_TOKENS, PROMPT_OVERHEAD_TOKENS } =
   await import("./classifier.ts");
 const { CLASSIFY_DAILY_TOKEN_CAP } = await import("./classify-topics.ts");
@@ -74,12 +69,15 @@ const messages = [
   { id: "m1", direction: "in" as const, sender_user_id: null, body: "está caro", created_at: "2026-09-01T10:00:00Z" },
 ];
 
-function call() {
+const KEY = { scope: "own" as const, key: "sk-test" };
+
+function call(key: { scope: "own" | "platform"; key: string } = KEY) {
   return classifyConversation({
     workspaceId: "ws-1",
     topics,
     messages,
     abortSignal: new AbortController().signal,
+    key,
   });
 }
 
@@ -93,6 +91,7 @@ test("éxito: resuelve claves a ids, usa el modelo barato y reporta tokens", asy
     ok: true,
     matches: [{ topic_id: "topic-price", message_id: "m1" }],
     usage: { promptTokens: 120, completionTokens: 8 },
+    keyScope: "own",
   });
   assert.deepEqual(lastOpts?.model, { modelId: CLASSIFY_MODEL });
   assert.equal(lastOpts?.temperature, 0);
@@ -112,14 +111,14 @@ test("tema inventado por el modelo se descarta sin fallar", async () => {
 
 test("salida con forma inválida → invalid_output con tokens", async () => {
   generateImpl = async () => ({ output: { matches: "ninguno" }, usage: { inputTokens: 5, outputTokens: 1 } });
-  assert.deepEqual(await call(), { ok: false, code: "invalid_output", usage: { promptTokens: 5, completionTokens: 1 } });
+  assert.deepEqual(await call(), { ok: false, code: "invalid_output", usage: { promptTokens: 5, completionTokens: 1 }, keyScope: "own" });
 });
 
 test("el SDK no logra parsear el objeto → invalid_output con los tokens del error", async () => {
   generateImpl = async () => {
     throw new FakeNoObjectGeneratedError();
   };
-  assert.deepEqual(await call(), { ok: false, code: "invalid_output", usage: { promptTokens: 7, completionTokens: 3 } });
+  assert.deepEqual(await call(), { ok: false, code: "invalid_output", usage: { promptTokens: 7, completionTokens: 3 }, keyScope: "own" });
 });
 
 test("respuesta truncada: el getter de output lanza, pero el consumo NO se pierde", async () => {
@@ -136,6 +135,7 @@ test("respuesta truncada: el getter de output lanza, pero el consumo NO se pierd
     ok: false,
     code: "invalid_output",
     usage: { promptTokens: 1234, completionTokens: 400 },
+    keyScope: "own",
   });
 });
 
@@ -148,13 +148,13 @@ const sdkUsage = (raw: Record<string, unknown> | undefined) =>
 
 test("respuesta sin usage → usage null (la reserva conserva la estimación), no ceros", async () => {
   generateImpl = async () => ({ output: { matches: [] }, usage: sdkUsage(undefined) });
-  assert.deepEqual(await call(), { ok: true, matches: [], usage: null });
+  assert.deepEqual(await call(), { ok: true, matches: [], usage: null, keyScope: "own" });
 });
 
 test("usage con UN solo conteo → null: el SDK rellena el otro con 0 y subcontaría", async () => {
   for (const raw of [{ prompt_tokens: 120 }, { completion_tokens: 8 }, { total_tokens: 128 }, { prompt_tokens: 120, completion_tokens: null }]) {
     generateImpl = async () => ({ output: { matches: [] }, usage: sdkUsage(raw) });
-    assert.deepEqual(await call(), { ok: true, matches: [], usage: null }, JSON.stringify(raw));
+    assert.deepEqual(await call(), { ok: true, matches: [], usage: null, keyScope: "own" }, JSON.stringify(raw));
   }
   // Y en el camino de error, que lee el usage del error del SDK.
   generateImpl = async () => {
@@ -162,12 +162,12 @@ test("usage con UN solo conteo → null: el SDK rellena el otro con 0 y subconta
     (err as { usage: unknown }).usage = sdkUsage({ prompt_tokens: 50 });
     throw err;
   };
-  assert.deepEqual(await call(), { ok: false, code: "invalid_output", usage: null });
+  assert.deepEqual(await call(), { ok: false, code: "invalid_output", usage: null, keyScope: "own" });
 });
 
 test("usage completo con raw → se liquida lo real, incluido un 0 informado", async () => {
   generateImpl = async () => ({ output: { matches: [] }, usage: sdkUsage({ prompt_tokens: 120, completion_tokens: 0 }) });
-  assert.deepEqual(await call(), { ok: true, matches: [], usage: { promptTokens: 120, completionTokens: 0 } });
+  assert.deepEqual(await call(), { ok: true, matches: [], usage: { promptTokens: 120, completionTokens: 0 }, keyScope: "own" });
 });
 
 test("error desconocido → provider_unavailable, sin propagar el mensaje", async () => {
@@ -175,33 +175,41 @@ test("error desconocido → provider_unavailable, sin propagar el mensaje", asyn
     throw new Error("401 invalid api key sk-live-123");
   };
   const r = await call();
-  assert.deepEqual(r, { ok: false, code: "provider_unavailable", usage: null });
+  assert.deepEqual(r, { ok: false, code: "provider_unavailable", usage: null, keyScope: "own" });
   assert.doesNotMatch(JSON.stringify(r), /sk-live/);
 });
 
-test("caída del proveedor (5xx, 408, 409, 404, red) → provider_unavailable, sin consumo conocido", async () => {
-  for (const status of [500, 502, 503, 408, 409, 404, undefined]) {
+test("proveedor caído (5xx, 408, 409, 404) → provider_unavailable liquidado en 0; sin respuesta (red) → consumo desconocido", async () => {
+  for (const status of [500, 502, 503, 408, 409, 404]) {
     generateImpl = async () => {
       throw new FakeAPICallError(status);
     };
-    assert.deepEqual(await call(), { ok: false, code: "provider_unavailable", usage: null }, `status ${status}`);
+    assert.deepEqual(
+      await call(),
+      { ok: false, code: "provider_unavailable", usage: { promptTokens: 0, completionTokens: 0 }, keyScope: "own" },
+      `status ${status}`,
+    );
   }
+  generateImpl = async () => {
+    throw new FakeAPICallError(undefined);
+  };
+  assert.deepEqual(await call(), { ok: false, code: "provider_unavailable", usage: null, keyScope: "own" });
 });
 
-test("la clave del workspace no sirve (401, 402, 403, 429) → workspace_unavailable, liquidado en 0", async () => {
+test("la clave del workspace no sirve (401, 402, 403, 429) → key_rejected, liquidado en 0", async () => {
   for (const status of [401, 402, 403, 429]) {
     generateImpl = async () => {
       throw new FakeAPICallError(status, '{"error":{"message":"Insufficient credits"}}');
     };
     assert.deepEqual(
       await call(),
-      { ok: false, code: "workspace_unavailable", usage: { promptTokens: 0, completionTokens: 0 } },
+      { ok: false, code: "key_rejected", usage: { promptTokens: 0, completionTokens: 0 }, keyScope: "own" },
       `status ${status}`,
     );
   }
 });
 
-test("el proveedor rechaza ESTE contenido (400, 413, 422, moderación) → provider_error, que sí gasta intento", async () => {
+test("el proveedor rechaza ESTE contenido (400, 413, 422, moderación) → content_rejected, que sí gasta intento", async () => {
   const cases: Array<[number, string | undefined]> = [
     [400, undefined], [413, undefined], [422, undefined],
     [403, '{"error":{"message":"Your chosen model requires moderation and your input was flagged"}}'],
@@ -212,7 +220,7 @@ test("el proveedor rechaza ESTE contenido (400, 413, 422, moderación) → provi
     };
     assert.deepEqual(
       await call(),
-      { ok: false, code: "provider_error", usage: { promptTokens: 0, completionTokens: 0 } },
+      { ok: false, code: "content_rejected", usage: { promptTokens: 0, completionTokens: 0 }, keyScope: "own" },
       `status ${status}`,
     );
   }
@@ -264,17 +272,14 @@ test("abort por tiempo → timeout", async () => {
     err.name = "AbortError";
     throw err;
   };
-  const r = await classifyConversation({ workspaceId: "ws-1", topics, messages, abortSignal: controller.signal });
-  assert.deepEqual(r, { ok: false, code: "timeout", usage: null });
+  const r = await classifyConversation({ workspaceId: "ws-1", topics, messages, abortSignal: controller.signal, key: KEY });
+  assert.deepEqual(r, { ok: false, code: "timeout", usage: null, keyScope: "own" });
 });
 
-test("clave de OpenRouter ilegible → workspace_unavailable (configuración del workspace), no lanza y no llama al modelo", async () => {
-  keyImpl = async () => {
-    throw new Error("openrouter_key_unreadable");
+test("REVIEW H1: the result says which key the call ran on", async () => {
+  generateImpl = async () => {
+    throw new FakeAPICallError(402);
   };
-  lastOpts = null;
-  const r = await call();
-  keyImpl = async () => "sk-test";
-  assert.deepEqual(r, { ok: false, code: "workspace_unavailable", usage: { promptTokens: 0, completionTokens: 0 } });
-  assert.equal(lastOpts, null);
+  assert.equal((await call({ scope: "platform", key: "sk-agency" })).keyScope, "platform");
+  assert.equal((await call({ scope: "own", key: "sk-own" })).keyScope, "own");
 });

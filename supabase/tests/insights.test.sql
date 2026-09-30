@@ -9,7 +9,7 @@ BEGIN;
 CREATE EXTENSION IF NOT EXISTS pgtap WITH SCHEMA extensions;
 SET search_path = public, extensions;
 
-SELECT plan(45);
+SELECT plan(50);
 
 -- ── Privileges ───────────────────────────────────────────────────────────────
 SELECT ok(NOT has_function_privilege('anon',
@@ -291,8 +291,17 @@ CREATE TEMP TABLE fair AS
     ARRAY(SELECT id FROM public.workspaces WHERE id NOT IN ('e3000000-0000-4000-8000-000000000001', 'e3000000-0000-4000-8000-000000000002')),
     120);
 SELECT is((SELECT array_agg(conversation_id ORDER BY conversation_id) FROM fair),
-  ARRAY['e3000000-0000-4000-8000-0000000000a6'::uuid, 'e3000000-0000-4000-8000-0000000000a7'::uuid],
-  'workspaces take turns, and each one''s oldest waiting customer goes first');
+  ARRAY['e3000000-0000-4000-8000-0000000000a2'::uuid, 'e3000000-0000-4000-8000-0000000000a7'::uuid],
+  'workspaces take turns; each one''s first is its oldest customer of the last 48 hours');
+-- F1 on its own: the rest of the last 48 h oldest first, then the older ones
+-- newest first (a first topic reads its history from yesterday backwards).
+SELECT is((SELECT array_agg(s.conversation_id ORDER BY s.ord)
+             FROM public.select_conversations_to_classify(4,
+                    ARRAY(SELECT id FROM public.workspaces WHERE id <> 'e3000000-0000-4000-8000-000000000001'), 120)
+                  WITH ORDINALITY AS s(conversation_id, workspace_id, contact_id, last_inbound_at, ord)),
+  ARRAY['e3000000-0000-4000-8000-0000000000a1', 'e3000000-0000-4000-8000-0000000000a3',
+        'e3000000-0000-4000-8000-0000000000a4', 'e3000000-0000-4000-8000-0000000000a5']::uuid[],
+  'inside a workspace: the last 48 hours oldest first, then the rest newest first');
 
 -- ── One active topic per name, case and accents aside (review) ──────────────
 SELECT throws_ok(
@@ -304,6 +313,25 @@ SELECT lives_ok(
   $$INSERT INTO public.insight_topics (workspace_id, name, description)
     VALUES ('e0000000-0000-4000-8000-000000000001', 'viejo', 'x')$$,
   'an archived topic does not hold its name');
+
+-- ── Transient failures wait without spending an attempt; blocked causes ─────
+SELECT public.defer_classification('e0000000-0000-4000-8000-000000000001',
+  'e0000000-0000-4000-8000-0000000000a7', 'timeout', 3600);
+SELECT is((SELECT attempts FROM public.conversation_classification
+            WHERE conversation_id = 'e0000000-0000-4000-8000-0000000000a7'), 0,
+  'a transient failure spends no attempt');
+SELECT ok((SELECT claimed_until > now() + interval '59 minutes' FROM public.conversation_classification
+            WHERE conversation_id = 'e0000000-0000-4000-8000-0000000000a7'),
+  'it waits an hour before the next try');
+SELECT public.note_classification_blocked('e0000000-0000-4000-8000-000000000001', 'key');
+SELECT public.note_classification_blocked('e0000000-0000-4000-8000-000000000001', 'key');
+SELECT public.note_classification_blocked('e0000000-0000-4000-8000-000000000001', 'cap');
+SELECT is((SELECT count(*)::int FROM public.events
+            WHERE workspace_id = 'e0000000-0000-4000-8000-000000000001' AND type = 'topic_classification_blocked'), 2,
+  'a blocked cause is noted once per workspace, reason and hour');
+SELECT ok(NOT has_function_privilege('authenticated', 'public.defer_classification(uuid, uuid, text, integer, timestamptz)', 'EXECUTE')
+          AND NOT has_function_privilege('authenticated', 'public.note_classification_blocked(uuid, text, timestamptz)', 'EXECUTE'),
+  'sessions cannot defer a conversation or note a blocked workspace');
 
 SELECT * FROM finish();
 ROLLBACK;

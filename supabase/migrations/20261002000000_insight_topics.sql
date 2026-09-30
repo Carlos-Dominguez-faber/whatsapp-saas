@@ -218,6 +218,10 @@ CREATE TABLE IF NOT EXISTS public.conversation_classification (
   -- created later than this skips nothing; one created earlier already read
   -- this conversation and skips it (next_backfill_batch).
   catalog_at       TIMESTAMPTZ,
+  -- Topics whose backfill read this conversation (it was read before they
+  -- existed). With catalog_at, it tells whether a conversation was analysed
+  -- FOR a given topic (get_insights), not just analysed.
+  backfill_topics  UUID[] NOT NULL DEFAULT '{}',
   updated_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
   -- FK compuesta: mismo motivo que en conversation_topics más arriba.
   CONSTRAINT fk_conversation_classification_conversation
@@ -229,6 +233,7 @@ CREATE INDEX IF NOT EXISTS idx_conversation_classification_ws
 -- #13's table has no catalog_at: its rows stay NULL (catalog unknown), so a
 -- backfill still reads them, as #13 did.
 ALTER TABLE public.conversation_classification ADD COLUMN IF NOT EXISTS catalog_at TIMESTAMPTZ;
+ALTER TABLE public.conversation_classification ADD COLUMN IF NOT EXISTS backfill_topics UUID[] NOT NULL DEFAULT '{}';
 
 -- ── RLS y privilegios ──────────────────────────────────────
 -- Escritura solo service_role: sin policies de escritura para miembros.

@@ -1,6 +1,5 @@
 import { createOpenAI } from "@ai-sdk/openai";
 import { APICallError, generateText, NoObjectGeneratedError, NoOutputGeneratedError, Output } from "ai";
-import { getOpenRouterApiKey } from "@/features/inbox/services/openrouter";
 import {
   buildClassificationPrompt,
   ClassificationOutputSchema,
@@ -55,24 +54,32 @@ export function classificationTokenCeiling(topics: PromptTopic[], messages: Prom
 }
 
 /**
- * - `invalid_output` / `provider_error`: culpa de ESTE contenido (salida
- *   inválida, petición rechazada por lo que trae, moderación). Gasta un intento.
- * - `workspace_unavailable`: la clave de OpenRouter con que corre este workspace
- *   no sirve ahora (401/402/403, 429). Se salta ESE workspace por el resto de la
- *   corrida; los demás siguen.
- * - `provider_unavailable` / `timeout`: el proveedor falla (5xx, red). El caller
- *   salta el workspace y corta la fase si un segundo workspace falla igual.
+ * Every outcome falls in exactly one class of the run's failure model
+ * (classify-topics.ts, header):
+ * - `invalid_output` / `content_rejected` (400, 413, 422, moderation): this
+ *   text. The conversation spends an attempt.
+ * - `key_rejected` (401, 402, 403 other than moderation, 429): the key the
+ *   call ran on. The caller stops using THAT key for the rest of the run.
+ * - `provider_unavailable` (5xx, 408, 409, 404, the network) and `timeout`:
+ *   transient. The conversation waits an hour, no attempt spent.
  */
 export type ClassifyErrorCode =
   | "invalid_output"
-  | "provider_error"
-  | "workspace_unavailable"
+  | "content_rejected"
+  | "key_rejected"
   | "provider_unavailable"
   | "timeout";
 
+/** The key a call ran on: the workspace's own, or the platform's. */
+export type KeyScope = "own" | "platform";
+
+/**
+ * `usage`: what to settle the reservation with. A number (0 included) is
+ * known; null means unknown, and the reservation keeps its estimate.
+ */
 export type ClassifyResult =
-  | { ok: true; matches: TopicMatch[]; usage: LlmUsage | null }
-  | { ok: false; code: ClassifyErrorCode; usage: LlmUsage | null };
+  | { ok: true; matches: TopicMatch[]; usage: LlmUsage | null; keyScope: KeyScope }
+  | { ok: false; code: ClassifyErrorCode; usage: LlmUsage | null; keyScope: KeyScope };
 
 /**
  * Estados HTTP que culpan al CONTENIDO (petición mal formada por lo que
@@ -83,10 +90,8 @@ export type ClassifyResult =
 const CONTENT_REJECTED = new Set([400, 413, 422]);
 
 /**
- * Estados que dicen que la CLAVE con que corre el workspace no sirve ahora:
+ * Estados que dicen que la CLAVE con que corrió la llamada no sirve ahora:
  * inválida o revocada, sin créditos, sin permiso para el modelo, o limitada.
- * Es cosa de ese workspace (su clave propia) o de todos los que usan la de la
- * agencia; el caller lo distingue porque la misma falla se repite en otro.
  */
 const KEY_REJECTED = new Set([401, 402, 403, 429]);
 
@@ -99,8 +104,9 @@ function isModeration(err: APICallError): boolean {
 }
 
 /**
- * A 4xx is refused before any generation: nothing was billed, so the caller
- * settles the reservation at 0 instead of leaving its ceiling counted.
+ * An HTTP error answer (4xx or 5xx) means no generation was billed, so the
+ * caller settles the reservation at 0. No answer at all (timeout, network)
+ * leaves it unknown: the reservation keeps its estimate, a ceiling.
  */
 const REFUSED_USAGE: LlmUsage = { promptTokens: 0, completionTokens: 0 };
 
@@ -132,22 +138,16 @@ export async function classifyConversation(params: {
   topics: PromptTopic[];
   messages: PromptMessage[];
   abortSignal: AbortSignal;
+  /** Resolved by the caller (resolveOpenRouterKey), once per workspace and run. */
+  key: { scope: KeyScope; key: string };
 }): Promise<ClassifyResult> {
   const prompt = buildClassificationPrompt(params.topics, params.messages);
-
-  // The key is this workspace's (or the agency's for it): if it can't be read,
-  // the workspace is skipped, like a rejected key. No call went out.
-  let apiKey: string;
-  try {
-    apiKey = await getOpenRouterApiKey(params.workspaceId);
-  } catch {
-    return { ok: false, code: "workspace_unavailable", usage: REFUSED_USAGE };
-  }
+  const keyScope = params.key.scope;
 
   try {
     const openrouter = createOpenAI({
       baseURL: "https://openrouter.ai/api/v1",
-      apiKey,
+      apiKey: params.key.key,
       headers: {
         "HTTP-Referer": process.env.NEXT_PUBLIC_APP_URL ?? "http://localhost:3000",
         "X-Title": "Agente WhatsApp",
@@ -176,34 +176,36 @@ export async function classifyConversation(params: {
       output = result.output;
     } catch (outputErr) {
       if (NoOutputGeneratedError.isInstance(outputErr) || NoObjectGeneratedError.isInstance(outputErr)) {
-        return { ok: false, code: "invalid_output", usage };
+        return { ok: false, code: "invalid_output", usage, keyScope };
       }
       throw outputErr;
     }
 
     const matches = resolveMatches(output, prompt);
-    if (matches === null) return { ok: false, code: "invalid_output", usage };
-    return { ok: true, matches, usage };
+    if (matches === null) return { ok: false, code: "invalid_output", usage, keyScope };
+    return { ok: true, matches, usage, keyScope };
   } catch (err) {
     // El mismo par de errores puede salir de `generateText` en vez del getter.
     if (NoObjectGeneratedError.isInstance(err)) {
-      return { ok: false, code: "invalid_output", usage: toUsage(err.usage) };
+      return { ok: false, code: "invalid_output", usage: toUsage(err.usage), keyScope };
     }
     if (NoOutputGeneratedError.isInstance(err)) {
-      return { ok: false, code: "invalid_output", usage: null };
+      return { ok: false, code: "invalid_output", usage: null, keyScope };
     }
     if (params.abortSignal.aborted || (err instanceof Error && err.name === "AbortError")) {
-      return { ok: false, code: "timeout", usage: null };
+      return { ok: false, code: "timeout", usage: null, keyScope };
     }
     if (APICallError.isInstance(err) && err.statusCode != null) {
       if (CONTENT_REJECTED.has(err.statusCode) || isModeration(err)) {
-        return { ok: false, code: "provider_error", usage: REFUSED_USAGE };
+        return { ok: false, code: "content_rejected", usage: REFUSED_USAGE, keyScope };
       }
       if (KEY_REJECTED.has(err.statusCode)) {
-        return { ok: false, code: "workspace_unavailable", usage: REFUSED_USAGE };
+        return { ok: false, code: "key_rejected", usage: REFUSED_USAGE, keyScope };
       }
+      // 5xx, 408, 409, 404: an HTTP answer, so nothing was generated.
+      return { ok: false, code: "provider_unavailable", usage: REFUSED_USAGE, keyScope };
     }
-    // 5xx, 408, 409, the network down or anything unknown: the provider.
-    return { ok: false, code: "provider_unavailable", usage: null };
+    // The network down or anything unknown: transient, usage unknown.
+    return { ok: false, code: "provider_unavailable", usage: null, keyScope };
   }
 }

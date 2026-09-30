@@ -225,6 +225,13 @@ export async function generateChatReply(params: {
   toolContext?: ToolContext;
   /** Model steps when tools are on (a tool call and its answer are two). Default 5. */
   maxSteps?: number;
+  /**
+   * One HTTP request per step: no SDK retries and no retry of the turn. For a
+   * caller that reserved the call's ceiling for exactly that many requests.
+   */
+  noRetries?: boolean;
+  /** Cuts each tool result to this many characters before the model reads it. */
+  maxToolResultChars?: number;
 }): Promise<GenerateReplyResult> {
   const modelId =
     params.model ??
@@ -256,8 +263,8 @@ export async function generateChatReply(params: {
       aiTools[forgeTool.name] = tool({
         description: forgeTool.description,
         inputSchema: zodSchema(forgeTool.schema),
-        execute: async (args: unknown): Promise<unknown> =>
-          registry.runTool(forgeTool, args, ctx, {
+        execute: async (args: unknown): Promise<unknown> => {
+          const result = await registry.runTool(forgeTool, args, ctx, {
             ...(forgeTool.preferredTimeoutMs !== undefined
               ? { timeoutMs: forgeTool.preferredTimeoutMs }
               : {}),
@@ -266,7 +273,12 @@ export async function generateChatReply(params: {
                 wroteSomething = true;
               }
             },
-          }),
+          });
+          const max = params.maxToolResultChars;
+          if (max === undefined) return result;
+          const text = JSON.stringify(result) ?? "";
+          return text.length <= max ? result : { truncated: true, result: text.slice(0, max) };
+        },
       });
     }
   }
@@ -285,11 +297,12 @@ export async function generateChatReply(params: {
         tools: hasTools ? aiTools : undefined,
         stopWhen: hasTools ? stepCountIs(params.maxSteps ?? 5) : undefined,
         maxOutputTokens: params.maxOutputTokens ?? 512,
+        ...(params.noRetries ? { maxRetries: 0 } : {}),
         abortSignal: AbortSignal.timeout(
           hasTools ? LLM_TOOL_TURN_TIMEOUT_MS : LLM_TIMEOUT_MS,
         ),
       }),
-      { canRetry: () => !wroteSomething },
+      { canRetry: () => !wroteSomething && !params.noRetries },
     );
   } catch (err) {
     // The caller must know a write ran before the failure: sending the

@@ -1,6 +1,65 @@
 import { createClient as createSbClient, type SupabaseClient } from "@supabase/supabase-js";
 import { isBodyTruncated, MAX_PROMPT_MESSAGES, type PromptMessage, type PromptTopic } from "../lib/classify-prompt";
-import { classificationTokenCeiling, classifyConversation, CLASSIFY_MODEL, type LlmUsage } from "./classifier";
+import {
+  classificationTokenCeiling,
+  classifyConversation,
+  CLASSIFY_MODEL,
+  type KeyScope,
+  type LlmUsage,
+} from "./classifier";
+import { resolveOpenRouterKey, type OpenRouterKeyResolution } from "@/features/inbox/services/openrouter-key";
+
+/*
+ * ════════════════════════════════════════════════════════════════════════════
+ * THE FAILURE AND TURN MODEL of topic classification. Every call ends in
+ * exactly one of these classes; each class has one owner and one response.
+ *
+ * 1. KEY — 401, 402, 403 (not moderation), 429, or an own key that can't be
+ *    decrypted, or an empty platform key. Owner: the KEY the call ran on
+ *    (classifyConversation says which). Response: that key is dead for the
+ *    rest of the run: with a workspace's own key, only that workspace is
+ *    skipped; with the platform key, every workspace without its own. No
+ *    attempt spent, no backoff (the next run tries the key once again, at no
+ *    cost: a refused request bills nothing). NEVER counts toward the breaker.
+ *    The dashboard is told (note_classification_blocked 'key').
+ * 2. TRANSIENT — 5xx, 408, 409, 404, the network, a timeout. Owner: nobody in
+ *    particular. Response: THIS conversation waits TRANSIENT_BACKOFF_SECONDS
+ *    (1 h, defer_classification), no attempt spent, and the run goes on with
+ *    the next one — its workspace is not skipped.
+ * 3. CONTENT — 400, 413, 422, a moderation 403, output that doesn't parse, a
+ *    save the database rejects as data. Owner: the conversation. Response: an
+ *    attempt, a backoff of 1 h per attempt, quarantine at the third.
+ * 4. BUDGET — the reservation doesn't fit the workspace's daily cap. Owner:
+ *    the workspace. Response: skipped for the rest of the run; the dashboard
+ *    is told (note_classification_blocked 'cap').
+ * 5. INFRA — our database: the reservation, the key lookup, a save or a
+ *    bookkeeping write fails. Response: the run stops (halt). A paid result
+ *    that can't be saved would be paid again by the next conversation.
+ *
+ * CIRCUIT BREAKER: TRANSIENT_BREAKER (3) transient failures in a row, on
+ * different conversations, stop the run: that is the provider, not three bad
+ * conversations. Any answer from the provider (a result, a content or a key
+ * rejection) resets the count.
+ *
+ * SETTLEMENT of the reservation made before every call:
+ *   result with usage ............................ the real count
+ *   result or invalid output without usage ....... the estimate stays (a ceiling)
+ *   any HTTP error answer (4xx, 5xx) ............. 0 (nothing was generated)
+ *   timeout / network (no answer) ................ the estimate stays
+ *   no call made (dead key, no time, no inbound) . no reservation at all
+ * The estimate is always a ceiling, so a crash between reservation and
+ * settlement overcounts the day, never undercounts it.
+ *
+ * TURNS. A run (route.ts) gives the backfill of new topics the first
+ * BACKFILL_SHARE_MS and the nightly phase the rest, including whatever the
+ * backfill didn't use: a backfill with nothing it can do (no topic pending,
+ * over the cap, a dead key) returns at once. Inside each phase the order is
+ * the database's (select_conversations_to_classify): workspaces take turns;
+ * inside each, customers of the last 48 h oldest first, then the rest newest
+ * first. Guards (dead keys, workspaces over the cap, the breaker) are shared
+ * by both phases of a run.
+ * ════════════════════════════════════════════════════════════════════════════
+ */
 
 /**
  * La clasificación se detiene con 300k tokens del día UTC. Tope DURO: ninguna
@@ -11,6 +70,11 @@ import { classificationTokenCeiling, classifyConversation, CLASSIFY_MODEL, type 
  * neither can starve the other.
  */
 export const CLASSIFY_DAILY_TOKEN_CAP = 300_000;
+
+/** Transient failures in a row, on different conversations, that stop a run. */
+export const TRANSIENT_BREAKER = 3;
+/** How long a conversation waits after a transient failure (no attempt spent). */
+export const TRANSIENT_BACKOFF_SECONDS = 3600;
 
 /**
  * Cuántas conversaciones se RECLAMAN por vuelta (con lease). Las llamadas
@@ -44,38 +108,24 @@ const POST_LLM_WRITES_BACKFILL = 3;
 export const LEASE_SECONDS = 180;
 
 /**
- * What a run keeps for the backfill when a topic is waiting for one: its
- * floor per call (40 s) plus room for a handful of calls. Without it, the
- * nightly phase used the whole run while it had a queue, and a new topic's
- * history waited for the queue to empty.
+ * The backfill's share of a run, taken first: its floor per call (40 s) plus
+ * room for a handful of calls. What it doesn't use goes to the nightly phase.
  */
 export const BACKFILL_SHARE_MS = 55_000;
 
-/** Is any topic waiting for its backfill? Errors read as "no" (phase 2 still runs). */
-export async function hasPendingBackfill(deadline: number, db: SupabaseClient = svc()): Promise<boolean> {
-  const { data, error } = await db
-    .from("insight_topics")
-    .select("id")
-    .eq("status", "active")
-    .eq("backfill_status", "pending")
-    .limit(1)
-    .abortSignal(dbSignal(deadline));
-  return !error && (data ?? []).length > 0;
-}
-
 export interface ClassificationPhaseResult {
   classified: number;
+  /** Content failures: an attempt spent. */
   failed: number;
+  /** Transient failures: the conversation waits an hour, no attempt spent. */
+  deferred: number;
+  /** Workspaces over their daily cap, skipped for the rest of the run. */
   skipped_workspaces: number;
-  /**
-   * Workspaces skipped for the rest of the run because their OpenRouter key
-   * or the provider failed on them. One such workspace never stops the others.
-   */
+  /** Workspaces skipped for the rest of the run because their key failed. */
   unavailable_workspaces: number;
   /**
-   * true = la fase no debe seguir gastando: la reserva de tokens no se
-   * pudo hacer, el proveedor está caído, o un resultado pagado que la base no pudo guardar. La ruta NO corre la fase
-   * 2 detrás.
+   * true = the run stops: the breaker tripped, or our database failed. The
+   * route doesn't run the other phase.
    */
   halt: boolean;
   error?: string;
@@ -84,12 +134,12 @@ export interface ClassificationPhaseResult {
 export interface BackfillPhaseResult {
   processed: number;
   failed: number;
+  deferred: number;
   topics_done: number;
   /** Lote vacío porque la ventana de 30 días se venció, no por terminar. */
   topics_expired: number;
-  /** Mismo significado que en ClassificationPhaseResult. */
+  skipped_workspaces: number;
   unavailable_workspaces: number;
-  /** Mismo significado que en ClassificationPhaseResult. */
   halt: boolean;
   error?: string;
 }
@@ -105,33 +155,34 @@ interface ConversationRow {
   last_inbound_at: string;
 }
 
-/**
- * `infra` = no es culpa de la conversación: NO gasta un intento y
- * corta la fase. `halt` = además la fase no puede seguir gastando.
- * `skipWorkspace` = the workspace's key or the provider failed on it: the run
- * skips that workspace (no attempt spent) and stops only if another workspace
- * fails the same way — then it is the platform, not one tenant.
- * `no_time` y `over_budget` son aparte: tampoco gastan intento, y no son error.
- */
-type Outcome =
-  | { ok: true }
-  | { ok: false; code: string; infra?: boolean; halt?: boolean; skipWorkspace?: boolean };
-
-/**
- * Remembers, per failure code, which workspaces hit it in this run. True once
- * a second workspace hits the same one: a bad key of one tenant skips that
- * tenant; the same failure in two means the provider (or the agency's key) is
- * down for everyone, and spending on a third is pointless.
- */
-function workspaceFailures(): (code: string, workspaceId: string) => boolean {
-  const byCode = new Map<string, Set<string>>();
-  return (code, workspaceId) => {
-    const seen = byCode.get(code) ?? new Set<string>();
-    seen.add(workspaceId);
-    byCode.set(code, seen);
-    return seen.size >= 2;
-  };
+/** What a run knows about keys, caps and the provider; shared by both phases. */
+export interface RunGuards {
+  /** Each workspace's key, resolved once per run. */
+  keys: Map<string, OpenRouterKeyResolution>;
+  /** Keys that failed this run: "platform", or "own:<workspace id>". */
+  deadKeys: Set<string>;
+  /** Workspaces out of the rest of the run: a dead key, or over the cap. */
+  skipped: Set<string>;
+  /** Conversations with a transient failure since the provider last answered. */
+  transientStreak: Set<string>;
 }
+
+export function newRunGuards(): RunGuards {
+  return { keys: new Map(), deadKeys: new Set(), skipped: new Set(), transientStreak: new Set() };
+}
+
+const keyId = (workspaceId: string, scope: KeyScope) => (scope === "platform" ? "platform" : `own:${workspaceId}`);
+
+/** The outcome of one conversation, in the model's classes. */
+type Outcome =
+  | { kind: "ok" }
+  | { kind: "no_time" }
+  | { kind: "budget" }
+  /** No call made: the workspace's key is dead this run (or unusable). */
+  | { kind: "key"; scope: KeyScope; called: boolean }
+  | { kind: "transient"; code: string }
+  | { kind: "content"; code: string }
+  | { kind: "infra"; code: string };
 
 function svc(): SupabaseClient {
   return createSbClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!);
@@ -171,17 +222,37 @@ const isDataRejection = (error: DbError) => /^(22|23|P0)/.test(error.code ?? "")
  */
 const isDeadlineAbort = (error: DbError, deadline: number) => !error.code && remainingMs(deadline) <= 0;
 
+/** Tells the dashboard why a workspace isn't being analysed. Best effort. */
+async function noteBlocked(db: SupabaseClient, workspaceId: string, reason: "key" | "cap", deadline: number) {
+  const { error } = await db
+    .rpc("note_classification_blocked", { p_workspace_id: workspaceId, p_reason: reason })
+    .abortSignal(dbSignal(deadline));
+  if (error) console.error("[classify-topics] could not note a blocked workspace", error.code);
+}
+
+/**
+ * The key the workspace's calls run on this run: resolved once, and dead
+ * when it already failed (its own, or the platform's for everyone on it).
+ */
+async function keyFor(
+  db: SupabaseClient,
+  guards: RunGuards,
+  workspaceId: string,
+): Promise<OpenRouterKeyResolution> {
+  let resolution = guards.keys.get(workspaceId);
+  if (!resolution) {
+    resolution = await resolveOpenRouterKey(workspaceId, db);
+    guards.keys.set(workspaceId, resolution);
+  }
+  return resolution;
+}
+
 /**
  * Reserva el techo de la llamada ANTES de hacerla.
- * La RPC suma el consumo del día y, si cabe, inserta la fila de llm_usage con
- * la estimación, todo bajo un lock por workspace (mismo patrón que
- * reserve_llm_turn). Consultar `sum_daily_llm_tokens` dejaría a dos corridas
- * autorizar cada una su llamada con el mismo saldo, e insertar después
- * dejaría el gasto sin contar si ese INSERT falla.
- * Devuelve el id de la reserva, `null` si no cabe bajo el tope, o "failed".
- * "No pude reservar" ≠ "sin saldo". Un corte por el deadline común no
- * puede pasar acá: el caller solo reserva con ≥ 35 s por delante, y
- * el techo de la consulta es de 5 s.
+ * La RPC suma el consumo del día y, si cabe, inserta la fila con la
+ * estimación, todo bajo un lock por workspace (mismo patrón que
+ * reserve_llm_turn). Devuelve el id de la reserva, `null` si no cabe bajo el
+ * tope, o "failed". "No pude reservar" ≠ "sin saldo".
  */
 async function reserveTokens(
   db: SupabaseClient,
@@ -198,8 +269,6 @@ async function reserveTokens(
     })
     .abortSignal(dbSignal(deadline));
   if (error) {
-    // Cualquier código, incluido un rechazo de datos: sin reserva no hay
-    // llamada, y la conversación no tiene la culpa.
     console.error("[classify-topics] token reservation failed", error.code);
     return "failed";
   }
@@ -207,11 +276,9 @@ async function reserveTokens(
 }
 
 /**
- * Liquida la reserva con el consumo real. Si falla, la fila conserva la
- * estimación, que es un techo: el día queda SOBREcontado, nunca subcontado, y
- * el gasto sigue acotado por las reservas. Por eso NO corta la fase (un
- * `halt` acá frenaría el trabajo sin proteger nada); se deja en el log. Si la
- * base de verdad está caída, el save que viene detrás corta con halt.
+ * Liquida la reserva (ver SETTLEMENT en la cabecera). Si falla, la fila
+ * conserva la estimación, que es un techo: el día queda SOBREcontado, nunca
+ * subcontado. Por eso NO corta la fase; se deja en el log.
  */
 async function settleTokens(
   db: SupabaseClient,
@@ -224,9 +291,6 @@ async function settleTokens(
   const total = usage.promptTokens + usage.completionTokens;
   // Alarma: la estimación dejó de ser un techo. Se registra lo real igual.
   if (total > estimate) console.error("[classify-topics] usage above reservation", total, estimate);
-  // Sin contact_id a propósito (la fila la crea la reserva sin él):
-  // reserve_llm_turn cuenta el tope por contacto con payload->>'contact_id', y
-  // la clasificación no debe comerle turnos al cliente.
   const { error } = await db
     .rpc("settle_classification_tokens", {
       p_reservation_id: reservationId,
@@ -286,22 +350,24 @@ async function loadMessages(
   return ((data ?? []) as PromptMessage[]).reverse();
 }
 
-const NO_TIME: Outcome = { ok: false, code: "no_time" };
-
+/**
+ * One conversation, start to end, in the model's classes. `backfillTopic`:
+ * the topic a backfill reads it for (null for the nightly phase).
+ */
 async function classifyOne(
   db: SupabaseClient,
+  guards: RunGuards,
   row: ConversationRow,
   topics: PromptTopic[],
   deadline: number,
-  classifiedUntil: string | null,
-  postLlmWrites: number,
+  backfillTopic: string | null,
 ): Promise<Outcome> {
+  const postLlmWrites = backfillTopic ? POST_LLM_WRITES_BACKFILL : POST_LLM_WRITES_CLASSIFY;
   let messages: PromptMessage[];
   try {
     messages = await loadMessages(db, row, deadline);
   } catch {
-    // La base no respondió; la conversación no tiene la culpa.
-    return { ok: false, code: "load_messages_failed", infra: true };
+    return { kind: "infra", code: "load_messages_failed" };
   }
 
   try {
@@ -310,50 +376,53 @@ async function classifyOne(
     // Only the customer's messages can carry a topic: with none in view there
     // is nothing to ask the LLM, and the row is saved as analysed.
     if (messages.some((m) => m.direction === "in")) {
-      // Piso de LLM COMPLETO antes de reservar. Solo
-      // se reserva y se llama si queda tiempo para la reserva, los 20 s enteros
-      // del LLM y el techo de cada escritura posterior. Con un piso mínimo, la
-      // última llamada de cada corrida saldría con segundos, se cortaría,
-      // OpenRouter la cobraría, no se guardaría nada y la reserva quedaría en el
-      // techo; con backlog, cada corrida de la noche quemaría una. Así
-      // toda llamada que sale tiene su presupuesto completo, y un corte siempre
-      // es el proveedor lento. Costo: el final de cada corrida queda ocioso.
-      // Fase 1: 5 + 20 + 2×5 = 35 s; fase 2: 40 s; RUN_BUDGET_MS = 50 s.
-      if (remainingMs(deadline) < DB_TIMEOUT_MS + LLM_TIMEOUT_MS + postLlmWrites * DB_TIMEOUT_MS) return NO_TIME;
+      // Piso de LLM COMPLETO antes de reservar: la reserva, los 20 s enteros
+      // del LLM y el techo de cada escritura posterior. Toda llamada que sale
+      // tiene su presupuesto completo, y un corte siempre es el proveedor
+      // lento. Fase 1: 5 + 20 + 2×5 = 35 s; fase 2: 40 s.
+      if (remainingMs(deadline) < DB_TIMEOUT_MS + LLM_TIMEOUT_MS + postLlmWrites * DB_TIMEOUT_MS) {
+        return { kind: "no_time" };
+      }
+
+      // KEY: resolved once per workspace and run. A key already dead, an own
+      // key that can't be decrypted or an empty platform key: no call.
+      let key: OpenRouterKeyResolution;
+      try {
+        key = await keyFor(db, guards, row.workspace_id);
+      } catch {
+        return { kind: "infra", code: "key_lookup_failed" };
+      }
+      if (key.scope === null) return { kind: "infra", code: "key_lookup_failed" };
+      if (guards.deadKeys.has(keyId(row.workspace_id, key.scope))) {
+        return { kind: "key", scope: key.scope, called: false };
+      }
+      if (!key.key) return { kind: "key", scope: key.scope, called: false };
 
       // Sin reserva no hay llamada.
       const estimate = classificationTokenCeiling(topics, messages);
       const reservation = await reserveTokens(db, row, estimate, deadline);
-      if (reservation === "failed") return { ok: false, code: "budget_reserve_failed", infra: true, halt: true };
-      if (reservation.id === null) return { ok: false, code: "over_budget" };
+      if (reservation === "failed") return { kind: "infra", code: "budget_reserve_failed" };
+      if (reservation.id === null) return { kind: "budget" };
 
-      // Presupuesto fijo. Con respuesta, la reserva tardó ≤ 5 s (su
-      // abort la convierte en "failed"); el jitter de ms lo absorbe el techo de
-      // las escrituras, que igual se acotan al deadline (dbSignal).
       const result = await classifyConversation({
         workspaceId: row.workspace_id,
         topics,
         messages,
         abortSignal: AbortSignal.timeout(LLM_TIMEOUT_MS),
+        key: { scope: key.scope, key: key.key },
       });
-      // Sin `usage` (corte, caída, o el proveedor no informó
-      // los dos conteos) la reserva conserva la estimación. OpenRouter factura
-      // las peticiones sin streaming aunque el cliente se desconecte, así que
-      // liquidar en 0 subcontaría.
+      // SETTLEMENT: a known count (0 included) settles; unknown keeps the estimate.
       if (result.usage) await settleTokens(db, row, reservation.id, estimate, result.usage, deadline);
       if (!result.ok) {
-        // The workspace's key, a provider outage or a slow provider (with the
-        // floor above the LLM always had its full time): not this
-        // conversation's fault, so no attempt is spent. The caller skips the
-        // workspace and stops only if another one fails the same way.
-        if (
-          result.code === "workspace_unavailable" ||
-          result.code === "provider_unavailable" ||
-          result.code === "timeout"
-        ) {
-          return { ok: false, code: result.code, infra: true, skipWorkspace: true };
+        switch (result.code) {
+          case "key_rejected":
+            return { kind: "key", scope: result.keyScope, called: true };
+          case "provider_unavailable":
+          case "timeout":
+            return { kind: "transient", code: result.code };
+          default:
+            return { kind: "content", code: result.code };
         }
-        return { ok: false, code: result.code };
       }
       matches = result.matches;
     }
@@ -363,7 +432,7 @@ async function classifyOne(
         p_workspace_id: row.workspace_id,
         p_conversation_id: row.conversation_id,
         p_matches: matches,
-        p_classified_until: classifiedUntil,
+        p_classified_until: backfillTopic ? null : row.last_inbound_at,
         // Cobertura parcial declarada. La RPC decide qué quedó fuera
         // (mensajes anteriores al más viejo que vio el LLM y aún no analizados)
         // y lo suma a los recortados. loadMessages ya trae los últimos 60 en
@@ -372,39 +441,64 @@ async function classifyOne(
         p_truncated_at: messages
           .filter((m) => m.direction === "in" && isBodyTruncated(m))
           .map((m) => m.created_at),
-        // The nightly run records which catalog it read the conversation
-        // with, so a later topic's backfill knows what is already covered.
-        ...(classifiedUntil !== null ? { p_catalog: topics.map((t) => t.id) } : {}),
+        // The nightly phase records which catalog it read the conversation
+        // with; a backfill, the topic it read it for.
+        ...(backfillTopic ? { p_backfill_topic: backfillTopic } : { p_catalog: topics.map((t) => t.id) }),
       })
       .abortSignal(dbSignal(deadline));
-    if (!error) return { ok: true };
-    if (isDeadlineAbort(error, deadline)) return { ok: false, code: "no_time" };
-    if (isDataRejection(error)) return { ok: false, code: "save_failed" };
-    // Con la base fallando, la siguiente conversación pagaría el LLM y
-    // perdería el resultado igual. halt deja el desperdicio en una llamada.
+    if (!error) return { kind: "ok" };
+    if (isDeadlineAbort(error, deadline)) return { kind: "no_time" };
+    if (isDataRejection(error)) return { kind: "content", code: "save_failed" };
     console.error("[classify-topics] save_conversation_topics failed", error.code);
-    return { ok: false, code: "save_infra_failed", infra: true, halt: true };
+    return { kind: "infra", code: "save_infra_failed" };
   } catch {
-    return { ok: false, code: "unexpected" };
+    return { kind: "content", code: "unexpected" };
   }
+}
+
+/**
+ * The response to a KEY outcome: the key is dead for the rest of the run
+ * (its workspace, or every workspace on the platform key), and the dashboard
+ * is told. Never a halt.
+ */
+async function killKey(
+  db: SupabaseClient,
+  guards: RunGuards,
+  workspaceId: string,
+  scope: KeyScope,
+  deadline: number,
+): Promise<void> {
+  const id = keyId(workspaceId, scope);
+  if (!guards.deadKeys.has(id)) {
+    console.error("[classify-topics] OpenRouter key failed; skipped for this run", scope === "platform" ? "platform" : workspaceId);
+  }
+  guards.deadKeys.add(id);
+  guards.skipped.add(workspaceId);
+  guards.transientStreak.clear();
+  await noteBlocked(db, workspaceId, "key", deadline);
+}
+
+/** TRANSIENT: true when the breaker trips (the run must stop). */
+function transientTrips(guards: RunGuards, conversationId: string): boolean {
+  guards.transientStreak.add(conversationId);
+  return guards.transientStreak.size >= TRANSIENT_BREAKER;
 }
 
 export async function runClassificationPhase(
   deadline: number,
   db: SupabaseClient = svc(),
+  guards: RunGuards = newRunGuards(),
 ): Promise<ClassificationPhaseResult> {
   const result: ClassificationPhaseResult = {
-    classified: 0, failed: 0, skipped_workspaces: 0, unavailable_workspaces: 0, halt: false,
+    classified: 0, failed: 0, deferred: 0, skipped_workspaces: 0, unavailable_workspaces: 0, halt: false,
   };
-  const skipped = new Set<string>();
-  const failedElsewhere = workspaceFailures();
   const topicsByWorkspace = new Map<string, PromptTopic[]>();
 
   while (hasTime(deadline)) {
     const { data, error } = await db
       .rpc("select_conversations_to_classify", {
         p_limit: BATCH_SIZE,
-        p_skip_workspaces: [...skipped],
+        p_skip_workspaces: [...guards.skipped],
         p_lease_seconds: LEASE_SECONDS,
       })
       .abortSignal(dbSignal(deadline));
@@ -415,64 +509,74 @@ export async function runClassificationPhase(
     // SECUENCIAL. Lo que quede del lote sin procesar sigue reclamado hasta
     // que vence el lease (LEASE_SECONDS) y lo retoma la corrida siguiente.
     for (const row of rows) {
-      if (!hasTime(deadline)) return result; // chequeo tras cada espera
-      if (skipped.has(row.workspace_id)) continue;
+      if (!hasTime(deadline)) return result;
+      if (guards.skipped.has(row.workspace_id)) continue;
 
       let topics = topicsByWorkspace.get(row.workspace_id);
       if (!topics) {
         try {
           topics = await loadTopics(db, row.workspace_id, deadline);
         } catch {
-          return { ...result, error: "load_topics_failed" }; // infraestructura
+          return { ...result, error: "load_topics_failed", halt: true };
         }
         topicsByWorkspace.set(row.workspace_id, topics);
       }
-      const outcome = await classifyOne(db, row, topics, deadline, row.last_inbound_at, POST_LLM_WRITES_CLASSIFY);
+      const outcome = await classifyOne(db, guards, row, topics, deadline, null);
 
-      if (outcome.ok) {
-        result.classified++;
-        continue;
-      }
-      // Quedarse sin tiempo no es culpa de la conversación: no gasta un intento.
-      if (outcome.code === "no_time") return result;
-      // Reserva negada: el workspace no tiene saldo para ESTA llamada. Se salta
-      // entero por el resto de la corrida (y en la selección). La conversación
-      // conserva su lease y vuelve cuando vence.
-      if (outcome.code === "over_budget") {
-        skipped.add(row.workspace_id);
-        result.skipped_workspaces++;
-        continue;
-      }
-      if (outcome.skipWorkspace) {
-        if (failedElsewhere(outcome.code, row.workspace_id)) {
-          return { ...result, error: outcome.code, halt: true };
+      switch (outcome.kind) {
+        case "ok":
+          result.classified++;
+          guards.transientStreak.clear();
+          break;
+        case "no_time":
+          return result;
+        case "budget":
+          guards.skipped.add(row.workspace_id);
+          result.skipped_workspaces++;
+          await noteBlocked(db, row.workspace_id, "cap", deadline);
+          break;
+        case "key":
+          await killKey(db, guards, row.workspace_id, outcome.scope, deadline);
+          result.unavailable_workspaces++;
+          break;
+        case "transient": {
+          const { error: deferErr } = await db
+            .rpc("defer_classification", {
+              p_workspace_id: row.workspace_id,
+              p_conversation_id: row.conversation_id,
+              p_code: outcome.code,
+              p_seconds: TRANSIENT_BACKOFF_SECONDS,
+            })
+            .abortSignal(dbSignal(deadline));
+          if (deferErr) {
+            if (isDeadlineAbort(deferErr, deadline)) return result;
+            return { ...result, error: "defer_failed", halt: true };
+          }
+          result.deferred++;
+          if (transientTrips(guards, row.conversation_id)) {
+            return { ...result, error: outcome.code, halt: true };
+          }
+          break;
         }
-        console.error("[classify-topics] workspace skipped for this run", row.workspace_id, outcome.code);
-        skipped.add(row.workspace_id);
-        result.unavailable_workspaces++;
-        continue;
-      }
-      // La infraestructura tampoco. No se registra el fallo (tres
-      // corridas con la base caída mandarían a cuarentena conversaciones sanas);
-      // la fase se corta en su lugar, y eso es lo que acota el gasto repetido.
-      // No hay RPC para soltar el lease de una conversación sin tocar sus
-      // intentos: vence solo (LEASE_SECONDS), antes del cron siguiente.
-      if (outcome.infra) return { ...result, error: outcome.code, halt: outcome.halt === true };
-
-      result.failed++;
-      const { error: failErr } = await db
-        .rpc("record_classification_failure", {
-          p_workspace_id: row.workspace_id,
-          p_conversation_id: row.conversation_id,
-          p_code: outcome.code,
-        })
-        .abortSignal(dbSignal(deadline));
-      if (failErr) {
-        // Cortado por el deadline = sin tiempo; el intento no se contó
-        // y la conversación vuelve cuando vence el lease.
-        if (isDeadlineAbort(failErr, deadline)) return result;
-        // No poder registrar el fallo también es infraestructura caída.
-        return { ...result, error: "record_failure_failed" };
+        case "content": {
+          guards.transientStreak.clear();
+          result.failed++;
+          const { error: failErr } = await db
+            .rpc("record_classification_failure", {
+              p_workspace_id: row.workspace_id,
+              p_conversation_id: row.conversation_id,
+              p_code: outcome.code,
+            })
+            .abortSignal(dbSignal(deadline));
+          if (failErr) {
+            // Cortado por el deadline = sin tiempo; el intento no se contó.
+            if (isDeadlineAbort(failErr, deadline)) return result;
+            return { ...result, error: "record_failure_failed", halt: true };
+          }
+          break;
+        }
+        case "infra":
+          return { ...result, error: outcome.code, halt: true };
       }
     }
   }
@@ -483,25 +587,21 @@ export async function runClassificationPhase(
 export async function runBackfillPhase(
   deadline: number,
   db: SupabaseClient = svc(),
+  guards: RunGuards = newRunGuards(),
 ): Promise<BackfillPhaseResult> {
   const result: BackfillPhaseResult = {
-    processed: 0, failed: 0, topics_done: 0, topics_expired: 0, unavailable_workspaces: 0, halt: false,
+    processed: 0, failed: 0, deferred: 0, topics_done: 0, topics_expired: 0,
+    skipped_workspaces: 0, unavailable_workspaces: 0, halt: false,
   };
-  const failedElsewhere = workspaceFailures();
   const TOPIC_PAGE = 20;
-  // Memo: workspaces cuya reserva se negó, o cuya clave falló, en esta corrida.
-  // Sus temas se saltan.
-  const noBudget = new Set<string>();
   let offset = 0;
   // Una escritura cortada por el deadline es "sin tiempo", no un 500.
   // El cursor que no avanzó solo repite trabajo idempotente la próxima corrida.
   const stopped = (err: DbError, code: string): BackfillPhaseResult =>
-    isDeadlineAbort(err, deadline) ? result : { ...result, error: code };
+    isDeadlineAbort(err, deadline) ? result : { ...result, error: code, halt: true };
 
-  // Se PAGINA. Si se tomaran los 20 primeros temas y recién ahí se
-  // descartaran los workspaces sin saldo, con 10 temas de A y 10 de B agotados
-  // el tema de C nunca sería consultado, y si A/B llegan al tope cada noche, el
-  // histórico de C quedaría bloqueado para siempre.
+  // Se PAGINA: los temas de workspaces sin saldo o con la clave caída se
+  // saltan sin cortar el recorrido, así el de otro workspace no espera.
   while (hasTime(deadline)) {
     const { data: topics, error } = await db
       .from("insight_topics")
@@ -511,36 +611,35 @@ export async function runBackfillPhase(
       .order("created_at")
       .range(offset, offset + TOPIC_PAGE - 1)
       .abortSignal(dbSignal(deadline));
-    if (error) return { ...result, error: "backfill_topics_failed" };
+    if (error) return { ...result, error: "backfill_topics_failed", halt: true };
     const page = (topics ?? []) as Array<PromptTopic & { workspace_id: string }>;
     if (page.length === 0) break;
     offset += page.length;
 
     for (const topic of page) {
       if (!hasTime(deadline)) return result;
-      if (noBudget.has(topic.workspace_id)) continue; // se salta el tema, NO se corta el recorrido
+      if (guards.skipped.has(topic.workspace_id)) continue;
 
       // Lease por tema (ver LEASE_SECONDS). Si otra corrida lo tiene,
       // se salta sin cortar la paginación.
       const { data: claimed, error: claimErr } = await db
         .rpc("claim_topic_backfill", { p_topic_id: topic.id, p_lease_seconds: LEASE_SECONDS })
         .abortSignal(dbSignal(deadline));
-      if (claimErr) return { ...result, error: "backfill_claim_failed" };
+      if (claimErr) return { ...result, error: "backfill_claim_failed", halt: true };
       if (claimed !== true) continue;
 
       // Reprocesamiento: solo ese tema, para no redetectar los viejos.
       const prompt: PromptTopic[] = [{ id: topic.id, name: topic.name, description: topic.description }];
 
-      while (hasTime(deadline)) {
+      topicLoop: while (hasTime(deadline)) {
         const { data, error: batchErr } = await db
           .rpc("next_backfill_batch", { p_topic_id: topic.id, p_limit: BATCH_SIZE })
           .abortSignal(dbSignal(deadline));
-        if (batchErr) return { ...result, error: "backfill_batch_failed" };
+        if (batchErr) return { ...result, error: "backfill_batch_failed", halt: true };
         const batch = (data ?? []) as ConversationRow[];
 
         if (batch.length === 0) {
-          // Lote vacío = terminado O ventana vencida. Lo decide la RPC (el piso
-          // de la ventana vive en SQL) y devuelve el estado con que quedó.
+          // Lote vacío = terminado O ventana vencida. Lo decide la RPC.
           const { data: status, error: doneErr } = await db
             .rpc("advance_topic_backfill", {
               p_topic_id: topic.id,
@@ -555,32 +654,29 @@ export async function runBackfillPhase(
           break;
         }
 
-        // Secuencial, con una reserva de tokens antes de cada llamada.
-        const outcomes: Outcome[] = [];
-        let ranOut = false;
+        // In cursor order: the cursor only moves past consecutive successes.
+        let done = 0;
+        let stop: Outcome | null = null;
         for (const row of batch) {
           if (!hasTime(deadline)) {
-            ranOut = true;
+            stop = { kind: "no_time" };
             break;
           }
-          const outcome = await classifyOne(db, row, prompt, deadline, null, POST_LLM_WRITES_BACKFILL);
-          if (!outcome.ok && outcome.code === "over_budget") {
-            noBudget.add(row.workspace_id);
-            ranOut = true;
-            break;
+          const outcome = await classifyOne(db, guards, row, prompt, deadline, topic.id);
+          if (outcome.kind === "ok") {
+            done++;
+            guards.transientStreak.clear();
+            continue;
           }
-          outcomes.push(outcome);
-          if (!outcome.ok) break; // el cursor solo avanza hasta el último éxito
+          stop = outcome;
+          break;
         }
-
-        const firstFail = outcomes.findIndex((o) => !o.ok);
-        const okCount = firstFail === -1 ? outcomes.length : firstFail;
-        result.processed += okCount;
+        result.processed += done;
 
         // Avanzar primero hasta el último éxito consecutivo: advance resetea
-        // backfill_attempts, así que va antes de registrar el fallo.
-        if (okCount > 0) {
-          const last = batch[okCount - 1];
+        // backfill_attempts, así que va antes de registrar un fallo.
+        if (done > 0) {
+          const last = batch[done - 1];
           const { error: advErr } = await db
             .rpc("advance_topic_backfill", {
               p_topic_id: topic.id,
@@ -592,49 +688,58 @@ export async function runBackfillPhase(
           if (advErr) return stopped(advErr, "backfill_advance_failed");
         }
 
-        if (firstFail === -1) {
-          if (ranOut) break; // sin tiempo o sin saldo: se retoma la próxima
-          continue;
-        }
+        if (!stop) continue;
+        switch (stop.kind) {
+          case "no_time":
+            return result;
+          case "infra":
+            return { ...result, error: stop.code, halt: true };
+          case "budget":
+            guards.skipped.add(topic.workspace_id);
+            result.skipped_workspaces++;
+            await noteBlocked(db, topic.workspace_id, "cap", deadline);
+            break topicLoop;
+          case "key":
+            await killKey(db, guards, topic.workspace_id, stop.scope, deadline);
+            result.unavailable_workspaces++;
+            break topicLoop;
+          case "transient":
+          case "content": {
+            // A cursor can't step around one conversation, so both count on
+            // the topic: three failures at the same spot and it is skipped (a
+            // conversation that always times out can't block a backfill).
+            if (stop.kind === "transient") {
+              result.deferred++;
+              if (transientTrips(guards, batch[done].conversation_id)) {
+                return { ...result, error: stop.code, halt: true };
+              }
+            } else {
+              guards.transientStreak.clear();
+              result.failed++;
+            }
+            const { data: attempts, error: recErr } = await db
+              .rpc("record_backfill_failure", { p_topic_id: topic.id })
+              .abortSignal(dbSignal(deadline));
+            if (recErr) return stopped(recErr, "record_failure_failed");
+            if (Number(attempts ?? 0) < 3) break topicLoop; // se reintenta en la próxima corrida
 
-        const failedOutcome = outcomes[firstFail] as Extract<Outcome, { ok: false }>;
-        if (failedOutcome.code === "no_time") return result;
-        if (failedOutcome.skipWorkspace) {
-          if (failedElsewhere(failedOutcome.code, topic.workspace_id)) {
-            return { ...result, error: failedOutcome.code, halt: true };
+            const failedRow = batch[done];
+            const { error: skipErr } = await db
+              .rpc("advance_topic_backfill", {
+                p_topic_id: topic.id,
+                p_cursor_at: failedRow.last_inbound_at,
+                p_cursor_id: failedRow.conversation_id,
+                p_done: false,
+              })
+              .abortSignal(dbSignal(deadline));
+            if (skipErr) return stopped(skipErr, "backfill_advance_failed");
+            break;
           }
-          console.error("[classify-topics] workspace skipped for this run", topic.workspace_id, failedOutcome.code);
-          noBudget.add(topic.workspace_id);
-          result.unavailable_workspaces++;
-          break; // this topic's lease is released below; its other topics are skipped
         }
-        // Igual que en la fase 1. Contarlo acá sería peor: al tercer
-        // intento el tema SALTA la conversación para siempre.
-        if (failedOutcome.infra) return { ...result, error: failedOutcome.code, halt: failedOutcome.halt === true };
-
-        result.failed++;
-        const { data: attempts, error: recErr } = await db
-          .rpc("record_backfill_failure", { p_topic_id: topic.id })
-          .abortSignal(dbSignal(deadline));
-        if (recErr) return stopped(recErr, "record_failure_failed");
-        if (Number(attempts ?? 0) < 3) break; // se reintenta en la próxima corrida
-
-        const failedRow = batch[firstFail];
-        const { error: skipErr } = await db
-          .rpc("advance_topic_backfill", {
-            p_topic_id: topic.id,
-            p_cursor_at: failedRow.last_inbound_at,
-            p_cursor_id: failedRow.conversation_id,
-            p_done: false,
-          })
-          .abortSignal(dbSignal(deadline));
-        if (skipErr) return stopped(skipErr, "backfill_advance_failed");
       }
 
       // Terminado con el tema: se suelta el lease (el cierre done/expired ya lo
-      // soltó en su UPDATE). Los `return` de arriba cortan la corrida entera y
-      // dejan que venza solo, igual que lo no procesado de la fase 1: 120 s,
-      // antes de la próxima corrida del cron. Por eso un fallo acá solo se loguea.
+      // soltó en su UPDATE). Los `return` de arriba dejan que venza solo.
       const { error: relErr } = await db
         .rpc("release_topic_backfill", { p_topic_id: topic.id })
         .abortSignal(dbSignal(deadline));

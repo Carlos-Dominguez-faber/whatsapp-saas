@@ -4,21 +4,24 @@ import { mock, test } from "node:test";
 let phase1: () => Promise<unknown> = async () => ({ classified: 2, failed: 1, skipped_workspaces: 0 });
 let phase2: () => Promise<unknown> = async () => ({ processed: 3, failed: 0, topics_done: 1 });
 let order: string[] = [];
-let backfillWaiting = false;
-const phase1Deadlines: number[] = [];
+const deadlines: Record<string, number[]> = { backfill: [], classification: [] };
+const guardsSeen: unknown[] = [];
 
 mock.module("@/features/analytics/services/classify-topics.ts", {
   exports: {
     BACKFILL_SHARE_MS: 55_000,
     LEASE_SECONDS: 180,
-    hasPendingBackfill: async () => backfillWaiting,
-    runClassificationPhase: (deadline: number) => {
+    newRunGuards: () => ({ marker: Math.random() }),
+    runClassificationPhase: (deadline: number, _db: unknown, guards: unknown) => {
       order.push("classification");
-      phase1Deadlines.push(deadline);
+      deadlines.classification.push(deadline);
+      guardsSeen.push(guards);
       return phase1();
     },
-    runBackfillPhase: () => {
+    runBackfillPhase: (deadline: number, _db: unknown, guards: unknown) => {
       order.push("backfill");
+      deadlines.backfill.push(deadline);
+      guardsSeen.push(guards);
       return phase2();
     },
   },
@@ -34,8 +37,9 @@ const req = (auth?: string) =>
 function reset() {
   process.env.CRON_SECRET = "s3cret";
   order = [];
-  backfillWaiting = false;
-  phase1Deadlines.length = 0;
+  deadlines.backfill = [];
+  deadlines.classification = [];
+  guardsSeen.length = 0;
   phase1 = async () => ({ classified: 2, failed: 1, skipped_workspaces: 0 });
   phase2 = async () => ({ processed: 3, failed: 0, topics_done: 1 });
 }
@@ -46,16 +50,14 @@ test("presupuesto de tiempo menor que maxDuration, y este menor que el lease", (
   assert.ok(maxDuration < 180, "a run could outlive its own lease");
 });
 
-test("REVIEW H2: with a backfill waiting, phase 1 leaves it its share of the run", async () => {
+test("TURNS: the backfill runs first with its own cut; phase 1 gets the rest; both share the guards", async () => {
   reset();
   const t0 = Date.now();
   await GET(req("Bearer s3cret"));
-  backfillWaiting = true;
-  await GET(req("Bearer s3cret"));
-  const [free, shared] = phase1Deadlines;
-  assert.ok(free - t0 >= RUN_BUDGET_MS - 1_000);
-  assert.ok(Math.abs(free - shared - 55_000) < 1_000, "phase 1 did not stop early for the backfill");
-  assert.deepEqual(order, ["classification", "backfill", "classification", "backfill"]);
+  assert.deepEqual(order, ["backfill", "classification"]);
+  assert.ok(Math.abs(deadlines.backfill[0] - t0 - 55_000) < 1_000);
+  assert.ok(Math.abs(deadlines.classification[0] - t0 - RUN_BUDGET_MS) < 1_000);
+  assert.equal(guardsSeen[0], guardsSeen[1], "the phases got different guards");
 });
 
 test("sin bearer o con bearer incorrecto → 401 sin correr fases", async () => {
@@ -65,7 +67,7 @@ test("sin bearer o con bearer incorrecto → 401 sin correr fases", async () => 
   assert.deepEqual(order, []);
 });
 
-test("éxito: fase 1 antes que la 2; failed > 0 sigue siendo 200", async () => {
+test("éxito: failed > 0 sigue siendo 200", async () => {
   reset();
   const res = await GET(req("Bearer s3cret"));
   assert.equal(res.status, 200);
@@ -74,10 +76,9 @@ test("éxito: fase 1 antes que la 2; failed > 0 sigue siendo 200", async () => {
     classified: { classified: 2, failed: 1, skipped_workspaces: 0 },
     backfill: { processed: 3, failed: 0, topics_done: 1 },
   });
-  assert.deepEqual(order, ["classification", "backfill"]);
 });
 
-test("fase 1 con error sin halt (select_failed) → 500 ok:false, y la fase 2 igual corre", async () => {
+test("error sin halt → 500 ok:false, y la otra fase igual corre", async () => {
   reset();
   phase1 = async () => ({ classified: 0, failed: 0, skipped_workspaces: 0, halt: false, error: "select_failed" });
   const res = await GET(req("Bearer s3cret"));
@@ -85,48 +86,23 @@ test("fase 1 con error sin halt (select_failed) → 500 ok:false, y la fase 2 ig
   const body = await res.json();
   assert.equal(body.ok, false);
   assert.equal(body.classified.error, "select_failed");
-  assert.deepEqual(order, ["classification", "backfill"]);
-  assert.equal(body.backfill.processed, 3);
+  assert.deepEqual(order, ["backfill", "classification"]);
 });
 
-test("fase 1 con halt (contabilidad rota) → 500 y la fase 2 NO corre", async () => {
+test("backfill con halt (breaker, base caída) → 500 y la fase 1 NO corre", async () => {
   reset();
   // El código de error es irrelevante para la ruta: decide por `halt`.
-  phase1 = async () => ({ classified: 0, failed: 1, skipped_workspaces: 0, halt: true, error: "cualquier_codigo" });
+  phase2 = async () => ({ processed: 0, failed: 0, topics_done: 0, halt: true, error: "cualquier_codigo" });
   const res = await GET(req("Bearer s3cret"));
   assert.equal(res.status, 500);
   const body = await res.json();
   assert.equal(body.ok, false);
-  assert.deepEqual(order, ["classification"], "la fase 2 corrió (y pagó) después de un halt");
-  assert.equal(body.backfill.error, "skipped_after_halt");
-  assert.equal(body.backfill.processed, 0);
+  assert.deepEqual(order, ["backfill"], "phase 1 ran (and paid) after a halt");
+  assert.equal(body.classified.error, "skipped_after_halt");
+  assert.equal(body.classified.classified, 0);
 });
 
-test("fase 1 que lanza → estado desconocido, la fase 2 NO corre", async () => {
-  reset();
-  phase1 = async () => {
-    throw new Error("boom");
-  };
-  const res = await GET(req("Bearer s3cret"));
-  assert.equal(res.status, 500);
-  const body = await res.json();
-  assert.equal(body.classified.error, "threw");
-  assert.equal(body.classified.halt, true);
-  assert.deepEqual(order, ["classification"]);
-  assert.equal(body.backfill.error, "skipped_after_halt");
-});
-
-test("presupuesto no consultable → 500, no 200 con skipped_workspaces", async () => {
-  reset();
-  phase1 = async () => ({ classified: 0, failed: 0, skipped_workspaces: 0, halt: true, error: "budget_reserve_failed" });
-  const res = await GET(req("Bearer s3cret"));
-  assert.equal(res.status, 500);
-  const body = await res.json();
-  assert.equal(body.ok, false);
-  assert.equal(body.classified.error, "budget_reserve_failed");
-});
-
-test("fase que lanza → 500 ok:false con código, sin el mensaje crudo", async () => {
+test("fase que lanza → estado desconocido, 500 ok:false con código, sin el mensaje crudo", async () => {
   reset();
   phase2 = async () => {
     throw new Error("connection string postgres://secret");
@@ -135,5 +111,17 @@ test("fase que lanza → 500 ok:false con código, sin el mensaje crudo", async 
   assert.equal(res.status, 500);
   const text = await res.text();
   assert.doesNotMatch(text, /secret/);
-  assert.equal(JSON.parse(text).backfill.error, "threw");
+  const body = JSON.parse(text);
+  assert.equal(body.backfill.error, "threw");
+  assert.equal(body.backfill.halt, true);
+  assert.deepEqual(order, ["backfill"]);
+  assert.equal(body.classified.error, "skipped_after_halt");
+
+  reset();
+  phase1 = async () => {
+    throw new Error("boom");
+  };
+  const res2 = await GET(req("Bearer s3cret"));
+  assert.equal(res2.status, 500);
+  assert.equal((await res2.json()).classified.error, "threw");
 });
