@@ -11,7 +11,7 @@ import { createClient as createSbClient } from "@supabase/supabase-js";
 import { checkWorkspaceMember } from "@/lib/auth/workspace-access";
 import {
   contactSyncOptions,
-  syncContactToCrm,
+  syncContactEditToCrm,
   syncContactManually,
   type CrmName,
 } from "./crm-sync";
@@ -99,14 +99,13 @@ export async function updateContact(
   //    mantiene viva la función hasta que termine. La edición del operador es la única que empuja
   //    nombre/email a un contacto que ya existía en el CRM, y solo si alguno de los dos CAMBIÓ:
   //    guardar la etapa con el mismo nombre no pisa el nombre que el cliente tiene en HubSpot.
-  //    En HubSpot las etiquetas viajan como delta (altas y bajas); HighLevel ignora las opciones y
-  //    empuja el contacto entero, como antes.
-  const opts = contactSyncOptions(prev, parsed.data);
+  //    En HubSpot las etiquetas viajan como delta (altas y bajas); HighLevel recibe UNA subida del
+  //    contacto entero, sin importar cuántos deltas haya.
+  const deltas = contactSyncOptions(prev, parsed.data);
   after(async () => {
-    for (const o of opts) {
-      await syncContactToCrm(workspace_id, contactId, o).catch((err: unknown) => {
-        console.warn("[updateContact] CRM sync failed (non-critical):", err);
-      });
+    const result = await syncContactEditToCrm(workspace_id, contactId, deltas);
+    if (!result.ok && result.reason === "failed") {
+      console.warn("[updateContact] CRM sync failed (non-critical):", result.code ?? "failed");
     }
   });
 
@@ -147,6 +146,8 @@ export async function getContact(
 /** Códigos de CrmSyncResult que se pueden explicar mejor que "intenta de nuevo". */
 const SYNC_FAILURE_MESSAGES: Record<string, string> = {
   properties_not_ready: "Falta probar la conexión de HubSpot en Configuración → Integraciones.",
+  hl_link_conflict:
+    "Este contacto ya está en HighLevel, enlazado a otro contacto de aquí: son la misma persona registrada dos veces. Revisa los dos y quédate con uno.",
 };
 
 /**

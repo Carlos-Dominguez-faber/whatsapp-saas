@@ -38,7 +38,7 @@ mock.module("@supabase/supabase-js", {
 });
 
 const hlCalls: unknown[][] = [];
-let hlResult: { hl_id: string } | null = { hl_id: "hl_1" };
+let hlResult: { hl_id: string; linkConflict?: { heldBy: string | null } } | null = { hl_id: "hl_1" };
 mock.module("./highlevel-client.ts", {
   exports: {
     syncContactToHL: async (...args: unknown[]) => {
@@ -196,4 +196,72 @@ test("un proveedor que lanza no revienta syncContactToCrm ni syncContactManually
   reset([HS]);
   pullThrows = new Error("network blew up");
   assert.deepEqual(await crm.syncContactManually("ws_1", "c1"), { ok: false, reason: "failed", code: "unexpected_error" });
+});
+
+// ── An operator's edit: one HighLevel push, HubSpot deltas in order ──────────
+
+test("una edición con varios deltas es UNA sola subida a HighLevel", async () => {
+  reset([HL]);
+  const deltas = crm.contactSyncOptions(
+    { name: "Ana", email: null, tags: ["a", "b", "c"] },
+    { name: "Ana María", tags: ["d"] },
+  );
+  assert.equal(deltas.length, 4, "a profile/add delta plus one per removed tag");
+  assert.deepEqual(await crm.syncContactEditToCrm("ws_1", "c1", deltas), {
+    ok: true,
+    provider: "highlevel",
+    id: "hl_1",
+  });
+  assert.deepEqual(hlCalls, [["ws_1", "c1"]]);
+  assert.equal(hsCalls.length, 0);
+});
+
+test("en HubSpot los deltas van en orden y se detienen en el primer fallo", async () => {
+  reset([HS]);
+  const deltas = [{ addTags: ["d"] }, { removeTag: "a" }, { removeTag: "b" }];
+  assert.deepEqual(await crm.syncContactEditToCrm("ws_1", "c1", deltas), {
+    ok: true,
+    provider: "hubspot",
+    id: "hs_1",
+  });
+  assert.deepEqual(hsCalls.map((c) => c[2]), deltas);
+
+  reset([HS]);
+  hsResult = { ok: false, code: "rate_limited" };
+  assert.deepEqual(await crm.syncContactEditToCrm("ws_1", "c1", deltas), {
+    ok: false,
+    reason: "failed",
+    code: "rate_limited",
+  });
+  assert.equal(hsCalls.length, 1);
+});
+
+test("un contacto que HighLevel ya enlaza a otro local no es un éxito", async () => {
+  reset([HL]);
+  hlResult = { hl_id: "hl_1", linkConflict: { heldBy: "c2" } };
+  assert.deepEqual(await crm.syncContactToCrm("ws_1", "c1"), {
+    ok: false,
+    reason: "failed",
+    code: "hl_link_conflict",
+  });
+  assert.deepEqual(await crm.syncContactEditToCrm("ws_1", "c1", [{}]), {
+    ok: false,
+    reason: "failed",
+    code: "hl_link_conflict",
+  });
+});
+
+test("sin CRM, con dos o con la lectura rota, una edición no llama a nadie", async () => {
+  reset([]);
+  assert.deepEqual(await crm.syncContactEditToCrm("ws_1", "c1", [{}]), { ok: false, reason: "no_crm" });
+  reset([HL, HS]);
+  assert.deepEqual(await crm.syncContactEditToCrm("ws_1", "c1", [{}]), { ok: false, reason: "crm_conflict" });
+  reset([HL]);
+  integrationsError = { message: "down" };
+  assert.deepEqual(await crm.syncContactEditToCrm("ws_1", "c1", [{}]), {
+    ok: false,
+    reason: "failed",
+    code: "crm_read_failed",
+  });
+  assert.equal(hlCalls.length + hsCalls.length, 0);
 });

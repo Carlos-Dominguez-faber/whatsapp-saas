@@ -14,6 +14,7 @@ import { createHash } from "node:crypto";
 import { createClient as createSbClient } from "@supabase/supabase-js";
 import { decryptCredentials } from "@/shared/lib/integration-secrets";
 import { splitName } from "./highlevel-client";
+import { loadWhatsAppSettings } from "./whatsapp-provider";
 
 const HS_BASE_URL = "https://api.hubapi.com";
 /** Versión fechada de la API. Un solo lugar: si el smoke da 404, se cambia acá. */
@@ -396,6 +397,16 @@ function profileProperties(contact: HsContactRow): Record<string, string> {
 
 const V = HS_API_VERSION;
 
+/**
+ * A HubSpot record id: digits only. Ids go into URL paths
+ * (/crm/objects/.../contacts/{id}), so one read from HubSpot's answer or from
+ * contacts.hs_contact_id is used only when it has this shape (the column has
+ * the same CHECK, contacts_hs_contact_id_numeric).
+ */
+export function isHubSpotId(value: unknown): value is string {
+  return typeof value === "string" && /^[0-9]{1,20}$/.test(value);
+}
+
 function remoteIdentity(r: { properties?: Record<string, unknown> }): string | null {
   const v = r.properties?.[HS_PHONE_PROPERTY];
   return typeof v === "string" && v.length > 0 ? v : null;
@@ -435,7 +446,7 @@ async function findContacts(
   if (!Array.isArray(results)) return { ok: false, code: "bad_response" };
 
   const valid = results.filter((r): r is { id: string; properties?: Record<string, unknown> } =>
-    typeof r.id === "string" && r.id.length > 0,
+    isHubSpotId(r.id),
   );
   const identity = valid.find((r) => remoteIdentity(r) === phone)?.id ?? null;
   const free = [...new Set(valid.filter((r) => remoteIdentity(r) === null).map((r) => r.id))];
@@ -475,7 +486,7 @@ async function createContact(
   });
   if (res.ok) {
     const id = (res.json as { id?: unknown } | null)?.id;
-    return typeof id === "string" && id ? { ok: true, id, created: true } : { ok: false, code: "bad_response" };
+    return isHubSpotId(id) ? { ok: true, id, created: true } : { ok: false, code: "bad_response" };
   }
   if (res.code !== "conflict" && res.code !== "bad_request") return { ok: false, code: res.code };
 
@@ -588,7 +599,9 @@ export async function pushContactToHubSpot(
   }
   const contact: HsContactRow = row;
 
-  let hsId = contact.hs_contact_id;
+  // A stored id that isn't a HubSpot id (written before the CHECK) is not
+  // used in a path: the contact is resolved again.
+  let hsId = isHubSpotId(contact.hs_contact_id) ? contact.hs_contact_id : null;
   let profileSent = false;
   if (!hsId) {
     const resolved = await resolveHubSpotContactId(cfg.token, workspaceId, contact);
@@ -1000,7 +1013,7 @@ function sliceCodePoints(s: string, max: number): string {
  * encabezado lleva el número del agente para distinguirlo del inbox nativo de HubSpot.
  *
  * Un dato ilegible nunca se convierte en "no hay datos": un error de lectura en
- * CUALQUIER paso (kapso, contacto, mensajes) devuelve `db_error` para que la cola reintente, en
+ * CUALQUIER paso (proveedor de WhatsApp, contacto, mensajes) devuelve `db_error` para que la cola reintente, en
  * vez de dejar un registro falso (`(Sin mensajes.)`/sin número) permanente en el CRM.
  */
 async function buildConversationBody(
@@ -1011,15 +1024,15 @@ async function buildConversationBody(
   agentSummary: unknown,
   reason: "handoff" | "closed",
 ): Promise<{ ok: true; body: string } | { ok: false; code: "db_error" }> {
-  const { data: kapso, error: kapsoError } = await db
-    .from("integrations")
-    .select("config")
-    .eq("workspace_id", workspaceId)
-    .eq("provider", "kapso")
-    .eq("enabled", true)
-    .maybeSingle();
-  if (kapsoError) return { ok: false, code: "db_error" };
-  const agentPhone = nonEmpty((kapso?.config as { phone_number?: unknown } | null)?.phone_number);
+  // The agent's number, from the workspace's ACTIVE WhatsApp provider (YCloud
+  // or Kapso), whichever it is.
+  let whatsapp: Awaited<ReturnType<typeof loadWhatsAppSettings>>;
+  try {
+    whatsapp = await loadWhatsAppSettings(db, workspaceId);
+  } catch {
+    return { ok: false, code: "db_error" };
+  }
+  const agentPhone = nonEmpty(whatsapp?.config.phone_number);
   const header = `[Agente de WhatsApp${agentPhone ? ` · ${agentPhone}` : ""}] ${REASON_LABEL[reason]}`;
 
   let content: string;

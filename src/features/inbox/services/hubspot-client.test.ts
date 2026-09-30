@@ -1893,3 +1893,46 @@ test("enlace existente:un error de la RPC de lectura es db_error (reintentable),
   }
   assert.equal(calls.length, 0);
 });
+
+// ── Ids de HubSpot: solo dígitos, porque van en la URL ───────────────────────
+
+test("isHubSpotId: solo dígitos", () => {
+  assert.equal(hs.isHubSpotId("600"), true);
+  for (const bad of ["", "6a0", "600/../deals", "600?x=1", " 600", 600, null, undefined, "1".repeat(21)]) {
+    assert.equal(hs.isHubSpotId(bad), false, String(bad));
+  }
+});
+
+test("un resultado de búsqueda con un id que no es de HubSpot no se enlaza ni viaja en la URL", async () => {
+  reset();
+  connect();
+  addContact();
+  on("POST", SEARCH, json(200, { results: [{ id: "600/../x", properties: { whatsapp_phone: PHONE } }] }));
+  on("POST", CREATE, json(201, { id: "601" }));
+  assert.deepEqual(await hs.syncContactToHubSpot(WS, "c1"), { hs_id: "601" });
+  assert.ok(calls.every((c) => !c.url.includes("600/../x")));
+});
+
+test("un enlace guardado que no es un id de HubSpot se resuelve de nuevo, no se usa en la URL", async () => {
+  reset();
+  connect();
+  addContact({ hs_contact_id: "abc" });
+  on("POST", SEARCH, json(200, { results: [{ id: "600", properties: { whatsapp_phone: PHONE } }] }));
+  on("PATCH", CONTACT, json(200, {}));
+  assert.deepEqual(await hs.pushContactToHubSpot(WS, "c1", { pushProfile: true }), { ok: true, hs_id: "600" });
+  assert.ok(calls.every((c) => !c.url.includes("/contacts/abc")));
+});
+
+test("el número del agente sale del proveedor de WhatsApp ACTIVO (YCloud), no de una fila de Kapso", async () => {
+  reset();
+  connect();
+  addContact({ hs_contact_id: "777" });
+  tables.conversations.push({ id: "conv_1", workspace_id: WS, contact_id: "c1", summary: "Hola." });
+  tables.integrations.push(
+    { workspace_id: WS, provider: "kapso", enabled: false, credentials: {}, config: { phone_number: "+1 555 000 0000" } },
+    { workspace_id: WS, provider: "ycloud", enabled: true, credentials: {}, config: { phone_number: "+52 998 123 4567" } },
+  );
+  on("POST", COMMS, json(201, {}));
+  await hs.logHubSpotConversation(WS, "conv_1", "handoff");
+  assert.equal(loggedBody(), "[Agente de WhatsApp · +52 998 123 4567] Traspaso a humano\n\nResumen: Hola.");
+});

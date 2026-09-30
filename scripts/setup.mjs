@@ -230,8 +230,8 @@ function cmdEnv() {
 // no parsing of the CLI's table output.
 const RETIRED_KAPSO_BRANCH_MIGRATIONS = ["20260731000000", "20260731000001"];
 
-// Versions from the community PR stack (#8, #9, #11, #12, #13, #14, #15 and #16, on
-// provider/kapso) that main does not have. main re-lands what it adopts under new versions, so an
+// Versions from the community PR stack (#8, #9, #11, #12, #13, #14, #15, #16 and
+// #17, on provider/kapso) that main does not have. main re-lands what it adopts under new versions, so an
 // install that ran those PR branches needs these marked as reverted too, or
 // `db push` refuses. This only fixes the history: whatever those versions
 // created stays in the database.
@@ -254,9 +254,9 @@ const RETIRED_PR_STACK_MIGRATIONS = [
   "20260830000001", // #11 retire custom_webhook (on main: 20260930000007)
   "20260906000002", // #14 cancel/reschedule seed (on main: 20260930000000)
   "20260907000000", // #12 handoff_human seed (on main: 20260930000002)
-  "20260820010000", // #15 Cal.com booking uid (Cal.com is not on main yet)
-  "20260820020000", // #15 Cal.com tools seed
-  "20260821010000", // #15 Cal.com slot claim guard
+  "20260820010000", // #15 Cal.com booking uid (on main: 20261003000000)
+  "20260820020000", // #15 Cal.com tools seed (on main: 20261003000001)
+  "20260821010000", // #15 Cal.com slot claim guard (on main: 20261003000002)
   "20260903000000", // #16 automation engine (on main: 20261001000000)
   "20260904000000", // #16 automation_rules writes service-role only
   "20260904000002", // #16 claim_next_automation_run time floor
@@ -264,6 +264,12 @@ const RETIRED_PR_STACK_MIGRATIONS = [
   "20260915000000", // #13 insight_topics (on main: 20261002000000)
   "20260915000001", // #13 classify_topics_rpcs (on main: 20261002000001)
   "20260915000002", // #13 get_insights (on main: 20261002000002)
+  "20260922000000", // #17 integration_provider 'hubspot' (on main: 20261003000004)
+  "20260922000001", // #17 contacts.hs_contact_id (on main: 20261003000005)
+  "20260922000002", // #17 one active CRM (on main: 20261003000006)
+  "20260922000003", // #17 conversation-log queue (on main: 20261003000007)
+  "20260922000004", // #17 mark_hubspot_ready (on main: 20261003000008)
+  "20260922000005", // #17 read_hubspot_link (on main: 20261003000009)
 ];
 
 function repairRetiredMigrations() {

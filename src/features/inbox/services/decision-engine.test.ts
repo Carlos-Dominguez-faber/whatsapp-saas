@@ -21,7 +21,13 @@ function nextResponse(): QueueEntry {
   return responseQueue.shift() ?? { data: null, error: null };
 }
 
+const rpcCalls: Array<{ fn: string; args: unknown }> = [];
+let rpcResult: { data: unknown; error: unknown } = { data: true, error: null };
 const fakeClient = {
+  rpc(fn: string, args: unknown) {
+    rpcCalls.push({ fn, args });
+    return Promise.resolve(rpcResult);
+  },
   from(table: string) {
     return {
       select() {
@@ -134,6 +140,8 @@ function reset(queue: QueueEntry[] = [FOUND, { error: null }, { error: null }]) 
   reserveCalls = 0;
   enabledTools = [];
   enabledToolsError = null;
+  rpcCalls.length = 0;
+  rpcResult = { data: true, error: null };
 }
 
 const DECIDE = {
@@ -366,4 +374,60 @@ test("si el INSERT del evento state_change falla, queda registrado server-side",
   assert.ok(logged.some((a) => String(a[0]).includes("state_change insert failed")));
   // Y no se filtra el mensaje crudo del error.
   assert.ok(logged.every((a) => !JSON.stringify(a).includes("connection string")));
+});
+
+// ── Handoff and close are queued for the HubSpot timeline, never sent here ──
+
+test("a handoff queues its HubSpot timeline entry by the version it moved from", async () => {
+  reset();
+  await applyTransition("conv_1", "handoff_pending", { trigger: "keyword" });
+  assert.deepEqual(rpcCalls, [
+    {
+      fn: "enqueue_hubspot_conversation_log",
+      args: {
+        p_workspace_id: "ws_1",
+        p_conversation_id: "conv_1",
+        p_from_state_version: 3,
+        p_reason: "handoff",
+      },
+    },
+  ]);
+});
+
+test("closing queues 'closed'; other transitions queue nothing", async () => {
+  reset([{ data: { state: "human_active", workspace_id: "ws_1", state_version: 7 }, error: null }, { error: null }, { error: null }]);
+  await applyTransition("conv_1", "closed");
+  assert.equal((rpcCalls[0].args as { p_reason: string }).p_reason, "closed");
+
+  reset();
+  await applyTransition("conv_1", "paused");
+  assert.deepEqual(rpcCalls, []);
+});
+
+test("a failed or missing queue never breaks the transition; without a version nothing is queued", async () => {
+  reset();
+  rpcResult = { data: null, error: { code: "PGRST202", message: "Could not find the function public.enqueue_hubspot_conversation_log" } };
+  const original = console.error;
+  console.error = () => {};
+  try {
+    await applyTransition("conv_1", "handoff_pending", { trigger: "keyword" });
+  } finally {
+    console.error = original;
+  }
+  assert.equal((updates[0].row as { state: string }).state, "handoff_pending");
+
+  reset([
+    { data: null, error: { code: "42703", message: "column conversations.state_version does not exist" } },
+    { data: { state: "ai_active", workspace_id: "ws_1" }, error: null },
+    {},
+    { error: null },
+  ]);
+  const warn = console.error;
+  console.error = () => {};
+  try {
+    await applyTransition("conv_1", "handoff_pending", { trigger: "keyword" });
+  } finally {
+    console.error = warn;
+  }
+  assert.deepEqual(rpcCalls, []);
 });

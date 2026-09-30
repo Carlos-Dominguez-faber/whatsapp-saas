@@ -66,7 +66,7 @@ const realCrmSync = await import("./crm-sync.ts");
 mock.module("./crm-sync.ts", {
   exports: {
     contactSyncOptions: realCrmSync.contactSyncOptions,
-    syncContactToCrm: async (ws: string, contactId: string, opts?: unknown) => {
+    syncContactEditToCrm: async (ws: string, contactId: string, opts?: unknown) => {
       syncCalls.push({ ws, contactId, opts });
       return { ok: false, reason: "no_crm" };
     },
@@ -167,22 +167,33 @@ test("updateContact entrega el sync a after() y empuja el perfil solo si cambió
   assert.equal(afterTasks.length, 1, "el sync quedó en manos de after");
   assert.deepEqual(syncCalls, [], "nada salió por fuera de after");
   await runAfter();
-  assert.deepEqual(syncCalls, [{ ws: "ws_1", contactId: "contact_1", opts: { pushProfile: true } }]);
+  assert.deepEqual(syncCalls, [{ ws: "ws_1", contactId: "contact_1", opts: [{ pushProfile: true }] }]);
 });
 
 test("updateContact: reenviar el mismo nombre con otra etapa sincroniza sin empujar el perfil", async () => {
   reset();
   await updateContact("contact_1", { name: "Ana", stage: "qualified" });
   await runAfter();
-  assert.deepEqual(syncCalls.map((c) => c.opts), [{}]);
+  assert.deepEqual(syncCalls.map((c) => c.opts), [[{}]]);
 });
 
-test("updateContact manda las etiquetas como delta: altas juntas, cada baja aparte", async () => {
+test("updateContact manda las etiquetas como delta, en UNA sola llamada al CRM", async () => {
   reset();
-  contacts[0].tags = ["a", "b"];
+  contacts[0].tags = ["a", "b", "x"];
   await updateContact("contact_1", { tags: ["b", "c", "d"] });
   await runAfter();
-  assert.deepEqual(syncCalls.map((c) => c.opts), [{ addTags: ["c", "d"] }, { removeTag: "a" }]);
+  // One sync per edit: HighLevel gets one push; HubSpot the deltas in order.
+  assert.deepEqual(syncCalls.map((c) => c.opts), [
+    [{ addTags: ["c", "d"] }, { removeTag: "a" }, { removeTag: "x" }],
+  ]);
+});
+
+test("syncContactCrm explica un contacto que HighLevel ya enlaza a otro de aquí", async () => {
+  reset();
+  manualResult = { ok: false, reason: "failed", code: "hl_link_conflict" };
+  const result = await syncContactCrm("contact_1");
+  assert.equal(result.ok, false);
+  assert.match(String(result.error), /misma persona/);
 });
 
 test("updateContact rechazado por validación no agenda ningún sync", async () => {

@@ -9,7 +9,11 @@ import {
   TransitionError,
   type ConversationState,
 } from "./state-machine";
-import { isMissingColumnError, reportMissingFunctionOnce } from "@/shared/lib/db-errors";
+import {
+  isMissingColumnError,
+  isMissingFunctionError,
+  reportMissingFunctionOnce,
+} from "@/shared/lib/db-errors";
 import { reserveLlmTurn } from "./cost-tracker";
 import { getEnabledTools } from "@/features/tools/services/tool-configs";
 import type { Tool } from "@/features/tools/core/tool";
@@ -311,7 +315,9 @@ export async function applyTransition(
   // hubspotLogs de cron/automations, con deadline. Un fallo no revierte ni rompe la transición.
   // Va ANTES del aviso por email (Resend, llamada externa): si el aviso se cuelga y la función
   // muere por maxDuration, el encolado ya quedó hecho.
-  if (to === "handoff_pending" || to === "closed") {
+  // Sin state_version (antes de la migración del motor) no hay identidad de la transición: no se
+  // encola, en vez de mandar un NULL que la tabla rechaza.
+  if ((to === "handoff_pending" || to === "closed") && typeof currentVersion === "number") {
     try {
       const { error: enqueueError } = await supabase.rpc("enqueue_hubspot_conversation_log", {
         p_workspace_id: row.workspace_id,
@@ -319,7 +325,9 @@ export async function applyTransition(
         p_from_state_version: currentVersion,
         p_reason: to === "closed" ? "closed" : "handoff",
       });
-      if (enqueueError) {
+      if (enqueueError && isMissingFunctionError(enqueueError, "enqueue_hubspot_conversation_log")) {
+        reportMissingFunctionOnce("enqueue_hubspot_conversation_log", "handoffs are not logged in HubSpot");
+      } else if (enqueueError) {
         console.error("[decision-engine] hubspot_log_enqueue_failed", { conversationId });
       }
     } catch {

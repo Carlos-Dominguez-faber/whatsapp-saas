@@ -8,6 +8,7 @@ process.env.SUPABASE_SERVICE_ROLE_KEY = "fake-service-key";
 type Row = Record<string, unknown>;
 let claimQueue: Array<{ data: Row[] | null; error: { message: string } | null }> = [];
 const claims: unknown[] = [];
+const purges: unknown[] = [];
 const finishes: Array<{ patch: Row; eqs: unknown[][] }> = [];
 const events: Row[] = [];
 /** Cuando true, el próximo cierre CAS afecta 0 filas (otra corrida ya reclamó y cerró el ítem). */
@@ -19,6 +20,10 @@ mock.module("@supabase/supabase-js", {
   exports: {
     createClient: () => ({
       rpc: async (fn: string, args: unknown) => {
+        if (fn === "purge_hubspot_conversation_logs") {
+          purges.push(args);
+          return { data: 0, error: null };
+        }
         assert.equal(fn, "claim_hubspot_conversation_log");
         claims.push(args);
         return claimQueue.shift() ?? { data: [], error: null };
@@ -80,6 +85,7 @@ function row(attempts = 1): Row {
 function reset(rows: Row[] = []) {
   claimQueue = rows.map((r) => ({ data: [r], error: null }));
   claims.length = 0;
+  purges.length = 0;
   finishes.length = 0;
   events.length = 0;
   outcomes = [];
@@ -257,4 +263,27 @@ test("un ítem reclamado con attempts > MAX_LOG_ATTEMPTS cierra failed/max_attem
     conversation_id: "conv_1",
     payload: { provider: "hubspot", code: "max_attempts", step: "conversation_log", attempts: MAX_LOG_ATTEMPTS + 1 },
   });
+});
+
+test("antes del db-push (sin la RPC del claim) la fase se salta, sin marcarse caída", async () => {
+  reset();
+  claimQueue = [
+    {
+      data: null,
+      error: { code: "PGRST202", message: "Could not find the function public.claim_hubspot_conversation_log" } as never,
+    },
+  ];
+  assert.deepEqual(await drainHubSpotConversationLogs(later()), { done: 0, retry: 0, failed: 0, cancelled: 0 });
+  assert.equal(logged.length, 0);
+});
+
+test("cada tick purga lo terminado de hace más de 30 días, en tandas acotadas", async () => {
+  reset([row()]);
+  await drainHubSpotConversationLogs(later());
+  assert.deepEqual(purges, [{ p_keep_days: 30, p_limit: 1000 }]);
+
+  // Sin tiempo, no se purga: la purga nunca le quita presupuesto a la cola.
+  reset();
+  await drainHubSpotConversationLogs(Date.now() + 1_000);
+  assert.equal(purges.length, 0);
 });

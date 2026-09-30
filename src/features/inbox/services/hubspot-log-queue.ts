@@ -1,7 +1,7 @@
 /**
  * hubspot-log-queue.ts — procesa la cola hubspot_conversation_logs. Es la fase hubspotLogs
  * de cron/automations: corre DESPUÉS del drenaje del motor y con el mismo deadline de la corrida
- * (RUN_BUDGET_MS 50 s < maxDuration 60 s = intervalo del cron).
+ * (RUN_BUDGET_MS, 50 s).
  *
  * - Reclamo con lease (RPC claim_hubspot_conversation_log, FOR UPDATE SKIP LOCKED).
  * - Cada ítem con deadline propio vía hsDeadline: cada llamada a HubSpot recorta su timeout.
@@ -13,7 +13,7 @@
  *   ítem lo deja reclamable para siempre. Un ítem reclamado ya por encima de MAX_LOG_ATTEMPTS
  *   cierra failed/max_attempts de una, SIN llamar a logHubSpotConversation.
  * - `db_error` (lectura transitoria fallida en logHubSpotConversation: conversación, contacto,
- *   mensajes, kapso o config) se trata como cualquier otro código reintentable: pending +
+ *   mensajes, proveedor de WhatsApp o config) se trata como cualquier otro código reintentable: pending +
  *   backoff, cuenta hacia MAX_LOG_ATTEMPTS. Nunca se lo confunde con "no hay datos".
  * - Un cierre `cancelled` (HubSpot desconectado o config ilegible) también emite
  *   `crm_sync_failed`, igual que `failed`: que quede visible, no solo silencioso en la fila.
@@ -21,6 +21,7 @@
 
 import { createClient as createSbClient } from "@supabase/supabase-js";
 import { hsDeadline, logHubSpotConversation, recordHsEvent, type Outcome } from "./hubspot-client";
+import { isMissingFunctionError, reportMissingFunctionOnce } from "@/shared/lib/db-errors";
 
 export const MAX_LOG_ATTEMPTS = 5;
 const LEASE_SECONDS = 120;
@@ -30,6 +31,8 @@ const ITEM_BUDGET_MS = 30_000;
 const MIN_REMAINING_MS = 15_000;
 const MAX_ITEMS_PER_TICK = 10;
 const BACKOFF_MS = 120_000;
+/** Finished rows (done, failed, cancelled) are kept this long, then purged. */
+export const LOG_RETENTION_DAYS = 30;
 
 export interface HubSpotLogTally {
   done: number;
@@ -89,6 +92,12 @@ export async function drainHubSpotConversationLogs(deadline: number): Promise<Hu
 
     const { data, error } = await db.rpc("claim_hubspot_conversation_log", { p_lease_seconds: LEASE_SECONDS });
     if (error) {
+      // Deployed before db-push: there is no queue yet, so there is nothing to
+      // drain. Not a failed phase (it would turn every tick into a 500).
+      if (isMissingFunctionError(error, "claim_hubspot_conversation_log")) {
+        reportMissingFunctionOnce("claim_hubspot_conversation_log", "the HubSpot timeline queue is skipped");
+        return tally;
+      }
       console.error("[hubspot-logs] hubspot_logs_claim_failed");
       return { ...tally, error: "hubspot_logs_claim_failed" };
     }
@@ -151,5 +160,27 @@ export async function drainHubSpotConversationLogs(deadline: number): Promise<Hu
     }
     tally[next.bucket]++;
   }
+  await purgeFinishedLogs(deadline);
   return tally;
+}
+
+/**
+ * Deletes finished rows older than LOG_RETENTION_DAYS, a bounded batch per
+ * tick, with whatever time is left. Best-effort: a failure is logged and the
+ * next tick tries again; it never fails the phase.
+ */
+async function purgeFinishedLogs(deadline: number): Promise<void> {
+  if (deadline - Date.now() < 2_000) return;
+  try {
+    const db = createSbClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!);
+    const { error } = await db.rpc("purge_hubspot_conversation_logs", {
+      p_keep_days: LOG_RETENTION_DAYS,
+      p_limit: 1000,
+    });
+    if (error && !isMissingFunctionError(error, "purge_hubspot_conversation_logs")) {
+      console.error("[hubspot-logs] purge failed:", error.message);
+    }
+  } catch (err) {
+    console.error("[hubspot-logs] purge failed:", err instanceof Error ? err.message : err);
+  }
 }

@@ -361,7 +361,7 @@ test("CAS: si otro escritor movió la fila entre la lectura y la escritura, 409 
 test("CAS: un primer guardado concurrente (la fila apareció entre lectura e INSERT) es 409, no pisa", async () => {
   resetCrm();
   upsertError = { code: "23505", message: 'duplicate key value violates unique constraint "integrations_workspace_id_provider_key"' };
-  const res = await PUT(putJson({ provider: "kapso", credentials: { kapso_api_key: "k" } }), params);
+  const res = await PUT(putJson({ provider: "openrouter", credentials: { openrouter_api_key: "k" } }), params);
   assert.equal(res.status, 409);
   assert.equal(((await res.json()) as { error: string }).error, CONCURRENT);
   assert.deepEqual(writeEqs[0], [], "sin fila leída va por INSERT, nunca por upsert");

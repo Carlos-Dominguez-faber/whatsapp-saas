@@ -1011,7 +1011,7 @@ function HighLevelSection({
     // botón "Desactivar CRM", así que se avisa antes de ejecutarlo.
     if (
       !window.confirm(
-        "Desactivar HighLevel también apaga el agendamiento de citas por HighLevel. HubSpot todavía no agenda citas (llega en la próxima entrega). ¿Desactivar igual?",
+        "Desactivar HighLevel también apaga el agendamiento de citas por HighLevel. HubSpot no agenda citas: para agendar con HubSpot como CRM, conecta Cal.com. ¿Desactivar igual?",
       )
     ) {
       return;
@@ -1180,7 +1180,7 @@ function HighLevelSection({
             variant="outline"
             size="sm"
             onClick={handleTest}
-            disabled={!controls.canTest}
+            disabled={!canEdit || !controls.canTest}
             aria-busy={testing}
           >
             {testing && (
@@ -1225,12 +1225,15 @@ function HubSpotSection({
   workspaceId,
   initial,
   blockedBy,
+  canEdit,
   onSaved,
 }: {
   workspaceId: string;
   initial: IntegrationData | undefined;
   /** CRM que ya está activo; un solo CRM por workspace. */
   blockedBy: string | null;
+  /** Admin: guardar, probar (escribe propiedades en HubSpot) y desactivar. */
+  canEdit: boolean;
   onSaved: () => void;
 }) {
   // El GET devuelve la credencial enmascarada ("••••••"). Solo se envía si el usuario la edita.
@@ -1347,8 +1350,8 @@ function HubSpotSection({
 
   return (
     <Section
-      title="HubSpot"
-      description="Conecta tu CRM con el token de una app privada. Sincroniza contactos, etiquetas, negocios y el resumen de cada conversación."
+      title="HubSpot (beta)"
+      description="Conecta tu CRM con el token de una app privada. Sincroniza contactos, etiquetas, negocios y el resumen de cada conversación. Pruébalo primero con un portal de HubSpot de prueba."
     >
       <div className="grid gap-4">
         {blockedBy && (
@@ -1369,6 +1372,7 @@ function HubSpotSection({
               setTokenDirty(true);
             }}
             autoComplete="off"
+            disabled={!canEdit}
           />
           <p className="text-xs text-muted-foreground">
             HubSpot → Configuración → Integraciones → Apps privadas: crea una
@@ -1462,7 +1466,7 @@ function HubSpotSection({
             variant="outline"
             size="sm"
             onClick={handleTest}
-            disabled={!controls.canTest}
+            disabled={!canEdit || !controls.canTest}
             aria-busy={testing}
           >
             {testing && (
@@ -1479,8 +1483,9 @@ function HubSpotSection({
                 "Configuración de HubSpot guardada.",
               )
             }
-            disabled={!controls.canSave}
+            disabled={!canEdit || !controls.canSave}
             aria-busy={saving}
+            aria-describedby={!canEdit ? "hubspot-admin-only" : undefined}
           >
             {saving && (
               <Loader2 className="h-4 w-4 mr-2 animate-spin" aria-hidden />
@@ -1493,7 +1498,7 @@ function HubSpotSection({
               variant="ghost"
               size="sm"
               onClick={() => void put(crmDisableBody("hubspot"), "HubSpot desactivado")}
-              disabled={saving}
+              disabled={!canEdit || saving}
             >
               Desactivar
             </Button>
@@ -1502,6 +1507,7 @@ function HubSpotSection({
             <p className="text-xs text-muted-foreground">{controls.testHint}</p>
           )}
         </div>
+        {!canEdit && <AdminOnlyNote id="hubspot-admin-only" />}
       </div>
     </Section>
   );
@@ -1736,6 +1742,7 @@ export function IntegrationsTab({
         workspaceId={workspaceId}
         initial={hubspot}
         blockedBy={crmBlockedBy(integrations, "hubspot")}
+        canEdit={canEdit}
         onSaved={refresh}
       />
       <Separator />

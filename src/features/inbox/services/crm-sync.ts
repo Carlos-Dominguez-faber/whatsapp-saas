@@ -84,10 +84,7 @@ export async function syncContactToCrm(
   if (crm === "error") return { ok: false, reason: "failed", code: "crm_read_failed" };
 
   try {
-    if (crm === "highlevel") {
-      const r = await syncContactToHL(workspaceId, contactId);
-      return r ? { ok: true, provider: "highlevel", id: r.hl_id } : { ok: false, reason: "failed" };
-    }
+    if (crm === "highlevel") return await pushToHighLevel(workspaceId, contactId);
     const r = await pushContactToHubSpot(workspaceId, contactId, opts);
     return r.ok ? { ok: true, provider: "hubspot", id: r.hs_id } : { ok: false, reason: "failed", code: r.code };
   } catch (err) {
@@ -105,11 +102,60 @@ export async function syncContactToCrm(
 }
 
 /**
+ * HighLevel has no deltas: one push of the whole contact (never with `tags`,
+ * see syncContactToHL). A contact HighLevel already links to another local
+ * contact is not a success.
+ */
+async function pushToHighLevel(workspaceId: string, contactId: string): Promise<CrmSyncResult> {
+  const r = await syncContactToHL(workspaceId, contactId);
+  if (!r) return { ok: false, reason: "failed" };
+  if (r.linkConflict) return { ok: false, reason: "failed", code: "hl_link_conflict" };
+  return { ok: true, provider: "highlevel", id: r.hl_id };
+}
+
+/**
+ * An operator's edit in the panel (`updateContact`), as contactSyncOptions
+ * split it. The active CRM is read ONCE: HighLevel gets a single push of the
+ * whole contact however many deltas there are (each push is a PUT with the
+ * full profile); HubSpot gets each delta in order, stopping at the first
+ * failure. Never throws.
+ */
+export async function syncContactEditToCrm(
+  workspaceId: string,
+  contactId: string,
+  deltas: CrmSyncOptions[],
+): Promise<CrmSyncResult> {
+  const crm = await activeCrm(workspaceId);
+  if (crm === "none") return { ok: false, reason: "no_crm" };
+  if (crm === "conflict") return { ok: false, reason: "crm_conflict" };
+  if (crm === "error") return { ok: false, reason: "failed", code: "crm_read_failed" };
+  try {
+    if (crm === "highlevel") return await pushToHighLevel(workspaceId, contactId);
+    let last: CrmSyncResult = { ok: false, reason: "failed" };
+    for (const opts of deltas.length > 0 ? deltas : [{}]) {
+      const r = await pushContactToHubSpot(workspaceId, contactId, opts);
+      if (!r.ok) return { ok: false, reason: "failed", code: r.code };
+      last = { ok: true, provider: "hubspot", id: r.hs_id };
+    }
+    return last;
+  } catch (err) {
+    console.error("[crm-sync] syncContactEditToCrm: el proveedor lanzó una excepción inesperada", {
+      workspaceId,
+      contactId,
+      provider: crm,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return { ok: false, reason: "failed", code: "unexpected_error" };
+  }
+}
+
+/**
  * Opciones de sync para una edición del operador en la ficha (`updateContact`), que guarda el
  * arreglo de etiquetas completo. HubSpot recibe las etiquetas como DELTA: las altas van juntas
  * (`addTags`, que manda la unión de todas las locales) y cada baja en su propia subida, porque
  * `removeTag` quita una sola. Nombre/email se empujan a un contacto existente solo si cambiaron.
- * Siempre hay al menos una subida: HighLevel ignora las opciones y empuja el contacto entero.
+ * Siempre hay al menos una entrada; syncContactEditToCrm las manda a HubSpot una por una y a
+ * HighLevel en UNA sola subida del contacto entero.
  */
 export function contactSyncOptions(
   prev: { name: string | null; email: string | null; tags: string[] | null },
