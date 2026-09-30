@@ -88,11 +88,12 @@ import { resolveOpenRouterKey } from "@/features/inbox/services/openrouter-key";
  * BACKFILL_SHARE_MS and the nightly phase the rest, including whatever the
  * backfill didn't use: a backfill with nothing it can do (no topic pending,
  * over the cap, a key down) returns at once. In both phases workspaces take
- * turns by the one served longest ago (classification_workspace_state.
- * last_served_at, stamped by the reservation of each call: a row claimed and
- * then not called — out of time, its key down — is not a turn): every
- * workspace's first conversation (or oldest pending topic) before anyone's
- * second, and among those the longest waiting first. The backfill gives each topic one batch per round. Inside a
+ * turns by the one served longest ago in THAT phase (classification_
+ * workspace_state.last_served_at and last_backfill_at, stamped by the
+ * reservation of each call: a row claimed and then not called — out of time,
+ * its key down — is not a turn): every workspace's first conversation (or
+ * oldest pending topic) before anyone's second, and among those the longest
+ * waiting first. The backfill gives each topic one batch per round. Inside a
  * workspace, the nightly phase reads customers of the last 48 h oldest first,
  * then the rest newest first.
  * ════════════════════════════════════════════════════════════════════════════
@@ -421,6 +422,7 @@ async function reserveTokens(
   row: ConversationRow,
   estimate: number,
   deadline: number,
+  phase: "nightly" | "backfill",
 ): Promise<{ id: string | null } | "failed"> {
   const { data, error } = await db
     .rpc("reserve_classification_tokens", {
@@ -428,6 +430,8 @@ async function reserveTokens(
       p_conversation_id: row.conversation_id,
       p_estimate: estimate,
       p_cap: CLASSIFY_DAILY_TOKEN_CAP,
+      // The reservation marks the workspace's turn in this phase.
+      p_phase: phase,
     })
     .abortSignal(dbSignal(deadline));
   if (error) {
@@ -557,7 +561,7 @@ async function classifyOne(
 
       // Sin reserva no hay llamada.
       const estimate = classificationTokenCeiling(topics, messages);
-      const reservation = await reserveTokens(db, row, estimate, deadline);
+      const reservation = await reserveTokens(db, row, estimate, deadline, backfillTopic ? "backfill" : "nightly");
       if (reservation === "failed") return { kind: "infra", code: "budget_reserve_failed" };
       if (reservation.id === null) return { kind: "budget" };
 

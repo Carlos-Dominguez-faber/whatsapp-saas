@@ -330,7 +330,7 @@ test("fase 1: reserva, clasifica, liquida con el consumo real y guarda con class
   // La reserva lleva el techo y el tope; el consumo no se inserta
   // aparte (la fila la crea la reserva, sin contact_id), se liquida.
   assert.deepEqual(callsTo("reserve_classification_tokens").map((c) => c.args), [
-    { p_workspace_id: WS_A, p_conversation_id: "d1", p_estimate: ESTIMATE, p_cap: CLASSIFY_DAILY_TOKEN_CAP },
+    { p_workspace_id: WS_A, p_conversation_id: "d1", p_estimate: ESTIMATE, p_cap: CLASSIFY_DAILY_TOKEN_CAP, p_phase: "nightly" },
   ]);
   assert.deepEqual(callsTo("settle_classification_tokens").map((c) => c.args), [
     { p_reservation_id: "res-1", p_workspace_id: WS_A, p_model: "openai/gpt-4o-mini", p_prompt_tokens: 100, p_completion_tokens: 5 },
@@ -1566,4 +1566,13 @@ test("TURNS r3: the backfill gives each pending topic one batch per round, in th
   );
   assert.equal(r.processed, 4);
   assert.equal(r.topics_done, 3);
+});
+
+test("REVIEW r4 M2: each phase marks its own turn (the reservation's p_phase)", async () => {
+  resetBackfill([[conv("d1")]]);
+  await runBackfillPhase(later(), db);
+  assert.deepEqual(callsTo("reserve_classification_tokens").map((c) => c.args.p_phase), ["backfill"]);
+  reset();
+  await runClassificationPhase(later(), db);
+  assert.deepEqual(callsTo("reserve_classification_tokens").map((c) => c.args.p_phase), ["nightly"]);
 });

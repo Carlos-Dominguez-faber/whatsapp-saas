@@ -455,8 +455,10 @@ $$;
 
 -- The backfill's turns: the topics it may take now, in the same order as the
 -- nightly phase's — each workspace's oldest pending topic before anyone's
--- second, and among those the workspace served longest ago first. A topic
--- another run holds, or of a workspace skipped this run, is left out.
+-- second, and among those the workspace whose backfill was served longest
+-- ago first (last_backfill_at, its own stamp: the nightly phase's turns
+-- don't count here). A topic another run holds, or of a workspace skipped
+-- this run, is left out.
 CREATE OR REPLACE FUNCTION public.pending_backfill_topics(
   p_limit INT,
   p_skip_workspaces UUID[] DEFAULT '{}',
@@ -478,7 +480,7 @@ AS $$
          AND NOT (t.workspace_id = ANY (COALESCE(p_skip_workspaces, '{}')))
     ) x
     LEFT JOIN public.classification_workspace_state s ON s.workspace_id = x.workspace_id
-   ORDER BY x.rn, s.last_served_at NULLS FIRST, x.created_at, x.id
+   ORDER BY x.rn, s.last_backfill_at NULLS FIRST, x.created_at, x.id
    LIMIT LEAST(GREATEST(COALESCE(p_limit, 1), 1), 200);
 $$;
 
@@ -636,13 +638,16 @@ $$;
 -- p_now: see select_conversations_to_classify (the day and the row's time).
 -- #13 shipped (UUID, UUID, INT, BIGINT).
 DROP FUNCTION IF EXISTS public.reserve_classification_tokens(UUID, UUID, INT, BIGINT);
+DROP FUNCTION IF EXISTS public.reserve_classification_tokens(UUID, UUID, INT, BIGINT, TIMESTAMPTZ);
 
 CREATE OR REPLACE FUNCTION public.reserve_classification_tokens(
   p_workspace_id UUID,
   p_conversation_id UUID,
   p_estimate INT,
   p_cap BIGINT,
-  p_now TIMESTAMPTZ DEFAULT now()
+  p_now TIMESTAMPTZ DEFAULT now(),
+  -- Whose turn the call is: the nightly phase's ('nightly') or the backfill's.
+  p_phase TEXT DEFAULT 'nightly'
 )
 RETURNS UUID
 LANGUAGE plpgsql
@@ -694,11 +699,19 @@ BEGIN
           v_now)
   RETURNING id INTO v_id;
 
-  -- A call goes out for this workspace: that is its turn, in both phases
-  -- (last_served_at, see select_conversations_to_classify).
-  INSERT INTO public.classification_workspace_state AS s (workspace_id, last_served_at, updated_at)
-  VALUES (p_workspace_id, v_now, now())
-  ON CONFLICT (workspace_id) DO UPDATE SET last_served_at = EXCLUDED.last_served_at, updated_at = now();
+  -- A call goes out for this workspace: that is its turn in THIS phase. Each
+  -- phase has its own (last_served_at, see select_conversations_to_classify;
+  -- last_backfill_at, see pending_backfill_topics): sharing one, a workspace
+  -- with nightly work every run never won a backfill turn.
+  IF p_phase = 'backfill' THEN
+    INSERT INTO public.classification_workspace_state AS s (workspace_id, last_backfill_at, updated_at)
+    VALUES (p_workspace_id, v_now, now())
+    ON CONFLICT (workspace_id) DO UPDATE SET last_backfill_at = EXCLUDED.last_backfill_at, updated_at = now();
+  ELSE
+    INSERT INTO public.classification_workspace_state AS s (workspace_id, last_served_at, updated_at)
+    VALUES (p_workspace_id, v_now, now())
+    ON CONFLICT (workspace_id) DO UPDATE SET last_served_at = EXCLUDED.last_served_at, updated_at = now();
+  END IF;
   RETURN v_id;
 END;
 $$;
@@ -966,7 +979,7 @@ REVOKE ALL ON FUNCTION public.advance_topic_backfill(UUID, TIMESTAMPTZ, UUID, BO
 REVOKE ALL ON FUNCTION public.record_backfill_failure(UUID) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.claim_topic_backfill(UUID, INT) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.release_topic_backfill(UUID) FROM PUBLIC, anon, authenticated;
-REVOKE ALL ON FUNCTION public.reserve_classification_tokens(UUID, UUID, INT, BIGINT, TIMESTAMPTZ) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.reserve_classification_tokens(UUID, UUID, INT, BIGINT, TIMESTAMPTZ, TEXT) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.settle_classification_tokens(UUID, UUID, TEXT, INT, INT) FROM PUBLIC, anon, authenticated;
 
 GRANT EXECUTE ON FUNCTION public.select_conversations_to_classify(INT, UUID[], INT, TIMESTAMPTZ) TO service_role;
@@ -978,5 +991,5 @@ GRANT EXECUTE ON FUNCTION public.advance_topic_backfill(UUID, TIMESTAMPTZ, UUID,
 GRANT EXECUTE ON FUNCTION public.record_backfill_failure(UUID) TO service_role;
 GRANT EXECUTE ON FUNCTION public.claim_topic_backfill(UUID, INT) TO service_role;
 GRANT EXECUTE ON FUNCTION public.release_topic_backfill(UUID) TO service_role;
-GRANT EXECUTE ON FUNCTION public.reserve_classification_tokens(UUID, UUID, INT, BIGINT, TIMESTAMPTZ) TO service_role;
+GRANT EXECUTE ON FUNCTION public.reserve_classification_tokens(UUID, UUID, INT, BIGINT, TIMESTAMPTZ, TEXT) TO service_role;
 GRANT EXECUTE ON FUNCTION public.settle_classification_tokens(UUID, UUID, TEXT, INT, INT) TO service_role;

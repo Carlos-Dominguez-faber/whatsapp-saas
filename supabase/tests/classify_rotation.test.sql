@@ -6,7 +6,7 @@ BEGIN;
 CREATE EXTENSION IF NOT EXISTS pgtap WITH SCHEMA extensions;
 SET search_path = public, extensions;
 
-SELECT plan(8);
+SELECT plan(10);
 
 -- W workspaces with 30 customers each who wrote yesterday; `sel` selects of 5
 -- a second apart, each claimed row read at once. Reads per workspace.
@@ -115,11 +115,57 @@ DECLARE k UUID := gen_random_uuid(); c UUID := gen_random_uuid();
 BEGIN
   INSERT INTO public.contacts (id, workspace_id, phone) VALUES (k, 'e7000000-0000-4000-8000-00000000000a', '+15559700001');
   INSERT INTO public.conversations (id, workspace_id, contact_id) VALUES (c, 'e7000000-0000-4000-8000-00000000000a', k);
+  -- A nightly call is not a backfill turn …
   PERFORM public.reserve_classification_tokens('e7000000-0000-4000-8000-00000000000a', c, 1, 300000);
 END
 $st$;
 SELECT is(pg_temp.bf_order(ARRAY(SELECT ws FROM rot_ws)),
-  ARRAY['B1', 'A1', 'A2'], 'a call for the workspace sends it to the back');
+  ARRAY['A1', 'B1', 'A2'], 'the nightly phase''s turns don''t count in the backfill''s');
+DO $st2$
+BEGIN
+  -- … a backfill call is.
+  PERFORM public.reserve_classification_tokens('e7000000-0000-4000-8000-00000000000a',
+    (SELECT id FROM public.conversations WHERE workspace_id = 'e7000000-0000-4000-8000-00000000000a' LIMIT 1),
+    1, 300000, now(), 'backfill');
+END
+$st2$;
+SELECT is(pg_temp.bf_order(ARRAY(SELECT ws FROM rot_ws)),
+  ARRAY['B1', 'A1', 'A2'], 'a backfill call sends the workspace to the back of the backfill''s turns');
+
+-- REVIEW r4 M2 (T1): X, Y and W with a topic each; W also has nightly work
+-- served every run after the backfill's call. In 24 runs each gets its turns.
+DO $t1$
+DECLARE
+  x UUID := 'e7200000-0000-4000-8000-00000000000a'; y UUID := 'e7200000-0000-4000-8000-00000000000b';
+  w UUID := 'e7200000-0000-4000-8000-00000000000c'; wsid UUID; k UUID; c UUID; conv UUID; first_ws UUID;
+  t0 TIMESTAMPTZ := now() - interval '2 hours'; r INT;
+BEGIN
+  CREATE TEMP TABLE t1_turns (ws UUID);
+  INSERT INTO public.workspaces (id, name, slug) VALUES (x, 'X', 't1-x'), (y, 'Y', 't1-y'), (w, 'W', 't1-w');
+  FOREACH wsid IN ARRAY ARRAY[x, y, w] LOOP
+    k := gen_random_uuid(); c := gen_random_uuid();
+    INSERT INTO public.contacts (id, workspace_id, phone) VALUES (k, wsid, '+1555' || substr(wsid::text, 36, 1) || '7440001');
+    INSERT INTO public.conversations (id, workspace_id, contact_id) VALUES (c, wsid, k);
+    INSERT INTO public.insight_topics (workspace_id, name, description, created_at)
+      VALUES (wsid, 'T-' || substr(wsid::text, 36, 1), 'x', now() - interval '3 hours');
+  END LOOP;
+  INSERT INTO public.classification_workspace_state (workspace_id, last_served_at) VALUES
+    (x, t0 - interval '10 minutes'), (y, t0 - interval '9 minutes'), (w, t0 - interval '1 minute')
+  ON CONFLICT (workspace_id) DO UPDATE SET last_served_at = EXCLUDED.last_served_at;
+  FOR r IN 0..23 LOOP
+    SELECT p.workspace_id INTO first_ws
+      FROM public.pending_backfill_topics(200, '{}') WITH ORDINALITY AS p(id, workspace_id, name, description, ord)
+     WHERE p.workspace_id IN (x, y, w) ORDER BY p.ord LIMIT 1;
+    INSERT INTO t1_turns VALUES (first_ws);
+    SELECT id INTO conv FROM public.conversations WHERE workspace_id = first_ws LIMIT 1;
+    PERFORM public.reserve_classification_tokens(first_ws, conv, 1, 300000, t0 + r * interval '5 minutes' + interval '1 second', 'backfill');
+    SELECT id INTO conv FROM public.conversations WHERE workspace_id = w LIMIT 1;
+    PERFORM public.reserve_classification_tokens(w, conv, 1, 300000, t0 + r * interval '5 minutes' + interval '30 seconds');
+  END LOOP;
+END
+$t1$;
+SELECT is((SELECT string_agg(n::text, '/' ORDER BY ws) FROM (SELECT ws, count(*) AS n FROM t1_turns GROUP BY ws) z),
+  '8/8/8', 'a workspace with nightly work every run gets its backfill turns too (it was 12/12/0)');
 SELECT is(pg_temp.bf_order(ARRAY(SELECT ws FROM rot_ws) || 'e7000000-0000-4000-8000-00000000000b'::uuid),
   ARRAY['A1', 'A2'], 'a workspace skipped this run is left out');
 SELECT ok(NOT has_function_privilege('authenticated', 'public.pending_backfill_topics(integer, uuid[], timestamptz)', 'EXECUTE'),
