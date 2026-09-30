@@ -680,6 +680,74 @@ Sin el paso 3 no corre nada: las reglas se guardan, pero ningún job las ejecuta
 - La ruta del cron puede durar hasta 120 segundos (Fluid Compute, igual que el
   buffer).
 
+**Análisis de temas, `/probar` y limpieza (Fase 5, octubre de 2026):**
+
+```bash
+SUPABASE_DB_PASSWORD='tu-contraseña-de-la-base' node scripts/setup.mjs db-push   # 1. migraciones
+vercel --prod                                                                     # 2. deploy
+node scripts/setup.mjs cron-apply                                                 # 3. agenda 'classify-topics'
+```
+
+El paso 3 agenda el job nuevo y reagenda los otros dos sin duplicarlos. Sin él, la
+pantalla de Análisis funciona pero nunca se analiza nada (avisa que hay
+conversaciones sin analizar).
+
+- **Análisis** (`/analisis`, en el menú de arriba): un admin o manager crea hasta 10
+  temas (un nombre y qué debe detectar). Entre las 04:00 y las 08:59 UTC, cada 5
+  minutos, el job `classify-topics` lee las conversaciones en las que el **cliente**
+  escribió algo nuevo (una hora después de su último mensaje) y marca qué temas
+  plantea. Solo cuenta lo que escribe el cliente: lo que dicen el agente o el equipo es
+  contexto, y una respuesta o un recordatorio no hacen que se vuelva a analizar. El
+  tablero muestra hasta ayer: conversaciones, cuántas agendaron y cuántas se
+  derivaron, el ranking de temas, la tendencia por semana y el cruce con etiquetas;
+  cada celda abre las conversaciones de evidencia. Cualquier miembro lo ve.
+- **Costo:** usa `openai/gpt-4o-mini` por OpenRouter, con la clave del workspace (o
+  la de la agencia), y tiene un tope propio de **300,000 tokens por día** (UTC) por
+  workspace, unos USD 0.05 a 0.10. **No cuenta en el presupuesto diario del agente**:
+  no lo degrada ni lo corta, y el agente tampoco le quita cupo. El día más caro de un
+  workspace pasa a ser 1,300,000 tokens (1,000,000 del agente + 300,000 del
+  análisis). El texto de los clientes va a OpenAI a través de OpenRouter aunque el
+  agente use otro modelo (sin nombres ni teléfonos).
+- **Hasta dónde mira:** 30 días hacia atrás, los últimos 60 mensajes de cada
+  conversación y hasta 800 caracteres por mensaje; si algo quedó fuera, el tablero lo
+  dice. Un tema nuevo reprocesa los 30 días anteriores a su creación. Mientras eso no
+  termina, o si el tema se creó dentro del período que estás viendo, se mide solo
+  desde la fecha que aparece junto a él, y sin comparación con el período anterior:
+  antes de esa fecha no se analizó, y contarlo como 0 % daría números falsos.
+- **Capacidad:** cada corrida analiza entre 5 y 10 conversaciones (depende de lo que
+  tarde el modelo), unas 300 a 600 por noche entre todos los workspaces de la
+  instalación. Si reciben más, el tablero avisa que hay conversaciones sin analizar.
+- **Para apagarlo:** `select cron.unschedule('classify-topics');` en el SQL Editor.
+  Sin temas activos tampoco gasta nada.
+- **`/probar`:** una pantalla con solo el chat del agente, para que alguien lo pruebe
+  sin el resto de la app (por ejemplo, un cliente antes de salir en vivo): comparte
+  `https://TU-URL/probar`. La pestaña **Prueba** de cada agente (en **Configuración →
+  Agentes**) también la enlaza.
+  - Cualquier miembro del workspace, incluido un viewer, chatea con el agente
+    **activo**, con su prompt publicado y su modelo. No se manda nada por WhatsApp.
+  - Solo corren las herramientas de consulta (ver disponibilidad, consultas de n8n),
+    también para un admin: desde ahí nadie agenda, cancela ni escribe en un CRM.
+  - Hasta 20 mensajes por persona y 60 por workspace cada hora, de hasta 1,000
+    caracteres. Cuentan en el presupuesto diario y se pausan desde los 800,000
+    tokens, igual que la prueba de agentes.
+  - **No aísla datos.** Solo esconde el menú: con la misma cuenta se pueden abrir el
+    inbox, el dashboard y los prompts. Si se la das a alguien de fuera, hazlo en un
+    workspace de demostración, sin conversaciones reales.
+  - Si alguien abre el enlace sin sesión, al entrar vuelve a `/probar`.
+- **La clave pública (`anon`) ya no tiene permisos sobre ninguna tabla.** Es la
+  clave que viaja en el navegador; hasta ahora solo las políticas de RLS impedían que
+  leyera algo. La app no la usa sin sesión. Las tablas que se creen después tampoco se
+  los dan. Si agregaste tablas propias que leías sin sesión, tendrás que darle el
+  permiso a mano (`grant select on public.tu_tabla to anon;`) y pensar si de verdad
+  quieres eso.
+- **Historial de automatizaciones: 30 días.** Un job de pg_cron que agenda el propio
+  `db-push` (`automation-history-purge`, cada hora) borra las ejecuciones terminadas
+  y los eventos sin ejecución de más de 30 días. Nunca borra una ejecución en cola ni
+  un evento que todavía la necesita.
+- **Panel de ejecuciones:** en **Configuración → Automatizaciones**, un admin o
+  manager ve las ejecuciones recientes: qué regla, a quién, si se ejecutó, se omitió
+  o falló, y por qué. Se filtran por resultado.
+
 **Si instalaste desde la antigua rama `provider/kapso`** (Kapso), cámbiate a `main`,
 donde ahora viven los dos proveedores. Cada workspace sigue con el proveedor que
 tenía **activo**: si tenía Kapso (o Kapso y YCloud a la vez), queda en Kapso; si solo
