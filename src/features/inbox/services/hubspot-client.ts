@@ -58,9 +58,21 @@ export type HsErrorCode =
   | "bad_request"
   | "bad_response"
   | "network"
+  /** The connection was never made (DNS, refused, unreachable): nothing was sent. */
+  | "network_before_send"
   | "timeout"
   | "deadline"
   | "http_error";
+
+/** Connection errors that happen before anything is sent. */
+const PRE_SEND_ERRORS = new Set([
+  "ENOTFOUND",
+  "EAI_AGAIN",
+  "ECONNREFUSED",
+  "EHOSTUNREACH",
+  "ENETUNREACH",
+  "UND_ERR_CONNECT_TIMEOUT",
+]);
 
 export type HsResponse =
   | { ok: true; status: number; json: unknown }
@@ -130,7 +142,13 @@ export async function hsFetch(
     } catch (err) {
       const timedOut =
         err instanceof Error && (err.name === "TimeoutError" || err.name === "AbortError");
-      return { ok: false, status: 0, code: timedOut ? "timeout" : "network", body: "" };
+      if (timedOut) return { ok: false, status: 0, code: "timeout", body: "" };
+      // fetch's cause says whether the connection was ever made. Only then
+      // could HubSpot have received the request; a dropped connection after
+      // that (ECONNRESET, "other side closed") stays ambiguous.
+      const cause = (err as { cause?: { code?: unknown } } | null)?.cause?.code;
+      const neverSent = typeof cause === "string" && PRE_SEND_ERRORS.has(cause);
+      return { ok: false, status: 0, code: neverSent ? "network_before_send" : "network", body: "" };
     }
 
     // 429: un solo reintento, y solo si la espera cabe en el deadline.
@@ -663,10 +681,16 @@ export async function pushContactToHubSpot(
   };
 
   if (opts.pushProfile && !profileSent) {
-    const res = await hsFetch(cfg.token, `/crm/objects/${V}/contacts/${hsId}`, {
-      method: "PATCH",
-      body: { properties: profileProperties(contact) },
-    });
+    const profile = profileProperties(contact);
+    const patchProfile = (properties: Record<string, string>) =>
+      hsFetch(cfg.token, `/crm/objects/${V}/contacts/${hsId}`, { method: "PATCH", body: { properties } });
+    let res = await patchProfile(profile);
+    // The email belongs to another contact in HubSpot (this one was created
+    // without it for that reason): the rest of the profile still goes.
+    if (!res.ok && res.code === "conflict" && profile.email) {
+      const { email: _email, ...withoutEmail } = profile;
+      res = await patchProfile(withoutEmail);
+    }
     if (!res.ok) return contactFail(res.code, "profile");
   }
 
@@ -1152,7 +1176,9 @@ export async function logHubSpotConversation(
         hs_communication_channel_type: "WHATS_APP",
         hs_communication_logged_from: "CRM",
         hs_communication_body: bodyResult.body,
-        hs_timestamp: at ?? new Date().toISOString(),
+        // PostgREST's text ("2026-09-22 11:00:00+00") as the ISO HubSpot expects.
+        hs_timestamp:
+          at && !Number.isNaN(Date.parse(at)) ? new Date(at).toISOString() : new Date().toISOString(),
       },
       associations: [
         { to: { id: linked.hs_id }, types: [{ associationCategory: "HUBSPOT_DEFINED", associationTypeId: COMMUNICATION_TO_CONTACT }] },

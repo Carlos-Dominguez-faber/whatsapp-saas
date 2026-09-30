@@ -1989,7 +1989,57 @@ test("the entry is dated when the handoff happened, and its transcript stops the
   on("POST", COMMS, json(201, {}));
   await hs.logHubSpotConversation(WS, "conv_1", "handoff", "2026-09-22T11:00:00Z");
   const post = calls.find((c) => COMMS.test(c.url))!.body as { properties: Row };
-  assert.equal(post.properties.hs_timestamp, "2026-09-22T11:00:00Z");
+  assert.equal(post.properties.hs_timestamp, "2026-09-22T11:00:00.000Z");
   assert.match(loggedBody(), /Cliente: antes/);
   assert.doesNotMatch(loggedBody(), /después/);
+});
+
+test("hs_timestamp goes as ISO even from PostgREST's timestamp text", async () => {
+  reset();
+  connect();
+  addContact({ hs_contact_id: "777" });
+  addConversation({ summary: "Resumen." });
+  on("POST", COMMS, json(201, {}));
+  await hs.logHubSpotConversation(WS, "conv_1", "handoff", "2026-09-22 11:00:00+00");
+  const post = calls.find((c) => COMMS.test(c.url))!.body as { properties: Row };
+  assert.equal(post.properties.hs_timestamp, "2026-09-22T11:00:00.000Z");
+});
+
+test("a connection never made is retryable; only a dropped one after connecting is ambiguous", async () => {
+  const refused = () => {
+    throw new TypeError("fetch failed", { cause: { code: "ECONNREFUSED" } });
+  };
+  const reset_ = () => {
+    reset();
+    connect();
+    addContact({ hs_contact_id: "777" });
+    addConversation({ summary: "Resumen." });
+  };
+  reset_();
+  on("POST", COMMS, refused as Reply);
+  assert.deepEqual(
+    await hs.hsDeadline.run(Date.now() + 25_000, () => hs.logHubSpotConversation(WS, "conv_1", "handoff")),
+    { ok: false, code: "network_before_send" },
+  );
+  reset_();
+  on("POST", COMMS, (() => {
+    throw new TypeError("fetch failed", { cause: { code: "ECONNRESET" } });
+  }) as Reply);
+  assert.deepEqual(
+    await hs.hsDeadline.run(Date.now() + 25_000, () => hs.logHubSpotConversation(WS, "conv_1", "handoff")),
+    { ok: false, code: "comm_outcome_unknown" },
+  );
+});
+
+test("a profile push whose email belongs to another HubSpot contact still sends the rest", async () => {
+  reset();
+  connect();
+  addContact({ hs_contact_id: "777", email: "compartido@ejemplo.cl" });
+  on("PATCH", CONTACT, json(409, { message: "Contact already exists. Existing ID: 889" }), json(200, {}));
+  assert.deepEqual(await hs.pushContactToHubSpot(WS, "c1", { pushProfile: true }), { ok: true, hs_id: "777" });
+  const sent = patches();
+  assert.equal(sent.length, 2);
+  assert.equal(((sent[0].body as { properties: Row }).properties).email, "compartido@ejemplo.cl");
+  assert.equal(((sent[1].body as { properties: Row }).properties).email, undefined);
+  assert.equal(((sent[1].body as { properties: Row }).properties).firstname, "Ana");
 });
