@@ -139,10 +139,25 @@ function cutToBytes(text: string, max: number): string {
   return out;
 }
 
-/** An HTTP 4xx from the provider: refused before anything was generated. */
-function refusedByProvider(err: unknown): boolean {
-  const status = (err as { statusCode?: unknown } | null)?.statusCode;
-  return typeof status === "number" && status >= 400 && status < 500;
+/**
+ * What a /probar call that failed after reaching the model spent, when it is
+ * known. The provider answered the failed request with an HTTP error (4xx or
+ * 5xx): that request generated nothing, and the steps that finished before
+ * it are in `usageSoFar` (generateChatReply). With no answer — a timeout, the
+ * network, a body that couldn't be read — the failed request may have been
+ * billed: null, and the reserved ceiling stays, as a ceiling.
+ */
+function spentBeforeFailure(err: unknown): { promptTokens: number; completionTokens: number } | null {
+  const e = err as {
+    statusCode?: unknown;
+    usageSoFar?: { promptTokens?: number; completionTokens?: number };
+  } | null;
+  const status = e?.statusCode;
+  if (typeof status !== "number" || status < 400 || status >= 600) return null;
+  return {
+    promptTokens: e?.usageSoFar?.promptTokens ?? 0,
+    completionTokens: e?.usageSoFar?.completionTokens ?? 0,
+  };
 }
 
 function svc() {
@@ -287,7 +302,11 @@ export async function runAgentPlayground(
       messages: input.messages,
       maxOutputTokens: input.maxOutputTokens,
       ...(probar
-        ? { maxSteps: PROBAR_MAX_STEPS, noRetries: true, maxToolResultChars: PROBAR_TOOL_RESULT_MAX_CHARS }
+        ? {
+            maxSteps: PROBAR_MAX_STEPS,
+            noRetries: true,
+            maxToolResultChars: PROBAR_TOOL_RESULT_MAX_CHARS,
+          }
         : {}),
       workspaceId,
       tools,
@@ -337,18 +356,19 @@ export async function runAgentPlayground(
     };
   } catch (err) {
     console.error(`[agents/${surface}]`, err);
-    // /probar's reservation holds the ceiling. A call the provider refused
-    // (4xx) or one that never went out generated nothing: settle it at 0 so
-    // it doesn't hold the day's cap. After a timeout or a 5xx the tokens are
-    // unknown (a step may have run): the ceiling stays, as a ceiling.
-    if (probar && (!requested || refusedByProvider(err))) {
+    // /probar's reservation holds the ceiling. It is settled to what was
+    // spent when that is known: 0 if nothing went out, or the finished steps
+    // when the provider answered the failed one with an HTTP error, so a
+    // tool step that was billed stays counted and an outage doesn't hold the
+    // day's cap. With no answer the ceiling stays.
+    const spent = !requested ? { promptTokens: 0, completionTokens: 0 } : spentBeforeFailure(err);
+    if (probar && spent) {
       await recordWorkspaceLlmCall({
         reservationId: guard.reservationId,
         workspaceId,
         type: surface,
         model,
-        promptTokens: 0,
-        completionTokens: 0,
+        ...spent,
         extra: { agent_id: agentId, user_id: input.userId, failed: true },
       });
     }

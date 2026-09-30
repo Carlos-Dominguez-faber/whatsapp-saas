@@ -421,3 +421,64 @@ test("generateChatReply cuts a tool result to maxToolResultChars before the mode
     registryRun = async () => null;
   }
 });
+
+type StepArgs = GenerateArgs & {
+  onStepFinish?: (step: { usage?: { inputTokens?: number; outputTokens?: number } }) => void | Promise<void>;
+  providerOptions?: { openai?: { parallelToolCalls?: boolean } };
+};
+
+test("generateChatReply tells the caller what the finished steps spent when a later one fails", async () => {
+  // Step 1 answers with a tool call (billed); step 2 is refused (429).
+  const refused = Object.assign(new Error("Rate limit exceeded"), { statusCode: 429 });
+  registryRun = async () => ({ ok: true, data: { slots: [] } });
+  generateImpl = async (raw) => {
+    const args = raw as StepArgs;
+    await args.tools!.lookup.execute({});
+    await args.onStepFinish?.({ usage: { inputTokens: 5_000, outputTokens: 40 } });
+    throw refused;
+  };
+  try {
+    await assert.rejects(
+      generateChatReply({
+        systemPrompt: "s",
+        messages: [{ role: "user", content: "u" }],
+        workspaceId: "ws_1",
+        tools: [{ name: "lookup", description: "d", schema: {}, sensitivity: "read" }],
+        toolContext: { workspaceId: "ws_1", conversationId: "", contactId: "", batchId: "b" },
+        noRetries: true,
+      } as never),
+      (err: unknown) => {
+        const e = err as { statusCode?: number; stepsDone?: number; usageSoFar?: unknown };
+        assert.equal(e.statusCode, 429);
+        assert.equal(e.stepsDone, 1);
+        assert.deepEqual(e.usageSoFar, { promptTokens: 5_000, completionTokens: 40 });
+        return true;
+      },
+    );
+  } finally {
+    generateImpl = null;
+    registryRun = async () => null;
+  }
+});
+
+test("generateChatReply without the /probar options sends what it sent before (auto-tagging)", async () => {
+  let seen: StepArgs | undefined;
+  generateImpl = async (raw) => {
+    seen = raw as StepArgs;
+    return { text: "{}", usage: LAST_STEP, totalUsage: ALL_STEPS, steps: [{}] };
+  };
+  try {
+    const reply = await generateChatReply({
+      systemPrompt: "s",
+      messages: [{ role: "user", content: "u" }],
+      maxOutputTokens: 200,
+      workspaceId: "ws_1",
+    });
+    assert.equal(seen?.providerOptions, undefined);
+    assert.equal((seen as { maxRetries?: unknown }).maxRetries, undefined);
+    assert.equal((seen as { stopWhen?: unknown }).stopWhen, undefined);
+    assert.deepEqual(reply, { text: "{}", promptTokens: 50, completionTokens: 9 });
+  } finally {
+    generateImpl = null;
+  }
+});

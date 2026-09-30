@@ -310,9 +310,61 @@ test("REVIEW M5: a failed message doesn't keep its ceiling when nothing was gene
   assert.equal(recorded.length, 1);
   assert.equal(recorded[0].promptTokens, 0);
 
-  // A 5xx or a timeout: a step may have run; the ceiling stays.
+  // A timeout: the failed request may have been billed; the ceiling stays.
   reset();
-  generateError = Object.assign(new Error("upstream 503"), { statusCode: 503 });
+  generateError = Object.assign(new Error("The operation was aborted due to timeout"), { name: "TimeoutError" });
+  assert.equal((await post()).status, 502);
+  assert.equal(recorded.length, 0);
+});
+
+test("REVIEW r3 M4: a billed tool step stays counted when the next step is refused", async () => {
+  // Step 1 ran a tool call (5,040 tokens billed); step 2 got a 429.
+  reset();
+  generateError = Object.assign(new Error("Rate limit exceeded"), {
+    statusCode: 429,
+    stepsDone: 1,
+    usageSoFar: { promptTokens: 5_000, completionTokens: 40 },
+  });
+  assert.equal((await post()).status, 502);
+  assert.equal(recorded.length, 1);
+  assert.equal(recorded[0].reservationId, "res_1");
+  assert.equal(recorded[0].promptTokens, 5_000);
+  assert.equal(recorded[0].completionTokens, 40);
+  assert.equal((recorded[0].extra as { failed?: boolean }).failed, true);
+});
+
+test("REVIEW r3 M4: retries during an outage (5xx) don't hold the day's cap", async () => {
+  for (let i = 0; i < 4; i++) {
+    reset();
+    generateError = Object.assign(new Error("upstream 503"), {
+      statusCode: 503,
+      stepsDone: 0,
+      usageSoFar: { promptTokens: 0, completionTokens: 0 },
+    });
+    assert.equal((await post()).status, 502);
+    assert.equal(recorded.length, 1, `attempt ${i + 1} kept its ceiling`);
+    assert.equal(recorded[0].promptTokens, 0);
+    assert.equal(recorded[0].completionTokens, 0);
+  }
+  // A 5xx after a finished step settles that step.
+  reset();
+  generateError = Object.assign(new Error("upstream 502"), {
+    statusCode: 502,
+    stepsDone: 1,
+    usageSoFar: { promptTokens: 3_000, completionTokens: 25 },
+  });
+  await post();
+  assert.equal(recorded[0].promptTokens, 3_000);
+  assert.equal(recorded[0].completionTokens, 25);
+});
+
+test("REVIEW r3 M4: an answer that couldn't be read (HTTP 200) keeps the ceiling", async () => {
+  reset();
+  generateError = Object.assign(new Error("Invalid JSON response"), {
+    statusCode: 200,
+    stepsDone: 0,
+    usageSoFar: { promptTokens: 0, completionTokens: 0 },
+  });
   assert.equal((await post()).status, 502);
   assert.equal(recorded.length, 0);
 });

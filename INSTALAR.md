@@ -765,9 +765,12 @@ conversaciones sin analizar).
     con el modelo barato.
   - Si el agente no responde nada, la pantalla lo dice y el mensaje vuelve a la caja
     de texto.
-  - Un mensaje que falla antes de que el modelo genere algo (la clave rechazada, la
-    base de conocimiento caída) libera lo que reservó; tras un error del proveedor o
-    un tiempo agotado se queda reservado, porque pudo haber gastado.
+  - Un mensaje que falla se ajusta a lo que ya gastó: nada si falló antes de llegar
+    al modelo (la base de conocimiento caída), o los pasos que el modelo terminó si
+    el proveedor contestó con un error (la clave rechazada, un 5xx). Así un paso que
+    usó una herramienta sigue contando, y los reintentos durante una caída no se
+    comen el tope. Tras un tiempo agotado o un corte de red se queda la reserva
+    completa, porque no se sabe qué gastó.
   - **No aísla datos.** Solo esconde el menú: con la misma cuenta se pueden abrir el
     inbox, el dashboard y los prompts. Si se la das a alguien de fuera, hazlo en un
     workspace de demostración, sin conversaciones reales.

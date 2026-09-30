@@ -284,6 +284,11 @@ export async function generateChatReply(params: {
   }
   const hasTools = Object.keys(aiTools).length > 0;
 
+  // What the provider already answered, step by step, attempts included: when
+  // the turn then fails, the caller can settle what was really spent.
+  let stepsDone = 0;
+  const usageSoFar = { promptTokens: 0, completionTokens: 0 };
+
   let result;
   try {
     result = await withTransientRetry(
@@ -298,6 +303,11 @@ export async function generateChatReply(params: {
         stopWhen: hasTools ? stepCountIs(params.maxSteps ?? 5) : undefined,
         maxOutputTokens: params.maxOutputTokens ?? 512,
         ...(params.noRetries ? { maxRetries: 0 } : {}),
+        onStepFinish: (step) => {
+          stepsDone++;
+          usageSoFar.promptTokens += step.usage?.inputTokens ?? 0;
+          usageSoFar.completionTokens += step.usage?.outputTokens ?? 0;
+        },
         abortSignal: AbortSignal.timeout(
           hasTools ? LLM_TOOL_TURN_TIMEOUT_MS : LLM_TIMEOUT_MS,
         ),
@@ -306,9 +316,11 @@ export async function generateChatReply(params: {
     );
   } catch (err) {
     // The caller must know a write ran before the failure: sending the
-    // same turn again would run it again.
-    if (wroteSomething && err && typeof err === "object") {
-      Object.assign(err, { wroteSomething: true });
+    // same turn again would run it again. And what the steps that finished
+    // spent (the failed request itself isn't in it).
+    if (err && typeof err === "object") {
+      if (wroteSomething) Object.assign(err, { wroteSomething: true });
+      Object.assign(err, { stepsDone, usageSoFar: { ...usageSoFar } });
     }
     throw err;
   }
