@@ -244,6 +244,7 @@ test("fase 1: reserva, clasifica, liquida con el consumo real y guarda con class
     p_classified_until: "2026-09-14T20:00:00Z",
     p_window_from: "2026-09-14T19:00:00Z",
     p_truncated_at: [],
+    p_catalog: ["t1"],
   });
   // La reserva lleva el techo y el tope; el consumo no se inserta
   // aparte (la fila la crea la reserva, sin contact_id), se liquida.
@@ -940,4 +941,12 @@ test("REVIEW M1: the team's internal notes and failed sends never reach the LLM"
   // In the query, before the limit of 60, not after it.
   assert.ok(extraFilters.includes('messages:not.meta.cs.{"internal":true}'));
   assert.ok(extraFilters.includes("messages:or.status.is.null,status.neq.failed"));
+});
+
+test("REVIEW M3: the backfill saves without a catalog, the nightly run with its own", async () => {
+  resetBackfill([[conv("d1")], []]);
+  await runBackfillPhase(later(), db);
+  const save = callsTo("save_conversation_topics")[0].args;
+  assert.equal(save.p_classified_until, null);
+  assert.equal("p_catalog" in save, false, "a backfill must not claim the whole catalog read the conversation");
 });

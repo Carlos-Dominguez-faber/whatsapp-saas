@@ -9,7 +9,7 @@ BEGIN;
 CREATE EXTENSION IF NOT EXISTS pgtap WITH SCHEMA extensions;
 SET search_path = public, extensions;
 
-SELECT plan(34);
+SELECT plan(38);
 
 -- ── Privileges ───────────────────────────────────────────────────────────────
 SELECT ok(NOT has_function_privilege('anon',
@@ -198,6 +198,32 @@ SELECT is((SELECT count(*)::int FROM public.select_conversations_to_classify(100
 SELECT is((SELECT count(*)::int FROM public.select_conversations_to_classify(100, '{}', 120, now() + interval '61 minutes')
             WHERE conversation_id = 'e0000000-0000-4000-8000-0000000000a6'), 1,
   'an hour later it is tried again');
+
+-- ── The backfill reads only what the nightly run read without the topic (M3) ─
+INSERT INTO public.insight_topics (id, workspace_id, name, description) VALUES
+  ('e0000000-0000-4000-8000-0000000000f5', 'e0000000-0000-4000-8000-000000000001', 'Envíos', 'Pregunta por envíos');
+INSERT INTO public.contacts (id, workspace_id, phone) VALUES
+  ('e0000000-0000-4000-8000-0000000000c7', 'e0000000-0000-4000-8000-000000000001', '+15550100007');
+INSERT INTO public.conversations (id, workspace_id, contact_id, last_message_at) VALUES
+  ('e0000000-0000-4000-8000-0000000000a7', 'e0000000-0000-4000-8000-000000000001', 'e0000000-0000-4000-8000-0000000000c7', now() - interval '2 days');
+INSERT INTO public.messages (id, workspace_id, conversation_id, direction, body, created_at) VALUES
+  ('e0000000-0000-4000-8000-0000000000e8', 'e0000000-0000-4000-8000-000000000001', 'e0000000-0000-4000-8000-0000000000a7', 'in', '¿envían a Mérida?', now() - interval '2 days');
+-- The nightly run read a7 with the new topic already in its catalog.
+SELECT public.save_conversation_topics('e0000000-0000-4000-8000-000000000001', 'e0000000-0000-4000-8000-0000000000a7',
+  '[]'::jsonb, now() - interval '2 days', NULL, NULL,
+  ARRAY['e0000000-0000-4000-8000-0000000000f1', 'e0000000-0000-4000-8000-0000000000f5']::uuid[]);
+CREATE TEMP TABLE bf AS SELECT conversation_id FROM public.next_backfill_batch('e0000000-0000-4000-8000-0000000000f5', 100);
+SELECT ok(EXISTS (SELECT 1 FROM bf WHERE conversation_id = 'e0000000-0000-4000-8000-0000000000a3'),
+  'the backfill reads a conversation the nightly run read before the topic existed');
+SELECT ok(NOT EXISTS (SELECT 1 FROM bf WHERE conversation_id = 'e0000000-0000-4000-8000-0000000000a7'),
+  'it does not pay again for one the nightly run already read with the topic');
+SELECT ok(NOT EXISTS (SELECT 1 FROM bf WHERE conversation_id IN ('e0000000-0000-4000-8000-0000000000a1',
+                                                               'e0000000-0000-4000-8000-0000000000a4')),
+  'nor for one still waiting for the nightly run (it will read it with the topic)');
+SELECT is((SELECT catalog_at FROM public.conversation_classification
+            WHERE conversation_id = 'e0000000-0000-4000-8000-0000000000a7'),
+  (SELECT created_at FROM public.insight_topics WHERE id = 'e0000000-0000-4000-8000-0000000000f5'),
+  'the nightly run records the newest topic of the catalog it used');
 
 SELECT * FROM finish();
 ROLLBACK;

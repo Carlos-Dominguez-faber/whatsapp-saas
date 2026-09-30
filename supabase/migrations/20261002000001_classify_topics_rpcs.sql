@@ -142,14 +142,19 @@ END;
 $$;
 
 -- p_window_from = created_at del mensaje más viejo que vio el LLM;
--- p_truncated_at = created_at de los mensajes cuyo cuerpo se recortó.
+-- p_truncated_at = created_at de los mensajes cuyo cuerpo se recortó;
+-- p_catalog = the topic ids the nightly run sent (catalog_at, below). The
+-- backfill passes none. #13 shipped the version without p_catalog.
+DROP FUNCTION IF EXISTS public.save_conversation_topics(UUID, UUID, JSONB, TIMESTAMPTZ, TIMESTAMPTZ, TIMESTAMPTZ[]);
+
 CREATE OR REPLACE FUNCTION public.save_conversation_topics(
   p_workspace_id UUID,
   p_conversation_id UUID,
   p_matches JSONB,
   p_classified_until TIMESTAMPTZ,
   p_window_from TIMESTAMPTZ DEFAULT NULL,
-  p_truncated_at TIMESTAMPTZ[] DEFAULT NULL
+  p_truncated_at TIMESTAMPTZ[] DEFAULT NULL,
+  p_catalog UUID[] DEFAULT NULL
 )
 RETURNS INT
 LANGUAGE plpgsql
@@ -160,6 +165,7 @@ DECLARE
   v_prev     TIMESTAMPTZ;
   v_pfrom    TIMESTAMPTZ;
   v_puntil   TIMESTAMPTZ;
+  v_catalog  TIMESTAMPTZ;
 BEGIN
   IF NOT EXISTS (
     SELECT 1 FROM public.conversations
@@ -219,13 +225,21 @@ BEGIN
   )
   SELECT count(*) INTO v_inserted FROM ins;
 
+  -- Topics are only ever created (never reactivated), so "every active topic
+  -- created up to the newest one sent" is exactly the catalog that was sent.
+  SELECT max(t.created_at) INTO v_catalog
+    FROM public.insight_topics t
+   WHERE t.id = ANY (COALESCE(p_catalog, '{}'::uuid[]))
+     AND t.workspace_id = p_workspace_id;
+
   IF p_classified_until IS NOT NULL THEN
     INSERT INTO public.conversation_classification AS cc
       (conversation_id, workspace_id, classified_until, attempts, error, quarantined_at, claimed_until, last_attempt_at,
-       partial_from, partial_until, updated_at)
-    VALUES (p_conversation_id, p_workspace_id, p_classified_until, 0, NULL, NULL, NULL, now(), v_pfrom, v_puntil, now())
+       partial_from, partial_until, catalog_at, updated_at)
+    VALUES (p_conversation_id, p_workspace_id, p_classified_until, 0, NULL, NULL, NULL, now(), v_pfrom, v_puntil, v_catalog, now())
     ON CONFLICT (conversation_id) DO UPDATE SET
       classified_until = GREATEST(cc.classified_until, EXCLUDED.classified_until),
+      catalog_at = GREATEST(cc.catalog_at, EXCLUDED.catalog_at),
       partial_from = LEAST(cc.partial_from, EXCLUDED.partial_from),
       partial_until = GREATEST(cc.partial_until, EXCLUDED.partial_until),
       attempts = 0,
@@ -352,9 +366,17 @@ AS $$
      ORDER BY m.created_at DESC
      LIMIT 1
   ) li
+  -- Only what the nightly run already read WITHOUT this topic. A conversation
+  -- it read with the topic in the catalog was covered then (paying again
+  -- bought nothing); one still waiting for it (never read, a new customer
+  -- message, backing off, quarantined) will be read with the whole current
+  -- catalog, this topic included.
+  JOIN public.conversation_classification cc ON cc.conversation_id = c.id
   WHERE t.id = p_topic_id
     AND t.status = 'active'
     AND t.backfill_status = 'pending'
+    AND cc.classified_until >= li.at
+    AND COALESCE(cc.catalog_at, '-infinity'::timestamptz) < t.created_at
     -- Pre-filter only (see select_conversations_to_classify).
     AND c.last_message_at >= GREATEST(t.created_at, COALESCE(p_now, now())) - INTERVAL '30 days'
     -- Mismo corte de 30 días que la fase normal. El GREATEST evita que un
@@ -619,7 +641,7 @@ AS $$
 $$;
 
 REVOKE ALL ON FUNCTION public.select_conversations_to_classify(INT, UUID[], INT, TIMESTAMPTZ) FROM PUBLIC, anon, authenticated;
-REVOKE ALL ON FUNCTION public.save_conversation_topics(UUID, UUID, JSONB, TIMESTAMPTZ, TIMESTAMPTZ, TIMESTAMPTZ[]) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.save_conversation_topics(UUID, UUID, JSONB, TIMESTAMPTZ, TIMESTAMPTZ, TIMESTAMPTZ[], UUID[]) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.record_classification_failure(UUID, UUID, TEXT, TIMESTAMPTZ) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.next_backfill_batch(UUID, INT, TIMESTAMPTZ) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.advance_topic_backfill(UUID, TIMESTAMPTZ, UUID, BOOLEAN, TIMESTAMPTZ) FROM PUBLIC, anon, authenticated;
@@ -630,7 +652,7 @@ REVOKE ALL ON FUNCTION public.reserve_classification_tokens(UUID, UUID, INT, BIG
 REVOKE ALL ON FUNCTION public.settle_classification_tokens(UUID, UUID, TEXT, INT, INT) FROM PUBLIC, anon, authenticated;
 
 GRANT EXECUTE ON FUNCTION public.select_conversations_to_classify(INT, UUID[], INT, TIMESTAMPTZ) TO service_role;
-GRANT EXECUTE ON FUNCTION public.save_conversation_topics(UUID, UUID, JSONB, TIMESTAMPTZ, TIMESTAMPTZ, TIMESTAMPTZ[]) TO service_role;
+GRANT EXECUTE ON FUNCTION public.save_conversation_topics(UUID, UUID, JSONB, TIMESTAMPTZ, TIMESTAMPTZ, TIMESTAMPTZ[], UUID[]) TO service_role;
 GRANT EXECUTE ON FUNCTION public.record_classification_failure(UUID, UUID, TEXT, TIMESTAMPTZ) TO service_role;
 GRANT EXECUTE ON FUNCTION public.next_backfill_batch(UUID, INT, TIMESTAMPTZ) TO service_role;
 GRANT EXECUTE ON FUNCTION public.advance_topic_backfill(UUID, TIMESTAMPTZ, UUID, BOOLEAN, TIMESTAMPTZ) TO service_role;

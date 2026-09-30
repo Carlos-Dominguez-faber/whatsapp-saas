@@ -179,6 +179,11 @@ CREATE TABLE IF NOT EXISTS public.conversation_classification (
   -- get_insights (`partial_conversations`).
   partial_from     TIMESTAMPTZ,
   partial_until    TIMESTAMPTZ,
+  -- The newest topic of the catalog the last nightly classification ran with:
+  -- every active topic created up to here was in it. The backfill of a topic
+  -- created later than this skips nothing; one created earlier already read
+  -- this conversation and skips it (next_backfill_batch).
+  catalog_at       TIMESTAMPTZ,
   updated_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
   -- FK compuesta: mismo motivo que en conversation_topics más arriba.
   CONSTRAINT fk_conversation_classification_conversation
@@ -187,6 +192,9 @@ CREATE TABLE IF NOT EXISTS public.conversation_classification (
 );
 CREATE INDEX IF NOT EXISTS idx_conversation_classification_ws
   ON public.conversation_classification (workspace_id, claimed_until);
+-- #13's table has no catalog_at: its rows stay NULL (catalog unknown), so a
+-- backfill still reads them, as #13 did.
+ALTER TABLE public.conversation_classification ADD COLUMN IF NOT EXISTS catalog_at TIMESTAMPTZ;
 
 -- ── RLS y privilegios ──────────────────────────────────────
 -- Escritura solo service_role: sin policies de escritura para miembros.

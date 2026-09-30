@@ -352,6 +352,9 @@ async function classifyOne(
         p_truncated_at: messages
           .filter((m) => m.direction === "in" && isBodyTruncated(m))
           .map((m) => m.created_at),
+        // The nightly run records which catalog it read the conversation
+        // with, so a later topic's backfill knows what is already covered.
+        ...(classifiedUntil !== null ? { p_catalog: topics.map((t) => t.id) } : {}),
       })
       .abortSignal(dbSignal(deadline));
     if (!error) return { ok: true };
