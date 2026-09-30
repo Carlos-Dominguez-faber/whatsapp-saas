@@ -69,7 +69,11 @@ const PARK_CODES = new Set(["unauthorized", "missing_scope", "properties_not_rea
  * Códigos permanentes: cierran failed al primer intento. El resto (incluido db_error,
  * deadline, timeout) sigue reintentándose.
  */
-const PERMANENT_CODES = new Set(["conversation_not_found"]);
+const PERMANENT_CODES = new Set([
+  "conversation_not_found",
+  // The timeline POST may have landed: resending could log it twice.
+  "comm_outcome_unknown",
+]);
 
 function nextState(outcome: Outcome, attempts: number): {
   bucket: Bucket;

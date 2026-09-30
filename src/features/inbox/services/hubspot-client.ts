@@ -1123,5 +1123,15 @@ export async function logHubSpotConversation(
       ],
     },
   });
-  return res.ok ? { ok: true } : { ok: false, code: res.code };
+  if (res.ok) return { ok: true };
+  // A 2xx whose body can't be read: HubSpot took it.
+  if (res.status >= 200 && res.status < 300) return { ok: true };
+  // Sent, and no clear answer (no response, a timeout after sending, a 5xx):
+  // HubSpot may have logged it. Resending could put it twice in the
+  // timeline, so it is never resent: the queue closes it as failed, with an
+  // event. `deadline` (never sent) and a 429 (refused) stay retryable.
+  if (res.code === "timeout" || res.code === "network" || res.status >= 500) {
+    return { ok: false, code: "comm_outcome_unknown" };
+  }
+  return { ok: false, code: res.code };
 }

@@ -1704,6 +1704,24 @@ test("con tiempo de sobra, el 429 del POST se reintenta una vez y sale", async (
   assert.equal(calls.filter((c) => COMMS.test(c.url)).length, 2);
 });
 
+test("a timeline POST with no clear answer is not retried: comm_outcome_unknown", async () => {
+  for (const reply of [
+    json(503, {}),
+    () => {
+      throw new TypeError("fetch failed");
+    },
+  ] as Reply[]) {
+    reset();
+    connect();
+    addContact({ hs_contact_id: "777" });
+    addConversation({ summary: "Resumen." });
+    on("POST", COMMS, reply);
+    const r = await hs.hsDeadline.run(Date.now() + 25_000, () => hs.logHubSpotConversation(WS, "conv_1", "handoff"));
+    assert.deepEqual(r, { ok: false, code: "comm_outcome_unknown" });
+    assert.equal(calls.filter((c) => COMMS.test(c.url)).length, 1);
+  }
+});
+
 test("con un timeout completo por delante sí la manda", async () => {
   reset();
   connect();

@@ -113,7 +113,15 @@ test("cada ítem corre con un deadline propio acotado a 30 s y al de la corrida"
   assert.ok(d <= deadline && d <= Date.now() + 30_000, `deadline del ítem ${d}`);
 });
 
-test("timeout de HubSpot: vuelve a pending con backoff y el código, para reintentar después", async () => {
+test("an entry whose timeline POST may have landed is never retried: failed, with an event", async () => {
+  reset([row(1)]);
+  outcomes = [{ ok: false, code: "comm_outcome_unknown" }];
+  assert.deepEqual(await drainHubSpotConversationLogs(later()), { done: 0, retry: 0, failed: 1, cancelled: 0 });
+  assert.equal(finishes[0].patch.status, "failed");
+  assert.equal(events.length, 1);
+});
+
+test("timeout de HubSpot antes del POST de la comunicación (pasos idempotentes): vuelve a pending con backoff", async () => {
   reset([row(2)]);
   outcomes = [{ ok: false, code: "timeout" }];
   const before = Date.now();
