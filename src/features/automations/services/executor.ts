@@ -121,7 +121,7 @@ interface ActionResult {
  *            | transition_not_allowed | opted_out | already_assigned
  *            | appointment_not_active | appointment_passed | appointment_moved
  *            | reminder_too_close | reminder_too_late | hl_not_connected
- *            | calcom_not_connected | calcom_unconfirmable
+ *            | calcom_not_connected | calcom_unconfirmable | pending_confirmation
  *            | cooldown | daily_cap
  *   failed:  outcome_unknown | cross_workspace | conversation_not_found
  *            | missing_business_name | missing_appointment | contact_not_found
@@ -584,7 +584,9 @@ async function confirmAppointmentWithCalCom(
   run: AutomationRun,
   appointment: { scheduledAt: string; calcomBookingUid: string | null },
   contactId: string | null,
-): Promise<"active" | "cancelled" | "moved" | "unconfirmable" | "not_connected" | "error"> {
+): Promise<
+  "active" | "cancelled" | "moved" | "pending" | "unconfirmable" | "not_connected" | "error"
+> {
   if (!appointment.calcomBookingUid || !contactId) return "unconfirmable";
 
   let cfg: Awaited<ReturnType<typeof loadCalComConfig>>;
@@ -618,6 +620,9 @@ async function confirmAppointmentWithCalCom(
   if (read === null) return "cancelled";
   if (read.moved) return "moved";
   if (read.booking.state !== "active") return "cancelled";
+  // The host hasn't confirmed it: a reminder would present a request as an
+  // appointment (Carlos to decide; see the PR).
+  if (read.booking.pending) return "pending";
   const local = Date.parse(appointment.scheduledAt);
   if (Math.abs(read.booking.startMs - local) > APPOINTMENT_MATCH_TOLERANCE_MS) return "moved";
   return "active";
@@ -768,6 +773,7 @@ async function actSendTemplate(
       if (confirmed === "not_connected") return skip("calcom_not_connected");
       if (confirmed === "cancelled") return skip("appointment_not_active");
       if (confirmed === "moved") return skip("appointment_moved");
+      if (confirmed === "pending") return skip("pending_confirmation");
     } else {
       const confirmed = await confirmAppointmentWithHL(
         run,

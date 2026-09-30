@@ -225,6 +225,11 @@ export interface CalComBooking {
   /** Cal.com's own status: accepted, pending, cancelled, rejected. */
   status: string;
   state: CalComBookingState;
+  /**
+   * The host still has to confirm it ("pending"): it holds the slot (state
+   * "active") but is a request, not an appointment.
+   */
+  pending: boolean;
   eventTypeId: number | null;
   /** Where Cal.com says it was moved to, when it was rescheduled. */
   rescheduledToUid: string | null;
@@ -268,6 +273,7 @@ export function parseCalComBooking(data: unknown): CalComBooking | null {
     createdMs: parseTime(b.createdAt),
     status,
     state: stateOf(status),
+    pending: status === "pending",
     eventTypeId,
     rescheduledToUid:
       typeof b.rescheduledToUid === "string" && b.rescheduledToUid ? b.rescheduledToUid : null,

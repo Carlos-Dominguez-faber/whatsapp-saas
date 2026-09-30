@@ -38,10 +38,14 @@ async function run(_args: Args, ctx: ToolContext): Promise<ToolResult> {
     const appointments = bookings.map((b) => ({
       datetime_iso: formatWithOffset(b.startMs, zone),
       cuando: describeInstant(b.startMs, zone),
+      ...(b.pending ? { pendiente_de_confirmar: true } : {}),
     }));
     const notes: string[] = [];
     if (appointments.length > 0) {
       notes.push("Para cancelar o reagendar, copia datetime_iso exactamente como aparece.");
+    }
+    if (appointments.some((a) => "pendiente_de_confirmar" in a)) {
+      notes.push("Las marcadas pendiente_de_confirmar son solicitudes que el negocio todavía no confirma.");
     } else if (unreadable === 0 && !more) {
       notes.push("El cliente no tiene citas próximas agendadas por WhatsApp.");
     }

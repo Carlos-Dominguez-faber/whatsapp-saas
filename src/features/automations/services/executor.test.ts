@@ -2343,11 +2343,12 @@ test("Cal.com: a booking live at the same time in Cal.com is reminded", async ()
   assert.equal(sendCalls.length, 1);
 });
 
-test("Cal.com: moved or cancelled there, the reminder is skipped", async () => {
+test("Cal.com: moved, cancelled or still pending confirmation there, the reminder is skipped", async () => {
   for (const [read, reason] of [
     [{ booking: { state: "active", startMs: Date.now() + 5 * 3600_000 }, moved: true, fromStartMs: 0 }, "appointment_moved"],
     [{ booking: { state: "cancelled", startMs: Date.parse(dueNow()) }, moved: false, fromStartMs: 0 }, "appointment_not_active"],
     [null, "appointment_not_active"],
+    [{ booking: { state: "active", pending: true, startMs: Date.parse(dueNow()) }, moved: false, fromStartMs: 0 }, "pending_confirmation"],
   ] as const) {
     reset();
     ruleRow = { ...APPOINTMENT_RULE };

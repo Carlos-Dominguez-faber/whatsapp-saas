@@ -252,7 +252,20 @@ async function run(args: Args, ctx: ToolContext, opts?: ToolRunOptions): Promise
     console.warn("[reschedule_calcom] Cal.com moved the booking without returning the new one");
   }
 
-  return { ok: true, output: { rescheduled: true, new_datetime: newLocal } };
+  // A move the host still has to confirm is a request.
+  return {
+    ok: true,
+    output: {
+      rescheduled: true,
+      new_datetime: newLocal,
+      ...(moved?.pending
+        ? {
+            status: "pending",
+            note: "El cambio quedó SOLICITADO, pendiente de que el negocio lo confirme. Díselo así al cliente.",
+          }
+        : {}),
+    },
+  };
 }
 
 export const rescheduleCalComTool: Tool<Args> = {

@@ -828,3 +828,32 @@ test("the cache lookups filter by contact and linked bookings: another contact's
   const list = await withFetch(claimRow, () => listCalComAppointmentsTool.run({}, ctx));
   assert.deepEqual((list.output as { appointments: unknown[] }).appointments, []);
 });
+
+// ── a booking the host still has to confirm is a request ─────────────────────
+
+test("a pending booking is reported as requested, in schedule, reschedule and the list", async () => {
+  const booked = calFetch({
+    create: { status: 201, body: { status: "success", data: booking("new_1", CONFIRMED_UTC, { status: "pending" }) } },
+  });
+  const s = await schedule(booked);
+  assert.equal(s.ok, true);
+  assert.equal((s.output as { status: string }).status, "pending");
+  assert.match((s.output as { note: string }).note, /SOLICITADA/);
+
+  const moved = calFetch({
+    local: [cached("b1", CONFIRMED_UTC)],
+    reschedule: { status: 201, body: { status: "success", data: booking("m1", NEW_TIME_UTC, { status: "pending" }) } },
+  });
+  const r = await moveTo(moved);
+  assert.equal((r.output as { status: string }).status, "pending");
+
+  const listed = calFetch({
+    local: [cached("b1", CONFIRMED_UTC), cached("b2", NEW_TIME_UTC)],
+    bookings: { b2: booking("b2", NEW_TIME_UTC, { status: "pending" }) },
+  });
+  const l = await withFetch(listed, () => listCalComAppointmentsTool.run({}, ctx));
+  const out = l.output as { appointments: Array<Record<string, unknown>>; note: string };
+  assert.equal(out.appointments[0].pendiente_de_confirmar, undefined);
+  assert.equal(out.appointments[1].pendiente_de_confirmar, true);
+  assert.match(out.note, /todavía no confirma/);
+});

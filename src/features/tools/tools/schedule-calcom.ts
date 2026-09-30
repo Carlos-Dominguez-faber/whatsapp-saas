@@ -50,6 +50,10 @@ export const CALCOM_CLAIM_TTL_SECONDS = 120;
 const SLOT_TAKEN =
   /\b(?:no longer available|not available|no available users|already (?:has|have) (?:a )?booking|booking conflict|slot)\b/i;
 
+/** For a booking the host still has to confirm. */
+export const PENDING_NOTE =
+  "La cita quedó SOLICITADA, pendiente de que el negocio la confirme. Díselo así al cliente: no le digas que ya está confirmada.";
+
 const UNKNOWN_BOOKING =
   "No pude confirmar si la cita quedó agendada. No le digas al cliente que se agendó ni que falló: dile que una persona del equipo lo confirmará.";
 
@@ -123,10 +127,14 @@ async function run(args: Args, ctx: ToolContext, opts?: ToolRunOptions): Promise
   }
   const startIso = new Date(start.ms).toISOString();
   const startLocal = formatWithOffset(start.ms, zone);
-  /** What the model gets for a booking Cal.com has. */
+  /**
+   * What the model gets for a booking Cal.com has. One the host still has to
+   * confirm is a request, and the model is told to say so.
+   */
   const bookedOutput = (b: CalComBooking) => ({
     booking_uid: b.uid,
     datetime: formatWithOffset(b.startMs, zone),
+    ...(b.pending ? { status: "pending", note: PENDING_NOTE } : {}),
   });
 
   // Cal.com books any eventTypeId, even another account's: only this key's own.
@@ -594,7 +602,7 @@ async function run(args: Args, ctx: ToolContext, opts?: ToolRunOptions): Promise
 export const scheduleCalComTool: Tool<Args> = {
   name: "schedule_calcom",
   description:
-    "Reserva una cita directamente en el calendario de Cal.com. Antes, usa list_event_types_calcom para saber el event_type_id y check_availability_calcom para ofrecer un horario real; copia su datetime_iso tal cual. Si no tienes el email del cliente, pídeselo primero: Cal.com lo exige. Solo confirma la cita si esta herramienta responde con éxito.",
+    "Reserva una cita directamente en el calendario de Cal.com. Antes, usa list_event_types_calcom para saber el event_type_id y check_availability_calcom para ofrecer un horario real; copia su datetime_iso tal cual. Si no tienes el email del cliente, pídeselo primero: Cal.com lo exige. Solo confirma la cita si esta herramienta responde con éxito; si responde status \"pending\", la cita queda solicitada hasta que el negocio la confirme.",
   sensitivity: "write",
   schema,
   enabledFor: () => true,
