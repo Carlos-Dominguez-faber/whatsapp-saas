@@ -85,6 +85,10 @@ function query(table: string) {
       filters.push((r) => vals.includes(r[col]));
       return chain;
     },
+    lte: (col: string, val: unknown) => {
+      filters.push((r) => String(r[col]) <= String(val));
+      return chain;
+    },
     // PostgREST-shaped OR filter, e.g. "name.is.null,name.eq." — enough for the guarded
     // updates in syncContactFromHubSpot (is.null / eq.<value>, OR'd together).
     or: (expr: string) => {
@@ -1953,4 +1957,21 @@ test("el número del agente sale del proveedor de WhatsApp ACTIVO (YCloud), no d
   on("POST", COMMS, json(201, {}));
   await hs.logHubSpotConversation(WS, "conv_1", "handoff");
   assert.equal(loggedBody(), "[Agente de WhatsApp · +52 998 123 4567] Traspaso a humano\n\nResumen: Hola.");
+});
+
+test("the entry is dated when the handoff happened, and its transcript stops there", async () => {
+  reset();
+  connect();
+  addContact({ hs_contact_id: "777" });
+  addConversation();
+  tables.messages.push(
+    { conversation_id: "conv_1", workspace_id: WS, direction: "in", body: "antes", created_at: "2026-09-22T10:00:00Z" },
+    { conversation_id: "conv_1", workspace_id: WS, direction: "out", body: "después", created_at: "2026-09-22T12:00:00Z" },
+  );
+  on("POST", COMMS, json(201, {}));
+  await hs.logHubSpotConversation(WS, "conv_1", "handoff", "2026-09-22T11:00:00Z");
+  const post = calls.find((c) => COMMS.test(c.url))!.body as { properties: Row };
+  assert.equal(post.properties.hs_timestamp, "2026-09-22T11:00:00Z");
+  assert.match(loggedBody(), /Cliente: antes/);
+  assert.doesNotMatch(loggedBody(), /después/);
 });

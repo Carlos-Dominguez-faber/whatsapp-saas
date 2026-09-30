@@ -52,6 +52,8 @@ interface ClaimedLog {
   conversation_id: string;
   reason: "handoff" | "closed";
   attempts: number;
+  /** When the transition was queued (before 20261003000013: absent). */
+  created_at?: string | null;
 }
 
 type Bucket = "done" | "retry" | "failed" | "cancelled" | "parked";
@@ -127,7 +129,7 @@ export async function drainHubSpotConversationLogs(deadline: number): Promise<Hu
       let outcome: Outcome;
       try {
         outcome = await hsDeadline.run(itemDeadline, () =>
-          logHubSpotConversation(row.workspace_id, row.conversation_id, row.reason),
+          logHubSpotConversation(row.workspace_id, row.conversation_id, row.reason, row.created_at ?? null),
         );
       } catch {
         outcome = { ok: false, code: "threw" };

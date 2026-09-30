@@ -79,7 +79,14 @@ mock.module("./hubspot-client.ts", {
 const { drainHubSpotConversationLogs, MAX_LOG_ATTEMPTS } = await import("./hubspot-log-queue.ts");
 
 function row(attempts = 1): Row {
-  return { id: "log_1", workspace_id: "ws_1", conversation_id: "conv_1", reason: "handoff", attempts };
+  return {
+    id: "log_1",
+    workspace_id: "ws_1",
+    conversation_id: "conv_1",
+    reason: "handoff",
+    attempts,
+    created_at: "2026-09-22T11:00:00Z",
+  };
 }
 
 function reset(rows: Row[] = []) {
@@ -100,7 +107,7 @@ test("camino correcto: reclama con lease, procesa y cierra done con filtros de i
   reset([row()]);
   assert.deepEqual(await drainHubSpotConversationLogs(later()), { done: 1, retry: 0, failed: 0, cancelled: 0 });
   assert.deepEqual(claims[0], { p_lease_seconds: 120 });
-  assert.deepEqual(logged[0].args, ["ws_1", "conv_1", "handoff"]);
+  assert.deepEqual(logged[0].args, ["ws_1", "conv_1", "handoff", "2026-09-22T11:00:00Z"], "dated when it was queued");
   assert.equal(finishes[0].patch.status, "done");
   assert.deepEqual(finishes[0].eqs, [["id", "log_1"], ["workspace_id", "ws_1"], ["attempts", 1], ["status", "pending"]]);
 });

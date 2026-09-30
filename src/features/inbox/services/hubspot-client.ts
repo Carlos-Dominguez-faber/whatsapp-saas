@@ -1023,6 +1023,8 @@ async function buildConversationBody(
   contactId: string,
   agentSummary: unknown,
   reason: "handoff" | "closed",
+  /** When the handoff or close happened: the transcript stops there. */
+  at: string | null,
 ): Promise<{ ok: true; body: string } | { ok: false; code: "db_error" }> {
   // The agent's number, from the workspace's ACTIVE WhatsApp provider (YCloud
   // or Kapso), whichever it is.
@@ -1051,11 +1053,13 @@ async function buildConversationBody(
     if (lead) {
       content = `Resumen del lead: ${lead}`;
     } else {
-      const { data: msgs, error: msgsError } = await db
+      let query = db
         .from("messages")
         .select("direction, body, created_at")
         .eq("conversation_id", conversationId)
-        .eq("workspace_id", workspaceId)
+        .eq("workspace_id", workspaceId);
+      if (at) query = query.lte("created_at", at);
+      const { data: msgs, error: msgsError } = await query
         .order("created_at", { ascending: false })
         .limit(TRANSCRIPT_MESSAGES);
       if (msgsError) return { ok: false, code: "db_error" };
@@ -1078,6 +1082,11 @@ export async function logHubSpotConversation(
   workspaceId: string,
   conversationId: string,
   reason: "handoff" | "closed",
+  /**
+   * When the transition was queued (the log's created_at): the entry is
+   * dated then and its transcript stops there. Now, when not given.
+   */
+  at: string | null = null,
 ): Promise<Outcome> {
   const cfgResult = await readHubSpotConfig(workspaceId);
   if (!cfgResult.ok) {
@@ -1101,7 +1110,7 @@ export async function logHubSpotConversation(
   const linked = await pushContactToHubSpot(workspaceId, contactId, {}, cfg);
   if (!linked.ok) return linked;
 
-  const bodyResult = await buildConversationBody(db, workspaceId, conversationId, contactId, conv.summary, reason);
+  const bodyResult = await buildConversationBody(db, workspaceId, conversationId, contactId, conv.summary, reason, at);
   if (!bodyResult.ok) return bodyResult;
 
   // El POST de la comunicación NO es idempotente: con el timeout recortado por el deadline,
@@ -1116,7 +1125,7 @@ export async function logHubSpotConversation(
         hs_communication_channel_type: "WHATS_APP",
         hs_communication_logged_from: "CRM",
         hs_communication_body: bodyResult.body,
-        hs_timestamp: new Date().toISOString(),
+        hs_timestamp: at ?? new Date().toISOString(),
       },
       associations: [
         { to: { id: linked.hs_id }, types: [{ associationCategory: "HUBSPOT_DEFINED", associationTypeId: COMMUNICATION_TO_CONTACT }] },
