@@ -7,9 +7,10 @@
 -- reminder scan dedups per (appointment, occurrence), so a booking moved away
 -- and then back to a time already reminded was reminded again under the new
 -- row. automation_reminder_candidates() now also skips a Cal.com row when
--- this rule has a run for the same occurrence (rule, lead, instant) and the
--- same contact under another row that was sent or is still on its way; a
--- skipped or failed one (it reminded nobody) doesn't block it. HighLevel
+-- this rule emitted the same occurrence (rule, lead, instant) for the same
+-- contact under another row and that reminder was sent or is still on its
+-- way (not expanded yet, or a run done, pending or processing); a skipped or
+-- failed one (it reminded nobody) doesn't block it. HighLevel
 -- rows (no calcom_event_type_id) are untouched: they keep one row per
 -- appointment. The index backs that lookup.
 -- ============================================================================
@@ -74,23 +75,31 @@ AS $$
      )
      -- A Cal.com booking moved away and back is a new row at a time this
      -- contact was already reminded of by this rule (the occurrence names the
-     -- rule, the lead and the instant): not again while another row's run
-     -- for it is sent or still on its way (done, pending, processing). One
-     -- that was skipped or failed (say, as moved) reminded nobody, so it
-     -- doesn't count. HighLevel rows keep one row per appointment and are
+     -- rule, the lead and the instant): not again while another row's
+     -- reminder for it was sent or is still on its way (emitted and not
+     -- expanded yet, or a run done, pending or processing). One skipped or
+     -- failed (say, as moved) reminded nobody, so it doesn't count. HighLevel rows keep one row per appointment and are
      -- untouched.
      AND NOT (
        a.calcom_event_type_id IS NOT NULL
        AND EXISTS (
          SELECT 1
            FROM public.automation_events e
-           JOIN public.automation_runs r ON r.event_id = e.id AND r.rule_id = rule.id
           WHERE e.event_type = 'appointment_upcoming'
             AND e.workspace_id = a.workspace_id
             AND e.contact_id = a.contact_id
             AND e.occurrence = o.occurrence
             AND e.subject_id <> a.id
-            AND r.status IN ('done', 'pending', 'processing')
+            AND (
+              -- Emitted and not expanded yet: on its way.
+              NOT EXISTS (SELECT 1 FROM public.automation_runs r WHERE r.event_id = e.id)
+              OR EXISTS (
+                SELECT 1 FROM public.automation_runs r
+                 WHERE r.event_id = e.id
+                   AND r.rule_id = rule.id
+                   AND r.status IN ('done', 'pending', 'processing')
+              )
+            )
        )
      )
    ORDER BY o.due_at, a.id
