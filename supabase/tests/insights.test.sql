@@ -9,7 +9,7 @@ BEGIN;
 CREATE EXTENSION IF NOT EXISTS pgtap WITH SCHEMA extensions;
 SET search_path = public, extensions;
 
-SELECT plan(31);
+SELECT plan(34);
 
 -- ── Privileges ───────────────────────────────────────────────────────────────
 SELECT ok(NOT has_function_privilege('anon',
@@ -182,6 +182,22 @@ SELECT is((SELECT (t->>'prev_conversations')::int
                     now() - interval '7 days', now(), '{}', 'UTC')->'topics') t
             WHERE t->>'id' = 'e0000000-0000-4000-8000-0000000000f1'), 0,
   'a topic covered through the previous period keeps its comparison');
+
+-- ── A failure waits before its next try (review M4) ─────────────────────────
+INSERT INTO public.contacts (id, workspace_id, phone) VALUES
+  ('e0000000-0000-4000-8000-0000000000c6', 'e0000000-0000-4000-8000-000000000001', '+15550100006');
+INSERT INTO public.conversations (id, workspace_id, contact_id, last_message_at) VALUES
+  ('e0000000-0000-4000-8000-0000000000a6', 'e0000000-0000-4000-8000-000000000001', 'e0000000-0000-4000-8000-0000000000c6', now() - interval '3 hours');
+INSERT INTO public.messages (workspace_id, conversation_id, direction, body, created_at) VALUES
+  ('e0000000-0000-4000-8000-000000000001', 'e0000000-0000-4000-8000-0000000000a6', 'in', 'x', now() - interval '3 hours');
+SELECT is(public.record_classification_failure('e0000000-0000-4000-8000-000000000001',
+    'e0000000-0000-4000-8000-0000000000a6', 'invalid_output'), 1, 'the first failure counts one attempt');
+SELECT is((SELECT count(*)::int FROM public.select_conversations_to_classify(100, '{}', 120)
+            WHERE conversation_id = 'e0000000-0000-4000-8000-0000000000a6'), 0,
+  'a failed conversation is not picked again in the same run');
+SELECT is((SELECT count(*)::int FROM public.select_conversations_to_classify(100, '{}', 120, now() + interval '61 minutes')
+            WHERE conversation_id = 'e0000000-0000-4000-8000-0000000000a6'), 1,
+  'an hour later it is tried again');
 
 SELECT * FROM finish();
 ROLLBACK;

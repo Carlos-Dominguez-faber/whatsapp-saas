@@ -251,10 +251,18 @@ BEGIN
 END;
 $$;
 
+-- A failure also sets the conversation's next try: its lease becomes a
+-- backoff of 1 h per attempt. Releasing it (as #13 did) let the same run pick
+-- it again right away, so one bad conversation burned its 3 attempts in
+-- seconds and went into quarantine without a second chance. p_now: see
+-- select_conversations_to_classify. #13 shipped (UUID, UUID, TEXT).
+DROP FUNCTION IF EXISTS public.record_classification_failure(UUID, UUID, TEXT);
+
 CREATE OR REPLACE FUNCTION public.record_classification_failure(
   p_workspace_id UUID,
   p_conversation_id UUID,
-  p_code TEXT
+  p_code TEXT,
+  p_now TIMESTAMPTZ DEFAULT now()
 )
 RETURNS INT
 LANGUAGE plpgsql
@@ -263,6 +271,7 @@ AS $$
 DECLARE
   v_attempts INT;
   v_released BOOLEAN;
+  v_now      TIMESTAMPTZ := COALESCE(p_now, now());
 BEGIN
   IF NOT EXISTS (
     SELECT 1 FROM public.conversations
@@ -292,20 +301,20 @@ BEGIN
 
   INSERT INTO public.conversation_classification AS cc
     (conversation_id, workspace_id, attempts, error, claimed_until, last_attempt_at, updated_at)
-  VALUES (p_conversation_id, p_workspace_id, 1, p_code, NULL, now(), now())
+  VALUES (p_conversation_id, p_workspace_id, 1, p_code, v_now + INTERVAL '1 hour', v_now, now())
   ON CONFLICT (conversation_id) DO UPDATE SET
     attempts = CASE WHEN v_released THEN 1 ELSE cc.attempts + 1 END,
     error = EXCLUDED.error,
     quarantined_at = CASE WHEN v_released THEN NULL ELSE cc.quarantined_at END,
-    -- Fallo: se suelta el lease para que la próxima corrida pueda reintentar.
-    claimed_until = NULL,
-    last_attempt_at = now(),
+    -- Next try in 1 h per attempt, never in the same run.
+    claimed_until = v_now + make_interval(hours => CASE WHEN v_released THEN 1 ELSE cc.attempts + 1 END),
+    last_attempt_at = v_now,
     updated_at = now()
   RETURNING attempts INTO v_attempts;
 
   IF v_attempts >= 3 THEN
     UPDATE public.conversation_classification
-       SET quarantined_at = now()
+       SET quarantined_at = v_now
      WHERE conversation_id = p_conversation_id;
   END IF;
 
@@ -611,7 +620,7 @@ $$;
 
 REVOKE ALL ON FUNCTION public.select_conversations_to_classify(INT, UUID[], INT, TIMESTAMPTZ) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.save_conversation_topics(UUID, UUID, JSONB, TIMESTAMPTZ, TIMESTAMPTZ, TIMESTAMPTZ[]) FROM PUBLIC, anon, authenticated;
-REVOKE ALL ON FUNCTION public.record_classification_failure(UUID, UUID, TEXT) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.record_classification_failure(UUID, UUID, TEXT, TIMESTAMPTZ) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.next_backfill_batch(UUID, INT, TIMESTAMPTZ) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.advance_topic_backfill(UUID, TIMESTAMPTZ, UUID, BOOLEAN, TIMESTAMPTZ) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.record_backfill_failure(UUID) FROM PUBLIC, anon, authenticated;
@@ -622,7 +631,7 @@ REVOKE ALL ON FUNCTION public.settle_classification_tokens(UUID, UUID, TEXT, INT
 
 GRANT EXECUTE ON FUNCTION public.select_conversations_to_classify(INT, UUID[], INT, TIMESTAMPTZ) TO service_role;
 GRANT EXECUTE ON FUNCTION public.save_conversation_topics(UUID, UUID, JSONB, TIMESTAMPTZ, TIMESTAMPTZ, TIMESTAMPTZ[]) TO service_role;
-GRANT EXECUTE ON FUNCTION public.record_classification_failure(UUID, UUID, TEXT) TO service_role;
+GRANT EXECUTE ON FUNCTION public.record_classification_failure(UUID, UUID, TEXT, TIMESTAMPTZ) TO service_role;
 GRANT EXECUTE ON FUNCTION public.next_backfill_batch(UUID, INT, TIMESTAMPTZ) TO service_role;
 GRANT EXECUTE ON FUNCTION public.advance_topic_backfill(UUID, TIMESTAMPTZ, UUID, BOOLEAN, TIMESTAMPTZ) TO service_role;
 GRANT EXECUTE ON FUNCTION public.record_backfill_failure(UUID) TO service_role;
