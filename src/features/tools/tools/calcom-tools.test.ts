@@ -330,6 +330,15 @@ test("schedule: another account's event type, or an unreadable list, books nothi
   const c = await schedule(recurring);
   assert.equal(c.ok, false);
   assert.match(c.error ?? "", /recurrente/);
+
+  // Seats share one booking uid per slot: refused until seatUid is tracked.
+  const seated = calFetch({ eventTypes: [{ id: 7, title: "Taller", seats: { seatsPerTimeSlot: 10 } }] });
+  const d = await schedule(seated);
+  assert.equal(d.ok, false);
+  assert.match(d.error ?? "", /con cupos/);
+  assert.equal(calPosts(seated.calls).length, 0);
+  const noSeats = calFetch({ eventTypes: [{ id: 7, title: "Consulta", seats: { disabled: true } }] });
+  assert.equal((await schedule(noSeats)).ok, true);
 });
 
 test("schedule: without an email given or saved, it asks for one", async () => {
@@ -750,8 +759,8 @@ test("event types: listed with their length, recurring ones flagged; a failure i
   const result = await withFetch(fake, () => listEventTypesCalComTool.run({}, ctx));
   assert.deepEqual(result.output, {
     event_types: [
-      { id: 7, title: "Consulta", duration_minutes: 30, recurring: false },
-      { id: 8, title: "Serie", duration_minutes: 60, recurring: true },
+      { id: 7, title: "Consulta", duration_minutes: 30, recurring: false, con_cupos: false },
+      { id: 8, title: "Serie", duration_minutes: 60, recurring: true, con_cupos: false },
     ],
     count: 2,
   });

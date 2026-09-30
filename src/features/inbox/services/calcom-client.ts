@@ -169,6 +169,8 @@ interface CalComEventTypesResponse {
     title?: string;
     lengthInMinutes?: number;
     recurrence?: { disabled?: boolean } | null;
+    seats?: { seatsPerTimeSlot?: number; disabled?: boolean } | null;
+    seatsPerTimeSlot?: number | null;
   }>;
 }
 
@@ -183,6 +185,19 @@ export interface CalComEventTypeInfo {
    * are rejected before booking.
    */
   recurring: boolean;
+  /**
+   * True when a time slot has seats: every attendee of a slot shares one
+   * booking uid, told apart by a seatUid this integration doesn't track (a
+   * second seat would find the slot "taken" by the first, and cancelling
+   * without the seatUid could cancel them all). Rejected before booking,
+   * like recurring ones, until seats are supported.
+   */
+  seated: boolean;
+}
+
+function isSeated(et: { seats?: { seatsPerTimeSlot?: number; disabled?: boolean } | null; seatsPerTimeSlot?: number | null }): boolean {
+  if (et.seats && et.seats.disabled !== true && (et.seats.seatsPerTimeSlot ?? 1) > 0) return true;
+  return typeof et.seatsPerTimeSlot === "number" && et.seatsPerTimeSlot > 0;
 }
 
 /**
@@ -211,6 +226,7 @@ export async function listCalComEventTypes(
       title: typeof et.title === "string" ? et.title : `#${et.id}`,
       durationMinutes: typeof et.lengthInMinutes === "number" ? et.lengthInMinutes : null,
       recurring: !!et.recurrence && et.recurrence.disabled !== true,
+      seated: isSeated(et),
     }));
 }
 

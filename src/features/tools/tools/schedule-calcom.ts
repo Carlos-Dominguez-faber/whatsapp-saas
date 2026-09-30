@@ -154,6 +154,13 @@ async function run(args: Args, ctx: ToolContext, opts?: ToolRunOptions): Promise
       error: "event_type_id no corresponde a ningún tipo de evento de este negocio: usa list_event_types_calcom para obtener uno válido.",
     };
   }
+  if (eventType.seated) {
+    return {
+      ok: false,
+      output: null,
+      error: "Ese tipo de evento es con cupos (varias personas por horario) y no se puede agendar por WhatsApp todavía: usa uno individual, o pide al negocio que lo agende en Cal.com.",
+    };
+  }
   if (eventType.recurring) {
     return {
       ok: false,

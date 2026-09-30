@@ -32,6 +32,7 @@ async function run(_args: Args, ctx: ToolContext): Promise<ToolResult> {
         duration_minutes: et.durationMinutes,
         // schedule_calcom rejects them: said here so the model doesn't offer one.
         recurring: et.recurring,
+        con_cupos: et.seated,
       })),
       count: eventTypes.length,
     },
@@ -41,7 +42,7 @@ async function run(_args: Args, ctx: ToolContext): Promise<ToolResult> {
 export const listEventTypesCalComTool: Tool<Args> = {
   name: "list_event_types_calcom",
   description:
-    "Lista los tipos de evento (servicios) del calendario de Cal.com del negocio. Úsala primero para saber qué event_type_id corresponde a lo que pide el cliente, antes de consultar disponibilidad o agendar. Los marcados recurring:true no se pueden agendar por WhatsApp (crean una serie de citas): no los ofrezcas para agendar, solo para informar.",
+    "Lista los tipos de evento (servicios) del calendario de Cal.com del negocio. Úsala primero para saber qué event_type_id corresponde a lo que pide el cliente, antes de consultar disponibilidad o agendar. Los marcados recurring:true (crean una serie de citas) o con_cupos:true (varias personas por horario) no se pueden agendar por WhatsApp: no los ofrezcas para agendar, solo para informar.",
   sensitivity: "read",
   schema,
   enabledFor: () => true,
