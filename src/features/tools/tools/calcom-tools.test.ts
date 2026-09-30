@@ -876,3 +876,49 @@ test("a taken slot is recognized by Cal.com's error code too", async () => {
   const result = await schedule(fake);
   assert.match(result.error ?? "", /ya no está disponible/);
 });
+
+// ── DST: a slot shown in the business zone books that same instant ───────────
+
+/** The instants in `year` where `tz`'s offset changes, found hour by hour. */
+async function transitions(tz: string, year: number): Promise<number[]> {
+  const { formatWithOffset } = await import("@/shared/lib/timezone");
+  const off = (ms: number) => formatWithOffset(ms, tz).slice(-6);
+  const out: number[] = [];
+  for (let ms = Date.UTC(year, 0, 1); ms < Date.UTC(year + 1, 0, 1); ms += 3_600_000) {
+    if (off(ms) !== off(ms + 3_600_000)) out.push(ms + 3_600_000);
+  }
+  return out;
+}
+
+test("DST (Santiago, Madrid): every slot around a change is shown once and books its own instant", async () => {
+  for (const tz of ["America/Santiago", "Europe/Madrid"]) {
+    const changes = await transitions(tz, 2030);
+    assert.equal(changes.length, 2, `${tz} changes twice a year`);
+    for (const t of changes) {
+      const starts = [t - 90 * 60_000, t - 30 * 60_000, t + 30 * 60_000, t + 90 * 60_000].map((ms) =>
+        new Date(ms).toISOString(),
+      );
+      const day = new Date(t).toISOString().slice(0, 10);
+      const fake = calFetch({
+        timezone: tz,
+        slots: { status: 200, body: { status: "success", data: { [day]: starts.map((start) => ({ start })) } } },
+      });
+      const avail = await withFetch(fake, () =>
+        checkAvailabilityCalComTool.run({ event_type_id: 7, date_from: day, date_to: day }, ctx),
+      );
+      const shown = Object.values((avail.output as { days: Record<string, string[]> }).days).flat();
+      assert.equal(shown.length, starts.length, `${tz} ${day}: ${JSON.stringify(avail.output)}`);
+      for (const iso of shown) {
+        const booked = calFetch({ timezone: tz });
+        const result = await schedule(booked, { datetime_iso: iso });
+        assert.equal(result.ok, true, `${tz} ${iso}: ${result.error}`);
+        const start = (calPosts(booked.calls)[0].body as { start: string }).start;
+        assert.ok(starts.includes(start), `${tz} ${iso} booked ${start}`);
+        assert.equal(
+          (calPosts(booked.calls)[0].body as { attendee: { timeZone: string } }).attendee.timeZone,
+          tz,
+        );
+      }
+    }
+  }
+});
