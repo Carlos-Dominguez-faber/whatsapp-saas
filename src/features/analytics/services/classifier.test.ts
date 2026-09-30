@@ -262,6 +262,8 @@ test("techo: el peor caso posible (60 × 800 unidades de 3 bytes, 10 temas lleno
   }));
   const worst = classificationTokenCeiling(worstTopics, worstMessages);
   assert.ok(worst < CLASSIFY_DAILY_TOKEN_CAP, `peor caso ${worst}`);
+  // The daily cap Carlos decided on 2026-09-30.
+  assert.equal(CLASSIFY_DAILY_TOKEN_CAP, 600_000);
 });
 
 test("abort por tiempo → timeout", async () => {

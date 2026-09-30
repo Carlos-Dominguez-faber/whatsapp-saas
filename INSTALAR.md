@@ -737,11 +737,11 @@ conversaciones sin analizar).
   la conversación espera una hora (dos, la segunda vez) antes del siguiente intento;
   al tercer fallo queda apartada hasta que el cliente vuelva a escribir.
 - **Costo:** usa `openai/gpt-4o-mini` por OpenRouter, con la clave del workspace (o
-  la de la agencia), y tiene un tope propio de **300,000 tokens por día** (UTC) por
-  workspace, unos USD 0.05 a 0.10. **No cuenta en el presupuesto diario del agente**:
-  no lo degrada ni lo corta, y el agente tampoco le quita cupo. El día más caro de un
-  workspace pasa a ser 1,300,000 tokens (1,000,000 del agente + 300,000 del
-  análisis). El texto de los clientes va a OpenAI a través de OpenRouter aunque el
+  la de la agencia), y tiene un tope propio de **600,000 tokens por día** (UTC) por
+  workspace, hasta unos USD 0.10 a 0.20. **No cuenta en el presupuesto diario del
+  agente**: no lo degrada ni lo corta, y el agente tampoco le quita cupo. El día más
+  caro de un workspace pasa a ser 1,600,000 tokens (1,000,000 del agente + 600,000
+  del análisis). El texto de los clientes va a OpenAI a través de OpenRouter aunque el
   agente use otro modelo (sin nombres ni teléfonos).
 - **Hasta dónde mira:** 30 días hacia atrás, los últimos 60 mensajes de cada
   conversación y hasta 800 caracteres por mensaje; si algo quedó fuera, el tablero lo
@@ -752,10 +752,10 @@ conversaciones sin analizar).
   dentro del período que estás viendo, se mide solo desde la fecha que aparece junto a él, y sin comparación con el período anterior:
   antes de esa fecha no se analizó, y contarlo como 0 % daría números falsos.
 - **Capacidad:** cada corrida lee unas 15 a 20 conversaciones (depende de lo que
-  tarde el modelo); cada 5 minutos, eso son miles al día en toda la instalación. El
-  límite real es el tope de 300,000 tokens diarios de cada workspace: unas 200
-  conversaciones al día (a unos 1,500 tokens cada una). Si un workspace recibe más, lo
-  que no cabe espera al día siguiente (primero lo de las últimas 48 horas, de lo más
+  tarde el modelo); cada 5 minutos, eso son unas 4,500 al día para toda la
+  instalación, repartidas por turnos entre los workspaces. Cada workspace tiene además
+  su tope de 600,000 tokens diarios: unas 400 conversaciones al día (a unos 1,500
+  tokens cada una). Si un workspace recibe más, lo que no cabe espera al día siguiente (primero lo de las últimas 48 horas, de lo más
   antiguo a lo más nuevo; después lo anterior, de lo más reciente hacia atrás) y el
   tablero muestra cuántas faltan. Para correrlo solo de noche, cambia la línea `'*/5 * * * *'` de
   `supabase/cron/schedule-classify-topics.sql` por `'*/5 4-8 * * *'` y vuelve a correr

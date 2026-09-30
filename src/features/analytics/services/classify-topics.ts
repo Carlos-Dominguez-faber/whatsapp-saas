@@ -112,14 +112,16 @@ import { openRouterKeyId, resolveOpenRouterKey } from "@/features/inbox/services
  */
 
 /**
- * La clasificación se detiene con 300k tokens del día UTC. Tope DURO: ninguna
+ * La clasificación se detiene con 600k tokens del día UTC (decided 2026-09-30:
+ * 300k left a busy workspace's yesterday at 67 % at 09:00; see
+ * pr-phase5a.md, decision 2). Tope DURO: ninguna
  * llamada sale sin una reserva de su techo (`reserve_classification_tokens`),
  * y la reserva se niega si consumo del día + techo > tope. It is its own
  * budget: the sum counts classification spend only (event type
  * 'topic_classification'), and the bot's daily budget does not count it, so
  * neither can starve the other.
  */
-export const CLASSIFY_DAILY_TOKEN_CAP = 300_000;
+export const CLASSIFY_DAILY_TOKEN_CAP = 600_000;
 
 /** Transient failures in a row on ONE key that take it down. */
 export const KEY_TRANSIENT_BREAKER = 3;
