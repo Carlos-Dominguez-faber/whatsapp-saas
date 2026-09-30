@@ -28,7 +28,7 @@ mock.module("./classifier.ts", {
   },
 });
 
-const { runClassificationPhase, runBackfillPhase, CLASSIFY_DAILY_TOKEN_CAP } = await import("./classify-topics.ts");
+const { runClassificationPhase, runBackfillPhase, CLASSIFY_DAILY_TOKEN_CAP, BACKFILL_SHARE_MS } = await import("./classify-topics.ts");
 const { MAX_PROMPT_CHARS } = await import("../lib/classify-prompt.ts");
 
 // ── Reloj virtual ──────────────────────────────────────────
@@ -949,4 +949,28 @@ test("REVIEW M3: the backfill saves without a catalog, the nightly run with its 
   const save = callsTo("save_conversation_topics")[0].args;
   assert.equal(save.p_classified_until, null);
   assert.equal("p_catalog" in save, false, "a backfill must not claim the whole catalog read the conversation");
+});
+
+test("REVIEW H2: with a queue in phase 1 and a topic waiting, the run's split leaves the backfill real calls", async () => {
+  // The route's split: 100 s, phase 1 stops BACKFILL_SHARE_MS early. Every LLM
+  // call takes 4 s on the virtual clock, with the real floors (35 s / 40 s).
+  resetBackfill(Array.from({ length: 20 }, (_, i) => [conv(`b${i}`)]));
+  tables.insight_topics.push(topic("t1", WS_A, "Precio"));
+  tables.messages = [
+    ...Array.from({ length: 20 }, (_, i) => message(`mb${i}`, `b${i}`, WS_A)),
+    ...Array.from({ length: 51 }, (_, i) => message(`mq${i}`, `q${i}`, WS_A)),
+  ];
+  const deadline = Date.now() + 100_000;
+  let round = 0;
+  rpcHandlers.select_conversations_to_classify = () => ({ data: round++ < 50 ? [conv(`q${round}`)] : [], error: null });
+  classifyImpl = llmTaking(() => 4_000);
+  const p1 = await runClassificationPhase(deadline - BACKFILL_SHARE_MS, db);
+  const afterPhase1 = classifyCalls.length;
+  const p2 = await runBackfillPhase(deadline, db);
+  assert.equal(p1.halt, false);
+  // Phase 1 has 45 s: it starts calls while 35 s remain, 4 s each.
+  assert.ok(p1.classified >= 2 && afterPhase1 === p1.classified, `phase 1 classified ${p1.classified}`);
+  // The backfill has the other 55 s: starts while 40 s remain.
+  assert.ok(p2.processed >= 3, `the backfill only got ${p2.processed} calls`);
+  assert.equal(classifyCalls.length - afterPhase1, p2.processed);
 });
