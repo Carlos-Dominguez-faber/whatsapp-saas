@@ -696,7 +696,8 @@ conversaciones sin analizar).
   nombre, sin contar mayúsculas ni acentos). Cada 5 minutos, el job `classify-topics`
   lee las conversaciones en las que el **cliente** escribió algo nuevo (una hora
   después de su último mensaje; primero lo más antiguo, y los workspaces se turnan:
-  primero el que lleva más tiempo sin que se le lea nada)
+  primero el que lleva más tiempo sin que se le lea nada; el reprocesamiento de temas
+  nuevos lleva su propio turno)
   y marca qué temas plantea. Solo cuenta lo que escribe el cliente: lo que dicen el
   agente o el equipo es contexto, las notas internas nunca se mandan al modelo, y una
   respuesta o un recordatorio no hacen que se vuelva a analizar. El tablero muestra
@@ -712,14 +713,19 @@ conversaciones sin analizar).
   (la de cada workspace con clave propia, y la de la agencia para todos los demás):
   - si OpenRouter **rechaza la clave** (sin créditos, revocada, limitada, o un 404
     porque su política de datos no deja usar el modelo), queda caída 15 minutos;
-  - si **falla tres veces seguidas** con esa clave (error 5xx, sin red, tiempo
-    agotado), queda caída 15 minutos, y cada caída seguida dura el doble (30 min,
-    1 h… hasta 6 horas);
+  - si **falla tres veces seguidas** (error 5xx, sin red, tiempo agotado, o un
+    "200" de OpenRouter que trae el error del proveedor), queda caída 15 minutos, y
+    cada caída seguida dura el doble (30 min, 1 h… hasta 6 horas). Una clave que
+    usan varios workspaces (la de la agencia, o una propia pegada en dos) solo cae
+    si fallan **al menos dos** de ellos: si falla uno solo (por ejemplo, porque sus
+    conversaciones rozan el tiempo límite), espera solo ese workspace, con las
+    mismas reglas;
   - mientras está caída no se usa, y sus workspaces esperan; al terminar la espera se
     prueba con **una sola** llamada: si responde, vuelve a la normalidad.
   Los demás workspaces siguen a su ritmo: la clave caída de uno nunca detiene a los
-  otros. El tablero de los afectados dice que la clave está fallando (la propia) o que
-  el análisis no está respondiendo (la de la agencia). Si la caída es la de la
+  otros. El tablero de los afectados dice que la clave está fallando (la propia), que
+  el análisis no está respondiendo (la de la agencia) o que las llamadas de ese
+  espacio están fallando. Si cambias la clave, el aviso de la vieja desaparece. Si la caída es la de la
   agencia, el job responde 500 (lo ves en `net._http_response`); las claves propias
   caídas nunca lo hacen. Una clave propia que no se puede descifrar cuenta como caída
   de ese workspace: nunca se le cobra a la de la agencia.
