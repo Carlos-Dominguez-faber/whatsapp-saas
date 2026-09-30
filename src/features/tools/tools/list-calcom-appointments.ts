@@ -43,11 +43,11 @@ async function run(_args: Args, ctx: ToolContext): Promise<ToolResult> {
     const notes: string[] = [];
     if (appointments.length > 0) {
       notes.push("Para cancelar o reagendar, copia datetime_iso exactamente como aparece.");
+    } else if (unreadable === 0 && !more) {
+      notes.push("El cliente no tiene citas próximas agendadas por WhatsApp.");
     }
     if (appointments.some((a) => "pendiente_de_confirmar" in a)) {
       notes.push("Las marcadas pendiente_de_confirmar son solicitudes que el negocio todavía no confirma.");
-    } else if (unreadable === 0 && !more) {
-      notes.push("El cliente no tiene citas próximas agendadas por WhatsApp.");
     }
     // A read that failed is not "no appointment": the model must not say so.
     if (unreadable > 0) {

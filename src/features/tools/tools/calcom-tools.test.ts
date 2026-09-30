@@ -922,3 +922,27 @@ test("DST (Santiago, Madrid): every slot around a change is shown once and books
     }
   }
 });
+
+test("the list's note: accepted, mixed and none", async () => {
+  const noteOf = async (fake: ReturnType<typeof calFetch>) =>
+    ((await withFetch(fake, () => listCalComAppointmentsTool.run({}, ctx))).output as { note: string }).note;
+
+  // Only accepted bookings: never "no appointments", right before a cancel or move.
+  const accepted = await noteOf(calFetch({ local: [cached("b1", CONFIRMED_UTC)] }));
+  assert.doesNotMatch(accepted, /no tiene citas/);
+  assert.match(accepted, /copia datetime_iso/);
+  assert.doesNotMatch(accepted, /pendiente_de_confirmar/);
+
+  const mixed = await noteOf(
+    calFetch({
+      local: [cached("b1", CONFIRMED_UTC), cached("b2", NEW_TIME_UTC)],
+      bookings: { b2: booking("b2", NEW_TIME_UTC, { status: "pending" }) },
+    }),
+  );
+  assert.doesNotMatch(mixed, /no tiene citas/);
+  assert.match(mixed, /copia datetime_iso/);
+  assert.match(mixed, /pendiente_de_confirmar/);
+
+  const none = await noteOf(calFetch({ local: [] }));
+  assert.match(none, /no tiene citas próximas/);
+});
