@@ -278,6 +278,7 @@ BEGIN
       attempts = 0,
       error = NULL,
       quarantined_at = NULL,
+      transient_failures = 0,
       -- Éxito: se suelta el lease en el acto, no se espera a que venza.
       claimed_until = NULL,
       last_attempt_at = now(),
@@ -357,6 +358,8 @@ BEGIN
     attempts = CASE WHEN v_released THEN 1 ELSE cc.attempts + 1 END,
     error = EXCLUDED.error,
     quarantined_at = CASE WHEN v_released THEN NULL ELSE cc.quarantined_at END,
+    -- The provider answered: the transient streak is over.
+    transient_failures = 0,
     -- Next try in 1 h per attempt, never in the same run.
     claimed_until = v_now + make_interval(hours => CASE WHEN v_released THEN 1 ELSE cc.attempts + 1 END),
     last_attempt_at = v_now,
@@ -685,9 +688,13 @@ AS $$
 $$;
 
 -- A transient failure (5xx, network, timeout) is nobody's fault that the
--- conversation should pay for: it spends no attempt, and waits p_seconds
--- (claimed_until, the same column the lease and the failure backoff use)
--- while the run goes on with the next one.
+-- conversation should pay for: it spends no attempt, and waits (claimed_until,
+-- the same column the lease and the failure backoff use) while the run goes on
+-- with the next one. The wait doubles each time the same conversation fails
+-- that way again — p_seconds, 2x, 4x … up to a day — and resets when it is
+-- read: a conversation that always times out keeps its estimate reserved at
+-- every try (the usage is unknown), and trying it every hour would use up its
+-- workspace's daily cap by itself.
 CREATE OR REPLACE FUNCTION public.defer_classification(
   p_workspace_id UUID,
   p_conversation_id UUID,
@@ -699,6 +706,8 @@ RETURNS VOID
 LANGUAGE plpgsql
 SET search_path = ''
 AS $$
+DECLARE
+  v_base INT := LEAST(GREATEST(COALESCE(p_seconds, 3600), 60), 86400);
 BEGIN
   IF NOT EXISTS (
     SELECT 1 FROM public.conversations
@@ -707,13 +716,14 @@ BEGIN
     RAISE EXCEPTION 'conversation_not_in_workspace' USING ERRCODE = 'P0001';
   END IF;
   INSERT INTO public.conversation_classification AS cc
-    (conversation_id, workspace_id, attempts, error, claimed_until, updated_at)
+    (conversation_id, workspace_id, attempts, error, claimed_until, transient_failures, updated_at)
   VALUES (p_conversation_id, p_workspace_id, 0, p_code,
-          COALESCE(p_now, now()) + make_interval(secs => LEAST(GREATEST(COALESCE(p_seconds, 3600), 60), 86400)),
-          now())
+          COALESCE(p_now, now()) + make_interval(secs => v_base), 1, now())
   ON CONFLICT (conversation_id) DO UPDATE SET
     error = EXCLUDED.error,
-    claimed_until = EXCLUDED.claimed_until,
+    claimed_until = COALESCE(p_now, now())
+      + make_interval(secs => LEAST(v_base::bigint * (2 ^ LEAST(cc.transient_failures, 10))::bigint, 86400)),
+    transient_failures = cc.transient_failures + 1,
     updated_at = now();
 END;
 $$;

@@ -24,8 +24,12 @@ import { resolveOpenRouterKey, type OpenRouterKeyResolution } from "@/features/i
  *    The dashboard is told (note_classification_blocked 'key').
  * 2. TRANSIENT — 5xx, 408, 409, 404, the network, a timeout. Owner: nobody in
  *    particular. Response: THIS conversation waits TRANSIENT_BACKOFF_SECONDS
- *    (1 h, defer_classification), no attempt spent, and the run goes on with
- *    the next one — its workspace is not skipped.
+ *    (1 h, defer_classification), doubling each time it fails that way again
+ *    (2 h, 4 h … up to 24 h; back to 1 h once it is read), no attempt spent,
+ *    and the run goes on with the next one — its workspace is not skipped. The
+ *    doubling matters: a timeout keeps its estimate reserved (the usage is
+ *    unknown), and a conversation that always times out, tried every hour,
+ *    would use up its workspace's daily cap by itself.
  * 3. CONTENT — 400, 413, 422, a moderation 403, output that doesn't parse, a
  *    save the database rejects as data. Owner: the conversation. Response: an
  *    attempt, a backoff of 1 h per attempt, quarantine at the third.

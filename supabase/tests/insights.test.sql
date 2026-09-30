@@ -9,7 +9,7 @@ BEGIN;
 CREATE EXTENSION IF NOT EXISTS pgtap WITH SCHEMA extensions;
 SET search_path = public, extensions;
 
-SELECT plan(55);
+SELECT plan(56);
 
 -- ── Privileges ───────────────────────────────────────────────────────────────
 SELECT ok(NOT has_function_privilege('anon',
@@ -331,6 +331,13 @@ SELECT is((SELECT attempts FROM public.conversation_classification
 SELECT ok((SELECT claimed_until > now() + interval '59 minutes' FROM public.conversation_classification
             WHERE conversation_id = 'e0000000-0000-4000-8000-0000000000a7'),
   'it waits an hour before the next try');
+SELECT public.defer_classification('e0000000-0000-4000-8000-000000000001',
+  'e0000000-0000-4000-8000-0000000000a7', 'timeout', 3600);
+SELECT public.defer_classification('e0000000-0000-4000-8000-000000000001',
+  'e0000000-0000-4000-8000-0000000000a7', 'timeout', 3600);
+SELECT ok((SELECT claimed_until BETWEEN now() + interval '239 minutes' AND now() + interval '241 minutes'
+             FROM public.conversation_classification WHERE conversation_id = 'e0000000-0000-4000-8000-0000000000a7'),
+  'the wait doubles each time the same conversation fails that way again (1 h, 2 h, 4 h)');
 SELECT public.note_classification_blocked('e0000000-0000-4000-8000-000000000001', 'key');
 SELECT public.note_classification_blocked('e0000000-0000-4000-8000-000000000001', 'key');
 SELECT public.note_classification_blocked('e0000000-0000-4000-8000-000000000001', 'cap');

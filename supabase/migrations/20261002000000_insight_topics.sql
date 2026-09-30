@@ -228,6 +228,9 @@ CREATE TABLE IF NOT EXISTS public.conversation_classification (
   -- existed). With catalog_at, it tells whether a conversation was analysed
   -- FOR a given topic (get_insights), not just analysed.
   backfill_topics  UUID[] NOT NULL DEFAULT '{}',
+  -- Transient failures in a row (5xx, network, timeout): each doubles the
+  -- wait before the next try (defer_classification). Back to 0 on success.
+  transient_failures INT NOT NULL DEFAULT 0,
   updated_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
   -- FK compuesta: mismo motivo que en conversation_topics más arriba.
   CONSTRAINT fk_conversation_classification_conversation
@@ -240,6 +243,7 @@ CREATE INDEX IF NOT EXISTS idx_conversation_classification_ws
 -- backfill still reads them, as #13 did.
 ALTER TABLE public.conversation_classification ADD COLUMN IF NOT EXISTS catalog_at TIMESTAMPTZ;
 ALTER TABLE public.conversation_classification ADD COLUMN IF NOT EXISTS backfill_topics UUID[] NOT NULL DEFAULT '{}';
+ALTER TABLE public.conversation_classification ADD COLUMN IF NOT EXISTS transient_failures INT NOT NULL DEFAULT 0;
 
 -- ── RLS y privilegios ──────────────────────────────────────
 -- Escritura solo service_role: sin policies de escritura para miembros.
