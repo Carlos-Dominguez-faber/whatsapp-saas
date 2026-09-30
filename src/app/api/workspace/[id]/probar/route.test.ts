@@ -46,6 +46,7 @@ type ToolContextSeen = { playground?: { userId: string } };
 const generateOpts: Array<{
   model: string;
   maxOutputTokens: number;
+  maxSteps?: number;
   tools?: Array<{ name: string }>;
   toolContext?: ToolContextSeen;
 }> = [];
@@ -178,7 +179,12 @@ test("only read-only tools run, even for an admin", async () => {
 test("each call is reserved per person before the model, and recorded with who ran it", async () => {
   reset();
   await post();
-  assert.deepEqual(guardCalls, [{ kind: "client", args: ["ws_1", "user_1"] }]);
+  assert.equal(guardCalls.length, 1);
+  assert.equal(guardCalls[0].kind, "client");
+  assert.deepEqual(guardCalls[0].args.slice(0, 2), ["ws_1", "user_1"]);
+  // The call's token ceiling: 2 steps of the prompt + allowances + 500 out.
+  const ceiling = guardCalls[0].args[2] as number;
+  assert.ok(ceiling >= 2 * 500 && ceiling < 20_000, `ceiling ${ceiling}`);
   assert.deepEqual(calls, ["guard", "generate"]);
   assert.equal(recorded[0].type, "client_test_chat");
   assert.equal(recorded[0].reservationId, "res_1");
@@ -234,4 +240,15 @@ test("failures don't leak the model or the provider's error", async () => {
   const off = await post();
   assert.equal(off.status, 503);
   assert.doesNotMatch((await off.json()).error, /unlisted/);
+});
+
+test("REVIEW M2: at most 2 model steps, and a longer prompt reserves a higher ceiling", async () => {
+  reset();
+  await post();
+  assert.equal(generateOpts[0].maxSteps, 2);
+  const short = guardCalls[0].args[2] as number;
+  reset();
+  await post({ messages: Array.from({ length: 7 }, () => ({ role: "user", content: "x".repeat(1_000) })) });
+  const long = guardCalls[0].args[2] as number;
+  assert.ok(long - short >= 2 * Math.floor(6_990 / 3), `ceiling grew by ${long - short}`);
 });

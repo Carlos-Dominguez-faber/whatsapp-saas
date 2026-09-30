@@ -4,6 +4,7 @@ import { test, mock } from "node:test";
 let policy: { policy: string; reason: string } | Error = { policy: "allow", reason: "within_budget" };
 mock.module("./cost-enforcer.ts", {
   exports: {
+    DAILY_TOKEN_WARN_THRESHOLD: 800_000,
     enforceCostPolicy: async () => {
       if (policy instanceof Error) throw policy;
       return policy;
@@ -88,16 +89,21 @@ test("a database error answers 503 instead of calling the model unchecked", asyn
 
 test("/probar reserves one of the person's and the workspace's hourly calls", async () => {
   reset();
-  const result = await guardClientTestChat("ws_1", "user_1");
+  const result = await guardClientTestChat("ws_1", "user_1", 12_000);
   assert.deepEqual(result, { ok: true, reservationId: "res_c" });
-  assert.deepEqual(clientReserveCalls[0], ["ws_1", "user_1", CLIENT_TEST_CHAT_LIMITS]);
+  assert.deepEqual(clientReserveCalls[0], [
+    "ws_1",
+    "user_1",
+    CLIENT_TEST_CHAT_LIMITS,
+    { ceiling: 12_000, workspaceLimit: 800_000 },
+  ]);
   assert.equal(reserveCalls.length, 0, "the playground's cap is not touched");
 });
 
 test("/probar's refusals don't mention budgets, and say whose cap it was", async () => {
   reset();
   policy = { policy: "degrade", reason: "x" };
-  const budget = await guardClientTestChat("ws_1", "user_1");
+  const budget = await guardClientTestChat("ws_1", "user_1", 12_000);
   assert.equal(budget.ok, false);
   if (!budget.ok) {
     assert.equal(budget.response.status, 429);
@@ -105,10 +111,15 @@ test("/probar's refusals don't mention budgets, and say whose cap it was", async
   }
   assert.equal(clientReserveCalls.length, 0);
 
-  for (const [reason, pattern] of [["user_hour", /Llegaste/], ["workspace_hour", /Este espacio/]] as const) {
+  for (const [reason, pattern] of [
+    ["user_hour", /Llegaste/],
+    ["workspace_hour", /Este espacio/],
+    ["daily_cap", /límite de hoy/],
+    ["budget", /no está disponible/],
+  ] as const) {
     reset();
     clientReservation = { allowed: false, reason };
-    const r = await guardClientTestChat("ws_1", "user_1");
+    const r = await guardClientTestChat("ws_1", "user_1", 12_000);
     assert.equal(r.ok, false);
     if (!r.ok) assert.match((await r.response.json()).error, pattern);
   }
@@ -117,7 +128,7 @@ test("/probar's refusals don't mention budgets, and say whose cap it was", async
 test("/probar fails closed when the reservation can't be made", async () => {
   reset();
   clientReservation = new Error("db down");
-  const r = await guardClientTestChat("ws_1", "user_1");
+  const r = await guardClientTestChat("ws_1", "user_1", 12_000);
   assert.equal(r.ok, false);
   if (!r.ok) assert.equal(r.response.status, 503);
 });

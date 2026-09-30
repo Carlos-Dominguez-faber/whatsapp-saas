@@ -223,6 +223,8 @@ export async function generateChatReply(params: {
   /** Optional tool-calling: when provided, the model can invoke these tools. */
   tools?: ForgeTool[];
   toolContext?: ToolContext;
+  /** Model steps when tools are on (a tool call and its answer are two). Default 5. */
+  maxSteps?: number;
 }): Promise<GenerateReplyResult> {
   const modelId =
     params.model ??
@@ -281,7 +283,7 @@ export async function generateChatReply(params: {
           ...params.messages,
         ],
         tools: hasTools ? aiTools : undefined,
-        stopWhen: hasTools ? stepCountIs(5) : undefined,
+        stopWhen: hasTools ? stepCountIs(params.maxSteps ?? 5) : undefined,
         maxOutputTokens: params.maxOutputTokens ?? 512,
         abortSignal: AbortSignal.timeout(
           hasTools ? LLM_TOOL_TURN_TIMEOUT_MS : LLM_TIMEOUT_MS,

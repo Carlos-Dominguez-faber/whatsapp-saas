@@ -301,22 +301,28 @@ export async function reserveWorkspaceLlmCall(
   return { allowed: true, reservationId: row.reservation_id ?? undefined };
 }
 
+export type ClientTestChatRefusal = "user_hour" | "workspace_hour" | "daily_cap" | "budget";
+
 export interface ReserveClientTestChatResult {
   allowed: boolean;
-  reason?: "user_hour" | "workspace_hour";
+  reason?: ClientTestChatRefusal;
   reservationId?: string;
 }
 
 /**
- * Atomically claims one /probar call for `userId` in the workspace, or denies
- * once the person or the workspace reached their calls of the last hour. Same
+ * Atomically claims one /probar call for `userId` in the workspace: under the
+ * person's and the workspace's calls of the last hour, with the call's token
+ * ceiling fitting /probar's daily cap and keeping the workspace's day under
+ * `workspaceLimit` (see 20261002000003_client_test_chat). The reservation
+ * holds the ceiling until recordWorkspaceLlmCall settles the real count. Same
  * contract as reserveWorkspaceLlmCall: a database error throws, and a missing
  * function (code deployed before `db-push`) falls back to a plain count.
  */
 export async function reserveClientTestChat(
   workspaceId: string,
   userId: string,
-  limits: { perUserHour: number; perWorkspaceHour: number },
+  limits: { perUserHour: number; perWorkspaceHour: number; dailyTokens: number },
+  tokens: { ceiling: number; workspaceLimit: number },
 ): Promise<ReserveClientTestChatResult> {
   const supabase = svc();
 
@@ -325,6 +331,9 @@ export async function reserveClientTestChat(
     p_user_id: userId,
     p_workspace_hourly_limit: limits.perWorkspaceHour,
     p_user_hourly_limit: limits.perUserHour,
+    p_ceiling: tokens.ceiling,
+    p_daily_cap: limits.dailyTokens,
+    p_workspace_limit: tokens.workspaceLimit,
   });
 
   if (error) {
@@ -346,7 +355,9 @@ export async function reserveClientTestChat(
   )?.[0];
 
   if (!row?.allowed) {
-    return { allowed: false, reason: row?.reason === "user_hour" ? "user_hour" : "workspace_hour" };
+    const known: ClientTestChatRefusal[] = ["user_hour", "workspace_hour", "daily_cap", "budget"];
+    const reason = known.find((r) => r === row?.reason) ?? "workspace_hour";
+    return { allowed: false, reason };
   }
 
   return { allowed: true, reservationId: row.reservation_id ?? undefined };

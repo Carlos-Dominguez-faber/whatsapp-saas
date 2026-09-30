@@ -303,3 +303,9 @@ test("a turn that failed after a write says so, distinctly, instead of inviting 
   assert.equal(plain.wroteSomething, undefined);
   assert.match(plain.error, /No se pudo generar la respuesta/);
 });
+
+test("the playground keeps its 5 steps (only /probar is capped at 2)", async () => {
+  reset();
+  await post();
+  assert.equal((generateOpts[0] as { maxSteps?: number }).maxSteps, undefined);
+});

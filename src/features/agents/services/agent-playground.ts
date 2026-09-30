@@ -93,6 +93,31 @@ export type RunAgentPlaygroundResult =
       wroteSomething: boolean;
     };
 
+/** /probar's model steps: one tool call and the answer that uses it. */
+export const PROBAR_MAX_STEPS = 2;
+/** What the KB excerpts (3) and the reference links may add to the prompt. */
+const KB_ALLOWANCE_BYTES = 8_000;
+/** Tool definitions sent with each step, and a tool's result in the second. */
+const TOOLS_ALLOWANCE_BYTES = 8_000;
+
+/**
+ * The most a /probar call can spend, reserved before it runs. Text in Spanish
+ * or English runs about 4 bytes per token; counting 3 keeps it a ceiling.
+ * Every step sends the whole prompt again, and writes up to maxOutputTokens.
+ */
+export function probarTokenCeiling(
+  systemPrompt: string,
+  messages: PlaygroundMessage[],
+  maxOutputTokens: number,
+): number {
+  const bytes =
+    Buffer.byteLength(systemPrompt, "utf8") +
+    messages.reduce((n, m) => n + Buffer.byteLength(m.content, "utf8"), 0) +
+    KB_ALLOWANCE_BYTES +
+    TOOLS_ALLOWANCE_BYTES;
+  return PROBAR_MAX_STEPS * (Math.ceil(bytes / 3) + maxOutputTokens);
+}
+
 function svc() {
   return svcClient(
     process.env.NEXT_PUBLIC_SUPABASE_URL!,
@@ -134,13 +159,6 @@ export async function runAgentPlayground(
     surface,
   );
 
-  // Budget and hourly caps before anything that spends, KB embeddings included.
-  const guard =
-    surface === "client_test_chat"
-      ? await guardClientTestChat(workspaceId, input.userId)
-      : await guardWorkspaceLlmCall(workspaceId, "agent_test_chat");
-  if (!guard.ok) return { ok: false, reason: "refused", response: guard.response };
-
   let promptBody = surface === "agent_test_chat" ? input.draftPromptBody : undefined;
   let guardrails: PromptGuardrails | null = null;
   if (!promptBody) {
@@ -161,6 +179,36 @@ export async function runAgentPlayground(
     "tu negocio";
   const bizContext = buildBusinessInfoContext(info);
   const timeZone = await workspaceSchedulingTimeZone(workspaceId, info);
+  const agentConfig = (agent.config ?? {}) as AgentConfig;
+  const promptFor = (kbContext: string) =>
+    buildSystemPrompt({
+      nowContext: buildNowContext(timeZone),
+      bizContext,
+      promptBase: promptBody,
+      kbContext,
+      responseStyle: agentConfig.responseStyle ?? null,
+      guardrails,
+      vars: {
+        agentName: agent.name as string,
+        businessName,
+        contactName: "",
+      },
+    });
+
+  // Budget and hourly caps before anything that spends, KB embeddings
+  // included. /probar also reserves the call's token ceiling (its own daily
+  // cap, and never past the workspace's degrade threshold): the prompt is
+  // known by now, except the KB excerpts and the tool results, which get a
+  // fixed allowance.
+  const guard =
+    surface === "client_test_chat"
+      ? await guardClientTestChat(
+          workspaceId,
+          input.userId,
+          probarTokenCeiling(promptFor(""), input.messages, input.maxOutputTokens),
+        )
+      : await guardWorkspaceLlmCall(workspaceId, "agent_test_chat");
+  if (!guard.ok) return { ok: false, reason: "refused", response: guard.response };
 
   // KB: search with the latest user message, just like buffer.ts.
   const lastUserMessage =
@@ -175,21 +223,7 @@ export async function runAgentPlayground(
   ]
     .filter(Boolean)
     .join("\n\n");
-
-  const agentConfig = (agent.config ?? {}) as AgentConfig;
-  const systemPrompt = buildSystemPrompt({
-    nowContext: buildNowContext(timeZone),
-    bizContext,
-    promptBase: promptBody,
-    kbContext,
-    responseStyle: agentConfig.responseStyle ?? null,
-    guardrails,
-    vars: {
-      agentName: agent.name as string,
-      businessName,
-      contactName: "",
-    },
-  });
+  const systemPrompt = promptFor(kbContext);
 
   // In Settings, an admin tests with every tool the workspace has on, writes
   // included (booking — the playground has no contact to cancel or
@@ -211,6 +245,7 @@ export async function runAgentPlayground(
       systemPrompt,
       messages: input.messages,
       maxOutputTokens: input.maxOutputTokens,
+      ...(surface === "client_test_chat" ? { maxSteps: PROBAR_MAX_STEPS } : {}),
       workspaceId,
       tools,
       toolContext: {
