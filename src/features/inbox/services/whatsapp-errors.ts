@@ -86,7 +86,7 @@ export const WINDOW_EXPIRED_MESSAGE =
   "Pasaron más de 24 horas desde el último mensaje del contacto. Envía una plantilla para retomar la conversación.";
 
 export const OPT_OUT_MESSAGE =
-  "Este contacto pidió no recibir más mensajes por WhatsApp. Solo puedes escribirle si vuelve a contactarte.";
+  "Este contacto pidió no recibir mensajes automáticos ni plantillas. Puedes responderle mientras su conversación siga abierta (24 horas desde su último mensaje).";
 
 /**
  * Códigos de la Cloud API → texto accionable + si conviene reintentar.

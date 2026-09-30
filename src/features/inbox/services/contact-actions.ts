@@ -9,6 +9,7 @@ import { createClient } from "@/lib/supabase/server";
 import { checkWorkspaceMember } from "@/lib/auth/workspace-access";
 import { syncContactToHL } from "./highlevel-client";
 import type { ContactRow } from "@/features/inbox/types";
+import { applyContactUpdate } from "./contact-update";
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Schemas
@@ -59,20 +60,17 @@ export async function updateContact(
     return { ok: false, error: "No se proporcionaron campos a actualizar" };
   }
 
-  // 3. Update contact (RLS ensures user can only update their workspace's contacts)
-  const { data: updated, error: updateError } = await supabase
-    .from("contacts")
-    .update({ ...parsed.data, updated_at: new Date().toISOString() })
-    .eq("id", contactId)
-    .select("id, workspace_id")
-    .single();
+  // 3. Update contact (RLS ensures user can only update their workspace's
+  //    contacts; the opt-in only changes when it differs from the stored one)
+  const result = await applyContactUpdate(
+    supabase,
+    contactId,
+    parsed.data,
+    "id, workspace_id",
+  );
+  if (!result.ok) return { ok: false, error: result.error };
 
-  if (updateError || !updated) {
-    console.error("[updateContact] Supabase error:", updateError?.message);
-    return { ok: false, error: "Error al actualizar el contacto" };
-  }
-
-  const { id: updatedId, workspace_id } = updated as {
+  const { id: updatedId, workspace_id } = result.contact as {
     id: string;
     workspace_id: string;
   };

@@ -47,3 +47,14 @@ export function reportMissingFunctionOnce(fnName: string, fallback: string): voi
     `[db] ${fnName} is missing — run \`setup.mjs db-push\`. Until then: ${fallback}`,
   );
 }
+
+/**
+ * True when a Supabase/PostgREST error means `column` does not exist yet
+ * (Postgres 42703, undefined_column) — code deployed before the migration that
+ * adds it. Matched on the column name so an unrelated typo still surfaces.
+ */
+export function isMissingColumnError(error: unknown, column: string): boolean {
+  const e = error as { code?: unknown; message?: unknown } | null;
+  if (!e || e.code !== "42703") return false;
+  return typeof e.message === "string" && e.message.includes(column);
+}

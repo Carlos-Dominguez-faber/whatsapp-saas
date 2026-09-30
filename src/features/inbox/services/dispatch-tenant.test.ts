@@ -48,11 +48,14 @@ const tables: Record<string, Row[]> = {
 let upserted: Array<{ table: string; row: Row }> = [];
 tables.messages = [];
 tables.events = [];
+tables.contact_opt_outs = [];
 /** The messages table as dispatch left it. */
 const msgs = () => tables.messages;
 
 /** The next N UPDATEs fail. */
 let failUpdates = 0;
+/** Reads of these tables fail like a dropped connection. */
+const failReads = new Set<string>();
 
 // A PostgREST-ish fake that honors eq() on reads, updates and deletes, so a
 // write scoped to the wrong row or workspace misses, as it would for real.
@@ -75,7 +78,12 @@ function query(table: string, mode: "select" | "update" | "delete" = "select", p
         ? { data: r[0], error: null }
         : { data: null, error: { message: "JSON object requested, multiple (or no) rows returned" } };
     },
+    limit: async (n: number) =>
+      failReads.has(table)
+        ? { data: null, error: { message: "connection refused" } }
+        : { data: rows().slice(0, n), error: null },
     maybeSingle: async () => {
+      if (failReads.has(table)) return { data: null, error: { message: "connection refused" } };
       const r = rows();
       return r.length > 1
         ? { data: null, error: { message: "multiple rows" } }
@@ -176,7 +184,8 @@ mock.module("./kapso-client.ts", {
   },
 });
 
-const { dispatchText, dispatchTemplate } = await import("./dispatch.ts");
+const { dispatchText, dispatchTemplate, prepareTemplateDispatch, sendPreparedTemplate } =
+  await import("./dispatch.ts");
 
 function reset() {
   tables.messages = [];
@@ -184,6 +193,8 @@ function reset() {
   upserted = [];
   sends = [];
   ycloudFailure = null;
+  failReads.clear();
+  tables.contact_opt_outs = [];
   (tables.contacts[0] as Row).opt_in = true;
 }
 
@@ -239,15 +250,18 @@ test("a conversation from another workspace is not sent nor persisted", async ()
   assert.equal(msgs().length, 0);
 });
 
-test("an opted-out contact is not sent to", async () => {
+test("an opted-out contact still gets replies in the open window, never a template", async () => {
   reset();
   (tables.contacts[0] as Row).opt_in = false;
-  const res = await dispatchText({ workspaceId: "ws_a", conversationId: "conv_a", body: "hola" });
-  assert.equal(res.ok, false);
-  assert.equal(res.errorCode, "OPT_OUT");
-  assert.match(res.error ?? "", /pidió no recibir/);
-  assert.equal(sends.length, 0);
-  assert.equal(msgs().length, 0);
+  const reply = await dispatchText({ workspaceId: "ws_a", conversationId: "conv_a", body: "hola" });
+  assert.equal(reply.ok, true, "STOP stops proactive messages, not the replies they asked for");
+  assert.equal(sends.length, 1);
+
+  const tpl = await dispatchTemplate({ workspaceId: "ws_a", conversationId: "conv_a", templateName: "welcome" });
+  assert.equal(tpl.ok, false);
+  assert.equal(tpl.errorCode, "OPT_OUT");
+  assert.match(tpl.error ?? "", /no recibir mensajes automáticos ni plantillas/);
+  assert.equal(sends.length, 1, "the template never left");
 });
 
 test("a workspace without an active WhatsApp provider fails loudly", async () => {
@@ -385,8 +399,10 @@ test("extra meta (the buffer's batch id) lands on the outbound row", async () =>
 });
 
 test("a blocked AI reply leaves an internal note with its text; a person's send doesn't", async () => {
+  const closeWindow = () =>
+    ((tables.conversations[0] as Row).window_expires_at = "2020-01-01T00:00:00Z");
   reset();
-  (tables.contacts[0] as Row).opt_in = false;
+  closeWindow();
   await dispatchText({ workspaceId: "ws_a", conversationId: "conv_a", body: "tu cita", noteWhenBlocked: true });
   assert.equal(sends.length, 0);
   assert.equal(msgs().length, 1);
@@ -395,8 +411,9 @@ test("a blocked AI reply leaves an internal note with its text; a person's send 
   assert.match(String(msgs()[0].body), /tu cita/);
 
   reset();
-  (tables.contacts[0] as Row).opt_in = false;
+  closeWindow();
   await dispatchText({ workspaceId: "ws_a", conversationId: "conv_a", body: "hola" });
+  (tables.conversations[0] as Row).window_expires_at = null;
   assert.equal(msgs().length, 0);
 });
 
@@ -415,4 +432,115 @@ test("a conversation the send can't find is logged for the workspace", async () 
   await dispatchText({ workspaceId: "ws_a", conversationId: "conv_b", body: "hola", noteWhenBlocked: true });
   assert.equal(msgs().length, 0);
   assert.equal(tables.events[0]?.type, "outbound_not_sent");
+});
+
+// ── prepare / send split (the automation engine marks its run in between) ────
+
+test("preparing a template reads everything and neither writes nor sends", async () => {
+  reset();
+  const prep = await prepareTemplateDispatch({
+    workspaceId: "ws_b",
+    conversationId: "conv_b",
+    templateName: "recordatorio",
+    templateLanguage: "es_MX",
+  });
+  assert.equal(prep.ok, true);
+  if (!prep.ok) return;
+  assert.equal(prep.prepared.toPhone, "+15550000002");
+  assert.equal(prep.prepared.sender.live, true);
+  assert.equal(sends.length, 0);
+  assert.equal(msgs().length, 0);
+});
+
+test("sending a prepared template queues the row with its meta, then sends in its language", async () => {
+  reset();
+  const prep = await prepareTemplateDispatch({
+    workspaceId: "ws_b",
+    conversationId: "conv_b",
+    templateName: "recordatorio",
+    templateLanguage: "es_MX",
+    meta: { automation_rule_id: "rule_1", automation_run_id: "run_1" },
+  });
+  assert.equal(prep.ok, true);
+  if (!prep.ok) return;
+  const res = await sendPreparedTemplate(prep.prepared);
+  assert.equal(res.ok, true);
+  assert.equal(sends.length, 1);
+  assert.equal(sends[0].provider, "kapso");
+  assert.equal(sends[0].language, "es_MX");
+  const row = msgs()[0];
+  assert.equal(row.workspace_id, "ws_b");
+  assert.equal(row.type, "template");
+  assert.equal((row.meta as Row).automation_run_id, "run_1");
+  assert.equal((row.meta as Row).template_language, "es_MX");
+});
+
+test("preparing refuses another workspace's conversation and an opted-out contact, for good", async () => {
+  reset();
+  const other = await prepareTemplateDispatch({
+    workspaceId: "ws_a",
+    conversationId: "conv_b",
+    templateName: "welcome",
+  });
+  assert.deepEqual(other.ok ? null : [other.errorCode, other.retryable], ["NOT_FOUND", false]);
+
+  (tables.contacts[0] as Row).opt_in = false;
+  const optedOut = await prepareTemplateDispatch({
+    workspaceId: "ws_a",
+    conversationId: "conv_a",
+    templateName: "welcome",
+  });
+  assert.deepEqual(optedOut.ok ? null : [optedOut.errorCode, optedOut.retryable], ["OPT_OUT", false]);
+  assert.equal(sends.length, 0);
+  assert.equal(msgs().length, 0);
+});
+
+test("a failed read of the integration is retryable, not a missing integration", async () => {
+  reset();
+  failReads.add("integrations");
+  const prep = await prepareTemplateDispatch({
+    workspaceId: "ws_a",
+    conversationId: "conv_a",
+    templateName: "welcome",
+  });
+  assert.deepEqual(prep.ok ? null : [prep.errorCode, prep.retryable], ["DB_ERROR", true]);
+});
+
+test("an unattended sender refuses development mode; an interactive send accepts it", async () => {
+  reset();
+  const live = tables.integrations[0].credentials;
+  tables.integrations[0].credentials = { ycloud_api_key: "placeholder" };
+  try {
+    const unattended = await prepareTemplateDispatch({
+      workspaceId: "ws_a",
+      conversationId: "conv_a",
+      templateName: "welcome",
+    });
+    assert.deepEqual(unattended.ok ? null : [unattended.errorCode, unattended.retryable], [
+      "CONFIG_ERROR",
+      false,
+    ]);
+    const interactive = await dispatchTemplate({
+      workspaceId: "ws_a",
+      conversationId: "conv_a",
+      templateName: "welcome",
+    });
+    assert.equal(interactive.ok, true);
+    assert.equal(sends.length, 0, "development mode records the row and sends nothing");
+  } finally {
+    tables.integrations[0].credentials = live;
+  }
+});
+
+test("a phone that opted out is refused a template even if its contact row says opted in", async () => {
+  reset();
+  // The contact was deleted and re-created after its STOP: the row is clean,
+  // the phone's suppression is not.
+  tables.contact_opt_outs.push({ workspace_id: "ws_a", phone_key: "15550000001" });
+  const tpl = await dispatchTemplate({ workspaceId: "ws_a", conversationId: "conv_a", templateName: "welcome" });
+  assert.equal(tpl.errorCode, "OPT_OUT");
+  assert.equal(sends.length, 0);
+
+  const other = await dispatchTemplate({ workspaceId: "ws_b", conversationId: "conv_b", templateName: "welcome" });
+  assert.equal(other.ok, true, "another workspace's suppression doesn't apply");
 });

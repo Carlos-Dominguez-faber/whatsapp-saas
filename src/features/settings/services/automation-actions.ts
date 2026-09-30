@@ -4,23 +4,21 @@ import { z } from "zod";
 import { revalidatePath } from "next/cache";
 import { createClient } from "@/lib/supabase/server";
 import { createClient as createSbClient } from "@supabase/supabase-js";
+import {
+  AutomationRuleInputSchema,
+  AutomationRuleUpdateSchema,
+  firstErrorMessage,
+  type ActionType,
+  type TriggerType,
+} from "@/features/automations/lib/rule-schema";
+import {
+  assertActiveRuleCap,
+  RuleCapError,
+} from "@/features/automations/services/rule-cap";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
-export type TriggerType =
-  | "first_message"
-  | "inactivity_24h"
-  | "window_closing"
-  | "handoff_requested"
-  | "lead_qualified"
-  | "keyword_match";
-
-export type ActionType =
-  | "send_template"
-  | "assign_agent"
-  | "add_tag"
-  | "close_conversation"
-  | "handoff_human";
+export type { TriggerType, ActionType };
 
 export interface AutomationRule {
   id: string;
@@ -31,6 +29,12 @@ export interface AutomationRule {
   trigger_config: Record<string, unknown>;
   action_type: ActionType;
   action_config: Record<string, unknown>;
+  /**
+   * Why the system switched the rule off, when it did: 'upgrade' (enabled
+   * before the automation engine existed, so it never ran) or
+   * 'template_paused' (Meta paused its template). Cleared on re-enable.
+   */
+  paused_reason?: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -59,6 +63,7 @@ async function assertAdminOrManager(
     .select("role")
     .eq("workspace_id", workspaceId)
     .eq("user_id", user.id)
+    .eq("is_active", true)
     .maybeSingle();
 
   if (!member) return { error: "Sin permisos" };
@@ -69,56 +74,45 @@ async function assertAdminOrManager(
   }
 }
 
-// ── Schemas ───────────────────────────────────────────────────────────────────
-
-const TRIGGER_TYPES = [
-  "first_message",
-  "inactivity_24h",
-  "window_closing",
-  "handoff_requested",
-  "lead_qualified",
-  "keyword_match",
-] as const;
-
-const ACTION_TYPES = [
-  "send_template",
-  "assign_agent",
-  "add_tag",
-  "close_conversation",
-  "handoff_human",
-] as const;
-
-const SaveSchema = z.object({
-  id: z.string().uuid().optional(),
-  name: z.string().min(1).max(120),
-  enabled: z.boolean().default(true),
-  trigger_type: z.enum(TRIGGER_TYPES),
-  trigger_config: z.record(z.string(), z.unknown()).default({}),
-  action_type: z.enum(ACTION_TYPES),
-  action_config: z.record(z.string(), z.unknown()).default({}),
-});
-
 // ── saveAutomationRule ────────────────────────────────────────────────────────
 
 export async function saveAutomationRule(
   workspaceId: string,
   rule: Omit<
     AutomationRule,
-    "workspace_id" | "created_at" | "updated_at" | "id"
+    "workspace_id" | "created_at" | "updated_at" | "id" | "enabled"
   > & {
     id?: string;
+    /** Omitted on an edit that didn't touch the switch: the rule keeps its state. */
+    enabled?: boolean;
   },
 ): Promise<{ data?: AutomationRule; error?: string }> {
   const authCheck = await assertAdminOrManager(workspaceId);
   if (authCheck && "error" in authCheck) return authCheck;
 
-  const parsed = SaveSchema.safeParse(rule);
+  // An edit goes through the update schema, where `enabled` has no default:
+  // saving a rule never switches it on unless the switch says so.
+  const parsed = rule.id
+    ? AutomationRuleUpdateSchema.safeParse(rule)
+    : AutomationRuleInputSchema.safeParse(rule);
   if (!parsed.success) {
-    return { error: parsed.error.issues[0].message };
+    return { error: firstErrorMessage(parsed.error) };
   }
 
   const db = svc();
-  const { id, ...fields } = parsed.data;
+  const { id, ...fields } = parsed.data as typeof parsed.data & { id?: string };
+
+  // Tope de reglas activas. Mismo criterio que la ruta de API: solo
+  // se comprueba cuando la regla queda HABILITADA, y al editar se excluye a sí
+  // misma del conteo (si no, guardar la regla nº 20 se rechazaría sola).
+  if (fields.enabled === true) {
+    try {
+      await assertActiveRuleCap(db, workspaceId, { excludeRuleId: id });
+    } catch (err) {
+      if (err instanceof RuleCapError) return { error: err.message };
+      return { error: "No se pudo guardar la automatización. Intenta de nuevo." };
+    }
+  }
 
   if (id) {
     // Update
@@ -196,7 +190,28 @@ export async function toggleAutomationRule(
   const idParsed = z.string().uuid().safeParse(ruleId);
   if (!idParsed.success) return { error: "ID de regla inválido" };
 
+  // Una server action es un endpoint HTTP público: `enabled` llega sin pasar
+  // por el schema de la regla, así que un caller puede mandar cualquier cosa
+  // (p. ej. el string "false", que es truthy en JS) y terminaría escribiéndose
+  // en una columna boolean.
+  const enabledParsed = z.boolean().safeParse(enabled);
+  if (!enabledParsed.success) {
+    return { error: "El estado de la automatización no es válido" };
+  }
+
   const db = svc();
+
+  // Tope de reglas activas. Deshabilitar nunca se rechaza: solo el
+  // toggle a `true` puede pasarse del tope.
+  if (enabled) {
+    try {
+      await assertActiveRuleCap(db, workspaceId, { excludeRuleId: ruleId });
+    } catch (err) {
+      if (err instanceof RuleCapError) return { error: err.message };
+      return { error: "No se pudo guardar la automatización. Intenta de nuevo." };
+    }
+  }
+
   const { data, error } = await db
     .from("automation_rules")
     .update({ enabled, updated_at: new Date().toISOString() })

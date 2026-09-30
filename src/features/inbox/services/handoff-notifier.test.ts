@@ -82,6 +82,11 @@ mock.module("./whatsapp-provider.ts", {
   },
 });
 
+let contactOptedOut = false;
+mock.module("./opt-out.ts", {
+  exports: { conversationContactOptedOut: async () => contactOptedOut },
+});
+
 const dispatchCalls: unknown[] = [];
 let dispatchResult: { ok: boolean; error?: string; errorCode?: string } = {
   ok: true,
@@ -280,4 +285,30 @@ test("dedupe cruzado de OTRO workspace no silencia el ACK real de este workspace
   });
 
   assert.equal(dispatchCalls.length, 1, "el ACK real no se puede quedar sin mandar");
+});
+
+test("an automation's handoff sends no ACK to a contact who opted out", async () => {
+  reset();
+  contactOptedOut = true;
+  await notifyHandoffPending({ workspaceId: "ws_1", conversationId: "conv_1", trigger: "automation" });
+  contactOptedOut = false;
+  assert.equal(dispatchCalls.length, 0);
+  const skipped = inserts.find(
+    (i) => (i.row as { type: string }).type === "handoff_ack_skipped",
+  );
+  assert.equal((skipped?.row as { payload: { reason: string } }).payload.reason, "opted_out");
+});
+
+test("an automation's handoff still acknowledges a contact who didn't opt out", async () => {
+  reset();
+  await notifyHandoffPending({ workspaceId: "ws_1", conversationId: "conv_1", trigger: "automation" });
+  assert.equal(dispatchCalls.length, 1);
+});
+
+test("the contact's own handoff request is acknowledged even after a STOP (a reply in their window)", async () => {
+  reset();
+  contactOptedOut = true;
+  await notifyHandoffPending({ workspaceId: "ws_1", conversationId: "conv_1", trigger: "keyword" });
+  contactOptedOut = false;
+  assert.equal(dispatchCalls.length, 1);
 });

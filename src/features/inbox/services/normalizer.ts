@@ -16,6 +16,8 @@ export interface InboundMessage {
   customerName: string | null;
   /** The provider's own type, before clamping (e.g. "reaction"). */
   rawType?: string;
+  /** When the contact sent it (ISO), per the provider. */
+  createTime?: string | null;
 }
 
 function svc() {
@@ -23,6 +25,13 @@ function svc() {
     process.env.NEXT_PUBLIC_SUPABASE_URL!,
     process.env.SUPABASE_SERVICE_ROLE_KEY!,
   );
+}
+
+/** The provider's send time as ISO, or null when it isn't a valid time. */
+function sentAt(value: string | null | undefined): string | null {
+  if (!value) return null;
+  const ms = Date.parse(value);
+  return Number.isFinite(ms) ? new Date(ms).toISOString() : null;
 }
 
 // Kept here too: callers import them from the normalizer.
@@ -63,8 +72,9 @@ export async function processInbound(
 
   // 1. Upsert contact
   // A user messaging the business first is implicit opt-in for service
-  // messages within the 24h window, so inbound contacts are opted in.
-  // (STOP-keyword opt-out handling is future work and would guard this.)
+  // messages within the 24h window, so inbound contacts are opted in — unless
+  // they opted out explicitly: trg_contacts_opt_out keeps opt_in false while
+  // their phone is in contact_opt_outs.
   const { data: contactData, error: contactError } = await supabase
     .from("contacts")
     .upsert(
@@ -138,6 +148,8 @@ export async function processInbound(
         status: "delivered",
         meta: {
           from_name: normalized.customerName,
+          // When the contact sent it: STOP/START are settled by this time.
+          ...(sentAt(normalized.createTime) ? { sent_at: sentAt(normalized.createTime) } : {}),
           // Kept in the thread, never answered: the webhook doesn't batch it,
           // and this keeps the orphan reconciler from batching it either.
           ...(normalized.rawType === "reaction" ? { no_reply: true } : {}),
@@ -157,6 +169,11 @@ export async function processInbound(
   }
 
   const message = msgData ? (msgData as MessageRow) : null;
+
+  // 4. STOP / START: applied by the database in the same statement that
+  //    stored the message (trg_messages_opt_out), so a failure fails the
+  //    insert and the webhook is retried, and a redelivery (not inserted)
+  //    never re-applies an old STOP.
 
   // F8-D1: media download hooks in here when message.type !== 'text' and message is not a dedup.
   // The webhook handler extracts the media `link` from the raw provider payload and passes it

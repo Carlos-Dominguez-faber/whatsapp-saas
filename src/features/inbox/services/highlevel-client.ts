@@ -98,6 +98,22 @@ function splitName(fullName: string | null): {
 export async function getHLConfig(
   workspaceId: string,
 ): Promise<HLConfig | null> {
+  return readHLConfig(workspaceId, false);
+}
+
+/**
+ * Like `getHLConfig`, but a failed read throws instead of reading as "not
+ * connected": for callers that must fail closed (a reminder must not skip its
+ * HighLevel check because the integration row couldn't be read).
+ */
+export async function loadHLConfig(workspaceId: string): Promise<HLConfig | null> {
+  return readHLConfig(workspaceId, true);
+}
+
+async function readHLConfig(
+  workspaceId: string,
+  throwOnReadError: boolean,
+): Promise<HLConfig | null> {
   const supabase = svc();
   const { data, error } = await supabase
     .from("integrations")
@@ -107,6 +123,9 @@ export async function getHLConfig(
     .eq("enabled", true)
     .maybeSingle();
 
+  if (error && throwOnReadError) {
+    throw new Error(`[HL] could not read the HighLevel integration: ${error.message}`);
+  }
   if (error || !data) return null;
 
   const creds = await decryptCredentials(
@@ -143,7 +162,7 @@ export async function getHLConfig(
  * zone used to look like, so it counts only when the location lookup wrote
  * it (timezone_source "location", see saveHLLocationTimeZone).
  */
-function hlZoneOf(config: Record<string, unknown>): string | null {
+export function hlZoneOf(config: Record<string, unknown>): string | null {
   const tz = config.timezone;
   if (!isIanaTimeZone(tz)) return null;
   if (tz.trim() === "UTC" && config.timezone_source !== "location") return null;

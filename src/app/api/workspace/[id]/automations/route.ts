@@ -4,6 +4,16 @@ import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
 import { createClient } from "@/lib/supabase/server";
 import { createClient as createSbClient } from "@supabase/supabase-js";
+import {
+  AutomationRuleInputSchema,
+  AutomationRuleUpdateSchema,
+  firstErrorMessage,
+} from "@/features/automations/lib/rule-schema";
+import {
+  assertActiveRuleCap,
+  RuleCapError,
+} from "@/features/automations/services/rule-cap";
+import { loadAutomationHealth } from "@/features/automations/services/rule-health";
 
 // ── Service-role client ───────────────────────────────────────────────────────
 
@@ -26,47 +36,12 @@ async function resolveMember(
     .select("role")
     .eq("workspace_id", workspaceId)
     .eq("user_id", userId)
+    .eq("is_active", true)
     .maybeSingle();
   return data;
 }
 
 // ── Validation schemas ────────────────────────────────────────────────────────
-
-const TRIGGER_TYPES = [
-  "first_message",
-  "inactivity_24h",
-  "window_closing",
-  "handoff_requested",
-  "lead_qualified",
-  "keyword_match",
-] as const;
-
-const ACTION_TYPES = [
-  "send_template",
-  "assign_agent",
-  "add_tag",
-  "close_conversation",
-  "handoff_human",
-] as const;
-
-const CreateSchema = z.object({
-  name: z.string().min(1).max(120),
-  enabled: z.boolean().default(true),
-  trigger_type: z.enum(TRIGGER_TYPES),
-  trigger_config: z.record(z.string(), z.unknown()).default({}),
-  action_type: z.enum(ACTION_TYPES),
-  action_config: z.record(z.string(), z.unknown()).default({}),
-});
-
-const UpdateSchema = z.object({
-  id: z.string().uuid(),
-  name: z.string().min(1).max(120).optional(),
-  enabled: z.boolean().optional(),
-  trigger_type: z.enum(TRIGGER_TYPES).optional(),
-  trigger_config: z.record(z.string(), z.unknown()).optional(),
-  action_type: z.enum(ACTION_TYPES).optional(),
-  action_config: z.record(z.string(), z.unknown()).optional(),
-});
 
 const DeleteSchema = z.object({
   id: z.string().uuid(),
@@ -110,7 +85,9 @@ export async function GET(
     );
   }
 
-  return NextResponse.json({ data: data ?? [] });
+  // How each rule is doing; null when it can't be read (the rules still load).
+  const health = await loadAutomationHealth(db, workspaceId);
+  return NextResponse.json({ data: data ?? [], health });
 }
 
 // ── POST /api/workspace/[id]/automations ──────────────────────────────────────
@@ -150,18 +127,40 @@ export async function POST(
     return NextResponse.json({ error: "Body inválido" }, { status: 400 });
   }
 
-  const parsed = CreateSchema.safeParse(body);
+  const parsed = AutomationRuleInputSchema.safeParse(body);
   if (!parsed.success) {
     return NextResponse.json(
-      { error: parsed.error.flatten() },
+      { error: firstErrorMessage(parsed.error) },
       { status: 400 },
     );
   }
 
+  // El schema compartido trae `id` opcional (lo usa el update); en un POST la
+  // clave la genera la base, así que no se propaga lo que mande el cliente.
+  const { id: _ignoredId, ...fields } = parsed.data;
+
   const db = svc();
+
+  // Tope de reglas activas. Solo cuenta si la regla nueva nace
+  // habilitada: crear una deshabilitada nunca puede pasarse del tope.
+  if (parsed.data.enabled) {
+    try {
+      await assertActiveRuleCap(db, workspaceId);
+    } catch (err) {
+      if (err instanceof RuleCapError) {
+        return NextResponse.json({ error: err.message }, { status: 422 });
+      }
+      // Conteo caído: fail-closed. El detalle ya se logueó en el helper.
+      return NextResponse.json(
+        { error: "Error interno del servidor" },
+        { status: 500 },
+      );
+    }
+  }
+
   const { data, error } = await db
     .from("automation_rules")
-    .insert({ workspace_id: workspaceId, ...parsed.data })
+    .insert({ workspace_id: workspaceId, ...fields })
     .select()
     .single();
 
@@ -213,10 +212,10 @@ export async function PATCH(
     return NextResponse.json({ error: "Body inválido" }, { status: 400 });
   }
 
-  const parsed = UpdateSchema.safeParse(body);
+  const parsed = AutomationRuleUpdateSchema.safeParse(body);
   if (!parsed.success) {
     return NextResponse.json(
-      { error: parsed.error.flatten() },
+      { error: firstErrorMessage(parsed.error) },
       { status: 400 },
     );
   }
@@ -224,6 +223,26 @@ export async function PATCH(
   const { id, ...fields } = parsed.data;
 
   const db = svc();
+
+  // Active-rule cap: checked only when this PATCH explicitly enables the rule.
+  // `enabled` has no default in the update schema, so a PATCH without it
+  // (a rename, a new template) keeps the rule's current state and never
+  // re-enables it. `excludeRuleId` keeps an already-active rule from counting
+  // against itself.
+  if (fields.enabled === true) {
+    try {
+      await assertActiveRuleCap(db, workspaceId, { excludeRuleId: id });
+    } catch (err) {
+      if (err instanceof RuleCapError) {
+        return NextResponse.json({ error: err.message }, { status: 422 });
+      }
+      return NextResponse.json(
+        { error: "Error interno del servidor" },
+        { status: 500 },
+      );
+    }
+  }
+
   const { data, error } = await db
     .from("automation_rules")
     .update({ ...fields, updated_at: new Date().toISOString() })
@@ -283,7 +302,7 @@ export async function DELETE(
   const parsed = DeleteSchema.safeParse(body);
   if (!parsed.success) {
     return NextResponse.json(
-      { error: parsed.error.flatten() },
+      { error: firstErrorMessage(parsed.error) },
       { status: 400 },
     );
   }

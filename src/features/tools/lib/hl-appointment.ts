@@ -557,7 +557,7 @@ export async function listUpcomingAppointments(
   };
 }
 
-interface HLEventDetails {
+export interface HLEventDetails {
   startMs: number | null;
   endMs: number | null;
   addedMs: number | null;
@@ -570,7 +570,7 @@ interface HLEventDetails {
  * One appointment as HighLevel has it now, or null when HighLevel no longer
  * has it (404). Throws when that can't be known.
  */
-async function fetchHLEvent(
+export async function fetchHLEvent(
   cfg: HLConfig,
   hlAppointmentId: string,
   hlZone: string,

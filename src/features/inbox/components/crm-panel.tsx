@@ -5,6 +5,7 @@
  * Shows contact info, stage, tags, opt-in status with inline editing.
  */
 
+import { useRouter } from "next/navigation";
 import { useState, useTransition, KeyboardEvent } from "react";
 import { User, RefreshCw, Save, ChevronDown, ChevronUp, X } from "lucide-react";
 import { toast } from "sonner";
@@ -83,7 +84,18 @@ export function CrmPanel({
   );
   const [tags, setTags] = useState<string[]>(contact.tags ?? []);
   const [tagInput, setTagInput] = useState("");
-  const [optIn, setOptIn] = useState(contact.opt_in);
+  const router = useRouter();
+  // Only what the user toggled: the switch otherwise shows the stored value,
+  // so a STOP that arrives while the panel is open isn't undone by a save.
+  // When the stored value changes (a save landed, or a STOP arrived) the local
+  // choice is dropped.
+  const [optInChoice, setOptInChoice] = useState<boolean | null>(null);
+  const [storedOptIn, setStoredOptIn] = useState(contact.opt_in);
+  if (storedOptIn !== contact.opt_in) {
+    setStoredOptIn(contact.opt_in);
+    setOptInChoice(null);
+  }
+  const optIn = optInChoice ?? contact.opt_in;
 
   // Section collapse
   const [contactOpen, setContactOpen] = useState(true);
@@ -119,10 +131,14 @@ export function CrmPanel({
         email: email || undefined,
         stage,
         tags,
-        opt_in: optIn,
+        ...(optInChoice !== null && optInChoice !== contact.opt_in
+          ? { opt_in: optInChoice }
+          : {}),
       });
 
       if (result.ok) {
+        // The switch keeps the saved value until the refreshed contact shows it.
+        router.refresh();
         toast.success("Contacto actualizado");
       } else {
         toast.error(result.error ?? "Error al guardar");
@@ -211,7 +227,7 @@ export function CrmPanel({
               </Label>
               <Switch
                 checked={optIn}
-                onCheckedChange={setOptIn}
+                onCheckedChange={setOptInChoice}
                 aria-label="WhatsApp Opt-in"
               />
             </div>
@@ -323,8 +339,9 @@ export function CrmPanel({
       {!optIn && (
         <div className="mx-4 mb-3 px-3 py-2 rounded-md bg-destructive/10 border border-destructive/30">
           <p className="text-[10px] text-destructive leading-snug">
-            <strong>Opt-out activo.</strong> No se enviarán mensajes a este
-            contacto.
+            <strong>Opt-out activo.</strong> No recibe automatizaciones ni
+            plantillas. Puedes responderle mientras su conversación siga
+            abierta.
           </p>
         </div>
       )}
