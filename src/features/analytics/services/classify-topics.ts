@@ -242,6 +242,9 @@ async function loadTopics(
  * there keeps what made the conversation eligible inside the prompt however
  * many replies or reminders came after it, and anything the customer writes
  * after the pick waits for the next run (classified_until stops at the pick).
+ * The team's internal notes and sends that never went out are left out in the
+ * query, before the limit, as the bot's own history does
+ * (conversation-history.ts): notes are never sent to an LLM.
  */
 async function loadMessages(
   db: SupabaseClient,
@@ -254,6 +257,8 @@ async function loadMessages(
     .eq("conversation_id", row.conversation_id)
     .eq("workspace_id", row.workspace_id)
     .lte("created_at", row.last_inbound_at)
+    .not("meta", "cs", JSON.stringify({ internal: true }))
+    .or("status.is.null,status.neq.failed")
     .order("created_at", { ascending: false })
     .limit(MAX_PROMPT_MESSAGES)
     .abortSignal(dbSignal(deadline));

@@ -99,14 +99,46 @@ function thenable(key: string, run: () => Promise<{ data?: unknown; error: unkno
   return p;
 }
 
+/** Filters the code adds besides eq/lte, as the query string sees them. */
+let extraFilters: string[] = [];
+
 function query(table: string) {
   const filters: Array<[string, unknown]> = [];
   const upTo: Array<[string, string]> = [];
+  const notContains: Array<[string, Record<string, unknown>]> = [];
+  const anyOf: Array<Array<(r: Record<string, unknown>) => boolean>> = [];
   const rows = () =>
     (tables[table] ?? []).filter(
-      (r) => filters.every(([k, v]) => r[k] === v) && upTo.every(([k, v]) => String(r[k]) <= v),
+      (r) =>
+        filters.every(([k, v]) => r[k] === v) &&
+        upTo.every(([k, v]) => String(r[k]) <= v) &&
+        notContains.every(([k, v]) => {
+          const cell = (r[k] ?? {}) as Record<string, unknown>;
+          return !Object.entries(v).every(([kk, vv]) => cell[kk] === vv);
+        }) &&
+        anyOf.every((alts) => alts.some((f) => f(r))),
     );
   const q = {
+    not: (col: string, op: string, val: string) => {
+      extraFilters.push(`${table}:not.${col}.${op}.${val}`);
+      assert.equal(op, "cs");
+      notContains.push([col, JSON.parse(val)]);
+      return q;
+    },
+    or: (expr: string) => {
+      extraFilters.push(`${table}:or.${expr}`);
+      // Only `col.is.null` and `col.neq.value` alternatives are used here.
+      anyOf.push(
+        expr.split(",").map((alt) => {
+          const [col, op, ...rest] = alt.split(".");
+          const val = rest.join(".");
+          if (op === "is" && val === "null") return (r: Record<string, unknown>) => r[col] == null;
+          if (op === "neq") return (r: Record<string, unknown>) => r[col] !== val;
+          throw new Error(`unsupported or() alternative ${alt}`);
+        }),
+      );
+      return q;
+    },
     select: () => q,
     eq: (col: string, val: unknown) => {
       filters.push([col, val]);
@@ -165,6 +197,7 @@ const llmTaking =
       : done;
 
 function reset() {
+  extraFilters = [];
   classifyImpl = llmTaking(() => 0);
   classifyCalls = [];
   rpcCalls = [];
@@ -889,4 +922,22 @@ test("only the customer's cut bodies make the analysis partial", async () => {
   tables.messages = [long("m-in", "2026-09-14T19:30:00Z", "in"), long("m-out", "2026-09-14T19:00:00Z", "out")];
   await runClassificationPhase(later(), db);
   assert.deepEqual(callsTo("save_conversation_topics")[0].args.p_truncated_at, ["2026-09-14T19:30:00Z"]);
+});
+
+test("REVIEW M1: the team's internal notes and failed sends never reach the LLM", async () => {
+  reset();
+  const at = (id: string, when: string, over: Record<string, unknown>) => ({
+    ...message(id, "d1", WS_A), created_at: when, meta: {}, status: null, ...over,
+  });
+  tables.messages = [
+    at("m-in", "2026-09-14T19:50:00Z", { direction: "in" }),
+    at("m-note", "2026-09-14T19:40:00Z", { direction: "out", sender_user_id: "u1", body: "cliente moroso, no darle descuento", meta: { internal: true } }),
+    at("m-failed", "2026-09-14T19:30:00Z", { direction: "out", body: "promo", status: "failed" }),
+    at("m-sent", "2026-09-14T19:20:00Z", { direction: "out", body: "hola", status: "delivered" }),
+  ];
+  await runClassificationPhase(later(), db);
+  assert.deepEqual(classifyCalls[0].messageIds.sort(), ["m-in", "m-sent"]);
+  // In the query, before the limit of 60, not after it.
+  assert.ok(extraFilters.includes('messages:not.meta.cs.{"internal":true}'));
+  assert.ok(extraFilters.includes("messages:or.status.is.null,status.neq.failed"));
 });
