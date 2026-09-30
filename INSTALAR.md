@@ -827,9 +827,12 @@ sigue haciendo falta si no lo has corrido).
     reintento no agenda dos veces.
     - Si la llamada murió antes de mandar nada, el horario se libera a los 2 minutos.
     - Si Cal.com pudo haber agendado (la llamada se cortó a medio envío), el horario
-      no se libera solo: cuando el cliente vuelve a pedirlo, la app pregunta a
-      Cal.com por su email, servicio y hora; si Cal.com responde que no existe, lo
-      libera, y si no da una respuesta completa, pasa la conversación a una persona.
+      no se libera solo: cuando el cliente vuelve a pedirlo, o a los 10 minutos en el
+      cron `automations`, la app pregunta a Cal.com por su email, servicio y hora
+      (y revisa que la respuesta sea de ese cliente y ese servicio): si la reserva
+      existe, la vincula; si Cal.com responde completo que no existe, la libera; si
+      no, deja una nota interna en la conversación (una vez) y un evento
+      `calcom_claim_unresolved`.
     - Para liberar uno a mano, después de revisar en Cal.com, en Supabase → SQL
       Editor: `update appointments set status = 'cancelled', meta = meta ||
       '{"calcom_claim":"released"}' where id = '<id>' and calcom_booking_uid is
