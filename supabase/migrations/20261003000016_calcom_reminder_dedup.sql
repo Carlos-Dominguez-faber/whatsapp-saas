@@ -8,9 +8,10 @@
 -- and then back to a time already reminded was reminded again under the new
 -- row. automation_reminder_candidates() now also skips a Cal.com row when
 -- this rule emitted the same occurrence (rule, lead, instant) for the same
--- contact under another row and that reminder was sent or is still on its
--- way (not expanded yet, or a run done, pending or processing); a skipped or
--- failed one (it reminded nobody) doesn't block it. HighLevel
+-- contact under another row and that reminder went out, may have gone out
+-- or is still on its way (not expanded yet and not quarantined; a run done,
+-- pending or processing, or dispatched). One that reminded nobody (expanded
+-- with no run, quarantined, skipped or failed before sending) doesn't block. HighLevel
 -- rows (no calcom_event_type_id) are untouched: they keep one row per
 -- appointment. The index backs that lookup.
 -- ============================================================================
@@ -76,9 +77,10 @@ AS $$
      -- A Cal.com booking moved away and back is a new row at a time this
      -- contact was already reminded of by this rule (the occurrence names the
      -- rule, the lead and the instant): not again while another row's
-     -- reminder for it was sent or is still on its way (emitted and not
-     -- expanded yet, or a run done, pending or processing). One skipped or
-     -- failed (say, as moved) reminded nobody, so it doesn't count. HighLevel rows keep one row per appointment and are
+     -- reminder for it went out, may have gone out, or is still on its way
+     -- (emitted and not expanded yet; a run done, pending or processing, or
+     -- dispatched). One expanded with no run (stale, rule off), quarantined,
+     -- or skipped/failed before sending reminded nobody and doesn't count. HighLevel rows keep one row per appointment and are
      -- untouched.
      AND NOT (
        a.calcom_event_type_id IS NOT NULL
@@ -91,13 +93,15 @@ AS $$
             AND e.occurrence = o.occurrence
             AND e.subject_id <> a.id
             AND (
-              -- Emitted and not expanded yet: on its way.
-              NOT EXISTS (SELECT 1 FROM public.automation_runs r WHERE r.event_id = e.id)
+              -- Emitted and not expanded yet (nor quarantined): on its way.
+              (e.expanded_at IS NULL AND e.expand_error IS NULL)
+              -- A run that went out, is on its way, or may have gone out
+              -- (dispatched, whatever it ended as: outcome_unknown).
               OR EXISTS (
                 SELECT 1 FROM public.automation_runs r
                  WHERE r.event_id = e.id
                    AND r.rule_id = rule.id
-                   AND r.status IN ('done', 'pending', 'processing')
+                   AND (r.status IN ('done', 'pending', 'processing') OR r.dispatched_at IS NOT NULL)
               )
             )
        )
