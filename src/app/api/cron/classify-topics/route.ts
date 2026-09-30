@@ -19,12 +19,14 @@ import {
 // TURNS (the model is in classify-topics.ts): the backfill of new topics runs
 // FIRST, with its own cut at BACKFILL_SHARE_MS; the nightly phase gets the
 // rest, so whatever the backfill doesn't use — nothing pending, over the cap,
-// a dead key — is not lost. Both phases share the run's guards: a key that
-// died in one is dead in the other, and so is the breaker's count.
+// a key down — is not lost. Both phases share the run's guards: what the run
+// learned of a key in one holds in the other.
 //
-// A halt (the breaker tripped, or our database failed) skips the other phase
-// and answers 500 ok:false with the phase's code. `200` with `failed`,
-// `deferred` or skipped workspaces is a normal run: those are handled.
+// 500 ok:false in two cases, so they show in net._http_response:
+// - a halt: our database failed (the only halt); the other phase is skipped;
+// - the platform key is down: every workspace on it is skipped
+//   (`platform_key_down`). Own keys down never make a 500.
+// `200` with `failed`, `deferred` or skipped workspaces is a normal run.
 export const maxDuration = 120;
 export const RUN_BUDGET_MS = 100_000;
 
@@ -74,8 +76,10 @@ export async function GET(request: Request) {
     }
   }
 
+  const platformDown = guards.platformDown === true;
+  const failed = phaseFailed || platformDown;
   return NextResponse.json(
-    { ok: !phaseFailed, classified, backfill },
-    { status: phaseFailed ? 500 : 200 },
+    { ok: !failed, classified, backfill, platform_key_down: platformDown },
+    { status: failed ? 500 : 200 },
   );
 }

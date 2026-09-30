@@ -9,7 +9,7 @@ BEGIN;
 CREATE EXTENSION IF NOT EXISTS pgtap WITH SCHEMA extensions;
 SET search_path = public, extensions;
 
-SELECT plan(56);
+SELECT plan(62);
 
 -- ── Privileges ───────────────────────────────────────────────────────────────
 SELECT ok(NOT has_function_privilege('anon',
@@ -338,12 +338,13 @@ SELECT public.defer_classification('e0000000-0000-4000-8000-000000000001',
 SELECT ok((SELECT claimed_until BETWEEN now() + interval '239 minutes' AND now() + interval '241 minutes'
              FROM public.conversation_classification WHERE conversation_id = 'e0000000-0000-4000-8000-0000000000a7'),
   'the wait doubles each time the same conversation fails that way again (1 h, 2 h, 4 h)');
-SELECT public.note_classification_blocked('e0000000-0000-4000-8000-000000000001', 'key');
-SELECT public.note_classification_blocked('e0000000-0000-4000-8000-000000000001', 'key');
+SELECT public.note_classification_blocked('e0000000-0000-4000-8000-000000000001', 'cap');
 SELECT public.note_classification_blocked('e0000000-0000-4000-8000-000000000001', 'cap');
 SELECT is((SELECT count(*)::int FROM public.events
-            WHERE workspace_id = 'e0000000-0000-4000-8000-000000000001' AND type = 'topic_classification_blocked'), 2,
-  'a blocked cause is noted once per workspace, reason and hour');
+            WHERE workspace_id = 'e0000000-0000-4000-8000-000000000001' AND type = 'topic_classification_blocked'), 1,
+  'a workspace over its cap is noted once an hour');
+SELECT throws_ok($$SELECT public.note_classification_blocked('e0000000-0000-4000-8000-000000000001', 'key')$$,
+  '22023', NULL, 'a key that is down is not an event: the dashboard reads the key''s health');
 SELECT ok(NOT has_function_privilege('authenticated', 'public.defer_classification(uuid, uuid, text, integer, timestamptz)', 'EXECUTE')
           AND NOT has_function_privilege('authenticated', 'public.note_classification_blocked(uuid, text, timestamptz)', 'EXECUTE'),
   'sessions cannot defer a conversation or note a blocked workspace');
@@ -380,10 +381,28 @@ SELECT is((SELECT (x->>'universe')::int FROM jsonb_array_elements(public.get_ins
           WHERE x->>'name' = 'Nuevo'), 2,
   'a conversation the backfill left out and the nightly run never read with the topic is not in its denominator');
 
--- ── Why the rest isn't being read (review LOW 9) ─────────────────────────────
-SELECT public.note_classification_blocked('e4000000-0000-4000-8000-000000000001', 'key');
+-- ── Why the rest isn't being read (review LOW 9; round 3: from the key) ─────
 SELECT is(public.get_insights('e4000000-0000-4000-8000-000000000001', now() - interval '9 days', now(), '{}', 'UTC')->>'blocked',
-  'key', 'the dashboard gets the cause: the workspace''s key is failing');
+  NULL, 'nothing blocks a workspace whose key was never seen failing');
+SELECT public.classification_key_gate('e4000000-0000-4000-8000-000000000001', 'sha256:l9-own', 'own');
+SELECT public.record_classification_key_outcome('sha256:l9-own', 'own', 'rejected', 'key_rejected');
+SELECT is(public.get_insights('e4000000-0000-4000-8000-000000000001', now() - interval '9 days', now(), '{}', 'UTC')->>'blocked',
+  'key', 'the dashboard gets the cause from the key''s health: the workspace''s own key is down');
+SELECT public.record_classification_key_outcome('sha256:l9-own', 'own', 'answered');
+SELECT is(public.get_insights('e4000000-0000-4000-8000-000000000001', now() - interval '9 days', now(), '{}', 'UTC')->>'blocked',
+  NULL, 'the key answering again clears it');
+SELECT public.classification_key_gate('e4000000-0000-4000-8000-000000000001', 'sha256:l9-platform', 'platform');
+SELECT public.record_classification_key_outcome('sha256:l9-platform', 'platform', 'transient', 'provider_unavailable');
+SELECT public.record_classification_key_outcome('sha256:l9-platform', 'platform', 'transient', 'provider_unavailable');
+SELECT is(public.get_insights('e4000000-0000-4000-8000-000000000001', now() - interval '9 days', now(), '{}', 'UTC')->>'blocked',
+  NULL, 'two transient failures in a row do not make a key down');
+SELECT public.record_classification_key_outcome('sha256:l9-platform', 'platform', 'transient', 'timeout');
+SELECT is(public.get_insights('e4000000-0000-4000-8000-000000000001', now() - interval '9 days', now(), '{}', 'UTC')->>'blocked',
+  'platform_key', 'the third does, and a workspace on the platform key says so');
+SELECT public.record_classification_key_outcome('sha256:l9-platform', 'platform', 'answered');
+SELECT public.note_classification_blocked('e4000000-0000-4000-8000-000000000001', 'cap');
+SELECT is(public.get_insights('e4000000-0000-4000-8000-000000000001', now() - interval '9 days', now(), '{}', 'UTC')->>'blocked',
+  'cap', 'over the cap, from its note');
 INSERT INTO public.events (type, level, workspace_id, payload, created_at)
 VALUES ('topic_classification', 'info', 'e4000000-0000-4000-8000-000000000001',
         '{"reserved": false, "total_tokens": 1500}', now() + interval '1 second');

@@ -50,8 +50,11 @@ export interface RawInsights {
   /** The customer's first message ever in the workspace. */
   data_from?: string | null;
   /** Why the classifier isn't reading this workspace right now, if it is stuck. */
-  blocked?: "key" | "cap" | null;
+  blocked?: Blocked | null;
 }
+
+export type Blocked = "key" | "platform_key" | "cap";
+const BLOCKED: readonly Blocked[] = ["key", "platform_key", "cap"];
 
 export interface AnalysisView {
   conversations: number;
@@ -62,8 +65,11 @@ export interface AnalysisView {
   failed: number;
   /** Older than the classifier's 30 days: never read. */
   tooOld: number;
-  /** The run can't read this workspace now: its key fails, or it is over its cap. */
-  blocked: "key" | "cap" | null;
+  /**
+   * The run can't read this workspace now: its own OpenRouter key is down
+   * ("key"), the platform's is ("platform_key"), or it is over its cap.
+   */
+  blocked: Blocked | null;
 }
 
 export interface TopicView {
@@ -283,7 +289,7 @@ export function toInsightsView(
       pending: Number(raw.analysis?.pending) || 0,
       failed: Number(raw.analysis?.failed) || 0,
       tooOld: Number(raw.analysis?.too_old) || 0,
-      blocked: raw.blocked === "key" || raw.blocked === "cap" ? raw.blocked : null,
+      blocked: BLOCKED.includes(raw.blocked as Blocked) ? (raw.blocked as Blocked) : null,
     },
   };
 }
@@ -299,7 +305,9 @@ export function analysisNotice(a: AnalysisView, hasTopics = true): string | null
   const n = (x: number) => x.toLocaleString("es-CL");
   const waiting =
     a.blocked === "key"
-      ? `${n(a.pending)} ${a.pending === 1 ? "espera" : "esperan"}: la clave de OpenRouter de este espacio está fallando (sin créditos o revocada), y se analizarán cuando vuelva a funcionar`
+      ? `${n(a.pending)} ${a.pending === 1 ? "espera" : "esperan"}: la clave de OpenRouter de este espacio está fallando (sin créditos, revocada o con una política de datos que no deja usar el modelo), y se analizarán cuando vuelva a funcionar`
+      : a.blocked === "platform_key"
+        ? `${n(a.pending)} ${a.pending === 1 ? "espera" : "esperan"}: el servicio de análisis no está respondiendo, y se analizarán cuando vuelva (se reintenta solo)`
       : a.blocked === "cap"
         ? `${n(a.pending)} ${a.pending === 1 ? "espera" : "esperan"}: el análisis llegó a su tope de hoy, y se retoma cuando empiece el día (00:00 UTC)`
         : `${n(a.pending)} ${a.pending === 1 ? "se analizará" : "se analizarán"} en las próximas horas`;

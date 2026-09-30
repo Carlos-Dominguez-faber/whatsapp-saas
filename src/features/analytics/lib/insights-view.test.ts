@@ -251,5 +251,9 @@ test("REVIEW LOW 9: the notice says why, and never promises 'the next hours' whe
   assert.equal(analysisNotice({ ...base, blocked: null }, false), null);
   // From the payload.
   assert.equal(toInsightsView(raw({ blocked: "cap" }), TZ, NOW).analysis.blocked, "cap");
+  assert.equal(toInsightsView(raw({ blocked: "platform_key" }), TZ, NOW).analysis.blocked, "platform_key");
+  const platform = analysisNotice({ ...base, blocked: "platform_key" }) ?? "";
+  assert.match(platform, /no está respondiendo/);
+  assert.doesNotMatch(platform, /próximas horas/);
   assert.equal(toInsightsView(raw({ blocked: "whatever" as never }), TZ, NOW).analysis.blocked, null);
 });

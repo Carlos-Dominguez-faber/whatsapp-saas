@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { mock, test } from "node:test";
 
-let phase1: () => Promise<unknown> = async () => ({ classified: 2, failed: 1, skipped_workspaces: 0 });
+type Guards = { marker: number; platformDown: boolean };
+let phase1: (guards: Guards) => Promise<unknown> = async () => ({ classified: 2, failed: 1, skipped_workspaces: 0 });
 let phase2: () => Promise<unknown> = async () => ({ processed: 3, failed: 0, topics_done: 1 });
 let order: string[] = [];
 const deadlines: Record<string, number[]> = { backfill: [], classification: [] };
@@ -11,12 +12,12 @@ mock.module("@/features/analytics/services/classify-topics.ts", {
   exports: {
     BACKFILL_SHARE_MS: 55_000,
     LEASE_SECONDS: 180,
-    newRunGuards: () => ({ marker: Math.random() }),
-    runClassificationPhase: (deadline: number, _db: unknown, guards: unknown) => {
+    newRunGuards: () => ({ marker: Math.random(), platformDown: false }),
+    runClassificationPhase: (deadline: number, _db: unknown, guards: Guards) => {
       order.push("classification");
       deadlines.classification.push(deadline);
       guardsSeen.push(guards);
-      return phase1();
+      return phase1(guards);
     },
     runBackfillPhase: (deadline: number, _db: unknown, guards: unknown) => {
       order.push("backfill");
@@ -75,7 +76,26 @@ test("éxito: failed > 0 sigue siendo 200", async () => {
     ok: true,
     classified: { classified: 2, failed: 1, skipped_workspaces: 0 },
     backfill: { processed: 3, failed: 0, topics_done: 1 },
+    platform_key_down: false,
   });
+});
+
+test("the platform key down → 500 (visible in net._http_response), without a halt; own keys down never", async () => {
+  reset();
+  phase1 = async (guards) => {
+    guards.platformDown = true;
+    return { classified: 5, failed: 0, skipped_workspaces: 0, unavailable_workspaces: 3, halt: false };
+  };
+  const res = await GET(req("Bearer s3cret"));
+  assert.equal(res.status, 500);
+  const body = await res.json();
+  assert.equal(body.ok, false);
+  assert.equal(body.platform_key_down, true);
+  assert.deepEqual(order, ["backfill", "classification"]);
+
+  reset();
+  phase1 = async () => ({ classified: 5, failed: 0, skipped_workspaces: 0, unavailable_workspaces: 3, halt: false });
+  assert.equal((await GET(req("Bearer s3cret"))).status, 200, "own keys down made a 500");
 });
 
 test("error sin halt → 500 ok:false, y la otra fase igual corre", async () => {

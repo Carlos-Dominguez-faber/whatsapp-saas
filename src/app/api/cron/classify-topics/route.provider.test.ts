@@ -5,8 +5,9 @@ import { mock, test } from "node:test";
 // reales (ai, @ai-sdk/openai, supabase-js). Solo se reemplaza `fetch`, que los
 // tres resuelven al momento de la llamada: OpenRouter responde 503 y PostgREST
 // es un fake en memoria. Each 503 defers its conversation (no attempt spent)
-// and the run goes on; three in a row, on different conversations, trip the
-// breaker and the run stops.
+// and counts on the key it ran on; the third in a row takes the key down.
+// It is the platform key: its workspaces are skipped, the run is NOT halted,
+// and the route answers 500 so it shows in net._http_response.
 mock.module("@/features/inbox/services/openrouter.ts", {
   exports: { getOpenRouterApiKey: async () => "test-key" },
 });
@@ -24,11 +25,12 @@ const CONV3 = "66666666-6666-6666-6666-666666666666";
 let openrouterCalls = 0;
 let selectRounds = 0;
 const rpcs: string[] = [];
+let keyFailures = 0;
 
 const json = (body: unknown, status = 200) =>
   new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
 
-globalThis.fetch = (async (input: RequestInfo | URL) => {
+globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
   const url = new URL(input instanceof Request ? input.url : String(input));
   if (url.hostname === "openrouter.ai") {
     openrouterCalls++;
@@ -50,6 +52,14 @@ globalThis.fetch = (async (input: RequestInfo | URL) => {
       return json(rows[selectRounds++] ?? []);
     }
     if (rpc === "reserve_classification_tokens") return json("33333333-3333-3333-3333-333333333333");
+    // The key's health, as the SQL keeps it (breaker 3).
+    if (rpc === "classification_key_gate") return json({ state: "up", failures: keyFailures });
+    if (rpc === "record_classification_key_outcome") {
+      const args = JSON.parse(String(init?.body ?? "{}"));
+      assert.equal(args.p_outcome, "transient");
+      assert.match(args.p_key_id, /^sha256:[0-9a-f]{64}$/, "the key's id must not carry the key");
+      return json(++keyFailures >= args.p_breaker ? "down" : "up");
+    }
     return json(1);
   }
   if (url.pathname.endsWith("/insight_topics")) {
@@ -66,26 +76,26 @@ globalThis.fetch = (async (input: RequestInfo | URL) => {
 
 const { GET } = await import("./route.ts");
 
-test("OpenRouter con 503 → cada conversación espera sin gastar intento; a la tercera seguida, el breaker detiene la corrida (500)", async () => {
+test("OpenRouter con 503 → cada conversación espera sin gastar intento; a la tercera seguida la clave de la plataforma cae: sin halt, 500 visible", async () => {
   const res = await GET(
     new Request("http://localhost:3000/api/cron/classify-topics", { headers: { Authorization: "Bearer s3cret" } }),
   );
   const body = await res.json();
   assert.equal(res.status, 500);
   assert.equal(body.ok, false);
+  assert.equal(body.platform_key_down, true);
   assert.deepEqual(body.classified, {
     classified: 0,
     failed: 0,
     deferred: 3,
     skipped_workspaces: 0,
-    unavailable_workspaces: 0,
-    halt: true,
-    error: "provider_unavailable",
+    unavailable_workspaces: 1,
+    halt: false,
   });
-  assert.equal(openrouterCalls, 3, "el SDK reintentó o la fase siguió llamando con el proveedor caído");
+  assert.equal(openrouterCalls, 3, "el SDK reintentó o la fase siguió llamando con la clave caída");
   assert.equal(rpcs.filter((r) => r === "defer_classification").length, 3);
   assert.equal(rpcs.filter((r) => r === "record_classification_failure").length, 0, "la caída quemó intentos");
   // A 503 is an HTTP answer: nothing was generated, each reservation settles at 0.
   assert.equal(rpcs.filter((r) => r === "settle_classification_tokens").length, 3);
-  assert.deepEqual(rpcs.slice(0, 2), ["select_conversations_to_classify", "reserve_classification_tokens"]);
+  assert.deepEqual(rpcs.slice(0, 3), ["select_conversations_to_classify", "classification_key_gate", "reserve_classification_tokens"]);
 });

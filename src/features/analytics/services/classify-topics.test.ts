@@ -30,7 +30,15 @@ mock.module("./classifier.ts", {
   },
 });
 
-const { runClassificationPhase, runBackfillPhase, CLASSIFY_DAILY_TOKEN_CAP, BACKFILL_SHARE_MS, newRunGuards } = await import("./classify-topics.ts");
+const {
+  runClassificationPhase,
+  runBackfillPhase,
+  CLASSIFY_DAILY_TOKEN_CAP,
+  BACKFILL_SHARE_MS,
+  KEY_TRANSIENT_BREAKER,
+  BACKFILL_TRANSIENT_SKIP,
+  newRunGuards,
+} = await import("./classify-topics.ts");
 const { MAX_PROMPT_CHARS } = await import("../lib/classify-prompt.ts");
 
 // ── Reloj virtual ──────────────────────────────────────────
@@ -152,7 +160,15 @@ function query(table: string) {
     },
     order: () => q,
     limit: (n: number) => thenable(`from:${table}`, async () => ({ data: rows().slice(0, n), error: null })),
-    maybeSingle: async () => ({ data: rows()[0] ?? null, error: null }),
+    abortSignal: (sig: AbortSignal) => {
+      abortSignals++;
+      assert.ok(sig instanceof AbortSignal);
+      return q;
+    },
+    maybeSingle: async () => {
+      queries++;
+      return { data: rows()[0] ?? null, error: null };
+    },
     range: (from: number, to: number) =>
       thenable(`from:${table}`, async () => ({ data: rows().slice(from, to + 1), error: null })),
     insert: (row: Record<string, unknown>) =>
@@ -199,7 +215,8 @@ const llmTaking =
       ? { ok: false, code: "timeout", usage: null }
       : done;
 
-function reset() {
+function reset(opts: { keepKeys?: boolean } = {}) {
+  const kept = opts.keepKeys ? { keyHealth, workspaceKeys, convTransients, clock } : null;
   extraFilters = [];
   classifyImpl = llmTaking(() => 0);
   classifyCalls = [];
@@ -230,8 +247,61 @@ function reset() {
     settle_classification_tokens: () => ({ data: true, error: null }),
     save_conversation_topics: () => ({ data: 1, error: null }),
     record_classification_failure: () => ({ data: 1, error: null }),
+    defer_classification: (a) => {
+      const id = a.p_conversation_id as string;
+      convTransients.set(id, (convTransients.get(id) ?? 0) + 1);
+      return { data: convTransients.get(id), error: null };
+    },
+    ...keyHealthRpcs(),
+  };
+  if (kept) ({ keyHealth, workspaceKeys, convTransients, clock } = kept);
+}
+
+// ── Key health, as the SQL keeps it (record_classification_key_outcome, the gate) ──
+type KeyRow = { scope: string; failures: number; downCount: number; downSince: number | null; downUntil: number | null; code: string | null };
+let keyHealth = new Map<string, KeyRow>();
+let workspaceKeys = new Map<string, string>();
+let convTransients = new Map<string, number>();
+function keyHealthRpcs(): Record<string, RpcHandler> {
+  keyHealth = new Map();
+  workspaceKeys = new Map();
+  convTransients = new Map();
+  return {
+    classification_key_gate: (a) => {
+      workspaceKeys.set(a.p_workspace_id as string, a.p_key_id as string);
+      const k = keyHealth.get(a.p_key_id as string);
+      if (!k || k.downSince === null) return { data: { state: "up", failures: k?.failures ?? 0 }, error: null };
+      if ((k.downUntil ?? 0) > clock) return { data: { state: "down" }, error: null };
+      k.downUntil = clock + Number(a.p_probe_seconds) * 1000;
+      return { data: { state: "probe" }, error: null };
+    },
+    record_classification_key_outcome: (a) => {
+      const id = a.p_key_id as string;
+      const k = keyHealth.get(id) ?? { scope: a.p_scope as string, failures: 0, downCount: 0, downSince: null, downUntil: null, code: null };
+      keyHealth.set(id, k);
+      if (a.p_outcome === "answered") {
+        Object.assign(k, { failures: 0, downCount: 0, downSince: null, downUntil: null, code: null });
+        return { data: "up", error: null };
+      }
+      k.code = a.p_code as string;
+      if (a.p_outcome === "rejected") {
+        Object.assign(k, { failures: 0, downSince: k.downSince ?? clock, downUntil: clock + Number(a.p_rejected_seconds) * 1000 });
+        return { data: "down", error: null };
+      }
+      if (k.downSince === null && k.failures + 1 < Number(a.p_breaker)) {
+        k.failures++;
+        return { data: "up", error: null };
+      }
+      const wait = Math.min(Number(a.p_base_seconds) * 2 ** k.downCount, Number(a.p_max_seconds));
+      Object.assign(k, { failures: 0, downCount: k.downCount + 1, downSince: k.downSince ?? clock, downUntil: clock + wait * 1000 });
+      return { data: "down", error: null };
+    },
   };
 }
+const { createHash } = await import("node:crypto");
+const hashOf = (key: string) => `sha256:${createHash("sha256").update(key).digest("hex")}`;
+/** The key's row for a workspace, as the gate mapped it. */
+const healthOf = (ws: string) => keyHealth.get(workspaceKeys.get(ws) ?? "");
 
 const later = () => Date.now() + 50_000;
 const callsTo = (fn: string) => rpcCalls.filter((c) => c.fn === fn);
@@ -425,23 +495,41 @@ test("TRANSIENT: a 5xx defers that conversation only; the run goes on with the n
   // An HTTP 5xx answer is settled at 0: nothing was generated.
   assert.equal(callsTo("settle_classification_tokens")[0].args.p_prompt_tokens, 0);
 });
-test("BREAKER: 3 transient failures in a row on different conversations stop the run", async () => {
+/** Rows handed out as the SQL would: in queue order, skipping p_skip_workspaces, `per` at a time. */
+function queueSelect(queue: Array<ReturnType<typeof conv>>, per = 2) {
+  const left = [...queue];
+  return (args: Record<string, unknown>) => {
+    const skip = (args.p_skip_workspaces as string[]) ?? [];
+    const rows = left.filter((r) => !skip.includes(r.workspace_id)).slice(0, per);
+    for (const r of rows) left.splice(left.indexOf(r), 1);
+    return { data: rows, error: null };
+  };
+}
+
+test("KEY STREAK: 3 transients in a row on ONE key take it down; its workspace is skipped, the others go on, no halt", async () => {
   for (const code of ["provider_unavailable", "timeout"]) {
     reset();
     tables.insight_topics.push(topic("t2", WS_B, "Precio"));
-    let round = 0;
-    rpcHandlers.select_conversations_to_classify = () => ({
-      data: [[conv("d1", WS_A)], [conv("d2", WS_B)], [conv("d3", WS_A)], [conv("d4", WS_B)]][round++] ?? [],
-      error: null,
-    });
-    classifyImpl = async () => ({ ok: false, code, usage: null, keyScope: "platform" });
+    tables.integrations = [{ workspace_id: WS_B, provider: "openrouter", credentials: { openrouter_api_key: "sk-b" } }];
+    const queue = [];
+    for (let i = 1; i <= 5; i++) {
+      tables.messages.push(message(`m-b${i}`, `b${i}`, WS_B), message(`m-a${i}`, `a${i}`, WS_A));
+      queue.push(conv(`b${i}`, WS_B), conv(`a${i}`, WS_A));
+    }
+    rpcHandlers.select_conversations_to_classify = queueSelect(queue);
+    classifyImpl = async (p) =>
+      p.workspaceId === WS_B ? { ok: false, code, usage: null, keyScope: "own" } : { ...OK_RESULT, keyScope: "platform" };
     const r = await runClassificationPhase(later(), db);
-    assert.deepEqual(r, { classified: 0, failed: 0, deferred: 3, skipped_workspaces: 0, unavailable_workspaces: 0, halt: true, error: code }, code);
-    assert.equal(classifyCalls.length, 3, `${code}: kept calling after the breaker`);
+    assert.equal(r.halt, false, code);
+    assert.equal(classifyCalls.filter((c) => c.workspaceId === WS_B).length, KEY_TRANSIENT_BREAKER, `${code}: calls on the down key`);
+    assert.equal(r.classified, 5, `${code}: the healthy workspace was not read at its pace`);
+    assert.equal(r.deferred, 3);
+    assert.equal(r.unavailable_workspaces, 1);
+    assert.notEqual(healthOf(WS_B)?.downSince ?? null, null, "B's key is down");
+    assert.equal(healthOf(WS_A), undefined, "the platform key's row was never touched");
   }
 });
-
-test("BREAKER: any answer from the provider resets the count", async () => {
+test("KEY STREAK: an answer on the SAME key resets it; answers on another key don't", async () => {
   reset();
   let round = 0;
   const rows = ["d1", "d2", "d3", "d4", "d5"].map((id) => [conv(id)]);
@@ -454,8 +542,27 @@ test("BREAKER: any answer from the provider resets the count", async () => {
   assert.equal(r.halt, false);
   assert.equal(r.deferred, 4);
   assert.equal(r.failed, 1);
-});
+  assert.equal(healthOf(WS_A)?.downSince, null, "the content refusal was an answer on this key");
+  assert.equal(healthOf(WS_A)?.failures, 2);
 
+  // B's own key fails; A's platform key answers in between: B's streak goes on.
+  reset();
+  tables.insight_topics.push(topic("t2", WS_B, "Precio"));
+  tables.integrations = [{ workspace_id: WS_B, provider: "openrouter", credentials: { openrouter_api_key: "sk-b" } }];
+  const queue = [];
+  for (let i = 1; i <= 3; i++) {
+    tables.messages.push(message(`m-b${i}`, `b${i}`, WS_B), message(`m-a${i}`, `a${i}`, WS_A));
+    queue.push(conv(`b${i}`, WS_B), conv(`a${i}`, WS_A));
+  }
+  rpcHandlers.select_conversations_to_classify = queueSelect(queue, 1);
+  classifyImpl = async (p) =>
+    p.workspaceId === WS_B
+      ? { ok: false, code: "provider_unavailable", usage: { promptTokens: 0, completionTokens: 0 }, keyScope: "own" }
+      : { ...OK_RESULT, keyScope: "platform" };
+  const r2 = await runClassificationPhase(later(), db);
+  assert.equal(r2.classified, 3);
+  assert.notEqual(healthOf(WS_B)?.downSince ?? null, null, "another key's answers reset B's streak");
+});
 test("KEY: a dead own key never counts toward a halt, however many workspaces have one", async () => {
   reset();
   for (const [ws, t] of [[WS_B, "t2"], ["ws-c", "t3"], ["ws-d", "t4"]] as const) tables.insight_topics.push(topic(t, ws, "Precio"));
@@ -485,10 +592,12 @@ test("KEY: a dead own key never counts toward a halt, however many workspaces ha
   assert.equal(r.halt, false);
   assert.equal(r.unavailable_workspaces, 3);
   assert.ok(dCalls >= 1, "the workspace on the platform key was not classified");
-  assert.deepEqual(
-    callsTo("note_classification_blocked").map((c) => c.args.p_workspace_id).sort(),
-    [WS_A, WS_B, "ws-c"].sort(),
-  );
+  // The dashboard reads it from each key's health, not from a note.
+  for (const ws of [WS_A, WS_B, "ws-c"]) {
+    assert.notEqual(healthOf(ws)?.downSince ?? null, null, `${ws}'s key is not down`);
+    assert.equal(healthOf(ws)?.code, "key_rejected");
+  }
+  assert.equal(callsTo("note_classification_blocked").length, 0);
 });
 
 test("KEY: when the platform key dies, every workspace on it is skipped WITHOUT a call; own keys go on", async () => {
@@ -506,8 +615,10 @@ test("KEY: when the platform key dies, every workspace on it is skipped WITHOUT 
     p.workspaceId === "ws-c"
       ? { ok: true, matches: [], usage: { promptTokens: 100, completionTokens: 5 }, keyScope: "own" }
       : { ok: false, code: "key_rejected", usage: { promptTokens: 0, completionTokens: 0 }, keyScope: "platform" };
-  const r = await runClassificationPhase(later(), db);
+  const guards = newRunGuards();
+  const r = await runClassificationPhase(later(), db, guards);
   assert.equal(r.halt, false);
+  assert.equal(guards.platformDown, true, "the route answers 500 for a down platform key");
   assert.equal(r.classified, 1, "the workspace with its own healthy key was not classified");
   // One call found the platform key dead; B was never called.
   assert.deepEqual(classifyCalls.map((c) => c.workspaceId), [WS_A, "ws-c"]);
@@ -522,6 +633,9 @@ test("KEY: an own key that can't be decrypted is that key's error — never char
   assert.equal(callsTo("reserve_classification_tokens").length, 0);
   assert.equal(r.unavailable_workspaces, 1);
   assert.equal(r.halt, false);
+  assert.equal(workspaceKeys.get(WS_A), `unreadable:${WS_A}`);
+  assert.equal(healthOf(WS_A)?.code, "key_unreadable", "the dashboard can't tell it's down");
+  assert.equal(healthOf(WS_A)?.scope, "own");
 });
 test("REVIEW H1: one workspace out of OpenRouter credit does not stop the others", async () => {
   reset();
@@ -674,7 +788,7 @@ test("error en la selección → la fase devuelve error select_failed", async ()
   rpcHandlers.select_conversations_to_classify = () => ({ data: null, error: { code: "42P01" } });
   const r = await runClassificationPhase(later(), db);
   assert.equal(r.error, "select_failed");
-  assert.equal(r.halt, false, "select_failed no deja gasto sin contar: la fase 2 puede correr");
+  assert.equal(r.halt, true, "our database failing is the one thing that halts a run");
 });
 
 test("sin tiempo suficiente no selecciona nada", async () => {
@@ -761,7 +875,7 @@ test("loadMessages y loadTopics filtran por workspace (y los temas por estado)",
 });
 
 // ── Fase 2 ─────────────────────────────────────────────────
-function resetBackfill(batches: Array<Array<ReturnType<typeof conv>>>) {
+function resetBackfill(batches: Array<Array<ReturnType<typeof conv> & { waits_until?: string | null }>>) {
   reset();
   tables.insight_topics = [topic("t-new", WS_A, "Nuevo")];
   let i = 0;
@@ -938,17 +1052,52 @@ test("fase 2 con la reserva caída → halt, sin llamar ni sumar fallos al tema"
   assert.equal(callsTo("record_backfill_failure").length, 0);
 });
 
-test("fase 2: TRANSIENT counts on the topic (a cursor can't step around it), no halt alone", async () => {
+test("fase 2: a TRANSIENT never counts on the topic: the conversation waits, and its topic with it", async () => {
   resetBackfill([[conv("d1")], [conv("d1")], [conv("d1")]]);
-  rpcHandlers.record_backfill_failure = () => ({ data: 1, error: null });
   classifyImpl = async () => ({ ok: false, code: "provider_unavailable", usage: null, keyScope: "platform" });
   const r = await runBackfillPhase(later(), db);
   assert.deepEqual(r, { processed: 0, failed: 0, deferred: 1, topics_done: 0, topics_expired: 0, skipped_workspaces: 0, unavailable_workspaces: 0, halt: false });
-  assert.equal(callsTo("record_backfill_failure").length, 1);
-  assert.equal(callsTo("advance_topic_backfill").length, 0, "skipped the conversation on the first failure");
+  assert.equal(callsTo("record_backfill_failure").length, 0, "a transient counted toward the topic's skip");
+  assert.deepEqual(callsTo("defer_classification").map((c) => c.args.p_conversation_id), ["d1"]);
+  assert.equal(callsTo("advance_topic_backfill").length, 0, "stepped past the conversation");
   assert.equal(classifyCalls.length, 1);
 });
-test("fase 2 con el save caído por infraestructura → halt, sin sumar fallos al tema", async () => {
+
+test("fase 2: a conversation waiting after a transient failure holds its topic, without a call", async () => {
+  resetBackfill([[{ ...conv("d1"), waits_until: "2026-09-14T21:00:00Z" }, conv("d2")]]);
+  const r = await runBackfillPhase(later(), db);
+  assert.equal(classifyCalls.length, 0);
+  assert.equal(callsTo("advance_topic_backfill").length, 0);
+  assert.equal(callsTo("record_backfill_failure").length, 0);
+  assert.equal(r.processed, 0);
+});
+
+test("fase 2: only a conversation that keeps failing transiently while its key is up is stepped past", async () => {
+  resetBackfill([[conv("d1"), conv("d2")], [conv("d2")]]);
+  convTransients.set("d1", BACKFILL_TRANSIENT_SKIP - 1);
+  classifyImpl = async () =>
+    classifyCalls.length === 1
+      ? { ok: false, code: "timeout", usage: null, keyScope: "platform" }
+      : { ...OK_RESULT, keyScope: "platform" };
+  const r = await runBackfillPhase(later(), db);
+  const advances = callsTo("advance_topic_backfill").map((c) => c.args.p_cursor_id);
+  assert.deepEqual(advances.slice(0, 2), ["d1", "d2"], "the third transient in a row steps past d1, and d2 is read");
+  assert.equal(r.processed, 1);
+  assert.equal(callsTo("record_backfill_failure").length, 0);
+});
+
+test("fase 2: a probe's failure is the key's, never the conversation's", async () => {
+  resetBackfill([[conv("d1")]]);
+  keyHealth.set(hashOf("sk-platform-test"), { scope: "platform", failures: 0, downCount: 1, downSince: clock - 900_000, downUntil: clock - 1, code: "timeout" });
+  classifyImpl = async () => ({ ok: false, code: "timeout", usage: null, keyScope: "platform" });
+  const r = await runBackfillPhase(later(), db);
+  assert.equal(classifyCalls.length, 1, "one probe");
+  assert.equal(callsTo("defer_classification").length, 0, "the probe's failure made the conversation wait");
+  assert.equal(r.unavailable_workspaces, 1);
+  const k = keyHealth.get(hashOf("sk-platform-test"))!;
+  assert.equal(k.downCount, 2, "down again");
+  assert.equal(k.downUntil, clock + 1_800_000, "for twice as long");
+});test("fase 2 con el save caído por infraestructura → halt, sin sumar fallos al tema", async () => {
   resetBackfill([[conv("d1"), conv("d2")]]);
   rpcHandlers.save_conversation_topics = () => ({ data: null, error: { code: "" } });
   const r = await runBackfillPhase(later(), db);
@@ -1153,4 +1302,238 @@ test("TURNS: a backfill with work takes its share first; phase 1 gets the rest",
   assert.ok(run.backfill.processed >= 3, `backfill ${run.backfill.processed}`);
   assert.ok(run.classified!.classified >= 3, `phase 1 ${run.classified!.classified}`);
   assert.ok(run.idleAtEnd_s <= 35);
+});
+
+// ───────────── Round 3 of review, on the key model (rv5a-3 rv1..rv5) ─────────────
+// Several runs 5 minutes apart on the virtual clock, with the key health, the
+// conversations' waits and the leases kept between runs as the database does.
+
+/** A stable pseudo-random order inside one rank, like the SQL's uuid. */
+const idOrder = (id: string) => [...id].reduce((h, c) => (h * 31 + c.charCodeAt(0)) % 1_000_003, 7);
+
+interface Night {
+  /** Conversation ids per workspace, in the order the workspace reads them. */
+  queues: Map<string, string[]>;
+  done: Set<string>;
+  waitUntil: Map<string, number>;
+  messages: Array<ReturnType<typeof message>>;
+}
+
+function night(queues: Map<string, string[]>): Night {
+  const messages = [...queues].flatMap(([ws, ids]) => ids.map((id) => message(`m-${id}`, id, ws)));
+  return { queues, done: new Set(), waitUntil: new Map(), messages };
+}
+
+/** The SQL's phase-1 pick on the fake: rank per workspace, then a random id; leases and waits honoured. */
+function nightHandlers(n: Night) {
+  const claimed = new Set<string>();
+  rpcHandlers.select_conversations_to_classify = (args) => {
+    const skip = (args.p_skip_workspaces as string[]) ?? [];
+    const heads = [...n.queues]
+      .filter(([ws]) => !skip.includes(ws))
+      .flatMap(([ws, ids]) =>
+        ids
+          .filter((id) => !claimed.has(id) && !n.done.has(id) && (n.waitUntil.get(id) ?? 0) <= clock)
+          .slice(0, 5)
+          .map((id, rn) => ({ ws, id, rn })),
+      );
+    const rows = heads.sort((x, y) => x.rn - y.rn || idOrder(x.id) - idOrder(y.id)).slice(0, 5);
+    for (const r of rows) claimed.add(r.id);
+    return { data: rows.map((r) => conv(r.id, r.ws)), error: null };
+  };
+  rpcHandlers.defer_classification = (a) => {
+    const id = a.p_conversation_id as string;
+    const k = (convTransients.get(id) ?? 0) + 1;
+    convTransients.set(id, k);
+    n.waitUntil.set(id, clock + Math.min(3_600_000 * 2 ** (k - 1), 86_400_000));
+    return { data: k, error: null };
+  };
+  rpcHandlers.save_conversation_topics = (a) => {
+    n.done.add(a.p_conversation_id as string);
+    convTransients.delete(a.p_conversation_id as string);
+    return { data: 1, error: null };
+  };
+}
+
+type BadMode = "404" | "503" | "timeout";
+/** The provider as a bad own key answers it, and as a healthy one does (4 s, 1,050 tokens). */
+const provider = (isBad: (ws: string) => boolean, mode: BadMode): Classify => async (p) => {
+  if (!isBad(p.workspaceId)) {
+    wait(4_000);
+    return { ok: true, matches: [], usage: { promptTokens: 1_000, completionTokens: 50 }, keyScope: "platform" };
+  }
+  if (mode === "timeout") {
+    wait(Infinity, p.abortSignal);
+    return { ok: false, code: "timeout", usage: null, keyScope: "own" };
+  }
+  wait(300);
+  return {
+    ok: false,
+    code: mode === "404" ? "key_rejected" : "provider_unavailable",
+    usage: { promptTokens: 0, completionTokens: 0 },
+    keyScope: "own",
+  };
+};
+
+/** Phase 1 only: A healthy with a backlog it can't finish, `bad` tenants whose own key fails every call. */
+async function tenants(bad: number, mode: BadMode, runs = 24) {
+  const badWs = Array.from({ length: bad }, (_, i) => `ws-bad${i}`);
+  const n = night(
+    new Map([
+      [WS_A, Array.from({ length: 1_000 }, (_, i) => `a${i}`)],
+      ...badWs.map((ws) => [ws, Array.from({ length: 300 }, (_, i) => `${ws}-c${i}`)] as [string, string[]]),
+    ]),
+  );
+  let t = 1_000_000;
+  let halts = 0;
+  let badCalls = 0;
+  for (let run = 0; run < runs; run++) {
+    reset({ keepKeys: run > 0 });
+    clock = t;
+    tables.integrations = badWs.map((ws) => ({ workspace_id: ws, provider: "openrouter", credentials: { openrouter_api_key: `sk-${ws}` } }));
+    tables.insight_topics = [WS_A, ...badWs].map((ws, i) => ({ ...topic(`t${i}`, ws, "Precio"), backfill_status: "done" }));
+    tables.messages = n.messages;
+    nightHandlers(n);
+    classifyImpl = provider((ws) => ws !== WS_A, mode);
+    const r = await runClassificationPhase(clock + 100_000, db, newRunGuards());
+    if (r.halt) halts++;
+    badCalls += classifyCalls.filter((c) => c.workspaceId !== WS_A).length;
+    t += 300_000;
+  }
+  return { bad, mode, halts, aRead: [...n.done].filter((id) => id.startsWith("a")).length, badCalls };
+}
+
+test("RV r3: healthy tenants keep their pace with 1, 2 and 3 own keys in 404, 503 or timeout; no halt", async () => {
+  const base = await tenants(0, "503");
+  const out = [base];
+  for (const mode of ["404", "503", "timeout"] as const) {
+    for (const bad of [1, 2, 3]) {
+      const r = await tenants(bad, mode);
+      out.push(r);
+      assert.equal(r.halts, 0, `${bad}×${mode}: a halt`);
+      // 404 and 503 answer in 0.3 s: the down keys cost ~nothing. A timeout
+      // costs its 20 s at each of the 3 calls that take the key down, and at
+      // each probe (15 min, 30, 1 h …): that is the time measured here.
+      const floor = mode === "timeout" ? 0.75 : 0.97;
+      assert.ok(r.aRead >= base.aRead * floor, `${bad}×${mode}: A read ${r.aRead} of the baseline's ${base.aRead}`);
+    }
+  }
+  console.log(out.map((r) => JSON.stringify(r)).join("\n"));
+});
+
+test("RV r3: the backfill is not self-sustaining: a tenant whose key always fails never stops the others", async () => {
+  const n = night(new Map([[WS_A, Array.from({ length: 400 }, (_, i) => `a${i}`)]]));
+  const xConvs = Array.from({ length: 30 }, (_, i) => `x${i}`);
+  const cursors = new Map<string, number>();
+  let t = 1_000_000;
+  const perRun: number[] = [];
+  let halts = 0;
+  for (let run = 0; run < 12; run++) {
+    reset({ keepKeys: run > 0 });
+    clock = t;
+    tables.integrations = [{ workspace_id: "ws-x", provider: "openrouter", credentials: { openrouter_api_key: "sk-x" } }];
+    tables.insight_topics = [
+      { ...topic("tA", WS_A, "Precio"), backfill_status: "done" },
+      ...["tX1", "tX2", "tX3"].map((id) => topic(id, "ws-x", id)),
+    ];
+    tables.messages = [...n.messages, ...xConvs.map((id) => message(`m-${id}`, id, "ws-x"))];
+    nightHandlers(n);
+    rpcHandlers.claim_topic_backfill = () => ({ data: true, error: null });
+    rpcHandlers.release_topic_backfill = () => ({ data: null, error: null });
+    rpcHandlers.record_backfill_failure = () => ({ data: 1, error: null });
+    rpcHandlers.next_backfill_batch = (a) => {
+      const i = cursors.get(a.p_topic_id as string) ?? 0;
+      return { data: xConvs.slice(i, i + 5).map((id) => conv(id, "ws-x")), error: null };
+    };
+    rpcHandlers.advance_topic_backfill = (a) => {
+      cursors.set(a.p_topic_id as string, xConvs.indexOf(a.p_cursor_id as string) + 1);
+      return { data: "pending", error: null };
+    };
+    classifyImpl = provider((ws) => ws === "ws-x", "503");
+    const before = [...n.done].length;
+    const r = await routeRun();
+    if (r.backfill.halt || r.classified?.halt) halts++;
+    perRun.push([...n.done].length - before);
+    t += 300_000;
+  }
+  assert.equal(halts, 0);
+  assert.ok(perRun.every((k) => k >= 14), `A's reads per run: ${perRun}`);
+  assert.equal(callsTo("record_backfill_failure").length, 0);
+  assert.equal(cursors.size, 0, "a transient moved a backfill cursor");
+});
+
+test("RV r3: a 15-minute outage never makes the backfill skip a conversation", async () => {
+  const ids = Array.from({ length: 12 }, (_, i) => `b${i}`);
+  const n = night(new Map());
+  const saved = new Set<string>();
+  const advanced: string[] = [];
+  let cursor = 0;
+  let t = 1_000_000;
+  const outageEnds = t + 15 * 60_000;
+  for (let run = 0; run < 36 && saved.size < ids.length; run++) {
+    reset({ keepKeys: run > 0 });
+    clock = t;
+    tables.insight_topics = [topic("t-new", WS_A, "Nuevo")];
+    tables.messages = ids.map((id) => message(`m-${id}`, id, WS_A));
+    nightHandlers(n);
+    rpcHandlers.claim_topic_backfill = () => ({ data: true, error: null });
+    rpcHandlers.release_topic_backfill = () => ({ data: null, error: null });
+    rpcHandlers.next_backfill_batch = () => ({
+      data: ids.slice(cursor, cursor + 5).map((id) => ({
+        ...conv(id),
+        waits_until: (n.waitUntil.get(id) ?? 0) > clock ? "later" : null,
+      })),
+      error: null,
+    });
+    rpcHandlers.advance_topic_backfill = (a) => {
+      if (a.p_done) return { data: "done", error: null };
+      advanced.push(a.p_cursor_id as string);
+      cursor = ids.indexOf(a.p_cursor_id as string) + 1;
+      return { data: "pending", error: null };
+    };
+    rpcHandlers.save_conversation_topics = (a) => {
+      saved.add(a.p_conversation_id as string);
+      convTransients.delete(a.p_conversation_id as string);
+      return { data: 1, error: null };
+    };
+    classifyImpl = async () => {
+      wait(4_000);
+      return clock < outageEnds
+        ? { ok: false, code: "provider_unavailable", usage: { promptTokens: 0, completionTokens: 0 }, keyScope: "platform" }
+        : { ok: true, matches: [], usage: { promptTokens: 1_000, completionTokens: 50 }, keyScope: "platform" };
+    };
+    await routeRun();
+    t += 300_000;
+  }
+  assert.equal(saved.size, ids.length, "not every conversation was read for the topic");
+  assert.ok(advanced.every((id) => saved.has(id)), "the cursor stepped past a conversation it never read");
+});
+
+test("RV r3: when a key's wait ends, ONE call probes it; the rest of the run follows its answer", async () => {
+  for (const answers of [true, false]) {
+    reset();
+    tables.insight_topics.push(topic("t2", WS_B, "Precio"));
+    for (const [id, ws] of [["a1", WS_A], ["b1", WS_B], ["a2", WS_A], ["b2", WS_B]]) tables.messages.push(message(`m-${id}`, id, ws));
+    rpcHandlers.select_conversations_to_classify = queueSelect([conv("a1"), conv("b1", WS_B), conv("a2"), conv("b2", WS_B)], 4);
+    keyHealth.set(hashOf("sk-platform-test"), { scope: "platform", failures: 0, downCount: 1, downSince: clock - 900_000, downUntil: clock - 1, code: "provider_unavailable" });
+    classifyImpl = async () =>
+      answers
+        ? { ...OK_RESULT, keyScope: "platform" }
+        : { ok: false, code: "provider_unavailable", usage: { promptTokens: 0, completionTokens: 0 }, keyScope: "platform" };
+    const guards = newRunGuards();
+    const r = await runClassificationPhase(later(), db, guards);
+    const k = keyHealth.get(hashOf("sk-platform-test"))!;
+    if (answers) {
+      assert.equal(r.classified, 4, "after a probe that answers, calls go");
+      assert.equal(k.downSince, null);
+      assert.equal(guards.platformDown, false);
+    } else {
+      assert.equal(classifyCalls.length, 1, "more than one call on a key that is down");
+      assert.equal(callsTo("defer_classification").length, 0);
+      assert.equal(r.unavailable_workspaces, 2);
+      assert.equal(k.downCount, 2);
+      assert.equal(guards.platformDown, true);
+    }
+    assert.equal(r.halt, false);
+  }
 });

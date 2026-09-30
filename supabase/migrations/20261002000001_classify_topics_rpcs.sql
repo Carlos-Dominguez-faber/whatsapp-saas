@@ -293,6 +293,8 @@ BEGIN
     ON CONFLICT (conversation_id) DO UPDATE SET
       partial_from = LEAST(cc.partial_from, EXCLUDED.partial_from),
       partial_until = GREATEST(cc.partial_until, EXCLUDED.partial_until),
+      -- Read: its transient streak (defer_classification) is over.
+      transient_failures = CASE WHEN p_backfill_topic IS NULL THEN cc.transient_failures ELSE 0 END,
       backfill_topics = CASE
         WHEN p_backfill_topic IS NULL OR p_backfill_topic = ANY (cc.backfill_topics) THEN cc.backfill_topics
         ELSE cc.backfill_topics || p_backfill_topic END,
@@ -383,19 +385,26 @@ $$;
 -- created can't move a conversation out of the backfill without the nightly
 -- run picking it up (it only runs on new customer messages).
 -- #13 shipped (UUID, INT) returning last_message_at.
+-- `waits_until`: the conversation is waiting after a transient failure
+-- (defer_classification) — the cursor can't step around it, so its topic waits
+-- too, without a call.
 DROP FUNCTION IF EXISTS public.next_backfill_batch(UUID, INT);
+DROP FUNCTION IF EXISTS public.next_backfill_batch(UUID, INT, TIMESTAMPTZ);
 
 CREATE OR REPLACE FUNCTION public.next_backfill_batch(
   p_topic_id UUID,
   p_limit INT,
   p_now TIMESTAMPTZ DEFAULT now()
 )
-RETURNS TABLE (conversation_id UUID, workspace_id UUID, contact_id UUID, last_inbound_at TIMESTAMPTZ)
+RETURNS TABLE (conversation_id UUID, workspace_id UUID, contact_id UUID, last_inbound_at TIMESTAMPTZ,
+               waits_until TIMESTAMPTZ)
 LANGUAGE sql
 STABLE
 SET search_path = ''
 AS $$
-  SELECT c.id, c.workspace_id, c.contact_id, li.at
+  SELECT c.id, c.workspace_id, c.contact_id, li.at,
+         CASE WHEN cc.transient_failures > 0 AND cc.claimed_until > COALESCE(p_now, now())
+              THEN cc.claimed_until END
   FROM public.insight_topics t
   JOIN public.conversations c ON c.workspace_id = t.workspace_id
   CROSS JOIN LATERAL (
@@ -694,7 +703,12 @@ $$;
 -- that way again — p_seconds, 2x, 4x … up to a day — and resets when it is
 -- read: a conversation that always times out keeps its estimate reserved at
 -- every try (the usage is unknown), and trying it every hour would use up its
--- workspace's daily cap by itself.
+-- workspace's daily cap by itself. Returns the failures in a row: the backfill
+-- steps past a conversation at the third (classify-topics.ts).
+-- A probe of a key that is down (classification_key_gate) never lands here:
+-- its failure is the key's, not the conversation's.
+DROP FUNCTION IF EXISTS public.defer_classification(UUID, UUID, TEXT, INT, TIMESTAMPTZ);
+
 CREATE OR REPLACE FUNCTION public.defer_classification(
   p_workspace_id UUID,
   p_conversation_id UUID,
@@ -702,12 +716,13 @@ CREATE OR REPLACE FUNCTION public.defer_classification(
   p_seconds INT,
   p_now TIMESTAMPTZ DEFAULT now()
 )
-RETURNS VOID
+RETURNS INT
 LANGUAGE plpgsql
 SET search_path = ''
 AS $$
 DECLARE
   v_base INT := LEAST(GREATEST(COALESCE(p_seconds, 3600), 60), 86400);
+  v_failures INT;
 BEGIN
   IF NOT EXISTS (
     SELECT 1 FROM public.conversations
@@ -724,12 +739,140 @@ BEGIN
     claimed_until = COALESCE(p_now, now())
       + make_interval(secs => LEAST(v_base::bigint * (2 ^ LEAST(cc.transient_failures, 10))::bigint, 86400)),
     transient_failures = cc.transient_failures + 1,
-    updated_at = now();
+    updated_at = now()
+  RETURNING transient_failures INTO v_failures;
+  RETURN v_failures;
 END;
 $$;
 
--- Why a workspace isn't being analysed, for the dashboard: its OpenRouter key
--- fails ('key') or it reached its daily cap ('cap'). At most one row per
+-- ── Key health (see classification_key_health) ─────────────
+-- The run asks this once per workspace and run, before its first call: it
+-- records which key the workspace runs on (the dashboard's "blocked" reads
+-- that key's health) and answers the key's state:
+--   {"state": "up", "failures": n}  calls go (n transient failures in a row)
+--   {"state": "down"}               no call before down_until
+--   {"state": "probe"}              down_until passed: THIS caller makes the one
+--                                   call that tests the key. down_until moves a
+--                                   lease ahead, so no other caller (another
+--                                   workspace on the key, another run) probes
+--                                   too; a probe that never reports lets the
+--                                   lease lapse and the next caller probes.
+CREATE OR REPLACE FUNCTION public.classification_key_gate(
+  p_workspace_id UUID,
+  p_key_id TEXT,
+  p_scope TEXT,
+  p_probe_seconds INT DEFAULT 180,
+  p_now TIMESTAMPTZ DEFAULT now()
+)
+RETURNS JSONB
+LANGUAGE plpgsql
+SET search_path = ''
+AS $$
+DECLARE
+  v_now TIMESTAMPTZ := COALESCE(p_now, now());
+  v_key public.classification_key_health%ROWTYPE;
+BEGIN
+  IF p_scope IS NULL OR p_scope NOT IN ('own', 'platform') OR p_key_id IS NULL THEN
+    RAISE EXCEPTION 'classification_key_gate: bad key' USING ERRCODE = '22023';
+  END IF;
+  INSERT INTO public.classification_workspace_state AS s (workspace_id, key_id, key_scope, updated_at)
+  VALUES (p_workspace_id, p_key_id, p_scope, now())
+  ON CONFLICT (workspace_id) DO UPDATE SET
+    key_id = EXCLUDED.key_id, key_scope = EXCLUDED.key_scope, updated_at = now()
+  WHERE (s.key_id, s.key_scope) IS DISTINCT FROM (EXCLUDED.key_id, EXCLUDED.key_scope);
+
+  SELECT * INTO v_key FROM public.classification_key_health h WHERE h.key_id = p_key_id FOR UPDATE;
+  IF NOT FOUND OR v_key.down_since IS NULL THEN
+    RETURN jsonb_build_object('state', 'up', 'failures', COALESCE(v_key.transient_failures, 0));
+  END IF;
+  IF v_key.down_until > v_now THEN
+    RETURN jsonb_build_object('state', 'down');
+  END IF;
+  UPDATE public.classification_key_health h
+     SET down_until = v_now + make_interval(secs => LEAST(GREATEST(COALESCE(p_probe_seconds, 180), 30), 600)),
+         updated_at = now()
+   WHERE h.key_id = p_key_id;
+  RETURN jsonb_build_object('state', 'probe');
+END;
+$$;
+
+-- What a call on a key got back, in the model's classes:
+--   'answered'   a result, or a refusal of THIS text: the key works. Back to up.
+--   'rejected'   the key itself was refused (401/402/403/404/429…), or it can't
+--                be used at all: down at once for p_rejected_seconds (flat: a
+--                refused request bills nothing, so testing it again is cheap).
+--   'transient'  5xx, network, timeout. Up: one more in a row, down at the
+--                p_breaker-th. Already down (a probe, or a concurrent call):
+--                down again. Each transient down waits twice the last one,
+--                from p_base_seconds up to p_max_seconds.
+-- Answers on OTHER keys never touch this row. Returns 'up' or 'down'.
+CREATE OR REPLACE FUNCTION public.record_classification_key_outcome(
+  p_key_id TEXT,
+  p_scope TEXT,
+  p_outcome TEXT,
+  p_code TEXT DEFAULT NULL,
+  p_breaker INT DEFAULT 3,
+  p_base_seconds INT DEFAULT 900,
+  p_max_seconds INT DEFAULT 21600,
+  p_rejected_seconds INT DEFAULT 900,
+  p_now TIMESTAMPTZ DEFAULT now()
+)
+RETURNS TEXT
+LANGUAGE plpgsql
+SET search_path = ''
+AS $$
+DECLARE
+  v_now TIMESTAMPTZ := COALESCE(p_now, now());
+  v_key public.classification_key_health%ROWTYPE;
+BEGIN
+  IF p_outcome IS NULL OR p_outcome NOT IN ('answered', 'rejected', 'transient')
+     OR p_scope IS NULL OR p_scope NOT IN ('own', 'platform') OR p_key_id IS NULL THEN
+    RAISE EXCEPTION 'record_classification_key_outcome: bad outcome' USING ERRCODE = '22023';
+  END IF;
+  INSERT INTO public.classification_key_health (key_id, scope) VALUES (p_key_id, p_scope)
+  ON CONFLICT (key_id) DO NOTHING;
+  SELECT * INTO v_key FROM public.classification_key_health h WHERE h.key_id = p_key_id FOR UPDATE;
+
+  IF p_outcome = 'answered' THEN
+    UPDATE public.classification_key_health h
+       SET transient_failures = 0, down_count = 0, down_since = NULL, down_until = NULL,
+           last_error_code = NULL, updated_at = now()
+     WHERE h.key_id = p_key_id;
+    RETURN 'up';
+  END IF;
+
+  IF p_outcome = 'rejected' THEN
+    UPDATE public.classification_key_health h
+       SET transient_failures = 0,
+           down_since = COALESCE(h.down_since, v_now),
+           down_until = v_now + make_interval(secs => GREATEST(COALESCE(p_rejected_seconds, 900), 60)),
+           last_error_code = p_code, updated_at = now()
+     WHERE h.key_id = p_key_id;
+    RETURN 'down';
+  END IF;
+
+  IF v_key.down_since IS NULL AND v_key.transient_failures + 1 < GREATEST(COALESCE(p_breaker, 3), 1) THEN
+    UPDATE public.classification_key_health h
+       SET transient_failures = h.transient_failures + 1, last_error_code = p_code, updated_at = now()
+     WHERE h.key_id = p_key_id;
+    RETURN 'up';
+  END IF;
+
+  UPDATE public.classification_key_health h
+     SET transient_failures = 0,
+         down_count = h.down_count + 1,
+         down_since = COALESCE(h.down_since, v_now),
+         down_until = v_now + make_interval(secs => LEAST(
+           GREATEST(COALESCE(p_base_seconds, 900), 60)::bigint * (2 ^ LEAST(h.down_count, 16))::bigint,
+           GREATEST(COALESCE(p_max_seconds, 21600), 60))),
+         last_error_code = p_code, updated_at = now()
+   WHERE h.key_id = p_key_id;
+  RETURN 'down';
+END;
+$$;
+
+-- A workspace that reached its daily cap, for the dashboard ('cap'; a key that
+-- is down comes from classification_key_health). At most one row per
 -- workspace, reason and hour, so a run every 5 minutes doesn't flood events.
 CREATE OR REPLACE FUNCTION public.note_classification_blocked(
   p_workspace_id UUID,
@@ -743,7 +886,7 @@ AS $$
 DECLARE
   v_now TIMESTAMPTZ := COALESCE(p_now, now());
 BEGIN
-  IF p_reason NOT IN ('key', 'cap') THEN
+  IF p_reason IS NULL OR p_reason <> 'cap' THEN
     RAISE EXCEPTION 'note_classification_blocked: unknown reason %', p_reason USING ERRCODE = '22023';
   END IF;
   PERFORM pg_advisory_xact_lock(hashtextextended('classify_blocked:' || p_workspace_id::text, 0));
@@ -762,8 +905,12 @@ END;
 $$;
 
 REVOKE ALL ON FUNCTION public.defer_classification(UUID, UUID, TEXT, INT, TIMESTAMPTZ) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.classification_key_gate(UUID, TEXT, TEXT, INT, TIMESTAMPTZ) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.record_classification_key_outcome(TEXT, TEXT, TEXT, TEXT, INT, INT, INT, INT, TIMESTAMPTZ) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.note_classification_blocked(UUID, TEXT, TIMESTAMPTZ) FROM PUBLIC, anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.defer_classification(UUID, UUID, TEXT, INT, TIMESTAMPTZ) TO service_role;
+GRANT EXECUTE ON FUNCTION public.classification_key_gate(UUID, TEXT, TEXT, INT, TIMESTAMPTZ) TO service_role;
+GRANT EXECUTE ON FUNCTION public.record_classification_key_outcome(TEXT, TEXT, TEXT, TEXT, INT, INT, INT, INT, TIMESTAMPTZ) TO service_role;
 GRANT EXECUTE ON FUNCTION public.note_classification_blocked(UUID, TEXT, TIMESTAMPTZ) TO service_role;
 
 REVOKE ALL ON FUNCTION public.select_conversations_to_classify(INT, UUID[], INT, TIMESTAMPTZ) FROM PUBLIC, anon, authenticated;

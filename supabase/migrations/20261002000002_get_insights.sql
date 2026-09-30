@@ -215,25 +215,35 @@ SELECT jsonb_build_object(
     SELECT min(m.created_at) FROM public.messages m
      WHERE m.workspace_id = p_workspace_id AND m.direction = 'in'
   ),
-  -- Why the rest isn't being read, if the run says so: the workspace's
-  -- OpenRouter key fails ('key') or it reached its daily cap ('cap'). Current
-  -- when noted in the last 2 hours with no paid classification since
-  -- (note_classification_blocked writes at most one an hour while it lasts).
-  'blocked', (
-    SELECT b.payload->>'reason'
-      FROM public.events b
-     WHERE b.workspace_id = p_workspace_id
-       AND b.type = 'topic_classification_blocked'
-       AND b.created_at > now() - INTERVAL '2 hours'
-       AND NOT EXISTS (
-         SELECT 1 FROM public.events ok
-          WHERE ok.workspace_id = p_workspace_id
-            AND ok.type = 'topic_classification'
-            AND ok.created_at > b.created_at
-            AND ok.payload->>'reserved' = 'false'
-            AND ok.payload->>'total_tokens' ~ '^[1-9][0-9]{0,11}$')
-     ORDER BY b.created_at DESC
-     LIMIT 1
+  -- Why the rest isn't being read, if anything blocks it:
+  -- * 'key' / 'platform_key': the OpenRouter key this workspace's calls run
+  --   on (its own, or the platform's) is down. Read from the key's health,
+  --   which the run keeps across runs (classification_key_health), for the
+  --   key the workspace ran on at its last turn.
+  -- * 'cap': it reached its daily cap. Current when noted in the last 2 hours
+  --   with no paid classification since (note_classification_blocked writes
+  --   at most one an hour while it lasts).
+  'blocked', COALESCE(
+    (SELECT CASE s.key_scope WHEN 'platform' THEN 'platform_key' ELSE 'key' END
+       FROM public.classification_workspace_state s
+       JOIN public.classification_key_health h ON h.key_id = s.key_id
+      WHERE s.workspace_id = p_workspace_id
+        AND h.down_since IS NOT NULL),
+    (SELECT b.payload->>'reason'
+       FROM public.events b
+      WHERE b.workspace_id = p_workspace_id
+        AND b.type = 'topic_classification_blocked'
+        AND b.payload->>'reason' = 'cap'
+        AND b.created_at > now() - INTERVAL '2 hours'
+        AND NOT EXISTS (
+          SELECT 1 FROM public.events ok
+           WHERE ok.workspace_id = p_workspace_id
+             AND ok.type = 'topic_classification'
+             AND ok.created_at > b.created_at
+             AND ok.payload->>'reserved' = 'false'
+             AND ok.payload->>'total_tokens' ~ '^[1-9][0-9]{0,11}$')
+      ORDER BY b.created_at DESC
+      LIMIT 1)
   ),
   'analysis', jsonb_build_object(
     'conversations', (SELECT count(*) FROM conv),

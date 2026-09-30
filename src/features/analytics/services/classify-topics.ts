@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { createClient as createSbClient, type SupabaseClient } from "@supabase/supabase-js";
 import { isBodyTruncated, MAX_PROMPT_MESSAGES, type PromptMessage, type PromptTopic } from "../lib/classify-prompt";
 import {
@@ -7,61 +8,89 @@ import {
   type KeyScope,
   type LlmUsage,
 } from "./classifier";
-import { resolveOpenRouterKey, type OpenRouterKeyResolution } from "@/features/inbox/services/openrouter-key";
+import { resolveOpenRouterKey } from "@/features/inbox/services/openrouter-key";
 
 /*
  * ════════════════════════════════════════════════════════════════════════════
- * THE FAILURE AND TURN MODEL of topic classification. Every call ends in
- * exactly one of these classes; each class has one owner and one response.
+ * THE FAILURE AND TURN MODEL of topic classification.
  *
- * 1. KEY — 401, 402, 403 (not moderation), 429, or an own key that can't be
- *    decrypted, or an empty platform key. Owner: the KEY the call ran on
- *    (classifyConversation says which). Response: that key is dead for the
- *    rest of the run: with a workspace's own key, only that workspace is
- *    skipped; with the platform key, every workspace without its own. No
- *    attempt spent, no backoff (the next run tries the key once again, at no
- *    cost: a refused request bills nothing). NEVER counts toward the breaker.
- *    The dashboard is told (note_classification_blocked 'key').
- * 2. TRANSIENT — 5xx, 408, 409, 404, the network, a timeout. Owner: nobody in
- *    particular. Response: THIS conversation waits TRANSIENT_BACKOFF_SECONDS
- *    (1 h, defer_classification), doubling each time it fails that way again
- *    (2 h, 4 h … up to 24 h; back to 1 h once it is read), no attempt spent,
- *    and the run goes on with the next one — its workspace is not skipped. The
- *    doubling matters: a timeout keeps its estimate reserved (the usage is
- *    unknown), and a conversation that always times out, tried every hour,
- *    would use up its workspace's daily cap by itself.
- * 3. CONTENT — 400, 413, 422, a moderation 403, output that doesn't parse, a
- *    save the database rejects as data. Owner: the conversation. Response: an
- *    attempt, a backoff of 1 h per attempt, quarantine at the third.
- * 4. BUDGET — the reservation doesn't fit the workspace's daily cap. Owner:
- *    the workspace. Response: skipped for the rest of the run; the dashboard
- *    is told (note_classification_blocked 'cap').
- * 5. INFRA — our database: the reservation, the key lookup, a save or a
- *    bookkeeping write fails. Response: the run stops (halt). A paid result
- *    that can't be saved would be paid again by the next conversation.
+ * Every call ends in exactly one class. Each class has ONE owner, and a
+ * failure only moves its owner's state:
  *
- * CIRCUIT BREAKER: TRANSIENT_BREAKER (3) transient failures in a row, on
- * different conversations, stop the run: that is the provider, not three bad
- * conversations. Any answer from the provider (a result, a content or a key
- * rejection) resets the count.
+ * KEY — 401, 402, 403 (not moderation), 404 (OpenRouter: no endpoint for the
+ *   key's data policy), 429, any other 4xx; an own key that can't be
+ *   decrypted; no platform key. Owner: the KEY. It goes down at once for
+ *   KEY_REJECTED_SECONDS (15 min, flat: a refused request bills nothing, so
+ *   testing it again is cheap). No attempt spent.
+ * TRANSIENT — 5xx, 408, 409, 425, the network, a timeout. Owners: the KEY
+ *   (one more in its streak; the KEY_TRANSIENT_BREAKER-th in a row takes it
+ *   down: 15 min, doubling each down in a row up to 6 h) and the CONVERSATION
+ *   (it waits TRANSIENT_BACKOFF_SECONDS, doubling each time it fails that way
+ *   again up to a day; no attempt spent). The run goes on with the next one.
+ * CONTENT — 400, 413, 422, a moderation 403, an answer that isn't an HTTP
+ *   error and can't be read, output that doesn't parse, a save the database
+ *   rejects as data. Owner: the CONVERSATION: an attempt, 1 h per attempt,
+ *   quarantine at the third.
+ * BUDGET — the reservation doesn't fit the workspace's daily cap. Owner: the
+ *   WORKSPACE: skipped for the rest of the run (note_classification_blocked
+ *   'cap' tells the dashboard).
+ * INFRA — our database fails. The run stops (halt). THE ONLY HALT: nothing a
+ *   key, a conversation or the provider does stops the run.
+ *
+ * STATE, where it lives and what resets it:
+ * - The key: classification_key_health, one row per key, across runs. Its id
+ *   is a hash of the key (never the key), so every workspace on the platform
+ *   key — or one key pasted into two workspaces — shares it.
+ *     up    calls go; transient_failures counts transients in a row.
+ *     down  down_since set: no call on it, in this run or the next, before
+ *           down_until. Its workspaces are skipped.
+ *     probe down_until passed: classification_key_gate hands ONE caller the
+ *           call that tests it (the others still see it down). Answered: up,
+ *           all reset. Transient: down again, twice as long. Refused: down
+ *           15 min.
+ *   Reset: any answer from the provider ON THIS KEY — a result, invalid
+ *   output, a refusal of the text. Answers on other keys never touch it, and
+ *   a workspace skipped without a call touches nothing.
+ *   The run reads it once per workspace and run (the gate, which also records
+ *   which key the workspace runs on) and keeps what it learns in RunGuards;
+ *   the dashboard reads it too (get_insights 'blocked': 'key' for an own key,
+ *   'platform_key' for the platform's).
+ * - The conversation: conversation_classification — claimed_until (its lease
+ *   and every wait), attempts and quarantined_at (content), transient_failures
+ *   (its transient waits). Reset when it is read.
+ * - The run: RunGuards — what it learned of each key, and the workspaces out
+ *   of it (a key down, over the cap). Shared by both phases; gone at the end.
+ * A down PLATFORM key skips every workspace on it and the route answers 500,
+ * so it shows in net._http_response. Own keys down never make a 500.
+ *
+ * THE BACKFILL walks a cursor, which can't step around a conversation:
+ * - content: counts on the topic (record_backfill_failure); at the third in a
+ *   row the cursor steps past that conversation;
+ * - transient: never counts on the topic. The conversation waits (its own
+ *   doubling), and its topic waits with it, without calls. Only its
+ *   BACKFILL_TRANSIENT_SKIP-th transient failure in a row steps past it — a
+ *   conversation that always times out can't hold a backfill forever. Each of
+ *   those failures happened on a key that was up: in an outage the key goes
+ *   down at the third transient of any conversation, and a probe's failure is
+ *   the key's, never the conversation's, so an outage can't make it skip.
  *
  * SETTLEMENT of the reservation made before every call:
  *   result with usage ............................ the real count
  *   result or invalid output without usage ....... the estimate stays (a ceiling)
+ *   an answer that isn't an HTTP error ........... the estimate stays
  *   any HTTP error answer (4xx, 5xx) ............. 0 (nothing was generated)
  *   timeout / network (no answer) ................ the estimate stays
- *   no call made (dead key, no time, no inbound) . no reservation at all
+ *   no call made (key down, no time, no inbound) . no reservation at all
  * The estimate is always a ceiling, so a crash between reservation and
  * settlement overcounts the day, never undercounts it.
  *
  * TURNS. A run (route.ts) gives the backfill of new topics the first
  * BACKFILL_SHARE_MS and the nightly phase the rest, including whatever the
  * backfill didn't use: a backfill with nothing it can do (no topic pending,
- * over the cap, a dead key) returns at once. Inside each phase the order is
+ * over the cap, a key down) returns at once. Inside each phase the order is
  * the database's (select_conversations_to_classify): workspaces take turns;
  * inside each, customers of the last 48 h oldest first, then the rest newest
- * first. Guards (dead keys, workspaces over the cap, the breaker) are shared
- * by both phases of a run.
+ * first.
  * ════════════════════════════════════════════════════════════════════════════
  */
 
@@ -75,10 +104,18 @@ import { resolveOpenRouterKey, type OpenRouterKeyResolution } from "@/features/i
  */
 export const CLASSIFY_DAILY_TOKEN_CAP = 300_000;
 
-/** Transient failures in a row, on different conversations, that stop a run. */
-export const TRANSIENT_BREAKER = 3;
-/** How long a conversation waits after a transient failure (no attempt spent). */
+/** Transient failures in a row on ONE key that take it down. */
+export const KEY_TRANSIENT_BREAKER = 3;
+/** A key down from transient failures waits this long; each down in a row doubles it. */
+export const KEY_DOWN_BASE_SECONDS = 900;
+/** … up to this. */
+export const KEY_DOWN_MAX_SECONDS = 21_600;
+/** A key the provider refused waits this long, flat. */
+export const KEY_REJECTED_SECONDS = 900;
+/** A conversation's wait after a transient failure (doubles for each in a row, up to a day). */
 export const TRANSIENT_BACKOFF_SECONDS = 3600;
+/** A conversation's transient failures in a row after which the backfill steps past it. */
+export const BACKFILL_TRANSIENT_SKIP = 3;
 
 /**
  * Cuántas conversaciones se RECLAMAN por vuelta (con lease). Las llamadas
@@ -121,16 +158,13 @@ export interface ClassificationPhaseResult {
   classified: number;
   /** Content failures: an attempt spent. */
   failed: number;
-  /** Transient failures: the conversation waits an hour, no attempt spent. */
+  /** Transient failures: the conversation waits, no attempt spent. */
   deferred: number;
   /** Workspaces over their daily cap, skipped for the rest of the run. */
   skipped_workspaces: number;
-  /** Workspaces skipped for the rest of the run because their key failed. */
+  /** Workspaces skipped for the rest of the run because their key is down. */
   unavailable_workspaces: number;
-  /**
-   * true = the run stops: the breaker tripped, or our database failed. The
-   * route doesn't run the other phase.
-   */
+  /** true = our database failed: the run stops. The only halt. */
   halt: boolean;
   error?: string;
 }
@@ -157,34 +191,53 @@ interface ConversationRow {
    * customer's messages up to here (classified_until, the backfill cursor).
    */
   last_inbound_at: string;
+  /** Backfill only: the conversation waits after a transient failure until then. */
+  waits_until?: string | null;
 }
 
-/** What a run knows about keys, caps and the provider; shared by both phases. */
+/** The key a workspace's calls run on this run. */
+interface WorkspaceKey {
+  /** classification_key_health.key_id: a hash of the key, never the key. */
+  keyId: string;
+  scope: KeyScope;
+  /** null: it can't be used at all (an own key that can't be decrypted, no platform key). */
+  key: string | null;
+}
+
+/** What the run knows of a key: the gate's answer, then every outcome on it. */
+interface KeyView {
+  state: "up" | "down" | "probe";
+  /** Transient failures in a row while up. */
+  failures: number;
+}
+
+/** What a run learned; shared by both phases, gone at its end. */
 export interface RunGuards {
   /** Each workspace's key, resolved once per run. */
-  keys: Map<string, OpenRouterKeyResolution>;
-  /** Keys that failed this run: "platform", or "own:<workspace id>". */
-  deadKeys: Set<string>;
-  /** Workspaces out of the rest of the run: a dead key, or over the cap. */
+  workspaces: Map<string, WorkspaceKey>;
+  /** Each key's state, from the gate and from the run's own calls. */
+  keys: Map<string, KeyView>;
+  /** Workspaces out of the rest of the run: their key is down, or over the cap. */
   skipped: Set<string>;
-  /** Conversations with a transient failure since the provider last answered. */
-  transientStreak: Set<string>;
+  /** The platform key was down in this run: the route answers 500. */
+  platformDown: boolean;
 }
 
 export function newRunGuards(): RunGuards {
-  return { keys: new Map(), deadKeys: new Set(), skipped: new Set(), transientStreak: new Set() };
+  return { workspaces: new Map(), keys: new Map(), skipped: new Set(), platformDown: false };
 }
 
-const keyId = (workspaceId: string, scope: KeyScope) => (scope === "platform" ? "platform" : `own:${workspaceId}`);
+const hashKey = (key: string) => `sha256:${createHash("sha256").update(key).digest("hex")}`;
 
 /** The outcome of one conversation, in the model's classes. */
 type Outcome =
   | { kind: "ok" }
   | { kind: "no_time" }
   | { kind: "budget" }
-  /** No call made: the workspace's key is dead this run (or unusable). */
-  | { kind: "key"; scope: KeyScope; called: boolean }
-  | { kind: "transient"; code: string }
+  /** The workspace's key is down (it just went, or it already was): skip the workspace. */
+  | { kind: "key" }
+  /** `probe`: the call was the one that tested a key that was down. */
+  | { kind: "transient"; code: string; probe: boolean }
   | { kind: "content"; code: string }
   | { kind: "infra"; code: string };
 
@@ -226,29 +279,127 @@ const isDataRejection = (error: DbError) => /^(22|23|P0)/.test(error.code ?? "")
  */
 const isDeadlineAbort = (error: DbError, deadline: number) => !error.code && remainingMs(deadline) <= 0;
 
-/** Tells the dashboard why a workspace isn't being analysed. Best effort. */
-async function noteBlocked(db: SupabaseClient, workspaceId: string, reason: "key" | "cap", deadline: number) {
+/** Tells the dashboard a workspace reached its daily cap. Best effort. */
+async function noteOverCap(db: SupabaseClient, workspaceId: string, deadline: number) {
   const { error } = await db
-    .rpc("note_classification_blocked", { p_workspace_id: workspaceId, p_reason: reason })
+    .rpc("note_classification_blocked", { p_workspace_id: workspaceId, p_reason: "cap" })
     .abortSignal(dbSignal(deadline));
-  if (error) console.error("[classify-topics] could not note a blocked workspace", error.code);
+  if (error) console.error("[classify-topics] could not note a workspace over its cap", error.code);
+}
+
+type Stop = Extract<Outcome, { kind: "no_time" } | { kind: "infra" }>;
+const dbStop = (error: DbError, deadline: number, code: string): Stop =>
+  isDeadlineAbort(error, deadline) ? { kind: "no_time" } : { kind: "infra", code };
+
+/** What the run learns of a key; a platform key down makes the route's 500. */
+function learnKey(guards: RunGuards, wk: WorkspaceKey, view: KeyView) {
+  guards.keys.set(wk.keyId, view);
+  if (view.state === "down" && wk.scope === "platform") guards.platformDown = true;
 }
 
 /**
- * The key the workspace's calls run on this run: resolved once, and dead
- * when it already failed (its own, or the platform's for everyone on it).
+ * Records what a call on a key got back (record_classification_key_outcome)
+ * and what the key is now. `answered` is best effort: a key that stays marked
+ * down gets probed again once its probe lease lapses, and answers then.
  */
-async function keyFor(
+async function recordKeyOutcome(
+  db: SupabaseClient,
+  guards: RunGuards,
+  wk: WorkspaceKey,
+  outcome: "answered" | "rejected" | "transient",
+  code: string | null,
+  deadline: number,
+): Promise<Stop | null> {
+  const { data, error } = await db
+    .rpc("record_classification_key_outcome", {
+      p_key_id: wk.keyId,
+      p_scope: wk.scope,
+      p_outcome: outcome,
+      p_code: code,
+      p_breaker: KEY_TRANSIENT_BREAKER,
+      p_base_seconds: KEY_DOWN_BASE_SECONDS,
+      p_max_seconds: KEY_DOWN_MAX_SECONDS,
+      p_rejected_seconds: KEY_REJECTED_SECONDS,
+    })
+    .abortSignal(dbSignal(deadline));
+  const before = guards.keys.get(wk.keyId) ?? { state: "up", failures: 0 };
+  if (error) {
+    console.error("[classify-topics] key health write failed", error.code);
+    if (outcome === "answered") {
+      learnKey(guards, wk, { state: "up", failures: 0 });
+      return null;
+    }
+    return dbStop(error, deadline, "key_health_failed");
+  }
+  if (data === "down") {
+    if (before.state !== "down") {
+      console.error("[classify-topics] OpenRouter key down", wk.scope, code ?? "");
+    }
+    learnKey(guards, wk, { state: "down", failures: 0 });
+  } else {
+    learnKey(guards, wk, { state: "up", failures: outcome === "transient" ? before.failures + 1 : 0 });
+  }
+  return null;
+}
+
+/**
+ * The key the workspace's calls run on, resolved once per run. The first
+ * time, the gate records it for the dashboard and tells its state (unless the
+ * run already knows the key, from another workspace on it). A key that can't
+ * be used at all is refused on the spot, without a call.
+ */
+async function workspaceKey(
   db: SupabaseClient,
   guards: RunGuards,
   workspaceId: string,
-): Promise<OpenRouterKeyResolution> {
-  let resolution = guards.keys.get(workspaceId);
-  if (!resolution) {
-    resolution = await resolveOpenRouterKey(workspaceId, db);
-    guards.keys.set(workspaceId, resolution);
+  deadline: number,
+): Promise<WorkspaceKey | Stop> {
+  const known = guards.workspaces.get(workspaceId);
+  if (known) return known;
+
+  let resolution;
+  try {
+    resolution = await resolveOpenRouterKey(workspaceId, db, dbSignal(deadline));
+  } catch {
+    return { kind: "infra", code: "key_lookup_failed" };
   }
-  return resolution;
+  if (resolution.scope === null) {
+    return remainingMs(deadline) <= 0 ? { kind: "no_time" } : { kind: "infra", code: "key_lookup_failed" };
+  }
+  const wk: WorkspaceKey = resolution.key
+    ? { keyId: hashKey(resolution.key), scope: resolution.scope, key: resolution.key }
+    : resolution.scope === "own"
+      ? { keyId: `unreadable:${workspaceId}`, scope: "own", key: null }
+      : { keyId: "missing:platform", scope: "platform", key: null };
+
+  const { data, error } = await db
+    .rpc("classification_key_gate", {
+      p_workspace_id: workspaceId,
+      p_key_id: wk.keyId,
+      p_scope: wk.scope,
+      p_probe_seconds: LEASE_SECONDS,
+    })
+    .abortSignal(dbSignal(deadline));
+  if (error) return dbStop(error, deadline, "key_gate_failed");
+  if (!guards.keys.has(wk.keyId)) {
+    const gate = (data ?? {}) as { state?: unknown; failures?: unknown };
+    const state = gate.state === "down" || gate.state === "probe" ? gate.state : "up";
+    learnKey(guards, wk, { state, failures: Number(gate.failures ?? 0) || 0 });
+  }
+  if (!wk.key && guards.keys.get(wk.keyId)?.state !== "down") {
+    const stop = await recordKeyOutcome(
+      db, guards, wk, "rejected", wk.scope === "own" ? "key_unreadable" : "key_missing", deadline,
+    );
+    if (stop) return stop;
+  }
+  guards.workspaces.set(workspaceId, wk);
+  return wk;
+}
+
+/** True when the run already knows this workspace's key is down: skip it, no call. */
+function keyKnownDown(guards: RunGuards, workspaceId: string): boolean {
+  const wk = guards.workspaces.get(workspaceId);
+  return !!wk && guards.keys.get(wk.keyId)?.state === "down";
 }
 
 /**
@@ -366,7 +517,14 @@ async function classifyOne(
   deadline: number,
   backfillTopic: string | null,
 ): Promise<Outcome> {
+  if (keyKnownDown(guards, row.workspace_id)) return { kind: "key" };
   const postLlmWrites = backfillTopic ? POST_LLM_WRITES_BACKFILL : POST_LLM_WRITES_CLASSIFY;
+  // Piso de LLM COMPLETO antes de reservar: la reserva, los 20 s enteros del
+  // LLM y el techo de cada escritura posterior. Toda llamada que sale tiene su
+  // presupuesto completo, y un corte siempre es el proveedor lento (never a
+  // timeout of ours counted against a key). Fase 1: 5 + 20 + 2×5 = 35 s;
+  // fase 2: 40 s.
+  const llmFloor = DB_TIMEOUT_MS + LLM_TIMEOUT_MS + postLlmWrites * DB_TIMEOUT_MS;
   let messages: PromptMessage[];
   try {
     messages = await loadMessages(db, row, deadline);
@@ -380,27 +538,15 @@ async function classifyOne(
     // Only the customer's messages can carry a topic: with none in view there
     // is nothing to ask the LLM, and the row is saved as analysed.
     if (messages.some((m) => m.direction === "in")) {
-      // Piso de LLM COMPLETO antes de reservar: la reserva, los 20 s enteros
-      // del LLM y el techo de cada escritura posterior. Toda llamada que sale
-      // tiene su presupuesto completo, y un corte siempre es el proveedor
-      // lento. Fase 1: 5 + 20 + 2×5 = 35 s; fase 2: 40 s.
-      if (remainingMs(deadline) < DB_TIMEOUT_MS + LLM_TIMEOUT_MS + postLlmWrites * DB_TIMEOUT_MS) {
-        return { kind: "no_time" };
-      }
+      if (remainingMs(deadline) < llmFloor) return { kind: "no_time" };
 
-      // KEY: resolved once per workspace and run. A key already dead, an own
-      // key that can't be decrypted or an empty platform key: no call.
-      let key: OpenRouterKeyResolution;
-      try {
-        key = await keyFor(db, guards, row.workspace_id);
-      } catch {
-        return { kind: "infra", code: "key_lookup_failed" };
-      }
-      if (key.scope === null) return { kind: "infra", code: "key_lookup_failed" };
-      if (guards.deadKeys.has(keyId(row.workspace_id, key.scope))) {
-        return { kind: "key", scope: key.scope, called: false };
-      }
-      if (!key.key) return { kind: "key", scope: key.scope, called: false };
+      // KEY: resolved once per workspace and run; its state from the gate.
+      const wk = await workspaceKey(db, guards, row.workspace_id, deadline);
+      if ("kind" in wk) return wk;
+      const view = guards.keys.get(wk.keyId);
+      if (!wk.key || !view || view.state === "down") return { kind: "key" };
+      // The lookup took time: the floor again, so the LLM still gets all of its own.
+      if (remainingMs(deadline) < llmFloor) return { kind: "no_time" };
 
       // Sin reserva no hay llamada.
       const estimate = classificationTokenCeiling(topics, messages);
@@ -408,26 +554,31 @@ async function classifyOne(
       if (reservation === "failed") return { kind: "infra", code: "budget_reserve_failed" };
       if (reservation.id === null) return { kind: "budget" };
 
+      const probe = view.state === "probe";
       const result = await classifyConversation({
         workspaceId: row.workspace_id,
         topics,
         messages,
         abortSignal: AbortSignal.timeout(LLM_TIMEOUT_MS),
-        key: { scope: key.scope, key: key.key },
+        key: { scope: wk.scope, key: wk.key },
       });
       // SETTLEMENT: a known count (0 included) settles; unknown keeps the estimate.
       if (result.usage) await settleTokens(db, row, reservation.id, estimate, result.usage, deadline);
-      if (!result.ok) {
-        switch (result.code) {
-          case "key_rejected":
-            return { kind: "key", scope: result.keyScope, called: true };
-          case "provider_unavailable":
-          case "timeout":
-            return { kind: "transient", code: result.code };
-          default:
-            return { kind: "content", code: result.code };
-        }
+
+      // The key's health: its own outcome, never another key's.
+      if (!result.ok && result.code === "key_rejected") {
+        const stop = await recordKeyOutcome(db, guards, wk, "rejected", result.code, deadline);
+        return stop ?? { kind: "key" };
       }
+      if (!result.ok && (result.code === "provider_unavailable" || result.code === "timeout")) {
+        const stop = await recordKeyOutcome(db, guards, wk, "transient", result.code, deadline);
+        return stop ?? { kind: "transient", code: result.code, probe };
+      }
+      // The provider answered (a result, or a refusal of this text): the key
+      // works. Written only when there is something to reset.
+      if (probe || view.failures > 0) await recordKeyOutcome(db, guards, wk, "answered", null, deadline);
+
+      if (!result.ok) return { kind: "content", code: result.code };
       matches = result.matches;
     }
 
@@ -461,31 +612,26 @@ async function classifyOne(
 }
 
 /**
- * The response to a KEY outcome: the key is dead for the rest of the run
- * (its workspace, or every workspace on the platform key), and the dashboard
- * is told. Never a halt.
+ * A transient failure, as the conversation's owner sees it: it waits
+ * (defer_classification: 1 h, doubling for each in a row), no attempt spent.
+ * Returns its failures in a row. A probe's failure is the key's alone.
  */
-async function killKey(
+async function deferConversation(
   db: SupabaseClient,
-  guards: RunGuards,
-  workspaceId: string,
-  scope: KeyScope,
+  row: ConversationRow,
+  code: string,
   deadline: number,
-): Promise<void> {
-  const id = keyId(workspaceId, scope);
-  if (!guards.deadKeys.has(id)) {
-    console.error("[classify-topics] OpenRouter key failed; skipped for this run", scope === "platform" ? "platform" : workspaceId);
-  }
-  guards.deadKeys.add(id);
-  guards.skipped.add(workspaceId);
-  guards.transientStreak.clear();
-  await noteBlocked(db, workspaceId, "key", deadline);
-}
-
-/** TRANSIENT: true when the breaker trips (the run must stop). */
-function transientTrips(guards: RunGuards, conversationId: string): boolean {
-  guards.transientStreak.add(conversationId);
-  return guards.transientStreak.size >= TRANSIENT_BREAKER;
+): Promise<number | Stop> {
+  const { data, error } = await db
+    .rpc("defer_classification", {
+      p_workspace_id: row.workspace_id,
+      p_conversation_id: row.conversation_id,
+      p_code: code,
+      p_seconds: TRANSIENT_BACKOFF_SECONDS,
+    })
+    .abortSignal(dbSignal(deadline));
+  if (error) return dbStop(error, deadline, "defer_failed");
+  return Number(data ?? 1) || 1;
 }
 
 export async function runClassificationPhase(
@@ -497,6 +643,8 @@ export async function runClassificationPhase(
     classified: 0, failed: 0, deferred: 0, skipped_workspaces: 0, unavailable_workspaces: 0, halt: false,
   };
   const topicsByWorkspace = new Map<string, PromptTopic[]>();
+  const stopped = (stop: Stop): ClassificationPhaseResult =>
+    stop.kind === "no_time" ? result : { ...result, error: stop.code, halt: true };
 
   while (hasTime(deadline)) {
     const { data, error } = await db
@@ -506,7 +654,7 @@ export async function runClassificationPhase(
         p_lease_seconds: LEASE_SECONDS,
       })
       .abortSignal(dbSignal(deadline));
-    if (error) return { ...result, error: "select_failed" };
+    if (error) return stopped(dbStop(error, deadline, "select_failed"));
     const rows = (data ?? []) as ConversationRow[];
     if (rows.length === 0) break;
 
@@ -530,40 +678,32 @@ export async function runClassificationPhase(
       switch (outcome.kind) {
         case "ok":
           result.classified++;
-          guards.transientStreak.clear();
           break;
         case "no_time":
           return result;
         case "budget":
           guards.skipped.add(row.workspace_id);
           result.skipped_workspaces++;
-          await noteBlocked(db, row.workspace_id, "cap", deadline);
+          await noteOverCap(db, row.workspace_id, deadline);
           break;
         case "key":
-          await killKey(db, guards, row.workspace_id, outcome.scope, deadline);
+          guards.skipped.add(row.workspace_id);
           result.unavailable_workspaces++;
           break;
         case "transient": {
-          const { error: deferErr } = await db
-            .rpc("defer_classification", {
-              p_workspace_id: row.workspace_id,
-              p_conversation_id: row.conversation_id,
-              p_code: outcome.code,
-              p_seconds: TRANSIENT_BACKOFF_SECONDS,
-            })
-            .abortSignal(dbSignal(deadline));
-          if (deferErr) {
-            if (isDeadlineAbort(deferErr, deadline)) return result;
-            return { ...result, error: "defer_failed", halt: true };
-          }
           result.deferred++;
-          if (transientTrips(guards, row.conversation_id)) {
-            return { ...result, error: outcome.code, halt: true };
+          if (!outcome.probe) {
+            const failures = await deferConversation(db, row, outcome.code, deadline);
+            if (typeof failures !== "number") return stopped(failures);
+          }
+          // Its key went down with this one: the workspace is out of the run.
+          if (keyKnownDown(guards, row.workspace_id)) {
+            guards.skipped.add(row.workspace_id);
+            result.unavailable_workspaces++;
           }
           break;
         }
         case "content": {
-          guards.transientStreak.clear();
           result.failed++;
           const { error: failErr } = await db
             .rpc("record_classification_failure", {
@@ -572,11 +712,8 @@ export async function runClassificationPhase(
               p_code: outcome.code,
             })
             .abortSignal(dbSignal(deadline));
-          if (failErr) {
-            // Cortado por el deadline = sin tiempo; el intento no se contó.
-            if (isDeadlineAbort(failErr, deadline)) return result;
-            return { ...result, error: "record_failure_failed", halt: true };
-          }
+          // Cortado por el deadline = sin tiempo; el intento no se contó.
+          if (failErr) return stopped(dbStop(failErr, deadline, "record_failure_failed"));
           break;
         }
         case "infra":
@@ -603,6 +740,15 @@ export async function runBackfillPhase(
   // El cursor que no avanzó solo repite trabajo idempotente la próxima corrida.
   const stopped = (err: DbError, code: string): BackfillPhaseResult =>
     isDeadlineAbort(err, deadline) ? result : { ...result, error: code, halt: true };
+  const advance = async (topicId: string, to: ConversationRow) =>
+    db
+      .rpc("advance_topic_backfill", {
+        p_topic_id: topicId,
+        p_cursor_at: to.last_inbound_at,
+        p_cursor_id: to.conversation_id,
+        p_done: false,
+      })
+      .abortSignal(dbSignal(deadline));
 
   // Se PAGINA: los temas de workspaces sin saldo o con la clave caída se
   // saltan sin cortar el recorrido, así el de otro workspace no espera.
@@ -615,7 +761,7 @@ export async function runBackfillPhase(
       .order("created_at")
       .range(offset, offset + TOPIC_PAGE - 1)
       .abortSignal(dbSignal(deadline));
-    if (error) return { ...result, error: "backfill_topics_failed", halt: true };
+    if (error) return stopped(error, "backfill_topics_failed");
     const page = (topics ?? []) as Array<PromptTopic & { workspace_id: string }>;
     if (page.length === 0) break;
     offset += page.length;
@@ -629,7 +775,7 @@ export async function runBackfillPhase(
       const { data: claimed, error: claimErr } = await db
         .rpc("claim_topic_backfill", { p_topic_id: topic.id, p_lease_seconds: LEASE_SECONDS })
         .abortSignal(dbSignal(deadline));
-      if (claimErr) return { ...result, error: "backfill_claim_failed", halt: true };
+      if (claimErr) return stopped(claimErr, "backfill_claim_failed");
       if (claimed !== true) continue;
 
       // Reprocesamiento: solo ese tema, para no redetectar los viejos.
@@ -639,7 +785,7 @@ export async function runBackfillPhase(
         const { data, error: batchErr } = await db
           .rpc("next_backfill_batch", { p_topic_id: topic.id, p_limit: BATCH_SIZE })
           .abortSignal(dbSignal(deadline));
-        if (batchErr) return { ...result, error: "backfill_batch_failed", halt: true };
+        if (batchErr) return stopped(batchErr, "backfill_batch_failed");
         const batch = (data ?? []) as ConversationRow[];
 
         if (batch.length === 0) {
@@ -660,16 +806,21 @@ export async function runBackfillPhase(
 
         // In cursor order: the cursor only moves past consecutive successes.
         let done = 0;
-        let stop: Outcome | null = null;
+        let stop: Outcome | { kind: "waiting" } | null = null;
         for (const row of batch) {
           if (!hasTime(deadline)) {
             stop = { kind: "no_time" };
             break;
           }
+          // Waiting after a transient failure: the cursor can't step around
+          // it, so the topic waits too, without a call.
+          if (row.waits_until) {
+            stop = { kind: "waiting" };
+            break;
+          }
           const outcome = await classifyOne(db, guards, row, prompt, deadline, topic.id);
           if (outcome.kind === "ok") {
             done++;
-            guards.transientStreak.clear();
             continue;
           }
           stop = outcome;
@@ -680,62 +831,58 @@ export async function runBackfillPhase(
         // Avanzar primero hasta el último éxito consecutivo: advance resetea
         // backfill_attempts, así que va antes de registrar un fallo.
         if (done > 0) {
-          const last = batch[done - 1];
-          const { error: advErr } = await db
-            .rpc("advance_topic_backfill", {
-              p_topic_id: topic.id,
-              p_cursor_at: last.last_inbound_at,
-              p_cursor_id: last.conversation_id,
-              p_done: false,
-            })
-            .abortSignal(dbSignal(deadline));
+          const { error: advErr } = await advance(topic.id, batch[done - 1]);
           if (advErr) return stopped(advErr, "backfill_advance_failed");
         }
 
         if (!stop) continue;
+        const failedRow = batch[done];
         switch (stop.kind) {
           case "no_time":
             return result;
           case "infra":
             return { ...result, error: stop.code, halt: true };
+          case "waiting":
+            break topicLoop;
           case "budget":
             guards.skipped.add(topic.workspace_id);
             result.skipped_workspaces++;
-            await noteBlocked(db, topic.workspace_id, "cap", deadline);
+            await noteOverCap(db, topic.workspace_id, deadline);
             break topicLoop;
           case "key":
-            await killKey(db, guards, topic.workspace_id, stop.scope, deadline);
+            guards.skipped.add(topic.workspace_id);
             result.unavailable_workspaces++;
             break topicLoop;
-          case "transient":
-          case "content": {
-            // A cursor can't step around one conversation, so both count on
-            // the topic: three failures at the same spot and it is skipped (a
-            // conversation that always times out can't block a backfill).
-            if (stop.kind === "transient") {
-              result.deferred++;
-              if (transientTrips(guards, batch[done].conversation_id)) {
-                return { ...result, error: stop.code, halt: true };
-              }
-            } else {
-              guards.transientStreak.clear();
-              result.failed++;
+          case "transient": {
+            // Never counts on the topic: the conversation waits (its own
+            // doubling) and the topic with it. Only a conversation that keeps
+            // failing that way while its key is up gets stepped past.
+            result.deferred++;
+            const failures = stop.probe ? 0 : await deferConversation(db, failedRow, stop.code, deadline);
+            if (typeof failures !== "number") {
+              if (failures.kind === "no_time") return result;
+              return { ...result, error: failures.code, halt: true };
             }
+            if (keyKnownDown(guards, topic.workspace_id)) {
+              guards.skipped.add(topic.workspace_id);
+              result.unavailable_workspaces++;
+              break topicLoop;
+            }
+            if (failures < BACKFILL_TRANSIENT_SKIP) break topicLoop;
+            const { error: skipErr } = await advance(topic.id, failedRow);
+            if (skipErr) return stopped(skipErr, "backfill_advance_failed");
+            break;
+          }
+          case "content": {
+            // A cursor can't step around one conversation: content failures
+            // count on the topic, and the third in a row steps past it.
+            result.failed++;
             const { data: attempts, error: recErr } = await db
               .rpc("record_backfill_failure", { p_topic_id: topic.id })
               .abortSignal(dbSignal(deadline));
             if (recErr) return stopped(recErr, "record_failure_failed");
             if (Number(attempts ?? 0) < 3) break topicLoop; // se reintenta en la próxima corrida
-
-            const failedRow = batch[done];
-            const { error: skipErr } = await db
-              .rpc("advance_topic_backfill", {
-                p_topic_id: topic.id,
-                p_cursor_at: failedRow.last_inbound_at,
-                p_cursor_id: failedRow.conversation_id,
-                p_done: false,
-              })
-              .abortSignal(dbSignal(deadline));
+            const { error: skipErr } = await advance(topic.id, failedRow);
             if (skipErr) return stopped(skipErr, "backfill_advance_failed");
             break;
           }

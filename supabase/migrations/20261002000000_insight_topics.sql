@@ -245,6 +245,38 @@ ALTER TABLE public.conversation_classification ADD COLUMN IF NOT EXISTS catalog_
 ALTER TABLE public.conversation_classification ADD COLUMN IF NOT EXISTS backfill_topics UUID[] NOT NULL DEFAULT '{}';
 ALTER TABLE public.conversation_classification ADD COLUMN IF NOT EXISTS transient_failures INT NOT NULL DEFAULT 0;
 
+-- ── Health of each OpenRouter key the run calls with ──────
+-- The failure model of classify-topics.ts keeps a key's health WITH THE KEY,
+-- across runs: a workspace's own key or the platform's. Several workspaces on
+-- one key (the platform's, or one key pasted into two workspaces) share its
+-- row. key_id never carries the secret: 'sha256:<hex>' of the key, or
+-- 'unreadable:<workspace>' for an own key that can't be decrypted and
+-- 'missing:platform' for an unset OPENROUTER_API_KEY.
+--   transient_failures  transient failures in a row while the key is up
+--   down_since          set while the key is down (the dashboard reads it)
+--   down_until          no call on the key before this; then ONE call probes it
+--   down_count          downs in a row from transient failures (the wait doubles)
+-- Only record_classification_key_outcome and classification_key_gate write it.
+CREATE TABLE IF NOT EXISTS public.classification_key_health (
+  key_id             TEXT PRIMARY KEY,
+  scope              TEXT NOT NULL CHECK (scope IN ('own', 'platform')),
+  transient_failures INT NOT NULL DEFAULT 0,
+  down_count         INT NOT NULL DEFAULT 0,
+  down_since         TIMESTAMPTZ,
+  down_until         TIMESTAMPTZ,
+  last_error_code    TEXT,
+  updated_at         TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Per workspace: the key its calls ran on at its last turn (the dashboard
+-- derives "blocked" from that key's health).
+CREATE TABLE IF NOT EXISTS public.classification_workspace_state (
+  workspace_id   UUID PRIMARY KEY REFERENCES public.workspaces(id) ON DELETE CASCADE,
+  key_id         TEXT,
+  key_scope      TEXT CHECK (key_scope IN ('own', 'platform')),
+  updated_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 -- ── RLS y privilegios ──────────────────────────────────────
 -- Escritura solo service_role: sin policies de escritura para miembros.
 ALTER TABLE public.insight_topics ENABLE ROW LEVEL SECURITY;
@@ -267,6 +299,11 @@ REVOKE ALL ON public.conversation_topics FROM anon, authenticated;
 GRANT SELECT ON public.insight_topics TO authenticated;
 GRANT SELECT ON public.conversation_topics TO authenticated;
 REVOKE ALL ON public.conversation_classification FROM anon, authenticated;
+-- Server-only, no policies: the run (service_role) and get_insights read them.
+ALTER TABLE public.classification_key_health ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.classification_workspace_state ENABLE ROW LEVEL SECURITY;
+REVOKE ALL ON public.classification_key_health FROM anon, authenticated;
+REVOKE ALL ON public.classification_workspace_state FROM anon, authenticated;
 
 -- ── Upgrade from #13's own migrations ──────────────────────
 -- No-ops on a fresh install. An install that ran #13 (20260915000000..02):
