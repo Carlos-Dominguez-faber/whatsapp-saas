@@ -118,7 +118,13 @@ export interface ProcessBatchResult {
   conversationId?: string;
   /** The batch this call claimed, if any. */
   batchId?: string;
+  /** A per-item failure: this batch didn't go out (retry or dead letter). */
   error?: string;
+  /**
+   * A PHASE failure: no batch could even be claimed, so the tick didn't do
+   * its work. A code, never PostgREST's text.
+   */
+  phaseError?: string;
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -327,7 +333,7 @@ export async function reconcileOrphanedMessages(
     delayMs?: number;
     sleep?: (ms: number) => Promise<void>;
   } = {},
-): Promise<number> {
+): Promise<{ recovered: number; error?: string }> {
   const supabase = svc();
   const now = Date.now();
   const cutoff = new Date(now - ORPHAN_MESSAGE_AGE_MS).toISOString();
@@ -350,8 +356,11 @@ export async function reconcileOrphanedMessages(
     .limit(MAX_ORPHANS_PER_RUN);
 
   if (error) {
+    // The query that FINDS the phase's work: a bare 0 would read as "no
+    // orphans" and the tick would answer 200 forever. A code, never
+    // PostgREST's text; the detail stays in the log.
     console.error("[buffer] reconcileOrphanedMessages lookup error:", error);
-    return 0;
+    return { recovered: 0, error: "reconcile_failed" };
   }
 
   const orphans = ((data ?? []) as unknown[]).map(
@@ -398,7 +407,9 @@ export async function reconcileOrphanedMessages(
     }
   }
 
-  return recovered;
+  // One orphan that couldn't be relinked is a per-item failure: it's in the
+  // log, and the tick stays healthy.
+  return { recovered };
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -632,7 +643,7 @@ export async function processNextBatch(): Promise<ProcessBatchResult> {
 
   if (claimError) {
     console.error("[buffer] claim_next_batch RPC error:", claimError);
-    return { processed: false, error: claimError.message };
+    return { processed: false, error: claimError.message, phaseError: "claim_failed" };
   }
 
   const batch = (claimedRows as MessageBatch[] | null)?.[0] ?? null;

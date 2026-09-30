@@ -1139,7 +1139,7 @@ test("an orphan gets an isolated batch flushed now; AI-off or rate-limited ones 
     { id: "o2", workspace_id: "ws_1", conversation_id: "conv_2", batch_id: null, direction: "in", created_at: minutesAgo(5), conversations: { ai_enabled: false, contact_id: "c2" } },
     { id: "o3", workspace_id: "ws_1", conversation_id: "conv_3", batch_id: null, direction: "in", created_at: minutesAgo(40), conversations: { ai_enabled: true, contact_id: "c3" } },
   ];
-  assert.equal(await reconcileOrphanedMessages(), 1);
+  assert.deepEqual(await reconcileOrphanedMessages(), { recovered: 1 });
   const args = rpcCalls.find((c) => c.fn === "upsert_batch_and_link_message")!.args as Row;
   assert.equal(args.p_message_id, "o1");
   assert.equal(args.p_force_new_batch, true);
@@ -1150,7 +1150,7 @@ test("an orphan gets an isolated batch flushed now; AI-off or rate-limited ones 
     { id: "o1", workspace_id: "ws_1", conversation_id: "conv_1", batch_id: null, direction: "in", created_at: minutesAgo(5), conversations: { ai_enabled: true, contact_id: "c1" } },
   ];
   rateAllowed = false;
-  assert.equal(await reconcileOrphanedMessages(), 0);
+  assert.deepEqual(await reconcileOrphanedMessages(), { recovered: 0 });
 });
 
 test("a reaction is never revived as an orphan: it isn't for answering", async () => {
@@ -1168,7 +1168,7 @@ test("a reaction is never revived as an orphan: it isn't for answering", async (
       conversations: { ai_enabled: true, contact_id: "c1" },
     },
   ];
-  assert.equal(await reconcileOrphanedMessages(), 0);
+  assert.deepEqual(await reconcileOrphanedMessages(), { recovered: 0 });
   assert.ok(!rpcCalls.some((c) => c.fn === "upsert_batch_and_link_message"));
 });
 
