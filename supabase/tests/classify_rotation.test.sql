@@ -92,6 +92,12 @@ SELECT is((SELECT count(*)::int FROM public.select_conversations_to_classify(2, 
   'the two claimed but never called go before the one that was');
 
 -- ── The backfill takes turns the same way ────────────────────────────────────
+-- Its order, for this test's two workspaces (an install may have others pending).
+CREATE FUNCTION pg_temp.bf_order(p_skip UUID[]) RETURNS TEXT[] LANGUAGE sql AS $$
+  SELECT array_agg(x.name ORDER BY x.ord)
+    FROM public.pending_backfill_topics(200, p_skip) WITH ORDINALITY AS x(id, workspace_id, name, description, ord)
+   WHERE x.workspace_id IN ('e7000000-0000-4000-8000-00000000000a', 'e7000000-0000-4000-8000-00000000000b');
+$$;
 DO $bf$
 DECLARE a UUID := 'e7000000-0000-4000-8000-00000000000a'; b UUID := 'e7000000-0000-4000-8000-00000000000b';
 BEGIN
@@ -102,7 +108,7 @@ BEGIN
     ('e7000000-0000-4000-8000-0000000000b1', b, 'B1', 'x', now() - interval '1 hour');
 END
 $bf$;
-SELECT is((SELECT array_agg(name) FROM public.pending_backfill_topics(10, ARRAY(SELECT ws FROM rot_ws))),
+SELECT is(pg_temp.bf_order(ARRAY(SELECT ws FROM rot_ws)),
   ARRAY['A1', 'B1', 'A2'], 'each workspace''s oldest topic before anyone''s second');
 DO $st$
 DECLARE k UUID := gen_random_uuid(); c UUID := gen_random_uuid();
@@ -112,10 +118,9 @@ BEGIN
   PERFORM public.reserve_classification_tokens('e7000000-0000-4000-8000-00000000000a', c, 1, 300000);
 END
 $st$;
-SELECT is((SELECT array_agg(name) FROM public.pending_backfill_topics(10, ARRAY(SELECT ws FROM rot_ws))),
+SELECT is(pg_temp.bf_order(ARRAY(SELECT ws FROM rot_ws)),
   ARRAY['B1', 'A1', 'A2'], 'a call for the workspace sends it to the back');
-SELECT is((SELECT array_agg(name) FROM public.pending_backfill_topics(10,
-            ARRAY(SELECT ws FROM rot_ws) || 'e7000000-0000-4000-8000-00000000000b'::uuid)),
+SELECT is(pg_temp.bf_order(ARRAY(SELECT ws FROM rot_ws) || 'e7000000-0000-4000-8000-00000000000b'::uuid),
   ARRAY['A1', 'A2'], 'a workspace skipped this run is left out');
 SELECT ok(NOT has_function_privilege('authenticated', 'public.pending_backfill_topics(integer, uuid[], timestamptz)', 'EXECUTE'),
   'server only');
