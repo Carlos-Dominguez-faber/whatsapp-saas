@@ -15,6 +15,10 @@ const MESSAGES: Record<string, string> = {
   unauthorized: "El token de HubSpot no es válido. Revisa que lo copiaste completo.",
   missing_scope:
     "El token no tiene todos los permisos. Revisa los scopes de la app privada: contactos, negocios, propiedades de contactos y comunicaciones.",
+  missing_scope_deals:
+    "El token no puede leer negocios. Agrega a la app privada los permisos de negocios (crm.objects.deals.read y write) y vuelve a probar.",
+  missing_scope_communications:
+    "El token no puede leer comunicaciones. Agrega a la app privada el permiso de comunicaciones y vuelve a probar: sin él, los resúmenes de las conversaciones no llegan a HubSpot.",
   rate_limited: "HubSpot está limitando las consultas. Espera un minuto y vuelve a probar.",
   phone_property_conflict:
     "Ya existe en tu HubSpot una propiedad «whatsapp_phone» que no es de texto con valor único. Corrígela o renómbrala y vuelve a probar.",
@@ -69,6 +73,12 @@ export async function POST(
 
   const probe = await hsFetch(cfg.token, `/crm/objects/${HS_API_VERSION}/contacts?limit=1`);
   if (!probe.ok) return fail(probe.code);
+  // Every object the integration writes: a missing scope shows up here, not
+  // as timeline entries or deals that silently never arrive.
+  for (const object of ["deals", "communications"] as const) {
+    const res = await hsFetch(cfg.token, `/crm/objects/${HS_API_VERSION}/${object}?limit=1`);
+    if (!res.ok) return fail(res.code === "missing_scope" ? `missing_scope_${object}` : res.code);
+  }
   const portal = await getHubSpotPortalId(cfg.token);
   if (!portal.ok) return fail(portal.code);
   const props = await ensureHubSpotProperties(cfg.token);
@@ -84,9 +94,13 @@ export async function POST(
     console.error("[integrations/hubspot/test] mark_hubspot_ready:", error.message);
     return NextResponse.json({ ok: false, error: "No pudimos guardar el estado de la conexión. Intenta de nuevo." });
   }
-  const result = ((data as Array<{ updated: boolean; portal_changed: boolean }> | null) ?? [])[0];
+  const result = ((data as Array<{ updated: boolean; portal_changed: boolean; logs_requeued?: number }> | null) ?? [])[0];
   if (!result?.updated) {
     return NextResponse.json({ ok: false, error: "El token cambió mientras probábamos la conexión. Vuelve a probar." });
   }
-  return NextResponse.json({ ok: true, portalChanged: result.portal_changed });
+  return NextResponse.json({
+    ok: true,
+    portalChanged: result.portal_changed,
+    requeued: result.logs_requeued ?? 0,
+  });
 }

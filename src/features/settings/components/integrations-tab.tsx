@@ -1329,12 +1329,15 @@ function HubSpotSection({
         ok: boolean;
         error?: string;
         portalChanged?: boolean;
+        requeued?: number;
       };
       if (json.ok) {
         toast.success(
           json.portalChanged
             ? "HubSpot conectado a otra cuenta. Los contactos se volverán a enlazar solos."
-            : "HubSpot conectado. Las propiedades del agente quedaron listas.",
+            : json.requeued
+              ? `HubSpot conectado. ${json.requeued} resumen(es) de conversaciones que esperaban vuelven a enviarse.`
+              : "HubSpot conectado. Las propiedades del agente quedaron listas.",
         );
         onSaved();
         void loadPipelines();

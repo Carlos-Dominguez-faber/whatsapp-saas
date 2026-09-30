@@ -18,6 +18,8 @@ mock.module("@/lib/auth/workspace-access.ts", {
 
 let cfgResult: unknown = null;
 let probeResult: unknown = null;
+/** Answers for a given path; any other gets probeResult. */
+let probeByPath: Record<string, unknown> = {};
 let portalResult: unknown = null;
 let ensureResult: unknown = null;
 const probes: unknown[][] = [];
@@ -29,6 +31,8 @@ mock.module("@/features/inbox/services/hubspot-client.ts", {
     readHubSpotConfig: async () => cfgResult,
     hsFetch: async (...args: unknown[]) => {
       probes.push(args);
+      const path = String(args[1]);
+      if (path in probeByPath) return probeByPath[path];
       return probeResult;
     },
     getHubSpotPortalId: async () => portalResult,
@@ -64,20 +68,28 @@ function reset() {
   portalResult = { ok: true, portalId: "999" };
   ensureResult = { ok: true };
   probes.length = 0;
+  probeByPath = {};
   ensures.length = 0;
   rpcCalls.length = 0;
-  rpcResult = { data: [{ updated: true, portal_changed: false, links_cleared: 0, logs_cancelled: 0 }], error: null };
+  rpcResult = { data: [{ updated: true, portal_changed: false, links_cleared: 0, logs_cancelled: 0, logs_requeued: 0 }], error: null };
 }
 
 async function body(res: Response) {
-  return (await res.json()) as { ok: boolean; error?: string; portalChanged?: boolean };
+  return (await res.json()) as { ok: boolean; error?: string; portalChanged?: boolean; requeued?: number };
 }
 
 test("token válido: prueba, provisiona y marca lista SOLO para la huella del token probado", async () => {
   reset();
-  assert.deepEqual(await body(await POST(req, params)), { ok: true, portalChanged: false });
+  assert.deepEqual(await body(await POST(req, params)), { ok: true, portalChanged: false, requeued: 0 });
   assert.deepEqual(memberCalls[0], ["ws_1", { minRole: "admin" }]);
-  assert.deepEqual(probes[0], ["pat-A", "/crm/objects/2026-09/contacts?limit=1"]);
+  assert.deepEqual(
+    probes.map((p) => p[1]),
+    [
+      "/crm/objects/2026-09/contacts?limit=1",
+      "/crm/objects/2026-09/deals?limit=1",
+      "/crm/objects/2026-09/communications?limit=1",
+    ],
+  );
   assert.deepEqual(ensures, ["pat-A"]);
   assert.deepEqual(rpcCalls, [
     { fn: "mark_hubspot_ready", args: { p_workspace_id: "ws_1", p_token_fingerprint: "fp(pat-A)", p_portal_id: "999" } },
@@ -95,8 +107,28 @@ test("PUT intercalado (el token cambió mientras probábamos): no se marca lista
 
 test("cuenta de HubSpot distinta: ok con portalChanged para avisar al admin", async () => {
   reset();
-  rpcResult = { data: [{ updated: true, portal_changed: true, links_cleared: 12, logs_cancelled: 1 }], error: null };
-  assert.deepEqual(await body(await POST(req, params)), { ok: true, portalChanged: true });
+  rpcResult = { data: [{ updated: true, portal_changed: true, links_cleared: 12, logs_cancelled: 1, logs_requeued: 0 }], error: null };
+  assert.deepEqual(await body(await POST(req, params)), { ok: true, portalChanged: true, requeued: 0 });
+});
+
+test("a token without the deals or communications scope fails the test, says which, and marks nothing", async () => {
+  for (const object of ["deals", "communications"]) {
+    reset();
+    probeByPath = {
+      [`/crm/objects/2026-09/${object}?limit=1`]: { ok: false, status: 403, code: "missing_scope", body: "" },
+    };
+    const res = await body(await POST(req, params));
+    assert.equal(res.ok, false);
+    assert.match(res.error ?? "", object === "deals" ? /negocios/ : /comunicaciones/);
+    assert.equal(rpcCalls.length, 0, "not marked ready");
+    assert.equal(ensures.length, 0);
+  }
+});
+
+test("a passing test with the same portal reports the parked entries it put back in line", async () => {
+  reset();
+  rpcResult = { data: [{ updated: true, portal_changed: false, links_cleared: 0, logs_cancelled: 0, logs_requeued: 3 }], error: null };
+  assert.deepEqual(await body(await POST(req, params)), { ok: true, portalChanged: false, requeued: 3 });
 });
 
 test("errores de HubSpot → mensajes accionables, sin texto técnico ni marcar lista", async () => {

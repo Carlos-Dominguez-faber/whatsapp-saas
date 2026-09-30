@@ -5,7 +5,7 @@ BEGIN;
 CREATE EXTENSION IF NOT EXISTS pgtap WITH SCHEMA extensions;
 SET search_path = public, extensions;
 
-SELECT plan(26);
+SELECT plan(30);
 
 -- ── privileges: the queue and its RPCs are service role only ────────────────
 SELECT ok(NOT has_table_privilege('anon', 'public.hubspot_conversation_logs', 'SELECT'),
@@ -92,12 +92,26 @@ SELECT is((SELECT ready FROM public.read_hubspot_link('e0000000-0000-4000-8000-0
   'e0000000-0000-4000-8000-0000000000c1', 'fp_other')), false,
   'a link is not read with another token');
 
+-- ── a token problem parks a log; a passing test (same portal) requeues it ───
+INSERT INTO public.hubspot_conversation_logs (workspace_id, conversation_id, from_state_version, reason, status, attempts, last_error)
+VALUES ('e0000000-0000-4000-8000-000000000001', 'e0000000-0000-4000-8000-0000000000a1', 30, 'handoff', 'parked', 1, 'missing_scope');
+SELECT is((SELECT count(*)::INT FROM public.claim_hubspot_conversation_log(120) c
+            WHERE c.id = (SELECT id FROM public.hubspot_conversation_logs WHERE from_state_version = 30)),
+  0, 'a parked log is never claimed');
+CREATE TEMP TABLE m0 AS SELECT * FROM public.mark_hubspot_ready(
+  'e0000000-0000-4000-8000-000000000001', 'fp_a', '111');
+SELECT ok((SELECT updated AND NOT portal_changed AND logs_requeued = 1 FROM m0),
+  'a passing test on the same portal requeues the parked log');
+SELECT is((SELECT status || '/' || attempts || '/' || coalesce(last_error, '-') FROM public.hubspot_conversation_logs
+            WHERE from_state_version = 30), 'pending/0/-', 'back to pending, attempts from 0');
+UPDATE public.hubspot_conversation_logs SET status = 'parked', last_error = 'unauthorized' WHERE from_state_version = 30;
+
 -- ── another portal: links cleared and pending logs cancelled at once ────────
 UPDATE public.hubspot_conversation_logs SET claimed_until = NULL;
 CREATE TEMP TABLE m1 AS SELECT * FROM public.mark_hubspot_ready(
   'e0000000-0000-4000-8000-000000000001', 'fp_a', '222');
-SELECT ok((SELECT updated AND portal_changed AND links_cleared = 1 AND logs_cancelled = 1 FROM m1),
-  'a new portal clears the links and cancels the pending logs');
+SELECT ok((SELECT updated AND portal_changed AND links_cleared = 1 AND logs_cancelled = 2 AND logs_requeued = 0 FROM m1),
+  'a new portal clears the links and cancels the pending and parked logs');
 SELECT is((SELECT hs_contact_id FROM public.contacts WHERE id = 'e0000000-0000-4000-8000-0000000000c1'),
   NULL, 'the old portal''s id is gone');
 
@@ -108,7 +122,15 @@ VALUES ('e0000000-0000-4000-8000-000000000001', 'e0000000-0000-4000-8000-0000000
        ('e0000000-0000-4000-8000-000000000001', 'e0000000-0000-4000-8000-0000000000a1', 52, 'closed', 'failed', now() - INTERVAL '2 days');
 -- The update trigger (if any) must not have moved updated_at for this test.
 UPDATE public.hubspot_conversation_logs SET updated_at = now() - INTERVAL '40 days' WHERE from_state_version IN (50, 51);
-SELECT is(public.purge_hubspot_conversation_logs(30, 1000), 1, 'only the old finished row is purged');
+INSERT INTO public.hubspot_conversation_logs (workspace_id, conversation_id, from_state_version, reason, status, updated_at)
+VALUES ('e0000000-0000-4000-8000-000000000001', 'e0000000-0000-4000-8000-0000000000a1', 53, 'closed', 'parked', now()),
+       ('e0000000-0000-4000-8000-000000000001', 'e0000000-0000-4000-8000-0000000000a1', 54, 'closed', 'parked', now());
+UPDATE public.hubspot_conversation_logs SET updated_at = now() - INTERVAL '40 days' WHERE from_state_version = 53;
+UPDATE public.hubspot_conversation_logs SET updated_at = now() - INTERVAL '100 days' WHERE from_state_version = 54;
+SELECT is(public.purge_hubspot_conversation_logs(30, 1000), 2,
+  'the old finished row goes, and a parked one only past three times the retention');
+SELECT is((SELECT count(*)::INT FROM public.hubspot_conversation_logs WHERE from_state_version = 53), 1,
+  'a parked log 40 days old stays');
 SELECT is((SELECT count(*)::INT FROM public.hubspot_conversation_logs WHERE from_state_version IN (51, 52)), 2,
   'a pending row and a recent failed one stay');
 

@@ -39,6 +39,8 @@ export interface HubSpotLogTally {
   retry: number;
   failed: number;
   cancelled: number;
+  /** Waiting for the token to be fixed (see PARK_CODES). */
+  parked?: number;
   /** Cierres cuyo UPDATE devolvió error (el ítem queda pending bajo su lease). */
   finish_failed?: number;
   error?: string;
@@ -52,26 +54,33 @@ interface ClaimedLog {
   attempts: number;
 }
 
-type Bucket = "done" | "retry" | "failed" | "cancelled";
+type Bucket = "done" | "retry" | "failed" | "cancelled" | "parked";
 
 /** Códigos que cierran cancelled, sin reintento: HubSpot desconectado o config ilegible. */
 const CANCEL_CODES = new Set(["not_configured", "config_decrypt_failed"]);
 /**
- * Códigos permanentes: cierran failed al primer intento. Token revocado o sin permisos no se
- * arregla solo, y reintentarlo 5 veces le come el presupuesto de la fase a los demás tenants
- * El resto (incluido db_error, deadline, timeout) sigue reintentándose.
+ * Token problems a person fixes: revoked or wrong token, missing scope, or a
+ * connection not tested yet. Retrying doesn't fix them and would eat the
+ * phase's budget, and failing them loses the entry: the log is PARKED, and
+ * "Probar conexión" (mark_hubspot_ready, same portal) puts it back in line.
  */
-const PERMANENT_CODES = new Set(["conversation_not_found", "unauthorized", "missing_scope"]);
+const PARK_CODES = new Set(["unauthorized", "missing_scope", "properties_not_ready"]);
+/**
+ * Códigos permanentes: cierran failed al primer intento. El resto (incluido db_error,
+ * deadline, timeout) sigue reintentándose.
+ */
+const PERMANENT_CODES = new Set(["conversation_not_found"]);
 
 function nextState(outcome: Outcome, attempts: number): {
   bucket: Bucket;
-  status: "done" | "pending" | "failed" | "cancelled";
+  status: "done" | "pending" | "failed" | "cancelled" | "parked";
   last_error: string | null;
   claimed_until: string | null;
 } {
   if (outcome.ok) return { bucket: "done", status: "done", last_error: null, claimed_until: null };
   const code = outcome.code;
   if (CANCEL_CODES.has(code)) return { bucket: "cancelled", status: "cancelled", last_error: code, claimed_until: null };
+  if (PARK_CODES.has(code)) return { bucket: "parked", status: "parked", last_error: code, claimed_until: null };
   if (PERMANENT_CODES.has(code) || attempts >= MAX_LOG_ATTEMPTS) {
     return { bucket: "failed", status: "failed", last_error: code, claimed_until: null };
   }
@@ -150,7 +159,7 @@ export async function drainHubSpotConversationLogs(deadline: number): Promise<Hu
     }
     if (!Array.isArray(finishRows) || finishRows.length === 0) continue;
 
-    if (next.status === "failed" || next.status === "cancelled") {
+    if (next.status === "failed" || next.status === "cancelled" || next.status === "parked") {
       await recordHsEvent(
         row.workspace_id,
         "crm_sync_failed",
@@ -158,7 +167,7 @@ export async function drainHubSpotConversationLogs(deadline: number): Promise<Hu
         row.conversation_id,
       );
     }
-    tally[next.bucket]++;
+    tally[next.bucket] = (tally[next.bucket] ?? 0) + 1;
   }
   await purgeFinishedLogs(deadline);
   return tally;

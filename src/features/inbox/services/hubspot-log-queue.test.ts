@@ -198,12 +198,16 @@ test("un cierre que devuelve error se cuenta y marca la fase (500 ok:false), sin
   assert.ok(errors.every((a) => !JSON.stringify(a).includes("db blip")), "no se filtra el texto de PostgREST");
 });
 
-test("unauthorized y missing_scope cierran failed al primer intento, con evento de códigos", async () => {
-  for (const code of ["unauthorized", "missing_scope"]) {
+test("a token problem parks the log at once (no retries), with an event: a passing test brings it back", async () => {
+  for (const code of ["unauthorized", "missing_scope", "properties_not_ready"]) {
     reset([row(1)]);
     outcomes = [{ ok: false, code }];
-    assert.deepEqual(await drainHubSpotConversationLogs(later()), { done: 0, retry: 0, failed: 1, cancelled: 0 }, code);
-    assert.equal(finishes[0].patch.status, "failed");
+    assert.deepEqual(
+      await drainHubSpotConversationLogs(later()),
+      { done: 0, retry: 0, failed: 0, cancelled: 0, parked: 1 },
+      code,
+    );
+    assert.equal(finishes[0].patch.status, "parked");
     assert.equal(finishes[0].patch.last_error, code);
     assert.equal(finishes[0].patch.claimed_until, null);
     assert.deepEqual(events[0].payload, { provider: "hubspot", code, step: "conversation_log", attempts: 1 });
