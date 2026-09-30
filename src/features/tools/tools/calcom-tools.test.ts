@@ -79,7 +79,8 @@ function booking(
     status: extra.status ?? "accepted",
     eventType: { id: extra.eventTypeId ?? 7, slug: "consulta" },
     createdAt: "2030-01-01T00:00:00.000Z",
-    attendees: (extra.attendees ?? ["Ana@Example.com"]).map((email) => ({ email, name: "Ana" })),
+    // What Cal.com keeps: the email as it was POSTed (lowercased by schedule_calcom).
+    attendees: (extra.attendees ?? ["ana@example.com"]).map((email) => ({ email, name: "Ana" })),
     ...(extra.rescheduledToUid ? { rescheduledToUid: extra.rescheduledToUid } : {}),
   };
 }
@@ -102,6 +103,11 @@ function calFetch(opts: {
   holderWriteFails?: boolean;
   /** GET /v2/bookings (the list by attendee). */
   list?: { status: number; body: unknown } | { throws: true };
+  /**
+   * Cal.com ignoring the attendee and event type filters. By default the fake
+   * applies them EXACTLY (case included), as a strict Cal.com would.
+   */
+  listIgnoresFilters?: boolean;
   create?: { status: number; body?: unknown } | { throws: true };
   cancel?: { status: number } | { throws: true };
   reschedule?: { status: number; body?: unknown } | { throws: true };
@@ -184,7 +190,15 @@ function calFetch(opts: {
       if (method === "GET" && path === "/v2/bookings") {
         const l = opts.list ?? { status: 200, body: { status: "success", data: [], pagination: { hasMore: false } } };
         if ("throws" in l) throw new Error("socket hang up");
-        return json(l.status, l.body);
+        const body = l.body as { data?: unknown } | null;
+        if (opts.listIgnoresFilters || !body || !Array.isArray(body.data)) return json(l.status, l.body);
+        const q = new URL(url).searchParams;
+        const data = (body.data as Array<{ attendees?: Array<{ email?: string }>; eventType?: { id?: number } }>).filter(
+          (b) =>
+            (b.attendees ?? []).some((a) => a.email === q.get("attendeeEmail")) &&
+            String(b.eventType?.id) === q.get("eventTypeId"),
+        );
+        return json(l.status, { ...body, data });
       }
       if (method === "POST" && path === "/v2/bookings") {
         const c = opts.create ?? { status: 201, body: { status: "success", data: booking("new_1", "2030-06-12T16:00:00.000Z") } };
@@ -432,7 +446,7 @@ test("schedule: a claim that may have booked is asked in Cal.com, by attendee, s
   assert.equal(calPosts(found.calls).length, 0);
 
   // Cal.com answers completely that there is none: freed, claimed again, booked.
-  const none = calFetch({ claims: [holder("legacy", 86_400)] });
+  const none = calFetch({ claims: [holder("unknown", 86_400)] });
   const b = await schedule(none);
   assert.equal(b.ok, true);
   const release = localWrites(none.calls).find((c) => c.method === "PATCH" && c.url.includes("id=eq.row_x"))!;
@@ -447,7 +461,7 @@ test("schedule: a claim that may have booked is asked in Cal.com, by attendee, s
     { status: 200, body: { status: "success", data: [], pagination: { hasMore: true } } },
     { status: 200, body: { status: "success", data: [{ weird: true }] } },
   ]) {
-    const unsure = calFetch({ claim: holder("sending", 300), list });
+    const unsure = calFetch({ claim: holder("sending", 300), list, listIgnoresFilters: true });
     const c = await schedule(unsure);
     assert.equal(c.ok, false);
     assert.deepEqual(c.output, { needs_human: true });
@@ -968,6 +982,7 @@ test("the lookup by attendee checks Cal.com's filters itself: another service or
   // event type 99 at that instant, for someone else.
   const other = booking("bk_other", CONFIRMED_UTC, { eventTypeId: 99, attendees: ["zoe@other.com"] });
   const fake = calFetch({
+    listIgnoresFilters: true,
     claim: holder("sending", 300),
     list: { status: 200, body: { status: "success", data: [other], pagination: { hasNextPage: false } } },
   });
@@ -979,6 +994,7 @@ test("the lookup by attendee checks Cal.com's filters itself: another service or
 
   // Same service, another attendee at that time: also not this customer's.
   const sameServiceOtherPerson = calFetch({
+    listIgnoresFilters: true,
     claim: holder("sending", 300),
     list: { status: 200, body: { status: "success", data: [booking("bk_c", CONFIRMED_UTC, { attendees: ["carlos@x.com"] })] } },
   });
@@ -1009,4 +1025,32 @@ test("the 'sending' mark is a compare-and-swap: a claim already taken over never
   assert.equal(r.ok, false);
   assert.match(r.error ?? "", /NO se agendó/);
   assert.equal(calPosts(expired.calls).length, 0);
+});
+
+test("the email is lowercased once: the POST, the claim's mark and a later lookup agree", async () => {
+  const fake = calFetch({});
+  await schedule(fake, { attendee_email: " Ana@Example.COM " });
+  const post = calPosts(fake.calls)[0].body as { attendee: { email: string } };
+  assert.equal(post.attendee.email, "ana@example.com");
+  const mark = localWrites(fake.calls).find((c) => c.method === "PATCH")!;
+  assert.deepEqual(mark.body, { meta: { calcom_claim: "sending", attendee_email: "ana@example.com" } });
+
+  // With a Cal.com that filters case-sensitively, a retry finds that booking
+  // (it was POSTed lowercased) instead of reading "none" and booking again.
+  const retry = calFetch({
+    claim: holder("unknown", 300, { holder_email: "ana@example.com" }),
+    list: { status: 200, body: { status: "success", data: [booking("bk_9", CONFIRMED_UTC)], pagination: { hasMore: false } } },
+  });
+  const r = await schedule(retry, { attendee_email: "ANA@example.com" });
+  assert.equal(r.ok, true);
+  assert.equal((r.output as { booking_uid: string }).booking_uid, "bk_9");
+  assert.equal(calPosts(retry.calls).length, 0, "no second booking");
+});
+
+test("a #15 claim with no marker is never freed on a 'none': its email's case is unknown", async () => {
+  const fake = calFetch({ claim: holder("legacy", 86_400, { holder_email: null }) });
+  const r = await schedule(fake);
+  assert.deepEqual(r.output, { needs_human: true });
+  assert.equal(calPosts(fake.calls).length, 0);
+  assert.equal(localWrites(fake.calls).filter((c) => c.url.includes("id=eq.row_x")).length, 0);
 });

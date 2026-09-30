@@ -836,8 +836,10 @@ sigue haciendo falta si no lo has corrido).
     - Para liberar uno a mano, después de revisar en Cal.com, en Supabase → SQL
       Editor: `update appointments set status = 'cancelled', meta = meta ||
       '{"calcom_claim":"released"}' where id = '<id>' and calcom_booking_uid is
-      null;` (o, si la reserva sí existe: `set calcom_booking_uid = '<uid>', meta =
-      '{}'`).
+      null and status = 'booked';` (o, si la reserva sí existe: `update
+      appointments set calcom_booking_uid = '<uid>', meta = '{}' where id = '<id>'
+      and calcom_booking_uid is null and status = 'booked';`). Si responde `UPDATE
+      0`, el claim ya cambió: vuelve a revisarlo.
   - Los tipos de evento **recurrentes** o **con cupos** (varias personas por
     horario) no se agendan por WhatsApp.
   - Una reserva que el negocio tiene que **confirmar** en Cal.com se le presenta al

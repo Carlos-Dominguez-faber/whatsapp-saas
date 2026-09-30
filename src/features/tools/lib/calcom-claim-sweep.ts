@@ -112,6 +112,12 @@ export async function sweepStaleCalComClaims(deadline: number): Promise<CalComSw
       else await report("no se pudo vincular la reserva que tiene Cal.com");
       continue;
     }
+    // A #15 claim (no marker) sent the email as the customer wrote it: a "no"
+    // for the lowercased email proves nothing.
+    if (found.kind === "none" && typeof claim.meta?.calcom_claim !== "string") {
+      await report("es una reserva de una versión anterior");
+      continue;
+    }
     if (found.kind === "none") {
       const { error: releaseError } = await db
         .from("appointments")

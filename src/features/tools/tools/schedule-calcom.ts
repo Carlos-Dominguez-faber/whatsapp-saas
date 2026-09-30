@@ -229,6 +229,10 @@ async function run(args: Args, ctx: ToolContext, opts?: ToolRunOptions): Promise
       error: "Necesito el email del cliente para agendar en Cal.com: pídeselo y vuelve a intentarlo.",
     };
   }
+  // One spelling of the email for the booking, the claim's mark and any later
+  // lookup by attendee: a filter that tells case apart would otherwise miss
+  // the booking this call made.
+  email = email.trim().toLowerCase();
   /** The playground trace's outcome. Never throws. */
   const traceOutcome = async (outcome: string, extra: Record<string, unknown> = {}) => {
     if (!traceId || !playground) return;
@@ -369,6 +373,11 @@ async function run(args: Args, ctx: ToolContext, opts?: ToolRunOptions): Promise
         startMs: start.ms,
       });
       if (found.kind === "unknown") return heldUnconfirmed("Cal.com no dio una respuesta completa");
+      // A #15 claim sent the email as the customer wrote it, which this
+      // lookup (lowercased) may not match: its "no" proves nothing.
+      if (found.kind === "none" && row.holder_claim === "legacy") {
+        return heldUnconfirmed("es una reserva de una versión anterior");
+      }
       if (found.kind === "found") {
         // The booking exists: the claim becomes its cache row. If that link
         // can't be written (the uid is already cached elsewhere, the row
