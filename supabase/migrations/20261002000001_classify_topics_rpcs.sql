@@ -564,11 +564,16 @@ $$;
 -- classification pushed the next day's bot toward its degrade threshold. The
 -- workspace's worst-case day is the bot's cap plus this one. Nor does it
 -- count as an agent turn: no contact_id, and not an 'llm_usage' row.
+-- p_now: see select_conversations_to_classify (the day and the row's time).
+-- #13 shipped (UUID, UUID, INT, BIGINT).
+DROP FUNCTION IF EXISTS public.reserve_classification_tokens(UUID, UUID, INT, BIGINT);
+
 CREATE OR REPLACE FUNCTION public.reserve_classification_tokens(
   p_workspace_id UUID,
   p_conversation_id UUID,
   p_estimate INT,
-  p_cap BIGINT
+  p_cap BIGINT,
+  p_now TIMESTAMPTZ DEFAULT now()
 )
 RETURNS UUID
 LANGUAGE plpgsql
@@ -578,6 +583,7 @@ AS $$
 DECLARE
   v_id   UUID;
   v_used BIGINT;
+  v_now  TIMESTAMPTZ := COALESCE(p_now, now());
 BEGIN
   -- Una estimación nula o no positiva reservaría sin contar nada.
   IF p_estimate IS NULL OR p_estimate <= 0 OR p_cap IS NULL THEN
@@ -603,19 +609,20 @@ BEGIN
     FROM public.events e
    WHERE e.workspace_id = p_workspace_id
      AND e.type = 'topic_classification'
-     AND e.created_at >= date_trunc('day', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC';
+     AND e.created_at >= date_trunc('day', v_now AT TIME ZONE 'UTC') AT TIME ZONE 'UTC';
 
   IF v_used + p_estimate > p_cap THEN
     RETURN NULL;
   END IF;
 
-  INSERT INTO public.events (type, level, workspace_id, conversation_id, payload)
+  INSERT INTO public.events (type, level, workspace_id, conversation_id, payload, created_at)
   VALUES ('topic_classification', 'info', p_workspace_id, p_conversation_id,
           jsonb_build_object(
             'purpose', 'topic_classification',
             'reserved', true,
             'estimated_tokens', p_estimate,
-            'total_tokens', p_estimate))
+            'total_tokens', p_estimate),
+          v_now)
   RETURNING id INTO v_id;
   RETURN v_id;
 END;
@@ -666,7 +673,7 @@ REVOKE ALL ON FUNCTION public.advance_topic_backfill(UUID, TIMESTAMPTZ, UUID, BO
 REVOKE ALL ON FUNCTION public.record_backfill_failure(UUID) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.claim_topic_backfill(UUID, INT) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.release_topic_backfill(UUID) FROM PUBLIC, anon, authenticated;
-REVOKE ALL ON FUNCTION public.reserve_classification_tokens(UUID, UUID, INT, BIGINT) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.reserve_classification_tokens(UUID, UUID, INT, BIGINT, TIMESTAMPTZ) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.settle_classification_tokens(UUID, UUID, TEXT, INT, INT) FROM PUBLIC, anon, authenticated;
 
 GRANT EXECUTE ON FUNCTION public.select_conversations_to_classify(INT, UUID[], INT, TIMESTAMPTZ) TO service_role;
@@ -677,5 +684,5 @@ GRANT EXECUTE ON FUNCTION public.advance_topic_backfill(UUID, TIMESTAMPTZ, UUID,
 GRANT EXECUTE ON FUNCTION public.record_backfill_failure(UUID) TO service_role;
 GRANT EXECUTE ON FUNCTION public.claim_topic_backfill(UUID, INT) TO service_role;
 GRANT EXECUTE ON FUNCTION public.release_topic_backfill(UUID) TO service_role;
-GRANT EXECUTE ON FUNCTION public.reserve_classification_tokens(UUID, UUID, INT, BIGINT) TO service_role;
+GRANT EXECUTE ON FUNCTION public.reserve_classification_tokens(UUID, UUID, INT, BIGINT, TIMESTAMPTZ) TO service_role;
 GRANT EXECUTE ON FUNCTION public.settle_classification_tokens(UUID, UUID, TEXT, INT, INT) TO service_role;

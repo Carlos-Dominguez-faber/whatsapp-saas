@@ -16,7 +16,7 @@ SELECT ok(NOT has_function_privilege('anon',
   'public.select_conversations_to_classify(integer, uuid[], integer, timestamptz)', 'EXECUTE'),
   'anon cannot execute select_conversations_to_classify()');
 SELECT ok(NOT has_function_privilege('authenticated',
-  'public.reserve_classification_tokens(uuid, uuid, integer, bigint)', 'EXECUTE'),
+  'public.reserve_classification_tokens(uuid, uuid, integer, bigint, timestamptz)', 'EXECUTE'),
   'authenticated cannot execute reserve_classification_tokens()');
 SELECT ok(NOT has_function_privilege('authenticated',
   'public.get_insights(uuid, timestamptz, timestamptz, text[], text, timestamptz)', 'EXECUTE'),
