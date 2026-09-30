@@ -33,10 +33,6 @@ function needsHuman(error: string): ToolResult {
   return { ok: false, output: { needs_human: true }, error };
 }
 
-/** Cal.com's wording when the new slot can't be booked (unverified: see the PR). */
-const SLOT_TAKEN =
-  /\b(?:no longer available|not available|no available users|already (?:has|have) (?:a )?booking|booking conflict|slot)\b/i;
-
 const UNCONFIRMED =
   "No pude confirmar la cita en el calendario en este momento, así que NO se movió. Dile al cliente que una persona del equipo lo revisará.";
 
@@ -46,9 +42,8 @@ const UNKNOWN_MOVE =
 async function run(args: Args, ctx: ToolContext, opts?: ToolRunOptions): Promise<ToolResult> {
   const startedAt = Date.now();
   const budgetMs = opts?.timeoutMs ?? APPOINTMENT_TOOL_TIMEOUT_MS;
-  const { getCalComConfig, calcomRequest, parseCalComBooking, CALCOM_API_VERSION } = await import(
-    "../../inbox/services/calcom-client.ts"
-  );
+  const { getCalComConfig, calcomRequest, parseCalComBooking, isSlotTaken, CALCOM_API_VERSION } =
+    await import("../../inbox/services/calcom-client.ts");
   const { getBusinessInfo } = await import("../../inbox/services/business-info.ts");
   const { workspaceSchedulingTimeZone } = await import("../../inbox/services/scheduling-timezone.ts");
   const {
@@ -210,7 +205,7 @@ async function run(args: Args, ctx: ToolContext, opts?: ToolRunOptions): Promise
   }
   if (res.kind === "http") {
     console.error(`[reschedule_calcom] Cal.com ${res.status}:`, res.detail);
-    if (SLOT_TAKEN.test(res.detail)) {
+    if (isSlotTaken(res.detail)) {
       return {
         ok: false,
         output: null,

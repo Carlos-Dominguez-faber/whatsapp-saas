@@ -866,3 +866,13 @@ test("a pending booking is reported as requested, in schedule, reschedule and th
   assert.equal(out.appointments[1].pendiente_de_confirmar, true);
   assert.match(out.note, /todavía no confirma/);
 });
+
+test("a taken slot is recognized by Cal.com's error code too", async () => {
+  const { isSlotTaken } = await import("../../inbox/services/calcom-client.ts");
+  assert.equal(isSlotTaken('{"code":"no_available_users_found_error"}'), true);
+  assert.equal(isSlotTaken("User either already has booking at this time or is not available"), true);
+  assert.equal(isSlotTaken("invalid api key"), false);
+  const fake = calFetch({ create: { status: 400, body: { error: { code: "no_available_users_found_error" } } } });
+  const result = await schedule(fake);
+  assert.match(result.error ?? "", /ya no está disponible/);
+});

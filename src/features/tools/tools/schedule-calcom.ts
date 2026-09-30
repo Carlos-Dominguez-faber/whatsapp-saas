@@ -46,10 +46,6 @@ type Args = z.infer<typeof schema>;
  */
 export const CALCOM_CLAIM_TTL_SECONDS = 120;
 
-/** Cal.com's wording when the slot can't be booked (unverified: see the PR). */
-const SLOT_TAKEN =
-  /\b(?:no longer available|not available|no available users|already (?:has|have) (?:a )?booking|booking conflict|slot)\b/i;
-
 /** For a booking the host still has to confirm. */
 export const PENDING_NOTE =
   "La cita quedó SOLICITADA, pendiente de que el negocio la confirme. Díselo así al cliente: no le digas que ya está confirmada.";
@@ -105,6 +101,7 @@ async function run(args: Args, ctx: ToolContext, opts?: ToolRunOptions): Promise
     calcomRequest,
     parseCalComBooking,
     findCalComBookingAt,
+    isSlotTaken,
     CALCOM_API_VERSION,
   } = await import("../../inbox/services/calcom-client.ts");
   const { getBusinessInfo } = await import("../../inbox/services/business-info.ts");
@@ -496,7 +493,7 @@ async function run(args: Args, ctx: ToolContext, opts?: ToolRunOptions): Promise
     console.error(`[schedule_calcom] Cal.com ${res.status}:`, res.detail);
     await releaseClaim();
     await traceOutcome("refused", { status: res.status });
-    if (res.status < 500 && SLOT_TAKEN.test(res.detail)) {
+    if (res.status < 500 && isSlotTaken(res.detail)) {
       return {
         ok: false,
         output: null,

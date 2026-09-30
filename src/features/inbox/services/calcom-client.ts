@@ -320,6 +320,18 @@ export async function fetchCalComBooking(
   return booking;
 }
 
+/**
+ * Cal.com's answer when the slot can't be booked, in words or as an error
+ * code ("no_available_users_found_error"): underscores are read as spaces.
+ * Unverified against every Cal.com wording: see the PR's smoke test.
+ */
+const SLOT_TAKEN =
+  /\b(?:no longer available|not available|no available users|already (?:has|have) (?:a )?booking|booking conflict|slot)\b/i;
+
+export function isSlotTaken(detail: string): boolean {
+  return SLOT_TAKEN.test(detail.replace(/_/g, " "));
+}
+
 export type CalComLookupAt =
   | { kind: "found"; booking: CalComBooking }
   /** Cal.com answered, completely, and has no live booking there. */
