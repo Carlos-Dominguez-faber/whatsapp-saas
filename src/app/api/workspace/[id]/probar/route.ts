@@ -81,6 +81,11 @@ export async function POST(
   switch (result.reason) {
     case "refused":
       return result.response;
+    case "empty_reply":
+      return NextResponse.json(
+        { error: "El agente no respondió. Intenta de nuevo o escribe tu mensaje de otra forma." },
+        { status: 502 },
+      );
     case "agent_not_found":
       return NextResponse.json(
         { error: "Todavía no hay un agente activo para probar." },

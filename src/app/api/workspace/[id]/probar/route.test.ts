@@ -51,6 +51,7 @@ const generateOpts: Array<{
   toolContext?: ToolContextSeen;
 }> = [];
 let generateError: Error | null = null;
+let replyText = "¡Hola! ¿En qué te ayudo?";
 mock.module("@/features/inbox/services/openrouter.ts", {
   exports: {
     getWorkspaceModel: async () => "openai/gpt-4.1",
@@ -58,7 +59,7 @@ mock.module("@/features/inbox/services/openrouter.ts", {
       calls.push("generate");
       generateOpts.push(opts);
       if (generateError) throw generateError;
-      return { text: "¡Hola! ¿En qué te ayudo?", promptTokens: 10, completionTokens: 5 };
+      return { text: replyText, promptTokens: 10, completionTokens: 5 };
     },
   },
 });
@@ -137,6 +138,7 @@ function reset() {
   agentLookups.length = 0;
   enabledTools = [];
   generateError = null;
+  replyText = "¡Hola! ¿En qué te ayudo?";
   guardResult = { ok: true, reservationId: "res_1" };
   member = { ok: true, userId: "user_1", role: "viewer" };
   activeAgent = { id: "agent_active" };
@@ -251,4 +253,17 @@ test("REVIEW M2: at most 2 model steps, and a longer prompt reserves a higher ce
   await post({ messages: Array.from({ length: 7 }, () => ({ role: "user", content: "x".repeat(1_000) })) });
   const long = guardCalls[0].args[2] as number;
   assert.ok(long - short >= 2 * Math.floor(6_990 / 3), `ceiling grew by ${long - short}`);
+});
+
+test("REVIEW M5: an empty reply is an error the chat can recover from, and its tokens are recorded", async () => {
+  reset();
+  replyText = "";
+  const res = await post();
+  assert.equal(res.status, 502);
+  assert.match((await res.json()).error, /no respondió/);
+  assert.equal(recorded.length, 1, "the tokens of the empty turn were not recorded");
+  // The next message goes through normally.
+  replyText = "ok";
+  const next = await post({ messages: [{ role: "user", content: "quiero hablar con alguien" }, { role: "user", content: "¿sigues ahí?" }] });
+  assert.equal(next.status, 200);
 });

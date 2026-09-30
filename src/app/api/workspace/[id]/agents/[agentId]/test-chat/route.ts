@@ -114,6 +114,16 @@ export async function POST(
       );
     case "refused":
       return result.response;
+    case "empty_reply":
+      return NextResponse.json(
+        {
+          error: result.writeTools
+            ? "El agente no respondió con texto (a veces pasa después de usar una herramienta). Si tenía herramientas de escritura activas, revisa qué quedó hecho antes de reintentar."
+            : "El agente no respondió con texto. Reformula el mensaje o intenta de nuevo.",
+          wroteSomething: result.writeTools ? true : undefined,
+        },
+        { status: 502 },
+      );
     case "generation_failed":
       // A turn that already ran a write (a booking, an n8n write) must not be
       // sent again blindly: it would run it again.

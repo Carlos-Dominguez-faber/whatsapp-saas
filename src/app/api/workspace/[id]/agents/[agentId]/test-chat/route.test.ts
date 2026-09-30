@@ -58,6 +58,7 @@ type ToolContextSeen = {
 const generateOpts: Array<{ tools?: Array<{ name: string }>; toolContext?: ToolContextSeen }> = [];
 /** Makes the model call fail; `wroteSomething` as generateChatReply marks it. */
 let generateError: Error | null = null;
+let replyText = "¡Hola!";
 mock.module("@/features/inbox/services/openrouter.ts", {
   exports: {
     getWorkspaceModel: async () => "openai/gpt-4.1",
@@ -70,7 +71,7 @@ mock.module("@/features/inbox/services/openrouter.ts", {
       generateModels.push(opts.model);
       generateOpts.push(opts);
       if (generateError) throw generateError;
-      return { text: "¡Hola!", promptTokens: 10, completionTokens: 5 };
+      return { text: replyText, promptTokens: 10, completionTokens: 5 };
     },
   },
 });
@@ -157,6 +158,7 @@ function reset() {
   memberRole = "manager";
   memberships = [];
   generateError = null;
+  replyText = "¡Hola!";
 }
 
 /** Makes user_1 an active member of ws_1 with `memberRole` (set it before posting). */
@@ -308,4 +310,13 @@ test("the playground keeps its 5 steps (only /probar is capped at 2)", async () 
   reset();
   await post();
   assert.equal((generateOpts[0] as { maxSteps?: number }).maxSteps, undefined);
+});
+
+test("REVIEW M5: an empty reply in the playground is an error, not an empty bubble", async () => {
+  reset();
+  replyText = " ";
+  const res = await post();
+  assert.equal(res.status, 502);
+  assert.match((await res.json()).error, /no respondió con texto/);
+  assert.equal(recorded.length, 1);
 });

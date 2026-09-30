@@ -18,8 +18,10 @@ export function probarHistory(messages: ProbarMsg[]): ProbarMsg[] {
   let chars = 0;
   for (let i = messages.length - 1; i >= 0 && kept.length < PROBAR_MAX_MESSAGES; i--) {
     // An answer longer than a message may be (the route caps what it
-    // receives, not what the agent writes) is cut to fit.
-    const content = messages[i].content.slice(0, PROBAR_MAX_MESSAGE_CHARS);
+    // receives, not what the agent writes) is cut to fit; an empty one is
+    // dropped (the route refuses empty messages).
+    const content = messages[i].content.trim().slice(0, PROBAR_MAX_MESSAGE_CHARS);
+    if (!content) continue;
     if (chars + content.length > PROBAR_MAX_CHARS) break;
     chars += content.length;
     kept.unshift({ role: messages[i].role, content });

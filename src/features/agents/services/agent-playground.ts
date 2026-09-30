@@ -81,6 +81,12 @@ export type RunAgentPlaygroundResult =
       writeTools: boolean;
     }
   | { ok: false; reason: "agent_not_found" }
+  /**
+   * The model answered with no text (a last step that only called a tool, an
+   * empty goodbye). Its tokens are recorded; the routes answer with an error
+   * instead of an empty bubble that would go back as history and be refused.
+   */
+  | { ok: false; reason: "empty_reply"; writeTools: boolean }
   | { ok: false; reason: "model_not_in_catalog"; model: string }
   /** The budget or an hourly cap said no: answer with this response. */
   | { ok: false; reason: "refused"; response: NextResponse }
@@ -279,6 +285,10 @@ export async function runAgentPlayground(
           ? { agent_id: agentId, user_id: input.userId }
           : { agent_id: agentId },
     });
+
+    if (!reply.text.trim()) {
+      return { ok: false, reason: "empty_reply", writeTools };
+    }
 
     return {
       ok: true,

@@ -33,3 +33,12 @@ test("a long answer is cut to what the route accepts per message", () => {
   const kept = probarHistory([turn(0), { role: "assistant", content: "y".repeat(3_000) }, turn(2)]);
   assert.equal(kept[1].content.length, PROBAR_MAX_MESSAGE_CHARS);
 });
+
+test("REVIEW M5: an empty turn never goes back as history", () => {
+  const kept = probarHistory([
+    { role: "user", content: "hola" },
+    { role: "assistant", content: "  " },
+    { role: "user", content: "¿sigues ahí?" },
+  ]);
+  assert.deepEqual(kept.map((m) => m.content), ["hola", "¿sigues ahí?"]);
+});
