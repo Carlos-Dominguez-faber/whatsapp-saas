@@ -145,7 +145,10 @@ export function SettingsShell({
 
         <TabsContent value="automatizaciones">
           <div className="p-6 space-y-6 rounded-lg border border-border/60 bg-card">
-            <AutomationsTab workspaceId={workspaceId} />
+            <AutomationsTab
+              workspaceId={workspaceId}
+              canViewRuns={role === "admin" || role === "manager"}
+            />
           </div>
         </TabsContent>
       </Tabs>
