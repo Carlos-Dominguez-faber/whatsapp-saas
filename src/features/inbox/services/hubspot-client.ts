@@ -15,6 +15,7 @@ import { createClient as createSbClient } from "@supabase/supabase-js";
 import { decryptCredentials } from "@/shared/lib/integration-secrets";
 import { splitName } from "./highlevel-client";
 import { loadWhatsAppSettings } from "./whatsapp-provider";
+import { workspaceCountryCode } from "./country-code";
 
 const HS_BASE_URL = "https://api.hubapi.com";
 /** Versión fechada de la API. Un solo lugar: si el smoke da 404, se cambia acá. */
@@ -421,13 +422,25 @@ function remoteIdentity(r: { properties?: Record<string, unknown> }): string | n
 async function findContacts(
   token: string,
   phone: string,
+  countryCode: string | null,
 ): Promise<Outcome<{ identity: string | null; free: string[] }>> {
-  const variants = [...new Set([phone, phone.replace(/^\+/, "")])];
+  const digits = phone.replace(/\D/g, "");
+  const variants = [...new Set([phone, digits])];
+  // HubSpot's searchable phone numbers are digits only, often without the
+  // country code: both are asked for. A number stored with spaces or dashes
+  // in `phone` only matches there.
+  const national =
+    countryCode && digits.startsWith(countryCode) && digits.length > countryCode.length + 6
+      ? digits.slice(countryCode.length)
+      : null;
+  const searchable = [...new Set([digits, ...(national ? [national] : [])])];
+  // Five groups at most (HubSpot's limit), OR'd; IN lists the variants.
   const filterGroups = [
     { filters: [{ propertyName: HS_PHONE_PROPERTY, operator: "EQ", value: phone }] },
-    ...["phone", "mobilephone"].flatMap((propertyName) =>
-      variants.map((value) => ({ filters: [{ propertyName, operator: "EQ", value }] })),
-    ),
+    { filters: [{ propertyName: "phone", operator: "IN", values: variants }] },
+    { filters: [{ propertyName: "mobilephone", operator: "IN", values: variants }] },
+    { filters: [{ propertyName: "hs_searchable_calculated_phone_number", operator: "IN", values: searchable }] },
+    { filters: [{ propertyName: "hs_searchable_calculated_mobile_number", operator: "IN", values: searchable }] },
   ];
   const res = await hsFetch(token, `/crm/objects/${V}/contacts/search`, {
     method: "POST",
@@ -479,10 +492,13 @@ async function writeIdentity(token: string, id: string, phone: string): Promise<
 async function createContact(
   token: string,
   contact: HsContactRow,
+  withoutEmail = false,
 ): Promise<Outcome<{ id: string; created: boolean }>> {
+  const profile = profileProperties(contact);
+  if (withoutEmail) delete profile.email;
   const res = await hsFetch(token, `/crm/objects/${V}/contacts`, {
     method: "POST",
-    body: { properties: { ...profileProperties(contact), phone: contact.phone, [HS_PHONE_PROPERTY]: contact.phone } },
+    body: { properties: { ...profile, phone: contact.phone, [HS_PHONE_PROPERTY]: contact.phone } },
   });
   if (res.ok) {
     const id = (res.json as { id?: unknown } | null)?.id;
@@ -498,7 +514,12 @@ async function createContact(
   );
   if (!current.ok) return { ok: false, code: current.code };
   const owner = remoteIdentity((current.json as { properties?: Record<string, unknown> } | null) ?? {});
-  if (owner && owner !== contact.phone) return { ok: false, code: "email_taken" };
+  if (owner && owner !== contact.phone) {
+    // The email belongs to another WhatsApp identity in HubSpot (two people
+    // sharing one address): create this one without the email, once.
+    if (!withoutEmail && contact.email) return createContact(token, contact, true);
+    return { ok: false, code: "email_taken" };
+  }
   if (!owner) {
     const linked = await writeIdentity(token, existing, contact.phone);
     if (!linked.ok) return linked;
@@ -511,7 +532,13 @@ async function resolveHubSpotContactId(
   workspaceId: string,
   contact: HsContactRow,
 ): Promise<Outcome<{ id: string; created: boolean }>> {
-  const found = await findContacts(token, contact.phone);
+  let countryCode: string | null = null;
+  try {
+    countryCode = await workspaceCountryCode(svc(), workspaceId);
+  } catch {
+    // Only narrows the search.
+  }
+  const found = await findContacts(token, contact.phone, countryCode);
   if (!found.ok) return found;
   if (found.identity) return { ok: true, id: found.identity, created: false };
 

@@ -572,20 +572,22 @@ function patches(): Array<{ url: string; body: unknown }> {
   return calls.filter((c) => c.method === "PATCH").map((c) => ({ url: c.url, body: c.body }));
 }
 
-test("una sola búsqueda con la identidad propia primero y teléfonos con y sin '+'", async () => {
+test("una sola búsqueda: identidad propia, teléfonos con y sin '+', y los teléfonos buscables de HubSpot", async () => {
   reset();
   connect();
   addContact();
   on("POST", SEARCH, json(200, { results: [] }));
   on("POST", CREATE, json(201, { id: "901" }));
   await hs.syncContactToHubSpot(WS, "c1");
+  // The workspace has no country code set: Mexico's (52) doesn't prefix this
+  // US number, so only its full digits are searched.
   assert.deepEqual(calls[0].body, {
     filterGroups: [
       { filters: [{ propertyName: "whatsapp_phone", operator: "EQ", value: PHONE }] },
-      { filters: [{ propertyName: "phone", operator: "EQ", value: PHONE }] },
-      { filters: [{ propertyName: "phone", operator: "EQ", value: "15550001111" }] },
-      { filters: [{ propertyName: "mobilephone", operator: "EQ", value: PHONE }] },
-      { filters: [{ propertyName: "mobilephone", operator: "EQ", value: "15550001111" }] },
+      { filters: [{ propertyName: "phone", operator: "IN", values: [PHONE, "15550001111"] }] },
+      { filters: [{ propertyName: "mobilephone", operator: "IN", values: [PHONE, "15550001111"] }] },
+      { filters: [{ propertyName: "hs_searchable_calculated_phone_number", operator: "IN", values: ["15550001111"] }] },
+      { filters: [{ propertyName: "hs_searchable_calculated_mobile_number", operator: "IN", values: ["15550001111"] }] },
     ],
     properties: ["whatsapp_phone"],
     limit: 10,
@@ -724,7 +726,22 @@ test("409 al crear cuyo existente YA tiene NUESTRO whatsapp_phone: se enlaza sin
   assert.deepEqual(patches(), [], "ya tenía nuestra identidad: ningún PATCH de más");
 });
 
-test("409 por el email de un contacto con OTRO whatsapp_phone: falla con email_taken, sin escribir", async () => {
+test("409 por el email de un contacto con OTRO whatsapp_phone: se crea sin el email, una vez", async () => {
+  reset();
+  connect();
+  addContact({ email: "compartido@ejemplo.cl" });
+  on("POST", SEARCH, json(200, { results: [] }));
+  on("POST", CREATE, json(409, { message: "Contact already exists. Existing ID: 889" }), json(201, { id: "902" }));
+  on("GET", /\/contacts\/889\?properties=whatsapp_phone$/, json(200, { properties: { whatsapp_phone: "+15550003333" } }));
+  assert.deepEqual(await hs.syncContactToHubSpot(WS, "c1"), { hs_id: "902" });
+  const creates = calls.filter((c) => CREATE.test(c.url) && c.method === "POST");
+  assert.equal(creates.length, 2);
+  assert.equal((creates[0].body as { properties: Row }).properties.email, "compartido@ejemplo.cl");
+  assert.equal((creates[1].body as { properties: Row }).properties.email, undefined, "the retry leaves the email out");
+  assert.deepEqual(patches(), [], "the other person's contact is never touched");
+});
+
+test("si el alta sin email también choca con otra identidad: email_taken, sin escribir", async () => {
   reset();
   connect();
   addContact({ email: "compartido@ejemplo.cl" });
@@ -733,6 +750,7 @@ test("409 por el email de un contacto con OTRO whatsapp_phone: falla con email_t
   on("GET", /\/contacts\/889\?properties=whatsapp_phone$/, json(200, { properties: { whatsapp_phone: "+15550003333" } }));
   assert.equal(await hs.syncContactToHubSpot(WS, "c1"), null);
   assert.deepEqual(patches(), []);
+  assert.equal(calls.filter((c) => CREATE.test(c.url) && c.method === "POST").length, 2);
   assert.equal((eventsOf("crm_sync_failed")[0].payload as Row).code, "email_taken");
 });
 
