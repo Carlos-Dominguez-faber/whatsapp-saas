@@ -101,27 +101,48 @@ export type RunAgentPlaygroundResult =
 
 /** /probar's model steps: one tool call and the answer that uses it. */
 export const PROBAR_MAX_STEPS = 2;
-/** What the KB excerpts (3) and the reference links may add to the prompt. */
-const KB_ALLOWANCE_BYTES = 8_000;
-/** Tool definitions sent with each step, and a tool's result in the second. */
-const TOOLS_ALLOWANCE_BYTES = 8_000;
+/** The KB excerpts and reference links /probar sends: cut to this. */
+export const PROBAR_KB_MAX_BYTES = 8_000;
+/** A tool result /probar's model reads: cut to this many characters. */
+export const PROBAR_TOOL_RESULT_MAX_CHARS = 2_000;
+/** A tool's definition (name, description, input schema), generously. */
+const TOOL_DEFINITION_BYTES = 2_000;
 
 /**
- * The most a /probar call can spend, reserved before it runs. Text in Spanish
- * or English runs about 4 bytes per token; counting 3 keeps it a ceiling.
- * Every step sends the whole prompt again, and writes up to maxOutputTokens.
+ * The most a /probar call can spend, reserved before it runs, and a real
+ * ceiling because everything that goes in is bounded: the prompt (known),
+ * the KB excerpts (cut to PROBAR_KB_MAX_BYTES), each tool's definition and
+ * one result per tool (cut to PROBAR_TOOL_RESULT_MAX_CHARS, up to 4 bytes a
+ * character), one HTTP request per step (no retries, noRetries) and at most
+ * PROBAR_MAX_STEPS steps, each writing up to maxOutputTokens. Text runs
+ * about 4 bytes per token; counting 3 keeps it a ceiling.
  */
 export function probarTokenCeiling(
   systemPrompt: string,
   messages: PlaygroundMessage[],
   maxOutputTokens: number,
+  toolCount: number,
 ): number {
   const bytes =
     Buffer.byteLength(systemPrompt, "utf8") +
     messages.reduce((n, m) => n + Buffer.byteLength(m.content, "utf8"), 0) +
-    KB_ALLOWANCE_BYTES +
-    TOOLS_ALLOWANCE_BYTES;
+    PROBAR_KB_MAX_BYTES +
+    toolCount * (TOOL_DEFINITION_BYTES + 4 * PROBAR_TOOL_RESULT_MAX_CHARS);
   return PROBAR_MAX_STEPS * (Math.ceil(bytes / 3) + maxOutputTokens);
+}
+
+/** Cuts text to at most `max` UTF-8 bytes, on a character boundary. */
+function cutToBytes(text: string, max: number): string {
+  if (Buffer.byteLength(text, "utf8") <= max) return text;
+  let out = text.slice(0, max);
+  while (Buffer.byteLength(out, "utf8") > max) out = out.slice(0, -1);
+  return out;
+}
+
+/** An HTTP 4xx from the provider: refused before anything was generated. */
+function refusedByProvider(err: unknown): boolean {
+  const status = (err as { statusCode?: unknown } | null)?.statusCode;
+  return typeof status === "number" && status >= 400 && status < 500;
 }
 
 function svc() {
@@ -201,36 +222,6 @@ export async function runAgentPlayground(
       },
     });
 
-  // Budget and hourly caps before anything that spends, KB embeddings
-  // included. /probar also reserves the call's token ceiling (its own daily
-  // cap, and never past the workspace's degrade threshold): the prompt is
-  // known by now, except the KB excerpts and the tool results, which get a
-  // fixed allowance.
-  const guard =
-    surface === "client_test_chat"
-      ? await guardClientTestChat(
-          workspaceId,
-          input.userId,
-          probarTokenCeiling(promptFor(""), input.messages, input.maxOutputTokens),
-        )
-      : await guardWorkspaceLlmCall(workspaceId, "agent_test_chat");
-  if (!guard.ok) return { ok: false, reason: "refused", response: guard.response };
-
-  // KB: search with the latest user message, just like buffer.ts.
-  const lastUserMessage =
-    [...input.messages].reverse().find((m) => m.role === "user")?.content ?? "";
-  const [kbResults, kbLinks] = await Promise.all([
-    searchKb(workspaceId, lastUserMessage, 3),
-    listKbSourceLinks(workspaceId),
-  ]);
-  const kbContext = [
-    formatKbContext(kbResults),
-    formatKbReferenceLinks(kbLinks),
-  ]
-    .filter(Boolean)
-    .join("\n\n");
-  const systemPrompt = promptFor(kbContext);
-
   // In Settings, an admin tests with every tool the workspace has on, writes
   // included (booking — the playground has no contact to cancel or
   // reschedule for — and the n8n write workflows): they are the ones who
@@ -242,16 +233,62 @@ export async function runAgentPlayground(
   // every call of this request the same idempotency key base, and
   // generateChatReply doesn't retry a turn after a write.
   const writeTools = surface === "agent_test_chat" && input.role === "admin";
-
+  let tools: Awaited<ReturnType<typeof getEnabledTools>>;
   try {
     const enabled = await getEnabledTools(workspaceId);
-    const tools = writeTools ? enabled : enabled.filter((t) => t.sensitivity === "read");
+    tools = writeTools ? enabled : enabled.filter((t) => t.sensitivity === "read");
+  } catch (err) {
+    // Nothing reserved or spent yet.
+    console.error(`[agents/${surface}] tools`, err);
+    return { ok: false, reason: "generation_failed", model, detail: "tools_unavailable", wroteSomething: false };
+  }
+
+  // Budget and hourly caps before anything that spends, KB embeddings
+  // included. /probar also reserves the call's token ceiling (its own daily
+  // cap, and never past the workspace's degrade threshold): the prompt and
+  // the tools are known by now; the KB excerpts and the tool results get
+  // bounded allowances (probarTokenCeiling).
+  const probar = surface === "client_test_chat";
+  const guard =
+    probar
+      ? await guardClientTestChat(
+          workspaceId,
+          input.userId,
+          probarTokenCeiling(promptFor(""), input.messages, input.maxOutputTokens, tools.length),
+        )
+      : await guardWorkspaceLlmCall(workspaceId, "agent_test_chat");
+  if (!guard.ok) return { ok: false, reason: "refused", response: guard.response };
+
+  // The first call that spends is here: an error before `requested` means
+  // nothing reached the model.
+  let requested = false;
+  try {
+    // KB: search with the latest user message, just like buffer.ts.
+    const lastUserMessage =
+      [...input.messages].reverse().find((m) => m.role === "user")?.content ?? "";
+    const [kbResults, kbLinks] = await Promise.all([
+      searchKb(workspaceId, lastUserMessage, 3),
+      listKbSourceLinks(workspaceId),
+    ]);
+    const kbText = [
+      formatKbContext(kbResults),
+      formatKbReferenceLinks(kbLinks),
+    ]
+      .filter(Boolean)
+      .join("\n\n");
+    // /probar's KB allowance is part of its reserved ceiling: cut to it.
+    const kbContext = probar ? cutToBytes(kbText, PROBAR_KB_MAX_BYTES) : kbText;
+    const systemPrompt = promptFor(kbContext);
+
+    requested = true;
     const reply = await generateChatReply({
       model,
       systemPrompt,
       messages: input.messages,
       maxOutputTokens: input.maxOutputTokens,
-      ...(surface === "client_test_chat" ? { maxSteps: PROBAR_MAX_STEPS } : {}),
+      ...(probar
+        ? { maxSteps: PROBAR_MAX_STEPS, noRetries: true, maxToolResultChars: PROBAR_TOOL_RESULT_MAX_CHARS }
+        : {}),
       workspaceId,
       tools,
       toolContext: {
@@ -300,6 +337,21 @@ export async function runAgentPlayground(
     };
   } catch (err) {
     console.error(`[agents/${surface}]`, err);
+    // /probar's reservation holds the ceiling. A call the provider refused
+    // (4xx) or one that never went out generated nothing: settle it at 0 so
+    // it doesn't hold the day's cap. After a timeout or a 5xx the tokens are
+    // unknown (a step may have run): the ceiling stays, as a ceiling.
+    if (probar && (!requested || refusedByProvider(err))) {
+      await recordWorkspaceLlmCall({
+        reservationId: guard.reservationId,
+        workspaceId,
+        type: surface,
+        model,
+        promptTokens: 0,
+        completionTokens: 0,
+        extra: { agent_id: agentId, user_id: input.userId, failed: true },
+      });
+    }
     return {
       ok: false,
       reason: "generation_failed",

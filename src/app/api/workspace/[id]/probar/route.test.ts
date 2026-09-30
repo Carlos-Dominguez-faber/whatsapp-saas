@@ -47,6 +47,8 @@ const generateOpts: Array<{
   model: string;
   maxOutputTokens: number;
   maxSteps?: number;
+  noRetries?: boolean;
+  maxToolResultChars?: number;
   tools?: Array<{ name: string }>;
   toolContext?: ToolContextSeen;
 }> = [];
@@ -67,9 +69,13 @@ mock.module("@/features/inbox/services/prompt-resolver.ts", {
   exports: { resolveSystemPrompt: async () => ({ body: "Eres Sofía", guardrails: null }) },
 });
 mock.module("@/features/inbox/services/prompt-builder.ts", { exports: { buildSystemPrompt: () => "SYSTEM" } });
+let kbError: Error | null = null;
 mock.module("@/features/inbox/services/kb-service.ts", {
   exports: {
-    searchKb: async () => [],
+    searchKb: async () => {
+      if (kbError) throw kbError;
+      return [];
+    },
     formatKbContext: () => "",
     listKbSourceLinks: async () => [],
     formatKbReferenceLinks: () => "",
@@ -138,6 +144,7 @@ function reset() {
   agentLookups.length = 0;
   enabledTools = [];
   generateError = null;
+  kbError = null;
   replyText = "¡Hola! ¿En qué te ayudo?";
   guardResult = { ok: true, reservationId: "res_1" };
   member = { ok: true, userId: "user_1", role: "viewer" };
@@ -276,4 +283,47 @@ test("REVIEW M5: an empty reply is an error the chat can recover from, and its t
   replyText = "ok";
   const next = await post({ messages: [{ role: "user", content: "quiero hablar con alguien" }, { role: "user", content: "¿sigues ahí?" }] });
   assert.equal(next.status, 200);
+});
+
+test("REVIEW LOW 6: one request per step, and tool results cut to what the ceiling allows", async () => {
+  reset();
+  await post();
+  assert.equal(generateOpts[0].noRetries, true);
+  assert.equal(generateOpts[0].maxToolResultChars, 2_000);
+});
+
+test("REVIEW M5: a failed message doesn't keep its ceiling when nothing was generated", async () => {
+  // Refused by the provider (402: the key is out of credit) → settled at 0.
+  reset();
+  generateError = Object.assign(new Error("Payment Required"), { statusCode: 402 });
+  assert.equal((await post()).status, 502);
+  assert.equal(recorded.length, 1);
+  assert.equal(recorded[0].promptTokens, 0);
+  assert.equal(recorded[0].completionTokens, 0);
+  assert.equal(recorded[0].reservationId, "res_1");
+
+  // Failing before any request (the KB search) → settled at 0 too.
+  reset();
+  kbError = new Error("kb down");
+  assert.equal((await post()).status, 502);
+  assert.equal(calls.includes("generate"), false);
+  assert.equal(recorded.length, 1);
+  assert.equal(recorded[0].promptTokens, 0);
+
+  // A 5xx or a timeout: a step may have run; the ceiling stays.
+  reset();
+  generateError = Object.assign(new Error("upstream 503"), { statusCode: 503 });
+  assert.equal((await post()).status, 502);
+  assert.equal(recorded.length, 0);
+});
+
+test("REVIEW LOW 6: more tools reserve a higher ceiling", async () => {
+  reset();
+  await post();
+  const none = guardCalls[0].args[2] as number;
+  reset();
+  enabledTools = WORKSPACE_TOOLS; // 2 read tools
+  await post();
+  const two = guardCalls[0].args[2] as number;
+  assert.ok(two - none >= 2 * 2 * Math.floor((2_000 + 4 * 2_000) / 3), `ceiling grew by ${two - none}`);
 });

@@ -372,3 +372,52 @@ test("generateChatReply counts a write that threw or timed out (ok null) as mayb
     registryRun = async () => null;
   }
 });
+
+test("generateChatReply with noRetries: one request, no SDK retries, no turn retry (/probar's ceiling)", async () => {
+  const transient = Object.assign(new Error("upstream 503"), { statusCode: 503 });
+  let attempts = 0;
+  let maxRetries: unknown;
+  generateImpl = async (args) => {
+    attempts++;
+    maxRetries = (args as { maxRetries?: unknown }).maxRetries;
+    throw transient;
+  };
+  try {
+    await assert.rejects(
+      generateChatReply({
+        systemPrompt: "s",
+        messages: [{ role: "user", content: "u" }],
+        workspaceId: "ws_1",
+        noRetries: true,
+      } as never),
+    );
+    assert.equal(attempts, 1);
+    assert.equal(maxRetries, 0);
+  } finally {
+    generateImpl = null;
+  }
+});
+
+test("generateChatReply cuts a tool result to maxToolResultChars before the model reads it", async () => {
+  registryRun = async () => ({ ok: true, data: "x".repeat(5_000) });
+  let seen: unknown;
+  generateImpl = async (args) => {
+    seen = await args.tools!.lookup.execute({});
+    return { text: "ok", usage: LAST_STEP, totalUsage: ALL_STEPS, steps: [{}] };
+  };
+  try {
+    await generateChatReply({
+      systemPrompt: "s",
+      messages: [{ role: "user", content: "u" }],
+      workspaceId: "ws_1",
+      tools: [{ name: "lookup", description: "d", schema: {}, sensitivity: "read" }],
+      toolContext: { workspaceId: "ws_1", conversationId: "", contactId: "", batchId: "b" },
+      maxToolResultChars: 100,
+    } as never);
+    assert.deepEqual(Object.keys(seen as object).sort(), ["result", "truncated"]);
+    assert.equal(((seen as { result: string }).result).length, 100);
+  } finally {
+    generateImpl = null;
+    registryRun = async () => null;
+  }
+});
