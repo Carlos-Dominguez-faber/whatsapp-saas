@@ -49,6 +49,8 @@ export interface RawInsights {
   };
   /** The customer's first message ever in the workspace. */
   data_from?: string | null;
+  /** Why the classifier isn't reading this workspace right now, if it is stuck. */
+  blocked?: "key" | "cap" | null;
 }
 
 export interface AnalysisView {
@@ -60,6 +62,8 @@ export interface AnalysisView {
   failed: number;
   /** Older than the classifier's 30 days: never read. */
   tooOld: number;
+  /** The run can't read this workspace now: its key fails, or it is over its cap. */
+  blocked: "key" | "cap" | null;
 }
 
 export interface TopicView {
@@ -279,20 +283,28 @@ export function toInsightsView(
       pending: Number(raw.analysis?.pending) || 0,
       failed: Number(raw.analysis?.failed) || 0,
       tooOld: Number(raw.analysis?.too_old) || 0,
+      blocked: raw.blocked === "key" || raw.blocked === "cap" ? raw.blocked : null,
     },
   };
 }
 
 /**
  * The notice when part of the period isn't analysed yet: how many, and why.
- * null = everything is analysed.
+ * null = everything is analysed, or there is no topic to analyse for (the page
+ * says that already). Pending conversations are only promised "in the next
+ * hours" when nothing blocks the run.
  */
-export function analysisNotice(a: AnalysisView): string | null {
-  if (a.conversations === 0 || a.analyzed >= a.conversations) return null;
+export function analysisNotice(a: AnalysisView, hasTopics = true): string | null {
+  if (!hasTopics || a.conversations === 0 || a.analyzed >= a.conversations) return null;
   const n = (x: number) => x.toLocaleString("es-CL");
+  const waiting =
+    a.blocked === "key"
+      ? `${n(a.pending)} ${a.pending === 1 ? "espera" : "esperan"}: la clave de OpenRouter de este espacio está fallando (sin créditos o revocada), y se analizarán cuando vuelva a funcionar`
+      : a.blocked === "cap"
+        ? `${n(a.pending)} ${a.pending === 1 ? "espera" : "esperan"}: el análisis llegó a su tope de hoy, y se retoma cuando empiece el día (00:00 UTC)`
+        : `${n(a.pending)} ${a.pending === 1 ? "se analizará" : "se analizarán"} en las próximas horas`;
   const parts = [
-    a.pending > 0 &&
-      `${n(a.pending)} ${a.pending === 1 ? "se analizará" : "se analizarán"} en las próximas horas`,
+    a.pending > 0 && waiting,
     a.failed > 0 &&
       `${n(a.failed)} no se ${a.failed === 1 ? "pudo" : "pudieron"} analizar (se reintenta si el cliente vuelve a escribir)`,
     a.tooOld > 0 &&

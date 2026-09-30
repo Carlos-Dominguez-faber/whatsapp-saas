@@ -167,8 +167,8 @@ test("REVIEW H2: a topic's share is over the analysed conversations, and the not
     "Se han analizado 4 de 10 conversaciones de este período; los temas se miden solo sobre las analizadas. " +
       "De las demás: 5 se analizarán en las próximas horas; 1 no se pudo analizar (se reintenta si el cliente vuelve a escribir).",
   );
-  assert.equal(analysisNotice({ conversations: 3, analyzed: 3, pending: 0, failed: 0, tooOld: 0 }), null);
-  assert.match(analysisNotice({ conversations: 3, analyzed: 1, pending: 0, failed: 0, tooOld: 2 }) ?? "", /2 tienen más de 30 días/);
+  assert.equal(analysisNotice({ conversations: 3, analyzed: 3, pending: 0, failed: 0, tooOld: 0, blocked: null }), null);
+  assert.match(analysisNotice({ conversations: 3, analyzed: 1, pending: 0, failed: 0, tooOld: 2, blocked: null }) ?? "", /2 tienen más de 30 días/);
 });
 
 test("a topic covered from mid-range is measured over its own universe, without a delta", () => {
@@ -236,4 +236,20 @@ test("REVIEW: no change vs. a previous period before the first customer message"
   assert.equal(before.handedOffDeltaPts, null);
   const after = toInsightsView(raw({ data_from: "2026-07-01T15:00:00Z" }), TZ, NOW, period);
   assert.equal(after.universeChangePct, 25);
+});
+
+test("REVIEW LOW 9: the notice says why, and never promises 'the next hours' when something blocks the run", () => {
+  const base = { conversations: 10, analyzed: 4, pending: 6, failed: 0, tooOld: 0 };
+  const key = analysisNotice({ ...base, blocked: "key" }) ?? "";
+  assert.match(key, /6 esperan: la clave de OpenRouter de este espacio está fallando/);
+  assert.doesNotMatch(key, /próximas horas/);
+  const cap = analysisNotice({ ...base, blocked: "cap" }) ?? "";
+  assert.match(cap, /tope de hoy/);
+  assert.doesNotMatch(cap, /próximas horas/);
+  assert.match(analysisNotice({ ...base, blocked: null }) ?? "", /se analizarán en las próximas horas/);
+  // No topic: nothing is being analysed, and the page already says why.
+  assert.equal(analysisNotice({ ...base, blocked: null }, false), null);
+  // From the payload.
+  assert.equal(toInsightsView(raw({ blocked: "cap" }), TZ, NOW).analysis.blocked, "cap");
+  assert.equal(toInsightsView(raw({ blocked: "whatever" as never }), TZ, NOW).analysis.blocked, null);
 });

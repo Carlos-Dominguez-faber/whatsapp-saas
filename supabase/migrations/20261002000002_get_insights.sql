@@ -66,6 +66,8 @@ conv AS (
          u.last_in,
          COALESCE(cc.classified_until >= u.last_in, false) AS analyzed,
          cc.quarantined_at IS NOT NULL AS quarantined,
+         cc.catalog_at,
+         COALESCE(cc.backfill_topics, '{}'::uuid[]) AS backfill_topics,
          EXISTS (
            SELECT 1 FROM public.appointments a
             WHERE a.conversation_id = u.conversation_id
@@ -96,6 +98,8 @@ conv AS (
 prev_conv AS (
   SELECT pu.conversation_id,
          COALESCE(cc.classified_until >= pu.last_in, false) AS analyzed,
+         cc.catalog_at,
+         COALESCE(cc.backfill_topics, '{}'::uuid[]) AS backfill_topics,
          EXISTS (
            SELECT 1 FROM public.appointments a, bounds b
             WHERE a.conversation_id = pu.conversation_id
@@ -122,6 +126,7 @@ tag_list AS (
 topics AS (
   SELECT t.id,
          t.name,
+         t.created_at,
          t.covered_from,
          -- Where this topic's measurement starts inside the range.
          GREATEST(p_from, t.covered_from) AS cov_from,
@@ -135,11 +140,25 @@ topics AS (
 -- detección en el rango; con una fila por conversación, la primera detección
 -- taparía a las siguientes y un tema recurrente desaparecería de los períodos
 -- posteriores. Only analysed conversations: the same set as the denominator.
+-- Analysed FOR a topic: read up to the customer's last message of the period
+-- (analyzed) with that topic in the catalog (catalog_at, set by the nightly
+-- run), or by the topic's own backfill (backfill_topics). A conversation the
+-- backfill left out and the nightly run never read again doesn't dilute the
+-- topic: it isn't in its denominator. Rows #13 wrote have no catalog: they
+-- count as before.
+for_topic AS (
+  SELECT tp.id AS topic_id, conv.*
+    FROM topics tp
+    JOIN conv ON conv.analyzed
+             AND conv.last_in >= tp.cov_from
+             AND (conv.catalog_at IS NULL OR conv.catalog_at >= tp.created_at
+                  OR tp.id = ANY (conv.backfill_topics))
+),
 hits AS (
   SELECT DISTINCT ctp.topic_id, conv.conversation_id, conv.booked, conv.handed_off, conv.tags
     FROM public.conversation_topics ctp
     JOIN topics tp ON tp.id = ctp.topic_id
-    JOIN conv ON conv.conversation_id = ctp.conversation_id AND conv.analyzed
+    JOIN for_topic conv ON conv.conversation_id = ctp.conversation_id AND conv.topic_id = tp.id
    WHERE ctp.workspace_id = p_workspace_id
      AND ctp.detected_at >= tp.cov_from AND ctp.detected_at < p_to
 ),
@@ -151,6 +170,8 @@ prev_hits AS (
     -- hits usa conv. Con prev_universe crudo el numerador incluiría lo que el
     -- denominador (prev_conversations) descarta: porcentajes sobre 100 %.
     JOIN prev_conv pc ON pc.conversation_id = ctp.conversation_id AND pc.analyzed
+                     AND (pc.catalog_at IS NULL OR pc.catalog_at >= tp.created_at
+                          OR tp.id = ANY (pc.backfill_topics))
    WHERE ctp.workspace_id = p_workspace_id
      AND ctp.detected_at >= (SELECT prev_from FROM bounds) AND ctp.detected_at < p_from
    GROUP BY ctp.topic_id
@@ -194,6 +215,26 @@ SELECT jsonb_build_object(
     SELECT min(m.created_at) FROM public.messages m
      WHERE m.workspace_id = p_workspace_id AND m.direction = 'in'
   ),
+  -- Why the rest isn't being read, if the run says so: the workspace's
+  -- OpenRouter key fails ('key') or it reached its daily cap ('cap'). Current
+  -- when noted in the last 2 hours with no paid classification since
+  -- (note_classification_blocked writes at most one an hour while it lasts).
+  'blocked', (
+    SELECT b.payload->>'reason'
+      FROM public.events b
+     WHERE b.workspace_id = p_workspace_id
+       AND b.type = 'topic_classification_blocked'
+       AND b.created_at > now() - INTERVAL '2 hours'
+       AND NOT EXISTS (
+         SELECT 1 FROM public.events ok
+          WHERE ok.workspace_id = p_workspace_id
+            AND ok.type = 'topic_classification'
+            AND ok.created_at > b.created_at
+            AND ok.payload->>'reserved' = 'false'
+            AND ok.payload->>'total_tokens' ~ '^[1-9][0-9]{0,11}$')
+     ORDER BY b.created_at DESC
+     LIMIT 1
+  ),
   'analysis', jsonb_build_object(
     'conversations', (SELECT count(*) FROM conv),
     'analyzed', (SELECT count(*) FROM conv WHERE conv.analyzed),
@@ -213,12 +254,15 @@ SELECT jsonb_build_object(
       'covered_from', CASE WHEN tp.covered_from > p_from THEN tp.covered_from END,
       -- The topic's denominator: analysed conversations whose customer wrote
       -- while it was covered; `in_coverage` also counts the unread ones.
-      'universe', (SELECT count(*) FROM conv WHERE conv.analyzed AND conv.last_in >= tp.cov_from),
+      'universe', (SELECT count(*) FROM for_topic ft WHERE ft.topic_id = tp.id),
       'in_coverage', (SELECT count(*) FROM conv WHERE conv.last_in >= tp.cov_from),
       'conversations', (SELECT count(*) FROM hits h WHERE h.topic_id = tp.id),
       -- NULL, not 0, when the previous period wasn't covered: no delta.
       'prev_universe', CASE WHEN tp.prev_covered
-                         THEN (SELECT count(*) FROM prev_conv WHERE prev_conv.analyzed)
+                         THEN (SELECT count(*) FROM prev_conv
+                                WHERE prev_conv.analyzed
+                                  AND (prev_conv.catalog_at IS NULL OR prev_conv.catalog_at >= tp.created_at
+                                       OR tp.id = ANY (prev_conv.backfill_topics)))
                        END,
       'prev_conversations', CASE WHEN tp.prev_covered
                               THEN COALESCE((SELECT ph.n FROM prev_hits ph WHERE ph.topic_id = tp.id), 0)
@@ -243,8 +287,8 @@ SELECT jsonb_build_object(
                to_char(date_trunc('week', ctp.detected_at AT TIME ZONE p_tz), 'YYYY-MM-DD') AS week,
                count(DISTINCT ctp.conversation_id) AS n
           FROM public.conversation_topics ctp
-          JOIN conv ON conv.conversation_id = ctp.conversation_id AND conv.analyzed
           JOIN topics tp ON tp.id = ctp.topic_id
+          JOIN for_topic conv ON conv.conversation_id = ctp.conversation_id AND conv.topic_id = tp.id
          WHERE ctp.workspace_id = p_workspace_id
            AND ctp.detected_at >= tp.cov_from AND ctp.detected_at < p_to
          GROUP BY ctp.topic_id, 2
@@ -302,6 +346,7 @@ AS $$
        SELECT 1 FROM public.conversation_classification cc
         WHERE cc.conversation_id = ctp.conversation_id
           AND cc.workspace_id = p_workspace_id
+          AND (cc.catalog_at IS NULL OR cc.catalog_at >= t.created_at OR t.id = ANY (cc.backfill_topics))
           AND cc.classified_until >= (
             SELECT max(m2.created_at) FROM public.messages m2
              WHERE m2.conversation_id = ctp.conversation_id

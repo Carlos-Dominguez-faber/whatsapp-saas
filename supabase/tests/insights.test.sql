@@ -9,7 +9,7 @@ BEGIN;
 CREATE EXTENSION IF NOT EXISTS pgtap WITH SCHEMA extensions;
 SET search_path = public, extensions;
 
-SELECT plan(52);
+SELECT plan(55);
 
 -- ── Privileges ───────────────────────────────────────────────────────────────
 SELECT ok(NOT has_function_privilege('anon',
@@ -340,6 +340,48 @@ SELECT is((SELECT count(*)::int FROM public.events
 SELECT ok(NOT has_function_privilege('authenticated', 'public.defer_classification(uuid, uuid, text, integer, timestamptz)', 'EXECUTE')
           AND NOT has_function_privilege('authenticated', 'public.note_classification_blocked(uuid, text, timestamptz)', 'EXECUTE'),
   'sessions cannot defer a conversation or note a blocked workspace');
+
+-- ── A topic counts only conversations read WITH it (review LOW 8) ────────────
+-- Topic T (created 5 days ago, backfill done from 10 days back). X was read
+-- by the nightly run before T existed and the backfill left it out; Y was
+-- backfilled for T; Z was read by the nightly run with T in its catalog.
+DO $l8$
+DECLARE ws UUID := 'e4000000-0000-4000-8000-000000000001'; t UUID := 'e4000000-0000-4000-8000-0000000000f1';
+  old_t UUID := 'e4000000-0000-4000-8000-0000000000f0'; k UUID; c UUID; m UUID; tag TEXT;
+BEGIN
+  INSERT INTO public.workspaces (id, name, slug) VALUES (ws, 'L8', 'l8-test');
+  INSERT INTO public.insight_topics (id, workspace_id, name, description, created_at, covered_from, backfill_status) VALUES
+    (old_t, ws, 'Viejo', 'x', now() - interval '60 days', now() - interval '60 days', 'done'),
+    (t, ws, 'Nuevo', 'x', now() - interval '5 days', now() - interval '10 days', 'done');
+  FOREACH tag IN ARRAY ARRAY['x', 'y', 'z'] LOOP
+    k := gen_random_uuid(); c := ('e4000000-0000-4000-8000-0000000000a' || CASE tag WHEN 'x' THEN '1' WHEN 'y' THEN '2' ELSE '3' END)::uuid; m := gen_random_uuid();
+    INSERT INTO public.contacts (id, workspace_id, phone) VALUES (k, ws, '+1555950000' || tag);
+    INSERT INTO public.conversations (id, workspace_id, contact_id, last_message_at) VALUES (c, ws, k, now() - interval '7 days');
+    INSERT INTO public.messages (id, workspace_id, conversation_id, direction, body, created_at) VALUES (m, ws, c, 'in', 'hola', now() - interval '7 days');
+    -- The nightly run read it 7 days ago, when only the old topic existed…
+    PERFORM public.save_conversation_topics(ws, c, '[]'::jsonb, now() - interval '7 days', NULL, NULL, ARRAY[old_t]);
+    IF tag = 'y' THEN
+      PERFORM public.save_conversation_topics(ws, c, '[]'::jsonb, NULL, NULL, NULL, NULL, t);
+    ELSIF tag = 'z' THEN
+      UPDATE public.conversation_classification SET catalog_at = now() - interval '5 days' WHERE conversation_id = c;
+    END IF;
+  END LOOP;
+END
+$l8$;
+SELECT is((SELECT (x->>'universe')::int FROM jsonb_array_elements(public.get_insights(
+            'e4000000-0000-4000-8000-000000000001', now() - interval '9 days', now(), '{}', 'UTC')->'topics') x
+          WHERE x->>'name' = 'Nuevo'), 2,
+  'a conversation the backfill left out and the nightly run never read with the topic is not in its denominator');
+
+-- ── Why the rest isn't being read (review LOW 9) ─────────────────────────────
+SELECT public.note_classification_blocked('e4000000-0000-4000-8000-000000000001', 'key');
+SELECT is(public.get_insights('e4000000-0000-4000-8000-000000000001', now() - interval '9 days', now(), '{}', 'UTC')->>'blocked',
+  'key', 'the dashboard gets the cause: the workspace''s key is failing');
+INSERT INTO public.events (type, level, workspace_id, payload, created_at)
+VALUES ('topic_classification', 'info', 'e4000000-0000-4000-8000-000000000001',
+        '{"reserved": false, "total_tokens": 1500}', now() + interval '1 second');
+SELECT is(public.get_insights('e4000000-0000-4000-8000-000000000001', now() - interval '9 days', now(), '{}', 'UTC')->>'blocked',
+  NULL, 'a paid classification since then clears it');
 
 SELECT * FROM finish();
 ROLLBACK;

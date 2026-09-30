@@ -54,7 +54,7 @@ export default async function AnalisisPage({
   const { view, range, availableTags, topics, canManage } = result;
   const workspaceId = membership.workspace_id;
   const partialNotice = partialCoverageMessage(view.partialConversations);
-  const analysisText = analysisNotice(view.analysis);
+  const analysisText = analysisNotice(view.analysis, topics.length > 0);
 
   return (
     <main className="mx-auto max-w-5xl space-y-8 p-4 sm:p-6">
