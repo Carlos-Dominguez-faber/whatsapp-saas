@@ -22,13 +22,16 @@ export type OpenRouterKeyResolution =
 export async function resolveOpenRouterKey(
   workspaceId: string,
   db: SupabaseClient = svcClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!),
+  /** The caller's deadline: a slow lookup comes back as `lookup_failed`. */
+  signal?: AbortSignal,
 ): Promise<OpenRouterKeyResolution> {
-  const { data, error } = await db
+  let query = db
     .from("integrations")
     .select("credentials")
     .eq("workspace_id", workspaceId)
-    .eq("provider", "openrouter")
-    .maybeSingle();
+    .eq("provider", "openrouter");
+  if (signal) query = query.abortSignal(signal);
+  const { data, error } = await query.maybeSingle();
   if (error) return { scope: null, key: null, problem: "lookup_failed" };
   const credentials = (data?.credentials as Record<string, unknown> | null) ?? null;
   const stored = credentials?.openrouter_api_key;

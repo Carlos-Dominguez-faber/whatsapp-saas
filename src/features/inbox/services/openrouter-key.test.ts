@@ -26,3 +26,16 @@ test("the classifier's key: own, the platform's, own-but-unreadable, or a failed
     problem: "lookup_failed",
   });
 });
+
+test("the lookup runs under the caller's deadline", async () => {
+  let seen: AbortSignal | undefined;
+  const q: any = {
+    select: () => q,
+    eq: () => q,
+    abortSignal: (s: AbortSignal) => ((seen = s), q),
+    maybeSingle: async () => ({ data: null, error: null }),
+  };
+  const signal = AbortSignal.timeout(5_000);
+  await resolveOpenRouterKey("ws", { from: () => q } as never, signal);
+  assert.equal(seen, signal);
+});
