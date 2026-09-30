@@ -14,7 +14,14 @@
 --    finished rows (done, failed, cancelled) older than p_keep_days, at most
 --    p_limit per call; the queue's cron phase calls it once per tick. The
 --    partial index keeps that DELETE off the pending rows. Service role only.
+--
+-- The CHECK is added NOT VALID (enforced for every new write at once, with
+-- only a brief lock) and validated in its own statement, which scans
+-- contacts without blocking writes (as 20260926000002 does). lock_timeout
+-- keeps a busy table from queueing every write behind this migration.
 -- ============================================================================
+
+SET lock_timeout = '10s';
 
 DO $$
 DECLARE
@@ -41,9 +48,11 @@ BEGIN
   ) THEN
     ALTER TABLE public.contacts
       ADD CONSTRAINT contacts_hs_contact_id_numeric
-      CHECK (hs_contact_id IS NULL OR hs_contact_id ~ '^[0-9]{1,20}$');
+      CHECK (hs_contact_id IS NULL OR hs_contact_id ~ '^[0-9]{1,20}$') NOT VALID;
   END IF;
 END $$;
+
+ALTER TABLE public.contacts VALIDATE CONSTRAINT contacts_hs_contact_id_numeric;
 
 CREATE INDEX IF NOT EXISTS idx_hubspot_conversation_logs_finished
   ON public.hubspot_conversation_logs (updated_at)
@@ -77,6 +86,8 @@ $$;
 
 REVOKE ALL ON FUNCTION public.purge_hubspot_conversation_logs(INT, INT) FROM PUBLIC, anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.purge_hubspot_conversation_logs(INT, INT) TO service_role;
+
+RESET lock_timeout;
 
 -- ============================================================================
 -- End of migration: 20261003000010_hubspot_hardening

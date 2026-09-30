@@ -141,9 +141,12 @@ REVOKE ALL ON FUNCTION public.claim_calcom_slot(UUID, UUID, UUID, TIMESTAMPTZ, I
 GRANT EXECUTE ON FUNCTION public.claim_calcom_slot(UUID, UUID, UUID, TIMESTAMPTZ, INT, INT)
   TO service_role;
 
+-- SECURITY DEFINER: an admin or manager deleting a contact through their
+-- session may not be allowed to update appointments under RLS, and a claim
+-- left open would still collide.
 CREATE OR REPLACE FUNCTION public.close_calcom_claims_of_deleted_contact()
 RETURNS TRIGGER
-LANGUAGE plpgsql
+LANGUAGE plpgsql SECURITY DEFINER
 SET search_path = ''
 AS $$
 BEGIN
@@ -165,6 +168,8 @@ CREATE TRIGGER trg_contacts_close_calcom_claims
   FOR EACH ROW EXECUTE FUNCTION public.close_calcom_claims_of_deleted_contact();
 
 REVOKE ALL ON FUNCTION public.close_calcom_claims_of_deleted_contact() FROM PUBLIC, anon, authenticated;
+
+RESET lock_timeout;
 
 -- ============================================================================
 -- End of migration: 20261003000011_calcom_slot_index_contacts

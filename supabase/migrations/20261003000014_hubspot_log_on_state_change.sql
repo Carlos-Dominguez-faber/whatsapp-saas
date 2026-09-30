@@ -16,6 +16,8 @@
 -- update of a conversation must still queue its entry.
 -- ============================================================================
 
+SET lock_timeout = '10s';
+
 CREATE OR REPLACE FUNCTION public.enqueue_hubspot_log_on_state()
 RETURNS TRIGGER
 LANGUAGE plpgsql SECURITY DEFINER
@@ -47,6 +49,8 @@ CREATE TRIGGER trg_conversations_hubspot_log
   FOR EACH ROW
   WHEN (NEW.state IS DISTINCT FROM OLD.state AND NEW.state IN ('handoff_pending', 'closed'))
   EXECUTE FUNCTION public.enqueue_hubspot_log_on_state();
+
+RESET lock_timeout;
 
 -- ============================================================================
 -- End of migration: 20261003000014_hubspot_log_on_state_change

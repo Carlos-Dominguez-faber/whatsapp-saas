@@ -26,7 +26,13 @@
 --    is, with its age and the attendee email it was sent with: schedule_calcom
 --    asks Cal.com whether that booking exists before freeing the slot, or
 --    hands the conversation to a person.
+--
+-- lock_timeout: the LOCK below waits at most 10 s for writers in flight
+-- instead of queueing every new write behind it; if it can't get the lock,
+-- db push fails and can simply be run again.
 -- ============================================================================
+
+SET lock_timeout = '10s';
 
 DO $$
 DECLARE
@@ -164,6 +170,8 @@ REVOKE ALL ON FUNCTION public.claim_calcom_slot(UUID, UUID, UUID, TIMESTAMPTZ, I
   FROM PUBLIC, anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.claim_calcom_slot(UUID, UUID, UUID, TIMESTAMPTZ, INT, INT)
   TO service_role;
+
+RESET lock_timeout;
 
 -- ============================================================================
 -- End of migration: 20261003000003_calcom_booking_cache
