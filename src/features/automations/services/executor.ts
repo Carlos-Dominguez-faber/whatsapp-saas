@@ -603,7 +603,9 @@ async function confirmAppointmentWithCalCom(
   try {
     read = await readCalComBooking(
       { supabase: svc(), apiKey: cfg.apiKey, workspaceId: run.workspace_id, contactId },
-      { uid: appointment.calcomBookingUid },
+      // The run's conversation: a booking moved in Cal.com is cached with it,
+      // or the reminder scan would never see the new time.
+      { uid: appointment.calcomBookingUid, conversationId: run.conversation_id },
     );
   } catch (err) {
     console.error("[automations] could not confirm the booking in Cal.com:", {

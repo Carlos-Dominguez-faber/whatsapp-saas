@@ -7,6 +7,8 @@ import { listCalComAppointmentsTool } from "./list-calcom-appointments.ts";
 import { checkAvailabilityCalComTool } from "./check-availability-calcom.ts";
 import { listEventTypesCalComTool } from "./list-event-types-calcom.ts";
 import { registry } from "../registry.ts";
+import { readCalComBooking } from "../lib/calcom-appointment.ts";
+import { createClient } from "@supabase/supabase-js";
 import type { ToolContext, ToolExecution } from "../core/tool";
 
 process.env.NEXT_PUBLIC_SUPABASE_URL = "https://fake.supabase.co";
@@ -19,7 +21,9 @@ interface LocalRow {
   calcom_booking_uid: string | null;
   status: string;
   scheduled_at: string;
+  contact_id?: string;
   conversation_id?: string | null;
+  created_at?: string;
 }
 
 interface FetchCall {
@@ -36,15 +40,23 @@ function json(status: number, body: unknown): Response {
   });
 }
 
-/** Applies scheduled_at=gte./lte., status=in.() and calcom_booking_uid=eq. to the rows. */
+/**
+ * Applies scheduled_at=gte./lte., status=in.(), contact_id=eq.,
+ * calcom_booking_uid=eq. and calcom_booking_uid=not.is.null to the rows: a
+ * query that drops one of those filters reads rows it must not.
+ */
 function filterRows(url: string, rows: LocalRow[]) {
   const search = new URL(url).searchParams;
   const bounds = search.getAll("scheduled_at");
   const statusIn = search.get("status")?.match(/^in\.\((.*)\)$/)?.[1].split(",");
-  const uid = search.get("calcom_booking_uid")?.match(/^eq\.(.*)$/)?.[1];
+  const uidFilter = search.get("calcom_booking_uid");
+  const uid = uidFilter?.match(/^eq\.(.*)$/)?.[1];
+  const contact = search.get("contact_id")?.match(/^eq\.(.*)$/)?.[1];
   return rows.filter((row) => {
     if (statusIn && !statusIn.includes(row.status)) return false;
     if (uid !== undefined && row.calcom_booking_uid !== uid) return false;
+    if (uidFilter === "not.is.null" && row.calcom_booking_uid === null) return false;
+    if (contact !== undefined && (row.contact_id ?? "contact_1") !== contact) return false;
     const at = Date.parse(row.scheduled_at);
     return bounds.every((b) => {
       const [op, ...rest] = b.split(".");
@@ -217,12 +229,15 @@ const CONFIRMED = "2030-06-12T10:00:00-06:00";
 const CONFIRMED_UTC = "2030-06-12T16:00:00.000Z";
 const NEW_TIME = "2030-06-15T12:00:00-06:00";
 const NEW_TIME_UTC = "2030-06-15T18:00:00.000Z";
-const cached = (uid: string, at: string, status = "booked"): LocalRow => ({
+const cached = (uid: string, at: string, status = "booked", extra: Partial<LocalRow> = {}): LocalRow => ({
   id: `row_${uid}`,
   calcom_booking_uid: uid,
   status,
   scheduled_at: at,
+  contact_id: "contact_1",
   conversation_id: "conv_1",
+  created_at: "2030-01-01T00:00:00.000Z",
+  ...extra,
 });
 
 const schedule = (fake: ReturnType<typeof calFetch>, args: Partial<Record<string, unknown>> = {}, c = ctx) =>
@@ -675,4 +690,69 @@ test("event types: listed with their length, recurring ones flagged; a failure i
   const off = calFetch({ connected: false });
   const notConnected = await withFetch(off, () => listEventTypesCalComTool.run({}, ctx));
   assert.match(notConnected.error ?? "", /no está conectado/);
+});
+
+// ── the cache follows a move as the same appointment ─────────────────────────
+
+const upsertOf = (calls: FetchCall[], uid: string) =>
+  localWrites(calls).find(
+    (c) =>
+      c.method === "POST" &&
+      decodeURIComponent(c.url).includes("on_conflict=workspace_id,calcom_booking_uid") &&
+      (c.body as { calcom_booking_uid: string }).calcom_booking_uid === uid,
+  )?.body as Record<string, unknown> | undefined;
+
+test("a booking moved in Cal.com is cached with the conversation and created_at of the row it moved from", async () => {
+  const fake = calFetch({
+    local: [cached("b1", CONFIRMED_UTC, "booked", { created_at: "2029-12-01T10:00:00.000Z", conversation_id: "conv_row" })],
+    bookings: {
+      b1: booking("b1", CONFIRMED_UTC, { status: "cancelled", rescheduledToUid: "b2" }),
+      b2: booking("b2", NEW_TIME_UTC),
+    },
+  });
+  const supabase = createClient("https://fake.supabase.co", "fake-service-key");
+  const lookup = { supabase, apiKey: "cal_live_secret", workspaceId: "ws_1", contactId: "contact_1" };
+
+  // The reminder executor passes the run's conversation.
+  const read = await withFetch(fake, () => readCalComBooking(lookup, { uid: "b1", conversationId: "conv_run" }));
+  assert.equal(read?.moved, true);
+  const u2 = upsertOf(fake.calls, "b2")!;
+  assert.equal(u2.conversation_id, "conv_run");
+  assert.equal(u2.created_at, "2029-12-01T10:00:00.000Z", "not now(): the scan needs the original lead");
+  assert.equal(u2.contact_id, "contact_1");
+  assert.equal(u2.status, "booked");
+
+  // Without one, the row it moved from gives it.
+  const again = calFetch({
+    local: [cached("b1", CONFIRMED_UTC, "booked", { created_at: "2029-12-01T10:00:00.000Z", conversation_id: "conv_row" })],
+    bookings: {
+      b1: booking("b1", CONFIRMED_UTC, { status: "cancelled", rescheduledToUid: "b2" }),
+      b2: booking("b2", NEW_TIME_UTC),
+    },
+  });
+  await withFetch(again, () => readCalComBooking(lookup, { uid: "b1" }));
+  assert.equal(upsertOf(again.calls, "b2")!.conversation_id, "conv_row");
+
+  // An unmoved booking never rewrites created_at.
+  const still = calFetch({ local: [cached("b1", CONFIRMED_UTC)] });
+  await withFetch(still, () => readCalComBooking(lookup, { uid: "b1", conversationId: "conv_run" }));
+  assert.equal(upsertOf(still.calls, "b1")!.created_at, undefined);
+});
+
+test("reschedule_calcom caches the new booking with the old row's created_at", async () => {
+  const fake = calFetch({ local: [cached("b1", CONFIRMED_UTC, "booked", { created_at: "2029-12-01T10:00:00.000Z" })] });
+  await moveTo(fake);
+  assert.equal(upsertOf(fake.calls, "moved_1")!.created_at, "2029-12-01T10:00:00.000Z");
+});
+
+test("the cache lookups filter by contact and linked bookings: another contact's booking is never found", async () => {
+  const fake = calFetch({ local: [cached("b1", CONFIRMED_UTC, "booked", { contact_id: "contact_2" })] });
+  const result = await cancelAt(fake);
+  assert.equal(result.ok, false);
+  assert.match(result.error ?? "", /No encontré/);
+  assert.equal(calPosts(fake.calls).length, 0);
+
+  const claimRow = calFetch({ local: [{ ...cached("x", CONFIRMED_UTC), calcom_booking_uid: null }] });
+  const list = await withFetch(claimRow, () => listCalComAppointmentsTool.run({}, ctx));
+  assert.deepEqual((list.output as { appointments: unknown[] }).appointments, []);
 });

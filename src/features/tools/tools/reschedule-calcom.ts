@@ -233,15 +233,17 @@ async function run(args: Args, ctx: ToolContext, opts?: ToolRunOptions): Promise
   if (moved) {
     const { data: oldRow } = await supabase
       .from("appointments")
-      .select("conversation_id")
+      .select("conversation_id, created_at")
       .eq("workspace_id", ctx.workspaceId)
       .eq("calcom_booking_uid", booking.uid)
       .maybeSingle();
+    const old = oldRow as { conversation_id: string | null; created_at: string | null } | null;
     await markCalComCancelledLocally(lookup, booking.uid, { rescheduled_to: moved.uid });
+    // The same appointment at a new time: its conversation and created_at
+    // carry over (the reminder scan needs both).
     await recordCalComLocally(lookup, moved, {
-      conversationId:
-        (oldRow as { conversation_id: string | null } | null)?.conversation_id ??
-        (ctx.conversationId || null),
+      conversationId: old?.conversation_id ?? (ctx.conversationId || null),
+      createdAt: old?.created_at ?? null,
       meta: { rescheduled_from: new Date(currentMs).toISOString() },
     });
   } else {

@@ -74,7 +74,17 @@ function localStatusOf(booking: CalComBooking): string | null {
 export async function recordCalComLocally(
   opts: Pick<CalComLookup, "supabase" | "workspaceId" | "contactId">,
   booking: CalComBooking,
-  extra: { conversationId?: string | null; meta?: Record<string, unknown> } = {},
+  extra: {
+    conversationId?: string | null;
+    /**
+     * For a booking moved from a cached one: the original row's created_at.
+     * The reminder scan requires a booking made with enough lead
+     * (created_at <= due_at); a move is the same appointment, as HighLevel's
+     * row keeps its created_at when it moves.
+     */
+    createdAt?: string | null;
+    meta?: Record<string, unknown>;
+  } = {},
 ): Promise<void> {
   try {
     const row: Record<string, unknown> = {
@@ -87,6 +97,7 @@ export async function recordCalComLocally(
     if (status) row.status = status;
     if (booking.eventTypeId !== null) row.calcom_event_type_id = booking.eventTypeId;
     if (extra.conversationId) row.conversation_id = extra.conversationId;
+    if (extra.createdAt) row.created_at = extra.createdAt;
     if (extra.meta) {
       const { data } = await opts.supabase
         .from("appointments")
@@ -136,11 +147,38 @@ export async function markCalComCancelledLocally(
 }
 
 /**
+ * The cached row a move started from: its conversation and created_at carry
+ * over to the booking it moved to. Null when it can't be read.
+ */
+async function originRow(
+  opts: Pick<CalComLookup, "supabase" | "workspaceId">,
+  uid: string,
+): Promise<{ conversation_id: string | null; created_at: string | null } | null> {
+  try {
+    const { data } = await opts.supabase
+      .from("appointments")
+      .select("conversation_id, created_at")
+      .eq("workspace_id", opts.workspaceId)
+      .eq("calcom_booking_uid", uid)
+      .maybeSingle();
+    return (data as { conversation_id: string | null; created_at: string | null } | null) ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * The booking behind a cached uid as Cal.com has it now, following the moves
  * Cal.com recorded (a rescheduled booking is cancelled with
  * `rescheduledToUid`). Null when Cal.com no longer has the cached uid (404).
  * Throws when that can't be known: a failed read, a 404 along a move, or
  * more than MAX_HOPS moves.
+ *
+ * The booking a move leads to is written to the cache as the same
+ * appointment: with the conversation (the caller's, else the cached row's)
+ * and the created_at of the row it moved from (else Cal.com's createdAt of
+ * the original booking), so the reminder scan treats it like HighLevel's
+ * moved row, not like a booking made just now.
  */
 export async function readCalComBooking(
   opts: CalComLookup,
@@ -148,6 +186,7 @@ export async function readCalComBooking(
 ): Promise<ReadBooking | null> {
   let uid = cached.uid;
   let fromStartMs: number | null = null;
+  let originCreatedMs: number | null = null;
   const writes: Promise<void>[] = [];
   let result: ReadBooking | null = null;
   try {
@@ -157,7 +196,10 @@ export async function readCalComBooking(
         if (hop === 0) return null;
         throw new Error("Cal.com no tiene la reserva a la que movió la cita");
       }
-      fromStartMs ??= booking.startMs;
+      if (fromStartMs === null) {
+        fromStartMs = booking.startMs;
+        originCreatedMs = booking.createdMs;
+      }
       if (booking.state === "cancelled" && booking.rescheduledToUid) {
         writes.push(
           markCalComCancelledLocally(opts, booking.uid, { rescheduled_to: booking.rescheduledToUid }),
@@ -165,12 +207,22 @@ export async function readCalComBooking(
         uid = booking.rescheduledToUid;
         continue;
       }
-      writes.push(
-        recordCalComLocally(opts, booking, {
-          conversationId: cached.conversationId ?? null,
-          ...(hop > 0 ? { meta: { rescheduled_from: new Date(fromStartMs).toISOString() } } : {}),
-        }),
-      );
+      if (hop === 0) {
+        writes.push(
+          recordCalComLocally(opts, booking, { conversationId: cached.conversationId ?? null }),
+        );
+      } else {
+        const origin = await originRow(opts, cached.uid);
+        writes.push(
+          recordCalComLocally(opts, booking, {
+            conversationId: cached.conversationId ?? origin?.conversation_id ?? null,
+            createdAt:
+              origin?.created_at ??
+              (originCreatedMs !== null ? new Date(originCreatedMs).toISOString() : null),
+            meta: { rescheduled_from: new Date(fromStartMs).toISOString() },
+          }),
+        );
+      }
       result = { booking, fromStartMs, moved: hop > 0 };
       return result;
     }

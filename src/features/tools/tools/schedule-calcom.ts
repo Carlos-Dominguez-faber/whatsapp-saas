@@ -263,7 +263,7 @@ async function run(args: Args, ctx: ToolContext, opts?: ToolRunOptions): Promise
       try {
         read = await readCalComBooking(
           { supabase, apiKey: cfg.apiKey, workspaceId: ctx.workspaceId, contactId: ctx.contactId },
-          { uid: row.holder_uid },
+          { uid: row.holder_uid, conversationId: ctx.conversationId || null },
         );
       } catch (err) {
         console.error("[schedule_calcom] holder lookup failed:", err);

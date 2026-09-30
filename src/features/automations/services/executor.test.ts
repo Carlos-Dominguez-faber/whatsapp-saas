@@ -406,13 +406,15 @@ let calcomConfig: unknown = null;
 let calcomRead: unknown = null;
 let calcomReadThrows = false;
 const calcomReadCalls: unknown[] = [];
+const calcomReadConversations: unknown[] = [];
 mock.module("@/features/inbox/services/calcom-client.ts", {
   exports: { loadCalComConfig: async () => calcomConfig },
 });
 mock.module("@/features/tools/lib/calcom-appointment.ts", {
   exports: {
-    readCalComBooking: async (_opts: unknown, cached: { uid: string }) => {
+    readCalComBooking: async (_opts: unknown, cached: { uid: string; conversationId?: string | null }) => {
       calcomReadCalls.push(cached.uid);
+      calcomReadConversations.push(cached.conversationId);
       if (calcomReadThrows) throw new Error("Cal.com respondió 502");
       return calcomRead;
     },
@@ -560,6 +562,7 @@ function reset() {
   calcomRead = null;
   calcomReadThrows = false;
   calcomReadCalls.length = 0;
+  calcomReadConversations.length = 0;
   claimRpcError = null;
   claimOkBeforeError = 0;
   claimQueue = [];
@@ -2334,6 +2337,8 @@ test("Cal.com: a booking live at the same time in Cal.com is reminded", async ()
   calcomRead = { booking: { state: "active", startMs: at }, moved: false, fromStartMs: at };
   assert.equal(await executeRun(makeRun({ trigger_type: "appointment_upcoming" })), "done");
   assert.deepEqual(calcomReadCalls, ["cal_b1"]);
+  // A booking moved in Cal.com is cached with the run's conversation.
+  assert.deepEqual(calcomReadConversations, [makeRun({ trigger_type: "appointment_upcoming" }).conversation_id]);
   assert.equal(hlEventCalls.length, 0, "HighLevel is not asked about a Cal.com booking");
   assert.equal(sendCalls.length, 1);
 });
