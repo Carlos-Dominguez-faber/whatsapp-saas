@@ -57,8 +57,10 @@ INSERT INTO public.insight_topics (id, workspace_id, name, description, created_
   ('e0000000-0000-4000-8000-0000000000f1', 'e0000000-0000-4000-8000-000000000001', 'Precio', 'Objeta el precio', now() - interval '60 days', now() - interval '60 days');
 
 -- ── Eligibility: the customer's last message ────────────────────────────────
+-- Every pick skips the other workspaces a seeded database may hold: their
+-- conversations become eligible as the clock moves, and would take the batch.
 CREATE TEMP TABLE picked AS
-  SELECT * FROM public.select_conversations_to_classify(10, '{}', 120);
+  SELECT * FROM public.select_conversations_to_classify(10, ARRAY(SELECT id FROM public.workspaces WHERE id <> 'e0000000-0000-4000-8000-000000000001'), 120);
 SELECT is((SELECT array_agg(conversation_id ORDER BY conversation_id) FROM picked),
   ARRAY['e0000000-0000-4000-8000-0000000000a1'::uuid, 'e0000000-0000-4000-8000-0000000000a3'::uuid],
   'picks conversations whose customer wrote over an hour ago, not one that just wrote');
@@ -80,16 +82,16 @@ SELECT public.save_conversation_topics(
 -- A reminder goes out to a1: nothing new from the customer, nothing to pay for.
 INSERT INTO public.messages (workspace_id, conversation_id, direction, body, created_at)
 VALUES ('e0000000-0000-4000-8000-000000000001', 'e0000000-0000-4000-8000-0000000000a1', 'out', 'te recordamos tu cita', now() - interval '90 minutes');
-SELECT is((SELECT count(*)::int FROM public.select_conversations_to_classify(10, '{}', 120)), 0,
+SELECT is((SELECT count(*)::int FROM public.select_conversations_to_classify(10, ARRAY(SELECT id FROM public.workspaces WHERE id <> 'e0000000-0000-4000-8000-000000000001'), 120)), 0,
   'a reply or a reminder does not make a classified conversation eligible again');
 
 -- The customer writes again (settled): eligible again.
 INSERT INTO public.messages (workspace_id, conversation_id, direction, body, created_at)
 VALUES ('e0000000-0000-4000-8000-000000000001', 'e0000000-0000-4000-8000-0000000000a1', 'in', 'y el estacionamiento?', now() - interval '70 minutes');
-SELECT is((SELECT array_agg(conversation_id) FROM public.select_conversations_to_classify(10, '{}', 120)),
+SELECT is((SELECT array_agg(conversation_id) FROM public.select_conversations_to_classify(10, ARRAY(SELECT id FROM public.workspaces WHERE id <> 'e0000000-0000-4000-8000-000000000001'), 120)),
   ARRAY['e0000000-0000-4000-8000-0000000000a1'::uuid],
   'a new message from the customer makes it eligible again');
-SELECT is((SELECT count(*)::int FROM public.select_conversations_to_classify(10, '{}', 120, now() + interval '1 minute')), 0,
+SELECT is((SELECT count(*)::int FROM public.select_conversations_to_classify(10, ARRAY(SELECT id FROM public.workspaces WHERE id <> 'e0000000-0000-4000-8000-000000000001'), 120, now() + interval '1 minute')), 0,
   'the lease hides a claimed conversation from the next pick');
 
 -- The analysis counts follow the customer too: a1's new message and a2's
@@ -195,10 +197,10 @@ INSERT INTO public.messages (workspace_id, conversation_id, direction, body, cre
   ('e0000000-0000-4000-8000-000000000001', 'e0000000-0000-4000-8000-0000000000a6', 'in', 'x', now() - interval '3 hours');
 SELECT is(public.record_classification_failure('e0000000-0000-4000-8000-000000000001',
     'e0000000-0000-4000-8000-0000000000a6', 'invalid_output'), 1, 'the first failure counts one attempt');
-SELECT is((SELECT count(*)::int FROM public.select_conversations_to_classify(100, '{}', 120)
+SELECT is((SELECT count(*)::int FROM public.select_conversations_to_classify(100, ARRAY(SELECT id FROM public.workspaces WHERE id <> 'e0000000-0000-4000-8000-000000000001'), 120)
             WHERE conversation_id = 'e0000000-0000-4000-8000-0000000000a6'), 0,
   'a failed conversation is not picked again in the same run');
-SELECT is((SELECT count(*)::int FROM public.select_conversations_to_classify(100, '{}', 120, now() + interval '61 minutes')
+SELECT is((SELECT count(*)::int FROM public.select_conversations_to_classify(100, ARRAY(SELECT id FROM public.workspaces WHERE id <> 'e0000000-0000-4000-8000-000000000001'), 120, now() + interval '61 minutes')
             WHERE conversation_id = 'e0000000-0000-4000-8000-0000000000a6'), 1,
   'an hour later it is tried again');
 
