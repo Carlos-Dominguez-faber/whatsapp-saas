@@ -159,8 +159,10 @@ node scripts/seed-admin.mjs
 node scripts/setup.mjs cron-apply
 ```
 
-Agenda dos jobs, cada minuto: `buffer-flush` (responde los mensajes) y
-`automations` (corre las automatizaciones). Usa el `SUPABASE_ACCESS_TOKEN` del paso 7
+Agenda tres jobs: `buffer-flush` (responde los mensajes) y `automations` (corre las
+automatizaciones), cada minuto, y `classify-topics` (el análisis de temas de
+**Análisis**), cada 5 minutos entre las 04:00 y las 08:59 UTC; mientras nadie cree
+un tema no gasta nada. Usa el `SUPABASE_ACCESS_TOKEN` del paso 7
 para agendarlos vía Management API e imprime la verificación. Correrlo otra vez no
 duplica nada: actualiza los jobs existentes. Si no hay token, cae al camino manual: corre
 `node scripts/setup.mjs cron-sql` y pega el SQL en **Supabase → SQL Editor → Run**.
@@ -697,7 +699,7 @@ vercel --prod
 `db-push` marca como revertidas las dos migraciones que solo existían en esa rama
 (`20260731000000/1`; su contenido ya viene en las de `main`) y aplica las nuevas.
 
-**Si además aplicaste ramas de los PRs #8, #9, #11, #12, #14, #15 o #16 de la
+**Si además aplicaste ramas de los PRs #8, #9, #11, #12, #13, #14, #15 o #16 de la
 comunidad** (Francisco Velásquez), `db-push` también marca como revertidas sus versiones que
 `main` no tiene (la lista está en `scripts/setup.mjs`); si no, `supabase db push` se
 niega a seguir. Eso solo destraba el historial: lo que esas migraciones crearon
@@ -710,9 +712,12 @@ no hace nada si ya no está. El motor de automatizaciones de #16 vuelve como
 ejecuciones, apaga las reglas que #16 encendió solo por existir (las que alguien
 encendió con su motor siguen encendidas) y cambia sus referencias por unas que no
 pueden cruzar workspaces. Lo de Cal.com (#15) se queda en tu base, pero `main` no lo
-usa todavía.
+usa todavía. El análisis de temas de #13 vuelve como `20261002000000..02`, encima
+de sus tablas: conserva temas y detecciones, borra las detecciones que #13 guardó
+sobre mensajes del agente o del equipo (ahora solo cuenta lo que escribe el cliente)
+y pasa su gasto de LLM a un presupuesto propio.
 
-**Si aplicaste ramas de otros PRs de la comunidad (#13 o #17)**, traen
+**Si aplicaste ramas de otros PRs de la comunidad (#17)**, traen
 versiones que ni `main` ni esa lista conocen, y `supabase db push` se va a negar a
 seguir. Es a propósito: nada se aplica a ciegas sobre una base con cambios
 desconocidos.

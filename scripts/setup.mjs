@@ -10,7 +10,7 @@
 //   env            Generate secrets + write/update .env.local from pasted keys
 //   db-push [ref]  supabase link (ref derived from the URL) + db push
 //   set-app-url U  Set NEXT_PUBLIC_APP_URL to the prod URL (run after deploy)
-//   cron-sql       Fill the cron jobs' SQL templates with real values (buffer-flush, automations)
+//   cron-sql       Fill the cron jobs' SQL templates with real values (buffer-flush, automations, classify-topics)
 //   vercel-env     Push .env.local vars to Vercel production (best effort)
 //   doctor         Check prerequisites + which keys are still missing
 //   help           Show this usage
@@ -38,6 +38,11 @@ const CRON_JOBS = [
     name: "automations",
     tpl: resolve(ROOT, "supabase/cron/schedule-automations.sql"),
     filled: resolve(ROOT, "supabase/cron/schedule-automations.filled.sql"),
+  },
+  {
+    name: "classify-topics",
+    tpl: resolve(ROOT, "supabase/cron/schedule-classify-topics.sql"),
+    filled: resolve(ROOT, "supabase/cron/schedule-classify-topics.filled.sql"),
   },
 ];
 const SUPABASE_API = "https://api.supabase.com"; // Management API base
@@ -225,7 +230,7 @@ function cmdEnv() {
 // no parsing of the CLI's table output.
 const RETIRED_KAPSO_BRANCH_MIGRATIONS = ["20260731000000", "20260731000001"];
 
-// Versions from the community PR stack (#8, #9, #11, #12, #14, #15 and #16, on
+// Versions from the community PR stack (#8, #9, #11, #12, #13, #14, #15 and #16, on
 // provider/kapso) that main does not have. main re-lands what it adopts under new versions, so an
 // install that ran those PR branches needs these marked as reverted too, or
 // `db push` refuses. This only fixes the history: whatever those versions
@@ -256,6 +261,9 @@ const RETIRED_PR_STACK_MIGRATIONS = [
   "20260904000000", // #16 automation_rules writes service-role only
   "20260904000002", // #16 claim_next_automation_run time floor
   "20260908000000", // #16 appointment_upcoming reminders
+  "20260915000000", // #13 insight_topics (on main: 20261002000000)
+  "20260915000001", // #13 classify_topics_rpcs (on main: 20261002000001)
+  "20260915000002", // #13 get_insights (on main: 20261002000002)
 ];
 
 function repairRetiredMigrations() {
@@ -294,7 +302,7 @@ function cmdDbPush(args) {
   repairRetiredMigrations();
   run("supabase db push");
   ok("Migraciones aplicadas (incluye pg_cron + pg_net).");
-  log("➡️  Después del deploy: set-app-url <url> y luego cron-apply (o cron-sql) para agendar los crons (buffer-flush y automations).");
+  log("➡️  Después del deploy: set-app-url <url> y luego cron-apply (o cron-sql) para agendar los crons (buffer-flush, automations y classify-topics).");
 }
 
 function cmdSetAppUrl(args) {
@@ -483,7 +491,7 @@ Uso: node scripts/setup.mjs <comando>
   env            Genera secrets + escribe .env.local desde las keys pegadas
   db-push [ref]  supabase link (ref derivado de la URL) + db push
   set-app-url U  Setea NEXT_PUBLIC_APP_URL a la URL de prod (post-deploy)
-  cron-sql       Imprime el SQL de los crons (buffer-flush y automations) para pegar en el SQL Editor
+  cron-sql       Imprime el SQL de los crons (buffer-flush, automations y classify-topics) para pegar en el SQL Editor
   cron-apply     Agenda los crons vía Management API (necesita SUPABASE_ACCESS_TOKEN)
   site-url       Setea Site URL + Redirect y cierra el registro público (idem)
   close-signup   Solo cierra el registro público de Supabase Auth y lo verifica

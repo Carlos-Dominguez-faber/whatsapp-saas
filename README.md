@@ -106,6 +106,9 @@ El inbox agrupa los mensajes entrantes en _batches_ que un worker debe drenar
 distribución agenda el flush dentro de Postgres con **pg_cron + pg_net**, que
 llaman a `/api/cron/buffer-flush` (autenticado con `CRON_SECRET`). Lo configura el
 instalador — ver [`supabase/cron/schedule-buffer-flush.sql`](supabase/cron/schedule-buffer-flush.sql).
+Con el mismo mecanismo agenda `automations` (las automatizaciones, cada minuto) y
+`classify-topics` (el análisis de temas, de noche); las plantillas están en
+[`supabase/cron/`](supabase/cron/).
 
 ## Estructura
 
@@ -116,7 +119,7 @@ src/
 └── shared/     # Reutilizable (components, lib, types)
 supabase/
 ├── migrations/ # Schema (RLS, super admin, pg_cron, …)
-└── cron/       # SQL post-deploy del buffer-flush
+└── cron/       # SQL post-deploy de los crons (pg_cron + pg_net)
 scripts/
 ├── setup.mjs       # Orquestador de instalación (secrets, env, db, cron)
 └── seed-admin.mjs  # Crea el super admin
