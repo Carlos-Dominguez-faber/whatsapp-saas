@@ -4,8 +4,8 @@ import { mock, test } from "node:test";
 // Proveedor caído de punta a punta: ruta, fases, classifier y SDKs
 // reales (ai, @ai-sdk/openai, supabase-js). Solo se reemplaza `fetch`, que los
 // tres resuelven al momento de la llamada: OpenRouter responde 503 y PostgREST
-// es un fake en memoria. Sin los cortes: 9 peticiones HTTP, 3 intentos
-// quemados sobre una conversación sana y la ruta respondiendo 200.
+// es un fake en memoria. The first workspace that fails is skipped; the same
+// 503 in a second one is the platform, and the run stops there.
 mock.module("@/features/inbox/services/openrouter.ts", {
   exports: { getOpenRouterApiKey: async () => "test-key" },
 });
@@ -15,7 +15,9 @@ process.env.SUPABASE_SERVICE_ROLE_KEY = "service-role-test";
 process.env.CRON_SECRET = "s3cret";
 
 const WS = "11111111-1111-1111-1111-111111111111";
+const WS2 = "44444444-4444-4444-4444-444444444444";
 const CONV = "22222222-2222-2222-2222-222222222222";
+const CONV2 = "55555555-5555-5555-5555-555555555555";
 let openrouterCalls = 0;
 let selectRounds = 0;
 const rpcs: string[] = [];
@@ -34,13 +36,14 @@ globalThis.fetch = (async (input: RequestInfo | URL) => {
   if (rpc) {
     rpcs.push(rpc);
     if (rpc === "select_conversations_to_classify") {
-      // Tres vueltas con la misma conversación: lo que pasaba cuando cada
-      // fallo registrado soltaba el lease.
-      return json(
-        ++selectRounds <= 3
-          ? [{ conversation_id: CONV, workspace_id: WS, contact_id: "c1", last_message_at: "2026-09-14T20:00:00Z" }]
-          : [],
-      );
+      // A conversation of each workspace, then the first one again: what a
+      // run would see if a failure released the lease.
+      const rows = [
+        [{ conversation_id: CONV, workspace_id: WS, contact_id: "c1", last_inbound_at: "2026-09-14T20:00:00Z" }],
+        [{ conversation_id: CONV2, workspace_id: WS2, contact_id: "c2", last_inbound_at: "2026-09-14T20:00:00Z" }],
+        [{ conversation_id: CONV, workspace_id: WS, contact_id: "c1", last_inbound_at: "2026-09-14T20:00:00Z" }],
+      ];
+      return json(rows[selectRounds++] ?? []);
     }
     if (rpc === "reserve_classification_tokens") return json("33333333-3333-3333-3333-333333333333");
     return json(1);
@@ -54,7 +57,7 @@ globalThis.fetch = (async (input: RequestInfo | URL) => {
 
 const { GET } = await import("./route.ts");
 
-test("OpenRouter con 503 → una sola petición, cero intentos, halt y 500 ok:false", async () => {
+test("OpenRouter con 503 en dos workspaces → una petición por workspace, cero intentos, halt y 500 ok:false", async () => {
   const res = await GET(
     new Request("http://localhost:3000/api/cron/classify-topics", { headers: { Authorization: "Bearer s3cret" } }),
   );
@@ -65,11 +68,12 @@ test("OpenRouter con 503 → una sola petición, cero intentos, halt y 500 ok:fa
     classified: 0,
     failed: 0,
     skipped_workspaces: 0,
+    unavailable_workspaces: 1,
     halt: true,
     error: "provider_unavailable",
   });
   assert.equal(body.backfill.error, "skipped_after_halt");
-  assert.equal(openrouterCalls, 1, "el SDK reintentó o la fase siguió llamando con el proveedor caído");
+  assert.equal(openrouterCalls, 2, "el SDK reintentó o la fase siguió llamando con el proveedor caído");
   assert.equal(rpcs.filter((r) => r === "record_classification_failure").length, 0, "la caída quemó intentos");
   // Sin usage no hay liquidación: la reserva queda con la estimación.
   assert.equal(rpcs.filter((r) => r === "settle_classification_tokens").length, 0);

@@ -44,13 +44,13 @@ export async function GET(request: Request) {
   } catch (err) {
     phaseFailed = true;
     console.error("[cron/classify-topics] classification phase threw", errName(err));
-    classified = { classified: 0, failed: 0, skipped_workspaces: 0, halt: true, error: "threw" };
+    classified = { classified: 0, failed: 0, skipped_workspaces: 0, unavailable_workspaces: 0, halt: true, error: "threw" };
   }
 
   let backfill: BackfillPhaseResult;
   if (classified.halt) {
     phaseFailed = true;
-    backfill = { processed: 0, failed: 0, topics_done: 0, topics_expired: 0, halt: false, error: "skipped_after_halt" };
+    backfill = { processed: 0, failed: 0, topics_done: 0, topics_expired: 0, unavailable_workspaces: 0, halt: false, error: "skipped_after_halt" };
   } else {
     try {
       backfill = await runBackfillPhase(deadline);
@@ -58,7 +58,7 @@ export async function GET(request: Request) {
     } catch (err) {
       phaseFailed = true;
       console.error("[cron/classify-topics] backfill phase threw", errName(err));
-      backfill = { processed: 0, failed: 0, topics_done: 0, topics_expired: 0, halt: true, error: "threw" };
+      backfill = { processed: 0, failed: 0, topics_done: 0, topics_expired: 0, unavailable_workspaces: 0, halt: true, error: "threw" };
     }
   }
 

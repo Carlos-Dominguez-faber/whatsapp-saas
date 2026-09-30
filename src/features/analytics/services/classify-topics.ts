@@ -48,6 +48,11 @@ export interface ClassificationPhaseResult {
   failed: number;
   skipped_workspaces: number;
   /**
+   * Workspaces skipped for the rest of the run because their OpenRouter key
+   * or the provider failed on them. One such workspace never stops the others.
+   */
+  unavailable_workspaces: number;
+  /**
    * true = la fase no debe seguir gastando: la reserva de tokens no se
    * pudo hacer, el proveedor está caído, o un resultado pagado que la base no pudo guardar. La ruta NO corre la fase
    * 2 detrás.
@@ -62,6 +67,8 @@ export interface BackfillPhaseResult {
   topics_done: number;
   /** Lote vacío porque la ventana de 30 días se venció, no por terminar. */
   topics_expired: number;
+  /** Mismo significado que en ClassificationPhaseResult. */
+  unavailable_workspaces: number;
   /** Mismo significado que en ClassificationPhaseResult. */
   halt: boolean;
   error?: string;
@@ -81,9 +88,30 @@ interface ConversationRow {
 /**
  * `infra` = no es culpa de la conversación: NO gasta un intento y
  * corta la fase. `halt` = además la fase no puede seguir gastando.
+ * `skipWorkspace` = the workspace's key or the provider failed on it: the run
+ * skips that workspace (no attempt spent) and stops only if another workspace
+ * fails the same way — then it is the platform, not one tenant.
  * `no_time` y `over_budget` son aparte: tampoco gastan intento, y no son error.
  */
-type Outcome = { ok: true } | { ok: false; code: string; infra?: boolean; halt?: boolean };
+type Outcome =
+  | { ok: true }
+  | { ok: false; code: string; infra?: boolean; halt?: boolean; skipWorkspace?: boolean };
+
+/**
+ * Remembers, per failure code, which workspaces hit it in this run. True once
+ * a second workspace hits the same one: a bad key of one tenant skips that
+ * tenant; the same failure in two means the provider (or the agency's key) is
+ * down for everyone, and spending on a third is pointless.
+ */
+function workspaceFailures(): (code: string, workspaceId: string) => boolean {
+  const byCode = new Map<string, Set<string>>();
+  return (code, workspaceId) => {
+    const seen = byCode.get(code) ?? new Set<string>();
+    seen.add(workspaceId);
+    byCode.set(code, seen);
+    return seen.size >= 2;
+  };
+}
 
 function svc(): SupabaseClient {
   return createSbClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!);
@@ -289,13 +317,17 @@ async function classifyOne(
       // liquidar en 0 subcontaría.
       if (result.usage) await settleTokens(db, row, reservation.id, estimate, result.usage, deadline);
       if (!result.ok) {
-        // Una caída del proveedor no es culpa de la conversación. Si contara
-        // como intento, un 503 largo mandaría a cuarentena conversaciones
-        // sanas y el cron respondería 200.
-        if (result.code === "provider_unavailable") return { ok: false, code: result.code, infra: true, halt: true };
-        // Con el piso de arriba el LLM siempre tuvo sus 20 s: el corte es el
-        // proveedor lento, nunca el deadline común.
-        if (result.code === "timeout") return { ok: false, code: "timeout", infra: true, halt: true };
+        // The workspace's key, a provider outage or a slow provider (with the
+        // floor above the LLM always had its full time): not this
+        // conversation's fault, so no attempt is spent. The caller skips the
+        // workspace and stops only if another one fails the same way.
+        if (
+          result.code === "workspace_unavailable" ||
+          result.code === "provider_unavailable" ||
+          result.code === "timeout"
+        ) {
+          return { ok: false, code: result.code, infra: true, skipWorkspace: true };
+        }
         return { ok: false, code: result.code };
       }
       matches = result.matches;
@@ -333,8 +365,11 @@ export async function runClassificationPhase(
   deadline: number,
   db: SupabaseClient = svc(),
 ): Promise<ClassificationPhaseResult> {
-  const result: ClassificationPhaseResult = { classified: 0, failed: 0, skipped_workspaces: 0, halt: false };
+  const result: ClassificationPhaseResult = {
+    classified: 0, failed: 0, skipped_workspaces: 0, unavailable_workspaces: 0, halt: false,
+  };
   const skipped = new Set<string>();
+  const failedElsewhere = workspaceFailures();
   const topicsByWorkspace = new Map<string, PromptTopic[]>();
 
   while (hasTime(deadline)) {
@@ -380,6 +415,15 @@ export async function runClassificationPhase(
         result.skipped_workspaces++;
         continue;
       }
+      if (outcome.skipWorkspace) {
+        if (failedElsewhere(outcome.code, row.workspace_id)) {
+          return { ...result, error: outcome.code, halt: true };
+        }
+        console.error("[classify-topics] workspace skipped for this run", row.workspace_id, outcome.code);
+        skipped.add(row.workspace_id);
+        result.unavailable_workspaces++;
+        continue;
+      }
       // La infraestructura tampoco. No se registra el fallo (tres
       // corridas con la base caída mandarían a cuarentena conversaciones sanas);
       // la fase se corta en su lugar, y eso es lo que acota el gasto repetido.
@@ -412,9 +456,13 @@ export async function runBackfillPhase(
   deadline: number,
   db: SupabaseClient = svc(),
 ): Promise<BackfillPhaseResult> {
-  const result: BackfillPhaseResult = { processed: 0, failed: 0, topics_done: 0, topics_expired: 0, halt: false };
+  const result: BackfillPhaseResult = {
+    processed: 0, failed: 0, topics_done: 0, topics_expired: 0, unavailable_workspaces: 0, halt: false,
+  };
+  const failedElsewhere = workspaceFailures();
   const TOPIC_PAGE = 20;
-  // Memo: workspaces cuya reserva se negó en esta corrida. Sus temas se saltan.
+  // Memo: workspaces cuya reserva se negó, o cuya clave falló, en esta corrida.
+  // Sus temas se saltan.
   const noBudget = new Set<string>();
   let offset = 0;
   // Una escritura cortada por el deadline es "sin tiempo", no un 500.
@@ -523,6 +571,15 @@ export async function runBackfillPhase(
 
         const failedOutcome = outcomes[firstFail] as Extract<Outcome, { ok: false }>;
         if (failedOutcome.code === "no_time") return result;
+        if (failedOutcome.skipWorkspace) {
+          if (failedElsewhere(failedOutcome.code, topic.workspace_id)) {
+            return { ...result, error: failedOutcome.code, halt: true };
+          }
+          console.error("[classify-topics] workspace skipped for this run", topic.workspace_id, failedOutcome.code);
+          noBudget.add(topic.workspace_id);
+          result.unavailable_workspaces++;
+          break; // this topic's lease is released below; its other topics are skipped
+        }
         // Igual que en la fase 1. Contarlo acá sería peor: al tercer
         // intento el tema SALTA la conversación para siempre.
         if (failedOutcome.infra) return { ...result, error: failedOutcome.code, halt: failedOutcome.halt === true };

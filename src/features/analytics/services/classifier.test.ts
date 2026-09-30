@@ -26,9 +26,11 @@ class FakeNoOutputGeneratedError extends Error {
 // (provider-utils `handleFetchError`).
 class FakeAPICallError extends Error {
   statusCode?: number;
-  constructor(statusCode?: number) {
+  responseBody?: string;
+  constructor(statusCode?: number, responseBody?: string) {
     super(`api ${statusCode}`);
     this.statusCode = statusCode;
+    this.responseBody = responseBody;
     this.name = "AI_APICallError";
   }
 }
@@ -177,8 +179,8 @@ test("error desconocido → provider_unavailable, sin propagar el mensaje", asyn
   assert.doesNotMatch(JSON.stringify(r), /sk-live/);
 });
 
-test("caída del proveedor (5xx, 429, 408, red, clave, créditos) → provider_unavailable", async () => {
-  for (const status of [500, 502, 503, 429, 408, 409, 401, 402, 403, 404, undefined]) {
+test("caída del proveedor (5xx, 408, 409, 404, red) → provider_unavailable, sin consumo conocido", async () => {
+  for (const status of [500, 502, 503, 408, 409, 404, undefined]) {
     generateImpl = async () => {
       throw new FakeAPICallError(status);
     };
@@ -186,12 +188,33 @@ test("caída del proveedor (5xx, 429, 408, red, clave, créditos) → provider_u
   }
 });
 
-test("el proveedor rechaza ESTE contenido (400, 413, 422) → provider_error, que sí gasta intento", async () => {
-  for (const status of [400, 413, 422]) {
+test("la clave del workspace no sirve (401, 402, 403, 429) → workspace_unavailable, liquidado en 0", async () => {
+  for (const status of [401, 402, 403, 429]) {
     generateImpl = async () => {
-      throw new FakeAPICallError(status);
+      throw new FakeAPICallError(status, '{"error":{"message":"Insufficient credits"}}');
     };
-    assert.deepEqual(await call(), { ok: false, code: "provider_error", usage: null }, `status ${status}`);
+    assert.deepEqual(
+      await call(),
+      { ok: false, code: "workspace_unavailable", usage: { promptTokens: 0, completionTokens: 0 } },
+      `status ${status}`,
+    );
+  }
+});
+
+test("el proveedor rechaza ESTE contenido (400, 413, 422, moderación) → provider_error, que sí gasta intento", async () => {
+  const cases: Array<[number, string | undefined]> = [
+    [400, undefined], [413, undefined], [422, undefined],
+    [403, '{"error":{"message":"Your chosen model requires moderation and your input was flagged"}}'],
+  ];
+  for (const [status, body] of cases) {
+    generateImpl = async () => {
+      throw new FakeAPICallError(status, body);
+    };
+    assert.deepEqual(
+      await call(),
+      { ok: false, code: "provider_error", usage: { promptTokens: 0, completionTokens: 0 } },
+      `status ${status}`,
+    );
   }
 });
 
@@ -245,13 +268,13 @@ test("abort por tiempo → timeout", async () => {
   assert.deepEqual(r, { ok: false, code: "timeout", usage: null });
 });
 
-test("clave de OpenRouter ilegible → provider_unavailable (configuración), no lanza y no llama al modelo", async () => {
+test("clave de OpenRouter ilegible → workspace_unavailable (configuración del workspace), no lanza y no llama al modelo", async () => {
   keyImpl = async () => {
     throw new Error("openrouter_key_unreadable");
   };
   lastOpts = null;
   const r = await call();
   keyImpl = async () => "sk-test";
-  assert.deepEqual(r, { ok: false, code: "provider_unavailable", usage: null });
+  assert.deepEqual(r, { ok: false, code: "workspace_unavailable", usage: { promptTokens: 0, completionTokens: 0 } });
   assert.equal(lastOpts, null);
 });
