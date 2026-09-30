@@ -54,8 +54,13 @@ DECLARE
   v_skip  UUID[]   := COALESCE(p_skip_workspaces, '{}');
   v_now   TIMESTAMPTZ := COALESCE(p_now, now());
 BEGIN
-  -- ORDER (the turn model of classify-topics.ts): workspaces take turns
-  -- (row_number per workspace), and inside each one two tiers:
+  -- ORDER (the turn model of classify-topics.ts): workspaces take turns —
+  -- every workspace's first conversation before anyone's second (row_number
+  -- per workspace), and among those, the workspace served longest ago first
+  -- (classification_workspace_state.last_served_at, stamped below when this
+  -- takes its conversations; never served goes first). Ordering by rn and
+  -- then a random id, as before, let one workspace take 126 turns while
+  -- another got 2. Inside each workspace two tiers:
   --   1. customers who wrote in the last 48 hours, oldest first: yesterday is
   --      complete before today, and a busy day's leftover isn't pushed back by
   --      every newer one (newest first, as #13 did, never read it);
@@ -100,7 +105,8 @@ BEGIN
          AND EXISTS (SELECT 1 FROM public.insight_topics t
                       WHERE t.workspace_id = c.workspace_id AND t.status = 'active')
     ) x
-   ORDER BY x.rn, x.id
+    LEFT JOIN public.classification_workspace_state ws ON ws.workspace_id = x.workspace_id
+   ORDER BY x.rn, ws.last_served_at NULLS FIRST, x.id
    LIMIT 20 * v_limit
   ON CONFLICT (conversation_id) DO NOTHING;
 
@@ -114,7 +120,7 @@ BEGIN
   -- cron nunca va a tomar.
   RETURN QUERY
   WITH ranked AS MATERIALIZED (
-    SELECT cc.conversation_id AS id, li.at AS last_in,
+    SELECT cc.conversation_id AS id, c.workspace_id AS ws, li.at AS last_in,
            row_number() OVER (
              PARTITION BY c.workspace_id
              ORDER BY li.at < v_now - INTERVAL '48 hours',
@@ -144,13 +150,14 @@ BEGIN
                     WHERE t.workspace_id = c.workspace_id AND t.status = 'active')
   ),
   claimable AS (
-    SELECT cc.conversation_id AS id, r.last_in, r.rn
+    SELECT cc.conversation_id AS id, r.ws, r.last_in, r.rn, ws.last_served_at
       FROM public.conversation_classification cc
       JOIN ranked r ON r.id = cc.conversation_id
+      LEFT JOIN public.classification_workspace_state ws ON ws.workspace_id = r.ws
      -- Re-checked on the locked row: another run may have claimed it since
      -- `ranked` was read.
      WHERE (cc.claimed_until IS NULL OR cc.claimed_until <= v_now)
-     ORDER BY r.rn, r.id
+     ORDER BY r.rn, ws.last_served_at NULLS FIRST, r.id
      LIMIT v_limit
      FOR UPDATE OF cc SKIP LOCKED
   ),
@@ -161,6 +168,11 @@ BEGIN
       FROM claimable k
      WHERE cc2.conversation_id = k.id
     RETURNING cc2.conversation_id AS id
+  ),
+  served AS (
+    INSERT INTO public.classification_workspace_state AS s (workspace_id, last_served_at, updated_at)
+    SELECT DISTINCT k.ws, v_now, now() FROM claimable k
+    ON CONFLICT (workspace_id) DO UPDATE SET last_served_at = EXCLUDED.last_served_at, updated_at = now()
   )
   -- last_inbound_at is what the caller passes back as classified_until: the
   -- run covers the customer's messages up to it.
@@ -168,7 +180,7 @@ BEGIN
     FROM claimed cl
     JOIN claimable k ON k.id = cl.id
     JOIN public.conversations c ON c.id = cl.id
-   ORDER BY k.rn, c.id;
+   ORDER BY k.rn, k.last_served_at NULLS FIRST, c.id;
 END;
 $$;
 
@@ -398,10 +410,21 @@ CREATE OR REPLACE FUNCTION public.next_backfill_batch(
 )
 RETURNS TABLE (conversation_id UUID, workspace_id UUID, contact_id UUID, last_inbound_at TIMESTAMPTZ,
                waits_until TIMESTAMPTZ)
-LANGUAGE sql
-STABLE
+LANGUAGE plpgsql
+VOLATILE
 SET search_path = ''
 AS $$
+#variable_conflict use_column
+BEGIN
+  -- Taking a batch is serving the workspace: it goes to the back of the turns
+  -- (last_served_at, see select_conversations_to_classify).
+  INSERT INTO public.classification_workspace_state AS s (workspace_id, last_served_at, updated_at)
+  SELECT t.workspace_id, COALESCE(p_now, now()), now()
+    FROM public.insight_topics t
+   WHERE t.id = p_topic_id AND t.status = 'active' AND t.backfill_status = 'pending'
+  ON CONFLICT (workspace_id) DO UPDATE SET last_served_at = EXCLUDED.last_served_at, updated_at = now();
+
+  RETURN QUERY
   SELECT c.id, c.workspace_id, c.contact_id, li.at,
          CASE WHEN cc.transient_failures > 0 AND cc.claimed_until > COALESCE(p_now, now())
               THEN cc.claimed_until END
@@ -442,6 +465,36 @@ AS $$
     )
   ORDER BY li.at DESC, c.id DESC
   LIMIT LEAST(GREATEST(COALESCE(p_limit, 1), 1), 100);
+END;
+$$;
+
+-- The backfill's turns: the topics it may take now, in the same order as the
+-- nightly phase's — each workspace's oldest pending topic before anyone's
+-- second, and among those the workspace served longest ago first. A topic
+-- another run holds, or of a workspace skipped this run, is left out.
+CREATE OR REPLACE FUNCTION public.pending_backfill_topics(
+  p_limit INT,
+  p_skip_workspaces UUID[] DEFAULT '{}',
+  p_now TIMESTAMPTZ DEFAULT now()
+)
+RETURNS TABLE (id UUID, workspace_id UUID, name TEXT, description TEXT)
+LANGUAGE sql
+STABLE
+SET search_path = ''
+AS $$
+  SELECT x.id, x.workspace_id, x.name, x.description
+    FROM (
+      SELECT t.id, t.workspace_id, t.name, t.description, t.created_at,
+             row_number() OVER (PARTITION BY t.workspace_id ORDER BY t.created_at, t.id) AS rn
+        FROM public.insight_topics t
+       WHERE t.status = 'active'
+         AND t.backfill_status = 'pending'
+         AND (t.backfill_claimed_until IS NULL OR t.backfill_claimed_until <= COALESCE(p_now, now()))
+         AND NOT (t.workspace_id = ANY (COALESCE(p_skip_workspaces, '{}')))
+    ) x
+    LEFT JOIN public.classification_workspace_state s ON s.workspace_id = x.workspace_id
+   ORDER BY x.rn, s.last_served_at NULLS FIRST, x.created_at, x.id
+   LIMIT LEAST(GREATEST(COALESCE(p_limit, 1), 1), 200);
 $$;
 
 -- Devuelve el backfill_status resultante para que el caller distinga
@@ -917,6 +970,7 @@ REVOKE ALL ON FUNCTION public.select_conversations_to_classify(INT, UUID[], INT,
 REVOKE ALL ON FUNCTION public.save_conversation_topics(UUID, UUID, JSONB, TIMESTAMPTZ, TIMESTAMPTZ, TIMESTAMPTZ[], UUID[], UUID) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.record_classification_failure(UUID, UUID, TEXT, TIMESTAMPTZ) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.next_backfill_batch(UUID, INT, TIMESTAMPTZ) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.pending_backfill_topics(INT, UUID[], TIMESTAMPTZ) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.advance_topic_backfill(UUID, TIMESTAMPTZ, UUID, BOOLEAN, TIMESTAMPTZ) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.record_backfill_failure(UUID) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.claim_topic_backfill(UUID, INT) FROM PUBLIC, anon, authenticated;
@@ -928,6 +982,7 @@ GRANT EXECUTE ON FUNCTION public.select_conversations_to_classify(INT, UUID[], I
 GRANT EXECUTE ON FUNCTION public.save_conversation_topics(UUID, UUID, JSONB, TIMESTAMPTZ, TIMESTAMPTZ, TIMESTAMPTZ[], UUID[], UUID) TO service_role;
 GRANT EXECUTE ON FUNCTION public.record_classification_failure(UUID, UUID, TEXT, TIMESTAMPTZ) TO service_role;
 GRANT EXECUTE ON FUNCTION public.next_backfill_batch(UUID, INT, TIMESTAMPTZ) TO service_role;
+GRANT EXECUTE ON FUNCTION public.pending_backfill_topics(INT, UUID[], TIMESTAMPTZ) TO service_role;
 GRANT EXECUTE ON FUNCTION public.advance_topic_backfill(UUID, TIMESTAMPTZ, UUID, BOOLEAN, TIMESTAMPTZ) TO service_role;
 GRANT EXECUTE ON FUNCTION public.record_backfill_failure(UUID) TO service_role;
 GRANT EXECUTE ON FUNCTION public.claim_topic_backfill(UUID, INT) TO service_role;

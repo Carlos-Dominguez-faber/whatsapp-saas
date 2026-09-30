@@ -52,6 +52,8 @@ globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
       return json(rows[selectRounds++] ?? []);
     }
     if (rpc === "reserve_classification_tokens") return json("33333333-3333-3333-3333-333333333333");
+    // The backfill's turn: no topic pending.
+    if (rpc === "pending_backfill_topics") return json([]);
     // The key's health, as the SQL keeps it (breaker 3).
     if (rpc === "classification_key_gate") return json({ state: "up", failures: keyFailures });
     if (rpc === "record_classification_key_outcome") {
@@ -63,8 +65,6 @@ globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
     return json(1);
   }
   if (url.pathname.endsWith("/insight_topics")) {
-    // The backfill's page of pending topics: none.
-    if (url.searchParams.get("backfill_status")) return json([]);
     return json([{ id: "t1", name: "Precio", description: "Objeción de precio" }]);
   }
   if (url.pathname.endsWith("/integrations")) return json([]);
@@ -97,5 +97,10 @@ test("OpenRouter con 503 → cada conversación espera sin gastar intento; a la 
   assert.equal(rpcs.filter((r) => r === "record_classification_failure").length, 0, "la caída quemó intentos");
   // A 503 is an HTTP answer: nothing was generated, each reservation settles at 0.
   assert.equal(rpcs.filter((r) => r === "settle_classification_tokens").length, 3);
-  assert.deepEqual(rpcs.slice(0, 3), ["select_conversations_to_classify", "classification_key_gate", "reserve_classification_tokens"]);
+  assert.deepEqual(rpcs.slice(0, 4), [
+    "pending_backfill_topics",
+    "select_conversations_to_classify",
+    "classification_key_gate",
+    "reserve_classification_tokens",
+  ]);
 });

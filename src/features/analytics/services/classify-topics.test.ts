@@ -252,6 +252,14 @@ function reset(opts: { keepKeys?: boolean } = {}) {
       convTransients.set(id, (convTransients.get(id) ?? 0) + 1);
       return { data: convTransients.get(id), error: null };
     },
+    // The SQL's order is pinned in classify_rotation.test.sql; here, table order.
+    pending_backfill_topics: (a) => ({
+      data: (tables.insight_topics ?? [])
+        .filter((t) => t.status === "active" && t.backfill_status === "pending")
+        .filter((t) => !((a.p_skip_workspaces as string[]) ?? []).includes(t.workspace_id as string))
+        .slice(0, Number(a.p_limit)),
+      error: null,
+    }),
     ...keyHealthRpcs(),
   };
   if (kept) ({ keyHealth, workspaceKeys, convTransients, clock } = kept);
@@ -1023,8 +1031,10 @@ test("tema reclamado por otra corrida → se salta sin pedir lote y sigue con el
     "pidió el lote de un tema que no pudo reclamar",
   );
   assert.deepEqual(classifyCalls.map((c) => c.topicIds), [["t-libre"]]);
-  // Solo suelta el lease que tomó.
-  assert.deepEqual(callsTo("release_topic_backfill").map((c) => c.args.p_topic_id), ["t-libre"]);
+  // Never touches the lease it didn't take; the one it took, closing the
+  // topic released (advance_topic_backfill with p_done).
+  assert.deepEqual(callsTo("release_topic_backfill").map((c) => c.args.p_topic_id), []);
+  assert.ok(callsTo("advance_topic_backfill").some((c) => c.args.p_topic_id === "t-libre" && c.args.p_done === true));
 });
 
 test("el lease se suelta también cuando el tema se corta por un fallo reintentable", async () => {
@@ -1536,4 +1546,24 @@ test("RV r3: when a key's wait ends, ONE call probes it; the rest of the run fol
     }
     assert.equal(r.halt, false);
   }
+});
+
+test("TURNS r3: the backfill gives each pending topic one batch per round, in the database's order", async () => {
+  resetBackfill([]);
+  tables.insight_topics = [topic("tA", WS_A, "A"), topic("tB", WS_B, "B"), topic("tC", "ws-c", "C")];
+  for (const [id, ws] of [["a1", WS_A], ["a2", WS_A], ["b1", WS_B], ["c1", "ws-c"]]) tables.messages.push(message(`m-${id}`, id, ws));
+  const left: Record<string, string[][]> = { tA: [["a1"], ["a2"]], tB: [["b1"]], tC: [["c1"]] };
+  const ws: Record<string, string> = { tA: WS_A, tB: WS_B, tC: "ws-c" };
+  rpcHandlers.next_backfill_batch = (a) => {
+    const id = a.p_topic_id as string;
+    return { data: (left[id].shift() ?? []).map((c) => conv(c, ws[id])), error: null };
+  };
+  const r = await runBackfillPhase(later(), db);
+  assert.deepEqual(
+    callsTo("next_backfill_batch").map((c) => c.args.p_topic_id),
+    ["tA", "tB", "tC", "tA", "tB", "tC", "tA"],
+    "a topic took a second batch before the others had their first",
+  );
+  assert.equal(r.processed, 4);
+  assert.equal(r.topics_done, 3);
 });

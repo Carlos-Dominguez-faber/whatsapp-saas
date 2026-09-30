@@ -87,10 +87,14 @@ import { resolveOpenRouterKey } from "@/features/inbox/services/openrouter-key";
  * TURNS. A run (route.ts) gives the backfill of new topics the first
  * BACKFILL_SHARE_MS and the nightly phase the rest, including whatever the
  * backfill didn't use: a backfill with nothing it can do (no topic pending,
- * over the cap, a key down) returns at once. Inside each phase the order is
- * the database's (select_conversations_to_classify): workspaces take turns;
- * inside each, customers of the last 48 h oldest first, then the rest newest
- * first.
+ * over the cap, a key down) returns at once. In both phases workspaces take
+ * turns by the one served longest ago (classification_workspace_state.
+ * last_served_at, stamped when the run takes a workspace's conversations or a
+ * batch of its backfill): every workspace's first conversation (or oldest
+ * pending topic) before anyone's second, and among those the longest waiting
+ * first. The backfill gives each topic one batch per round. Inside a
+ * workspace, the nightly phase reads customers of the last 48 h oldest first,
+ * then the rest newest first.
  * ════════════════════════════════════════════════════════════════════════════
  */
 
@@ -147,6 +151,9 @@ const POST_LLM_WRITES_BACKFILL = 3;
  * rompe la exclusión.
  */
 export const LEASE_SECONDS = 180;
+
+/** Pending topics the backfill looks at per run, in turn order. */
+const BACKFILL_TOPICS = 50;
 
 /**
  * The backfill's share of a run, taken first: its floor per call (40 s) plus
@@ -725,6 +732,11 @@ export async function runClassificationPhase(
   return result;
 }
 
+type BackfillTopic = PromptTopic & { workspace_id: string };
+
+/** How one turn of a topic ended. */
+type TopicTurn = "again" | "done" | "yield" | { phase: BackfillPhaseResult };
+
 export async function runBackfillPhase(
   deadline: number,
   db: SupabaseClient = svc(),
@@ -734,8 +746,6 @@ export async function runBackfillPhase(
     processed: 0, failed: 0, deferred: 0, topics_done: 0, topics_expired: 0,
     skipped_workspaces: 0, unavailable_workspaces: 0, halt: false,
   };
-  const TOPIC_PAGE = 20;
-  let offset = 0;
   // Una escritura cortada por el deadline es "sin tiempo", no un 500.
   // El cursor que no avanzó solo repite trabajo idempotente la próxima corrida.
   const stopped = (err: DbError, code: string): BackfillPhaseResult =>
@@ -750,153 +760,157 @@ export async function runBackfillPhase(
       })
       .abortSignal(dbSignal(deadline));
 
-  // Se PAGINA: los temas de workspaces sin saldo o con la clave caída se
-  // saltan sin cortar el recorrido, así el de otro workspace no espera.
-  while (hasTime(deadline)) {
-    const { data: topics, error } = await db
-      .from("insight_topics")
-      .select("id, workspace_id, name, description")
-      .eq("status", "active")
-      .eq("backfill_status", "pending")
-      .order("created_at")
-      .range(offset, offset + TOPIC_PAGE - 1)
+  /** One turn of a topic: one batch, in cursor order. */
+  const turn = async (topic: BackfillTopic): Promise<TopicTurn> => {
+    // Reprocesamiento: solo ese tema, para no redetectar los viejos.
+    const prompt: PromptTopic[] = [{ id: topic.id, name: topic.name, description: topic.description }];
+    const { data, error: batchErr } = await db
+      .rpc("next_backfill_batch", { p_topic_id: topic.id, p_limit: BATCH_SIZE })
       .abortSignal(dbSignal(deadline));
-    if (error) return stopped(error, "backfill_topics_failed");
-    const page = (topics ?? []) as Array<PromptTopic & { workspace_id: string }>;
-    if (page.length === 0) break;
-    offset += page.length;
+    if (batchErr) return { phase: stopped(batchErr, "backfill_batch_failed") };
+    const batch = (data ?? []) as ConversationRow[];
 
-    for (const topic of page) {
-      if (!hasTime(deadline)) return result;
-      if (guards.skipped.has(topic.workspace_id)) continue;
-
-      // Lease por tema (ver LEASE_SECONDS). Si otra corrida lo tiene,
-      // se salta sin cortar la paginación.
-      const { data: claimed, error: claimErr } = await db
-        .rpc("claim_topic_backfill", { p_topic_id: topic.id, p_lease_seconds: LEASE_SECONDS })
+    if (batch.length === 0) {
+      // Lote vacío = terminado O ventana vencida. Lo decide la RPC.
+      const { data: status, error: doneErr } = await db
+        .rpc("advance_topic_backfill", {
+          p_topic_id: topic.id,
+          p_cursor_at: null,
+          p_cursor_id: null,
+          p_done: true,
+        })
         .abortSignal(dbSignal(deadline));
-      if (claimErr) return stopped(claimErr, "backfill_claim_failed");
-      if (claimed !== true) continue;
+      if (doneErr) return { phase: stopped(doneErr, "backfill_advance_failed") };
+      if (status === "expired") result.topics_expired++;
+      else result.topics_done++;
+      return "done";
+    }
 
-      // Reprocesamiento: solo ese tema, para no redetectar los viejos.
-      const prompt: PromptTopic[] = [{ id: topic.id, name: topic.name, description: topic.description }];
-
-      topicLoop: while (hasTime(deadline)) {
-        const { data, error: batchErr } = await db
-          .rpc("next_backfill_batch", { p_topic_id: topic.id, p_limit: BATCH_SIZE })
-          .abortSignal(dbSignal(deadline));
-        if (batchErr) return stopped(batchErr, "backfill_batch_failed");
-        const batch = (data ?? []) as ConversationRow[];
-
-        if (batch.length === 0) {
-          // Lote vacío = terminado O ventana vencida. Lo decide la RPC.
-          const { data: status, error: doneErr } = await db
-            .rpc("advance_topic_backfill", {
-              p_topic_id: topic.id,
-              p_cursor_at: null,
-              p_cursor_id: null,
-              p_done: true,
-            })
-            .abortSignal(dbSignal(deadline));
-          if (doneErr) return stopped(doneErr, "backfill_advance_failed");
-          if (status === "expired") result.topics_expired++;
-          else result.topics_done++;
-          break;
-        }
-
-        // In cursor order: the cursor only moves past consecutive successes.
-        let done = 0;
-        let stop: Outcome | { kind: "waiting" } | null = null;
-        for (const row of batch) {
-          if (!hasTime(deadline)) {
-            stop = { kind: "no_time" };
-            break;
-          }
-          // Waiting after a transient failure: the cursor can't step around
-          // it, so the topic waits too, without a call.
-          if (row.waits_until) {
-            stop = { kind: "waiting" };
-            break;
-          }
-          const outcome = await classifyOne(db, guards, row, prompt, deadline, topic.id);
-          if (outcome.kind === "ok") {
-            done++;
-            continue;
-          }
-          stop = outcome;
-          break;
-        }
-        result.processed += done;
-
-        // Avanzar primero hasta el último éxito consecutivo: advance resetea
-        // backfill_attempts, así que va antes de registrar un fallo.
-        if (done > 0) {
-          const { error: advErr } = await advance(topic.id, batch[done - 1]);
-          if (advErr) return stopped(advErr, "backfill_advance_failed");
-        }
-
-        if (!stop) continue;
-        const failedRow = batch[done];
-        switch (stop.kind) {
-          case "no_time":
-            return result;
-          case "infra":
-            return { ...result, error: stop.code, halt: true };
-          case "waiting":
-            break topicLoop;
-          case "budget":
-            guards.skipped.add(topic.workspace_id);
-            result.skipped_workspaces++;
-            await noteOverCap(db, topic.workspace_id, deadline);
-            break topicLoop;
-          case "key":
-            guards.skipped.add(topic.workspace_id);
-            result.unavailable_workspaces++;
-            break topicLoop;
-          case "transient": {
-            // Never counts on the topic: the conversation waits (its own
-            // doubling) and the topic with it. Only a conversation that keeps
-            // failing that way while its key is up gets stepped past.
-            result.deferred++;
-            const failures = stop.probe ? 0 : await deferConversation(db, failedRow, stop.code, deadline);
-            if (typeof failures !== "number") {
-              if (failures.kind === "no_time") return result;
-              return { ...result, error: failures.code, halt: true };
-            }
-            if (keyKnownDown(guards, topic.workspace_id)) {
-              guards.skipped.add(topic.workspace_id);
-              result.unavailable_workspaces++;
-              break topicLoop;
-            }
-            if (failures < BACKFILL_TRANSIENT_SKIP) break topicLoop;
-            const { error: skipErr } = await advance(topic.id, failedRow);
-            if (skipErr) return stopped(skipErr, "backfill_advance_failed");
-            break;
-          }
-          case "content": {
-            // A cursor can't step around one conversation: content failures
-            // count on the topic, and the third in a row steps past it.
-            result.failed++;
-            const { data: attempts, error: recErr } = await db
-              .rpc("record_backfill_failure", { p_topic_id: topic.id })
-              .abortSignal(dbSignal(deadline));
-            if (recErr) return stopped(recErr, "record_failure_failed");
-            if (Number(attempts ?? 0) < 3) break topicLoop; // se reintenta en la próxima corrida
-            const { error: skipErr } = await advance(topic.id, failedRow);
-            if (skipErr) return stopped(skipErr, "backfill_advance_failed");
-            break;
-          }
-        }
+    // In cursor order: the cursor only moves past consecutive successes.
+    let done = 0;
+    let stop: Outcome | { kind: "waiting" } | null = null;
+    for (const row of batch) {
+      if (!hasTime(deadline)) {
+        stop = { kind: "no_time" };
+        break;
       }
+      // Waiting after a transient failure: the cursor can't step around
+      // it, so the topic waits too, without a call.
+      if (row.waits_until) {
+        stop = { kind: "waiting" };
+        break;
+      }
+      const outcome = await classifyOne(db, guards, row, prompt, deadline, topic.id);
+      if (outcome.kind === "ok") {
+        done++;
+        continue;
+      }
+      stop = outcome;
+      break;
+    }
+    result.processed += done;
 
-      // Terminado con el tema: se suelta el lease (el cierre done/expired ya lo
-      // soltó en su UPDATE). Los `return` de arriba dejan que venza solo.
+    // Avanzar primero hasta el último éxito consecutivo: advance resetea
+    // backfill_attempts, así que va antes de registrar un fallo.
+    if (done > 0) {
+      const { error: advErr } = await advance(topic.id, batch[done - 1]);
+      if (advErr) return { phase: stopped(advErr, "backfill_advance_failed") };
+    }
+
+    if (!stop) return "again";
+    const failedRow = batch[done];
+    switch (stop.kind) {
+      case "no_time":
+        return { phase: result };
+      case "infra":
+        return { phase: { ...result, error: stop.code, halt: true } };
+      case "waiting":
+        return "yield";
+      case "budget":
+        guards.skipped.add(topic.workspace_id);
+        result.skipped_workspaces++;
+        await noteOverCap(db, topic.workspace_id, deadline);
+        return "yield";
+      case "key":
+        guards.skipped.add(topic.workspace_id);
+        result.unavailable_workspaces++;
+        return "yield";
+      case "transient": {
+        // Never counts on the topic: the conversation waits (its own
+        // doubling) and the topic with it. Only a conversation that keeps
+        // failing that way while its key is up gets stepped past.
+        result.deferred++;
+        const failures = stop.probe ? 0 : await deferConversation(db, failedRow, stop.code, deadline);
+        if (typeof failures !== "number") {
+          return { phase: failures.kind === "no_time" ? result : { ...result, error: failures.code, halt: true } };
+        }
+        if (keyKnownDown(guards, topic.workspace_id)) {
+          guards.skipped.add(topic.workspace_id);
+          result.unavailable_workspaces++;
+          return "yield";
+        }
+        if (failures < BACKFILL_TRANSIENT_SKIP) return "yield";
+        const { error: skipErr } = await advance(topic.id, failedRow);
+        if (skipErr) return { phase: stopped(skipErr, "backfill_advance_failed") };
+        return "again";
+      }
+      case "content": {
+        // A cursor can't step around one conversation: content failures
+        // count on the topic, and the third in a row steps past it.
+        result.failed++;
+        const { data: attempts, error: recErr } = await db
+          .rpc("record_backfill_failure", { p_topic_id: topic.id })
+          .abortSignal(dbSignal(deadline));
+        if (recErr) return { phase: stopped(recErr, "record_failure_failed") };
+        if (Number(attempts ?? 0) < 3) return "yield"; // se reintenta en la próxima corrida
+        const { error: skipErr } = await advance(topic.id, failedRow);
+        if (skipErr) return { phase: stopped(skipErr, "backfill_advance_failed") };
+        return "again";
+      }
+    }
+  };
+
+  // TURNS: the topics in the database's order (each workspace's oldest
+  // pending topic first, the workspace served longest ago first), one batch
+  // each per round, round after round while there is time. A topic is claimed
+  // (its lease, LEASE_SECONDS) when its first turn comes; one that another run
+  // holds is left alone.
+  const { data: topics, error } = await db
+    .rpc("pending_backfill_topics", { p_limit: BACKFILL_TOPICS, p_skip_workspaces: [...guards.skipped] })
+    .abortSignal(dbSignal(deadline));
+  if (error) return stopped(error, "backfill_topics_failed");
+  let queue = (Array.isArray(topics) ? topics : []) as BackfillTopic[];
+  const claimed = new Set<string>();
+  const release = async () => {
+    for (const id of claimed) {
       const { error: relErr } = await db
-        .rpc("release_topic_backfill", { p_topic_id: topic.id })
+        .rpc("release_topic_backfill", { p_topic_id: id })
         .abortSignal(dbSignal(deadline));
       if (relErr) console.error("[classify-topics] backfill lease release failed", relErr.code);
     }
+  };
+
+  while (queue.length > 0 && hasTime(deadline)) {
+    const next: BackfillTopic[] = [];
+    for (const topic of queue) {
+      if (!hasTime(deadline)) break;
+      if (guards.skipped.has(topic.workspace_id)) continue;
+      if (!claimed.has(topic.id)) {
+        const { data: ok, error: claimErr } = await db
+          .rpc("claim_topic_backfill", { p_topic_id: topic.id, p_lease_seconds: LEASE_SECONDS })
+          .abortSignal(dbSignal(deadline));
+        if (claimErr) return stopped(claimErr, "backfill_claim_failed");
+        if (ok !== true) continue;
+        claimed.add(topic.id);
+      }
+      const t = await turn(topic);
+      if (typeof t === "object") return t.phase; // the leases lapse on their own
+      if (t === "done") claimed.delete(topic.id); // closing it released the lease
+      if (t === "again") next.push(topic);
+    }
+    queue = next;
   }
 
+  await release();
   return result;
 }

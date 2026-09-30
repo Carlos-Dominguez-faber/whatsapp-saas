@@ -269,11 +269,13 @@ CREATE TABLE IF NOT EXISTS public.classification_key_health (
 );
 
 -- Per workspace: the key its calls ran on at its last turn (the dashboard
--- derives "blocked" from that key's health).
+-- derives "blocked" from that key's health), and when the run last took
+-- work of it (last_served_at: workspaces take turns by it, in both phases).
 CREATE TABLE IF NOT EXISTS public.classification_workspace_state (
   workspace_id   UUID PRIMARY KEY REFERENCES public.workspaces(id) ON DELETE CASCADE,
   key_id         TEXT,
   key_scope      TEXT CHECK (key_scope IN ('own', 'platform')),
+  last_served_at TIMESTAMPTZ,
   updated_at     TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
