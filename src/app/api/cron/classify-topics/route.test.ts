@@ -109,7 +109,7 @@ test("error sin halt → 500 ok:false, y la otra fase igual corre", async () => 
   assert.deepEqual(order, ["backfill", "classification"]);
 });
 
-test("backfill con halt (breaker, base caída) → 500 y la fase 1 NO corre", async () => {
+test("backfill con halt (nuestra base caída, el único alto) → 500 y la fase 1 NO corre", async () => {
   reset();
   // El código de error es irrelevante para la ruta: decide por `halt`.
   phase2 = async () => ({ processed: 0, failed: 0, topics_done: 0, halt: true, error: "cualquier_codigo" });

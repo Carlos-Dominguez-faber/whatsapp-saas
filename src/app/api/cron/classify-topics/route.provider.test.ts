@@ -54,7 +54,7 @@ globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
     if (rpc === "reserve_classification_tokens") return json("33333333-3333-3333-3333-333333333333");
     // The backfill's turn: no topic pending.
     if (rpc === "pending_backfill_topics") return json([]);
-    // The key's health, as the SQL keeps it (breaker 3).
+    // The key's health, as the SQL keeps it (down at the 3rd transient in a row).
     if (rpc === "classification_key_gate") return json({ state: "up", failures: keyFailures });
     if (rpc === "record_classification_key_outcome") {
       const args = JSON.parse(String(init?.body ?? "{}"));
