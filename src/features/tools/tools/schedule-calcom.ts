@@ -435,12 +435,17 @@ async function run(args: Args, ctx: ToolContext, opts?: ToolRunOptions): Promise
    * mark was written.
    */
   const markClaim = async (state: string): Promise<boolean> => {
+    // A compare-and-swap on the step before: 'sending' only over this call's
+    // live 'pending' claim, so a call whose claim already expired (and was
+    // taken over) never sends the POST; the later marks only over 'sending'.
     const { data: marked, error } = await supabase
       .from("appointments")
       .update({ meta: { calcom_claim: state, attendee_email: email } })
       .eq("id", claimId as string)
       .eq("workspace_id", ctx.workspaceId)
       .is("calcom_booking_uid", null)
+      .in("status", ["booked", "confirmed"])
+      .eq("meta->>calcom_claim", state === "sending" ? "pending" : "sending")
       .select("id");
     if (error) console.warn("[schedule_calcom] could not mark the claim:", error.message);
     return !error && ((marked as unknown[] | null) ?? []).length > 0;

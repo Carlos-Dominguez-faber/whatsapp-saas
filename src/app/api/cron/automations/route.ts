@@ -6,6 +6,7 @@ import {
   hasEnabledAutomationRules,
 } from "@/features/automations/services/executor";
 import { drainHubSpotConversationLogs, type HubSpotLogTally } from "@/features/inbox/services/hubspot-log-queue";
+import { sweepStaleCalComClaims, type CalComSweepTally } from "@/features/tools/lib/calcom-claim-sweep";
 import { isAuthorized } from "@/lib/cron-auth";
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -168,8 +169,20 @@ export async function GET(request: Request): Promise<NextResponse> {
   // junto al tally de lo que el tick sí alcanzó a hacer. Un no-200 no dispara
   // reintento: pg_net solo registra la respuesta en net._http_response y no hay
   // Vercel Cron para esta ruta.
+  // Cal.com claims that may have booked and that nobody is asking about
+  // (calcom-claim-sweep.ts): with what is left of the same deadline.
+  let calcomClaims: CalComSweepTally = { resolved: 0, released: 0, flagged: 0 };
+  try {
+    calcomClaims = await sweepStaleCalComClaims(deadline);
+    if (calcomClaims.error) phaseFailed = true;
+  } catch (err) {
+    console.error("[cron/automations] calcom claims error:", err instanceof Error ? err.message : err);
+    phaseFailed = true;
+    calcomClaims = { resolved: 0, released: 0, flagged: 0, error: "calcom_claims_threw" };
+  }
+
   return NextResponse.json(
-    { ok: !phaseFailed, scanned, expanded, executed, hubspotLogs },
+    { ok: !phaseFailed, scanned, expanded, executed, hubspotLogs, calcomClaims },
     { status: phaseFailed ? 500 : 200 },
   );
 }

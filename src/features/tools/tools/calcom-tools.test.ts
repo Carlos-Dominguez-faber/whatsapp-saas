@@ -96,6 +96,8 @@ function calFetch(opts: {
   /** Answers of successive claims, then `claim`. */
   claims?: Array<Record<string, unknown>>;
   claimError?: boolean;
+  /** This call's claim was taken over before the 'sending' mark. */
+  claimExpired?: boolean;
   /** The link/release of a holder row affects no row (or fails). */
   holderWriteFails?: boolean;
   /** GET /v2/bookings (the list by attendee). */
@@ -146,7 +148,10 @@ function calFetch(opts: {
     }
     if (url.includes("/rest/v1/appointments")) {
       if (method === "GET") return json(200, filterRows(url, opts.local ?? []));
-      if (method === "PATCH" && url.includes("id=eq.claim_1")) return json(200, [{ id: "claim_1" }]);
+      if (method === "PATCH" && url.includes("id=eq.claim_1")) {
+        const expired = opts.claimExpired && decodeURIComponent(url).includes("meta->>calcom_claim=eq.pending");
+        return json(200, expired ? [] : [{ id: "claim_1" }]);
+      }
       if (method === "PATCH" && url.includes("id=eq.row_x")) {
         return opts.holderWriteFails
           ? json(409, { code: "23505", message: "duplicate key value" })
@@ -986,4 +991,19 @@ test("a found booking whose link can't be written is never answered ok", async (
   const r = await schedule(fake);
   assert.equal(r.ok, false);
   assert.deepEqual(r.output, { needs_human: true });
+});
+
+test("the 'sending' mark is a compare-and-swap: a claim already taken over never sends the POST", async () => {
+  const ok = calFetch({});
+  await schedule(ok);
+  const mark = localWrites(ok.calls).find((c) => c.method === "PATCH")!;
+  const url = decodeURIComponent(mark.url);
+  assert.ok(url.includes("meta->>calcom_claim=eq.pending"), url);
+  assert.ok(url.includes("status=in.(booked,confirmed)"), url);
+
+  const expired = calFetch({ claimExpired: true });
+  const r = await schedule(expired);
+  assert.equal(r.ok, false);
+  assert.match(r.error ?? "", /NO se agendó/);
+  assert.equal(calPosts(expired.calls).length, 0);
 });

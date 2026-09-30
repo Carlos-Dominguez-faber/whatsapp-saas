@@ -70,6 +70,17 @@ mock.module("@/features/inbox/services/hubspot-log-queue.ts", {
   },
 });
 
+const calcomSweepCalls: Array<{ deadline: number; at: number }> = [];
+let calcomSweepResult: Record<string, unknown> = { resolved: 0, released: 0, flagged: 0 };
+mock.module("@/features/tools/lib/calcom-claim-sweep.ts", {
+  exports: {
+    sweepStaleCalComClaims: async (deadline: number) => {
+      calcomSweepCalls.push({ deadline, at: Date.now() });
+      return calcomSweepResult;
+    },
+  },
+});
+
 const { GET, maxDuration, RUN_BUDGET_MS } = await import("./route.ts");
 
 function req(auth?: string) {
@@ -93,6 +104,8 @@ function reset() {
   hubspotLogCalls.length = 0;
   hubspotLogsResult = { done: 1, retry: 0, failed: 0, cancelled: 0 };
   hubspotLogsShouldThrow = false;
+  calcomSweepCalls.length = 0;
+  calcomSweepResult = { resolved: 0, released: 0, flagged: 0 };
 }
 
 // ── Camino correcto ──────────────────────────────────────────────────────────
@@ -108,6 +121,7 @@ test("con el bearer correcto escanea, expande y después drena, con la forma exa
     expanded: { events: 3, runs: 5, errors: 0 },
     executed: { done: 4, failed: 1, skipped: 0, retry: 0, lost: 0 },
     hubspotLogs: { done: 1, retry: 0, failed: 0, cancelled: 0 },
+    calcomClaims: { resolved: 0, released: 0, flagged: 0 },
   });
   assert.equal(scanCalls.length, 1);
   assert.equal(expandCalls.length, 1);
@@ -386,4 +400,19 @@ test("si el motor se cae, la cola de HubSpot igual corre", async () => {
   drainShouldThrow = true;
   await GET(req("Bearer s3cret"));
   assert.equal(hubspotLogCalls.length, 1);
+});
+
+test("the Cal.com claim sweep runs last, on the same deadline; its failed lookup is a failed phase", async () => {
+  reset();
+  process.env.CRON_SECRET = "s3cret";
+  await GET(req("Bearer s3cret"));
+  assert.equal(calcomSweepCalls.length, 1);
+  assert.ok(hubspotLogCalls[0].at <= calcomSweepCalls[0].at, "after the HubSpot queue");
+  assert.equal(calcomSweepCalls[0].deadline, hubspotLogCalls[0].deadline);
+
+  reset();
+  calcomSweepResult = { resolved: 0, released: 0, flagged: 0, error: "calcom_sweep_lookup_failed" };
+  const res = await GET(req("Bearer s3cret"));
+  assert.equal(res.status, 500);
+  assert.equal(((await res.json()) as { calcomClaims: { error: string } }).calcomClaims.error, "calcom_sweep_lookup_failed");
 });
