@@ -56,12 +56,15 @@ export function classificationTokenCeiling(topics: PromptTopic[], messages: Prom
 /**
  * Every outcome falls in exactly one class of the run's failure model
  * (classify-topics.ts, header):
- * - `invalid_output` / `content_rejected` (400, 413, 422, moderation): this
- *   text. The conversation spends an attempt.
- * - `key_rejected` (401, 402, 403 other than moderation, 429): the key the
- *   call ran on. The caller stops using THAT key for the rest of the run.
- * - `provider_unavailable` (5xx, 408, 409, 404, the network) and `timeout`:
- *   transient. The conversation waits an hour, no attempt spent.
+ * - `invalid_output` / `content_rejected` (400, 413, 422, moderation, or an
+ *   answer that isn't an HTTP error and can't be read): this text. The
+ *   conversation spends an attempt.
+ * - `key_rejected` (401, 402, 403 other than moderation, 404 — OpenRouter's
+ *   "no endpoints match your data policy" —, 429 and any other 4xx): the key
+ *   the call ran on. That key goes down.
+ * - `provider_unavailable` (5xx, 408, 409, 425, the network) and `timeout`:
+ *   transient. They count toward the key's streak, and the conversation
+ *   waits, no attempt spent.
  */
 export type ClassifyErrorCode =
   | "invalid_output"
@@ -90,10 +93,13 @@ export type ClassifyResult =
 const CONTENT_REJECTED = new Set([400, 413, 422]);
 
 /**
- * Estados que dicen que la CLAVE con que corrió la llamada no sirve ahora:
- * inválida o revocada, sin créditos, sin permiso para el modelo, o limitada.
+ * HTTP answers that say "try again": the provider (or its route to the model)
+ * is failing now. Any other 4xx says the KEY the call ran on can't be used
+ * now: invalid or revoked (401), out of credit (402), not allowed (403), no
+ * endpoint for its account's data policy (404), rate limited (429).
  */
-const KEY_REJECTED = new Set([401, 402, 403, 429]);
+const TRANSIENT_STATUS = new Set([408, 409, 425]);
+const isTransientStatus = (status: number) => status >= 500 || TRANSIENT_STATUS.has(status);
 
 /**
  * OpenRouter answers a moderation refusal with 403 and says so in the body
@@ -196,14 +202,20 @@ export async function classifyConversation(params: {
       return { ok: false, code: "timeout", usage: null, keyScope };
     }
     if (APICallError.isInstance(err) && err.statusCode != null) {
-      if (CONTENT_REJECTED.has(err.statusCode) || isModeration(err)) {
+      const status = err.statusCode;
+      // Not an HTTP error (a 200 whose body couldn't be read, say): the
+      // provider answered, maybe billed, and this text is what failed.
+      if (status < 400 || status > 599) {
+        return { ok: false, code: "invalid_output", usage: null, keyScope };
+      }
+      // Below, an HTTP error answer: nothing was generated.
+      if (CONTENT_REJECTED.has(status) || isModeration(err)) {
         return { ok: false, code: "content_rejected", usage: REFUSED_USAGE, keyScope };
       }
-      if (KEY_REJECTED.has(err.statusCode)) {
-        return { ok: false, code: "key_rejected", usage: REFUSED_USAGE, keyScope };
+      if (isTransientStatus(status)) {
+        return { ok: false, code: "provider_unavailable", usage: REFUSED_USAGE, keyScope };
       }
-      // 5xx, 408, 409, 404: an HTTP answer, so nothing was generated.
-      return { ok: false, code: "provider_unavailable", usage: REFUSED_USAGE, keyScope };
+      return { ok: false, code: "key_rejected", usage: REFUSED_USAGE, keyScope };
     }
     // The network down or anything unknown: transient, usage unknown.
     return { ok: false, code: "provider_unavailable", usage: null, keyScope };

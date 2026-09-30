@@ -179,8 +179,8 @@ test("error desconocido → provider_unavailable, sin propagar el mensaje", asyn
   assert.doesNotMatch(JSON.stringify(r), /sk-live/);
 });
 
-test("proveedor caído (5xx, 408, 409, 404) → provider_unavailable liquidado en 0; sin respuesta (red) → consumo desconocido", async () => {
-  for (const status of [500, 502, 503, 408, 409, 404]) {
+test("proveedor caído (5xx, 408, 409, 425) → provider_unavailable liquidado en 0; sin respuesta (red) → consumo desconocido", async () => {
+  for (const status of [500, 502, 503, 408, 409, 425]) {
     generateImpl = async () => {
       throw new FakeAPICallError(status);
     };
@@ -196,8 +196,8 @@ test("proveedor caído (5xx, 408, 409, 404) → provider_unavailable liquidado e
   assert.deepEqual(await call(), { ok: false, code: "provider_unavailable", usage: null, keyScope: "own" });
 });
 
-test("la clave del workspace no sirve (401, 402, 403, 429) → key_rejected, liquidado en 0", async () => {
-  for (const status of [401, 402, 403, 429]) {
+test("la clave no sirve (401, 402, 403, 404 de política de datos, 429, otro 4xx) → key_rejected, liquidado en 0", async () => {
+  for (const status of [401, 402, 403, 404, 429, 410]) {
     generateImpl = async () => {
       throw new FakeAPICallError(status, '{"error":{"message":"Insufficient credits"}}');
     };
@@ -282,4 +282,13 @@ test("REVIEW H1: the result says which key the call ran on", async () => {
   };
   assert.equal((await call({ scope: "platform", key: "sk-agency" })).keyScope, "platform");
   assert.equal((await call({ scope: "own", key: "sk-own" })).keyScope, "own");
+});
+
+test("REVIEW r3 LOW: an answer that isn't an HTTP error and can't be read is CONTENT, and keeps the estimate", async () => {
+  for (const status of [200, 204, 302]) {
+    generateImpl = async () => {
+      throw new FakeAPICallError(status, "<html>not json</html>");
+    };
+    assert.deepEqual(await call(), { ok: false, code: "invalid_output", usage: null, keyScope: "own" }, `status ${status}`);
+  }
 });
