@@ -21,6 +21,8 @@ export const CALCOM_BASE_URL = "https://api.cal.com";
 
 export const CALCOM_API_VERSION = {
   bookings: "2026-02-25",
+  /** GET /v2/bookings (the list, cursor-paginated). */
+  bookingsList: "2026-05-01",
   eventTypes: "2024-06-14",
   slots: "2024-09-04",
 } as const;
@@ -294,4 +296,54 @@ export async function fetchCalComBooking(
   const booking = parseCalComBooking((res.json as { data?: unknown } | null)?.data);
   if (!booking) throw new Error("Cal.com devolvió una reserva que no se pudo leer");
   return booking;
+}
+
+export type CalComLookupAt =
+  | { kind: "found"; booking: CalComBooking }
+  /** Cal.com answered, completely, and has no live booking there. */
+  | { kind: "none" }
+  /** No reliable answer: a failed read, an unreadable body, more pages. */
+  | { kind: "unknown" };
+
+/**
+ * Whether Cal.com has a booking of `eventTypeId` for `email` starting at
+ * `startMs` (within a minute): GET /v2/bookings filtered by attendee, event
+ * type and a window around that start. "none" only when Cal.com answered with
+ * the whole list; anything else is "unknown", never "none". Never throws.
+ */
+export async function findCalComBookingAt(
+  apiKey: string,
+  q: { email: string; eventTypeId: number; startMs: number },
+): Promise<CalComLookupAt> {
+  const params = new URLSearchParams({
+    attendeeEmail: q.email,
+    eventTypeId: String(q.eventTypeId),
+    afterStart: new Date(q.startMs - 60_000).toISOString(),
+    beforeEnd: new Date(q.startMs + 24 * 60 * 60_000).toISOString(),
+  });
+  const res = await calcomRequest(apiKey, `/v2/bookings?${params.toString()}`, {
+    version: CALCOM_API_VERSION.bookingsList,
+    timeoutMs: CALCOM_READ_TIMEOUT_MS,
+  });
+  if (res.kind !== "ok") {
+    if (res.kind === "http") console.error("[CalCom] bookings lookup failed:", res.status, res.detail);
+    return { kind: "unknown" };
+  }
+  const body = res.json as {
+    status?: unknown;
+    data?: unknown;
+    pagination?: { hasMore?: unknown; hasNextPage?: unknown };
+  } | null;
+  if (!body || body.status !== "success" || !Array.isArray(body.data)) return { kind: "unknown" };
+  const bookings = body.data.map(parseCalComBooking);
+  // A booking that can't be read could be the one.
+  if (bookings.some((b) => b === null)) return { kind: "unknown" };
+  const match = (bookings as CalComBooking[]).find(
+    (b) => b.state === "active" && Math.abs(b.startMs - q.startMs) <= 60_000,
+  );
+  if (match) return { kind: "found", booking: match };
+  if (body.pagination?.hasMore === true || body.pagination?.hasNextPage === true) {
+    return { kind: "unknown" };
+  }
+  return { kind: "none" };
 }

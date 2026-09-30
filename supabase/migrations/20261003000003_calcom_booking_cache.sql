@@ -13,12 +13,19 @@
 --
 -- 2. claim_calcom_slot() — schedule_calcom claims (workspace, contact,
 --    instant) in `appointments` BEFORE calling Cal.com, backed by
---    idx_appointments_calcom_slot_claim (20261003000002). A claim whose call
---    died or never learned the outcome used to hold the slot forever; now a
---    claim without a booking uid older than p_ttl_seconds is expired (status
---    'cancelled', meta.calcom_claim 'expired') and replaced in the same call.
---    A claim that did book without a uid ('booked_without_uid') or booked a
---    series ('series') never expires: it IS a booking.
+--    idx_appointments_calcom_slot_claim (20261003000002). The claim's
+--    meta.calcom_claim says how far its call got:
+--      'pending'  claimed, nothing sent to Cal.com yet;
+--      'sending'  marked right before the POST: it may have booked;
+--      'unknown'  the POST got no answer: it may have booked;
+--      'booked_without_uid' / 'series'  Cal.com booked (it IS a booking);
+--      none       a claim #15 left: it may have booked.
+--    Only a 'pending' claim older than p_ttl_seconds is expired here (status
+--    'cancelled', meta.calcom_claim 'expired') and replaced in the same call:
+--    its call died before sending anything. Any other holder is returned as
+--    is, with its age and the attendee email it was sent with: schedule_calcom
+--    asks Cal.com whether that booking exists before freeing the slot, or
+--    hands the conversation to a person.
 -- ============================================================================
 
 DO $$
@@ -72,7 +79,9 @@ RETURNS TABLE (
   holder_id            UUID,
   holder_uid           TEXT,
   holder_event_type_id INT,
-  holder_claim         TEXT
+  holder_claim         TEXT,
+  holder_age_seconds   INT,
+  holder_email         TEXT
 )
 LANGUAGE plpgsql
 VOLATILE
@@ -101,7 +110,7 @@ BEGIN
         (p_workspace_id, p_contact_id, p_conversation_id, p_scheduled_at, 'booked', p_event_type_id,
          jsonb_build_object('calcom_claim', 'pending'))
       RETURNING id INTO v_id;
-      RETURN QUERY SELECT v_id, NULL::UUID, NULL::TEXT, NULL::INT, NULL::TEXT;
+      RETURN QUERY SELECT v_id, NULL::UUID, NULL::TEXT, NULL::INT, NULL::TEXT, NULL::INT, NULL::TEXT;
       RETURN;
     EXCEPTION WHEN unique_violation THEN
       GET STACKED DIAGNOSTICS v_constraint = CONSTRAINT_NAME;
@@ -112,7 +121,8 @@ BEGIN
 
     -- Who holds it. FOR UPDATE: a concurrent expiry waits for this one.
     SELECT a.id, a.calcom_booking_uid, a.calcom_event_type_id,
-           a.meta->>'calcom_claim' AS claim, a.created_at
+           COALESCE(a.meta->>'calcom_claim', 'legacy') AS claim, a.created_at,
+           a.meta->>'attendee_email' AS email
       INTO v_holder
       FROM public.appointments a
      WHERE a.workspace_id = p_workspace_id
@@ -127,10 +137,10 @@ BEGIN
       CONTINUE;
     END IF;
 
-    -- A claim without a booking whose call is over: expire it and claim
-    -- again. A claim with no marker (an install that ran #15) is one too.
+    -- A claim whose call died before sending anything: expire it and claim
+    -- again. Nothing else expires on its own (see the header).
     IF v_holder.calcom_booking_uid IS NULL
-       AND COALESCE(v_holder.claim, 'pending') IN ('pending', 'unknown')
+       AND v_holder.claim = 'pending'
        AND v_holder.created_at < now() - v_ttl THEN
       UPDATE public.appointments a
          SET status = 'cancelled',
@@ -140,7 +150,9 @@ BEGIN
     END IF;
 
     RETURN QUERY SELECT NULL::UUID, v_holder.id, v_holder.calcom_booking_uid,
-                        v_holder.calcom_event_type_id, v_holder.claim;
+                        v_holder.calcom_event_type_id, v_holder.claim,
+                        GREATEST(0, EXTRACT(EPOCH FROM now() - v_holder.created_at))::INT,
+                        v_holder.email;
     RETURN;
   END LOOP;
 

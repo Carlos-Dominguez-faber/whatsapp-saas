@@ -8,7 +8,7 @@ BEGIN;
 CREATE EXTENSION IF NOT EXISTS pgtap WITH SCHEMA extensions;
 SET search_path = public, extensions;
 
-SELECT plan(20);
+SELECT plan(22);
 
 -- ── privileges: service role only ───────────────────────────────────────────
 SELECT ok(NOT has_function_privilege('anon',
@@ -73,14 +73,30 @@ SELECT is(
   (SELECT status || ':' || (meta->>'calcom_claim') FROM public.appointments WHERE id = (SELECT claim_id FROM r1)),
   'cancelled:expired', 'the expired claim stays as a cancelled trace, out of the slot index');
 
--- 'unknown' (Cal.com never answered) expires too: Cal.com refuses the slot if it was booked.
+-- A claim that may have booked ('sending', 'unknown', or a #15 claim with no
+-- marker) never expires here, however old: schedule_calcom asks Cal.com.
 UPDATE public.appointments
-   SET created_at = now() - INTERVAL '10 minutes', meta = '{"calcom_claim":"unknown"}'
+   SET created_at = now() - INTERVAL '1 day', meta = '{"calcom_claim":"unknown","attendee_email":"a@b.co"}'
+ WHERE id = (SELECT claim_id FROM r6);
+CREATE TEMP TABLE r7a AS SELECT * FROM public.claim_calcom_slot(
+  'c0000000-0000-4000-8000-000000000001', 'c0000000-0000-4000-8000-0000000000c1', NULL,
+  '2030-06-12T16:00:00Z', 7, 120);
+SELECT ok((SELECT claim_id IS NULL AND holder_claim = 'unknown' AND holder_age_seconds >= 86399
+                  AND holder_email = 'a@b.co' FROM r7a),
+  'an unknown-outcome claim is never taken over; its age and email come back');
+UPDATE public.appointments SET meta = '{}' WHERE id = (SELECT claim_id FROM r6);
+CREATE TEMP TABLE r7b AS SELECT * FROM public.claim_calcom_slot(
+  'c0000000-0000-4000-8000-000000000001', 'c0000000-0000-4000-8000-0000000000c1', NULL,
+  '2030-06-12T16:00:00Z', 7, 120);
+SELECT ok((SELECT claim_id IS NULL AND holder_claim = 'legacy' FROM r7b),
+  'a #15 claim with no marker is never taken over either');
+-- Freed once Cal.com says there is no booking (what schedule_calcom does):
+UPDATE public.appointments SET status = 'cancelled', meta = '{"calcom_claim":"released"}'
  WHERE id = (SELECT claim_id FROM r6);
 CREATE TEMP TABLE r7 AS SELECT * FROM public.claim_calcom_slot(
   'c0000000-0000-4000-8000-000000000001', 'c0000000-0000-4000-8000-0000000000c1', NULL,
   '2030-06-12T16:00:00Z', 7, 120);
-SELECT ok((SELECT claim_id IS NOT NULL FROM r7), 'an unknown-outcome claim past the TTL is taken over');
+SELECT ok((SELECT claim_id IS NOT NULL FROM r7), 'a released claim frees the slot');
 
 -- A booking without a uid, a series, or a linked booking never expire.
 UPDATE public.appointments

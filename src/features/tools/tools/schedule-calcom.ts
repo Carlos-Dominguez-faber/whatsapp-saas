@@ -1,6 +1,7 @@
 import { createClient as createSbClient, type SupabaseClient } from "@supabase/supabase-js";
 import { z } from "zod";
 import type { Tool, ToolContext, ToolResult, ToolRunOptions } from "../core/tool";
+import type { CalComBooking } from "../../inbox/services/calcom-client.ts";
 import { formatWithOffset } from "@/shared/lib/timezone";
 import {
   APPOINTMENT_TOOL_TIMEOUT_MS,
@@ -37,11 +38,11 @@ const schema = z.object({
 type Args = z.infer<typeof schema>;
 
 /**
- * How long a claim without a booking uid holds the slot. Past it, the call
- * that made the claim is over (the tool's budget is 30 s): it died between
- * the claim and the booking, or never learned whether Cal.com booked. The
- * next call for that slot takes it over, and Cal.com itself refuses the slot
- * if the booking does exist.
+ * How long a claim without a booking uid is taken as its call still running
+ * (the tool's budget is 30 s). Past it, a 'pending' claim (nothing sent) is
+ * taken over by the next call; one that may have booked ('sending',
+ * 'unknown', or a #15 claim) is freed only once Cal.com says there's no such
+ * booking.
  */
 export const CALCOM_CLAIM_TTL_SECONDS = 120;
 
@@ -60,8 +61,15 @@ interface ClaimRow {
   holder_id: string | null;
   holder_uid: string | null;
   holder_event_type_id: number | null;
+  /** pending | sending | unknown | booked_without_uid | series | legacy (#15). */
   holder_claim: string | null;
+  holder_age_seconds: number | null;
+  /** The attendee email the holder's booking was sent with, if recorded. */
+  holder_email: string | null;
 }
+
+/** Holders whose booking may exist in Cal.com: never freed without asking it. */
+const MAYBE_BOOKED = new Set(["sending", "unknown", "legacy"]);
 
 /** A tool answer that a person has to follow up: the buffer hands off after the reply. */
 function needsHuman(error: string): ToolResult {
@@ -87,8 +95,14 @@ async function contactEmail(
 async function run(args: Args, ctx: ToolContext, opts?: ToolRunOptions): Promise<ToolResult> {
   const startedAt = Date.now();
   const budgetMs = opts?.timeoutMs ?? APPOINTMENT_TOOL_TIMEOUT_MS;
-  const { getCalComConfig, listCalComEventTypes, calcomRequest, parseCalComBooking, CALCOM_API_VERSION } =
-    await import("../../inbox/services/calcom-client.ts");
+  const {
+    getCalComConfig,
+    listCalComEventTypes,
+    calcomRequest,
+    parseCalComBooking,
+    findCalComBookingAt,
+    CALCOM_API_VERSION,
+  } = await import("../../inbox/services/calcom-client.ts");
   const { getBusinessInfo } = await import("../../inbox/services/business-info.ts");
   const { workspaceSchedulingTimeZone } = await import("../../inbox/services/scheduling-timezone.ts");
   const { readCalComBooking } = await import("../lib/calcom-appointment.ts");
@@ -109,6 +123,11 @@ async function run(args: Args, ctx: ToolContext, opts?: ToolRunOptions): Promise
   }
   const startIso = new Date(start.ms).toISOString();
   const startLocal = formatWithOffset(start.ms, zone);
+  /** What the model gets for a booking Cal.com has. */
+  const bookedOutput = (b: CalComBooking) => ({
+    booking_uid: b.uid,
+    datetime: formatWithOffset(b.startMs, zone),
+  });
 
   // Cal.com books any eventTypeId, even another account's: only this key's own.
   const eventTypes = await listCalComEventTypes(cfg.apiKey);
@@ -250,15 +269,36 @@ async function run(args: Args, ctx: ToolContext, opts?: ToolRunOptions): Promise
 
     // Someone holds this slot for this contact.
     const sameService = row.holder_event_type_id === args.event_type_id;
+    const otherService: ToolResult = {
+      ok: false,
+      output: null,
+      error: "El cliente ya tiene otra cita a esa hora con otro servicio, así que no se creó otra. Ofrécele otro horario.",
+    };
+    const heldUnconfirmed = async (why: string): Promise<ToolResult> => {
+      await traceOutcome("not_sent", { reason: "slot_unconfirmed" });
+      await noteForTeam(
+        supabase,
+        ctx,
+        "calcom_appointment_unconfirmed",
+        `El cliente pidió agendar el ${startLocal} en Cal.com y ya hay una reserva a su nombre a esa hora que no se pudo confirmar (${why}). Revísala en Cal.com.`,
+      );
+      return needsHuman(
+        "No pude confirmar si el cliente ya tenía esa cita, así que no se agendó otra. No le digas que quedó agendada ni que falló: dile que una persona del equipo lo confirmará.",
+      );
+    };
+    // The playground has no contact to read a booking for.
+    if (!ctx.contactId && (row.holder_uid || row.holder_claim !== "pending")) {
+      await traceOutcome("not_sent", { reason: "slot_held" });
+      return {
+        ok: false,
+        output: null,
+        error: "Ya hay una reserva de prueba a esa hora, así que no se hizo otra. Prueba con otro horario.",
+      };
+    }
     if (row.holder_uid) {
       // A booking this tool made (or the cache has) at that time: Cal.com
-      // says whether it still stands.
-      if (!ctx.contactId || !hasTimeToLookUp(startedAt, budgetMs)) {
-        await traceOutcome("not_sent", { reason: "slot_held" });
-        return sameService
-          ? { ok: true, output: { booking_uid: row.holder_uid, datetime: startLocal, already_booked: true } }
-          : { ok: false, output: null, error: "El cliente ya tiene otra cita a esa hora con otro servicio, así que no se creó otra. Ofrécele otro horario." };
-      }
+      // says whether it still stands. Never "already booked" without that.
+      if (!hasTimeToLookUp(startedAt, budgetMs)) return heldUnconfirmed("sin tiempo para consultar");
       let read;
       try {
         read = await readCalComBooking(
@@ -267,15 +307,7 @@ async function run(args: Args, ctx: ToolContext, opts?: ToolRunOptions): Promise
         );
       } catch (err) {
         console.error("[schedule_calcom] holder lookup failed:", err);
-        await noteForTeam(
-          supabase,
-          ctx,
-          "calcom_appointment_unconfirmed",
-          `El cliente pidió agendar el ${startLocal} en Cal.com y ya había una reserva a su nombre a esa hora que no se pudo confirmar. Revísalo tú.`,
-        );
-        return needsHuman(
-          "No pude confirmar si el cliente ya tenía esa cita, así que no se agendó otra. Dile que una persona del equipo lo confirmará.",
-        );
+        return heldUnconfirmed("Cal.com no respondió");
       }
       const stands =
         read !== null &&
@@ -284,8 +316,8 @@ async function run(args: Args, ctx: ToolContext, opts?: ToolRunOptions): Promise
       if (stands) {
         await traceOutcome("not_sent", { reason: "already_booked" });
         return sameService
-          ? { ok: true, output: { booking_uid: read!.booking.uid, datetime: startLocal, already_booked: true } }
-          : { ok: false, output: null, error: "El cliente ya tiene otra cita a esa hora con otro servicio, así que no se creó otra. Ofrécele otro horario." };
+          ? { ok: true, output: { ...bookedOutput(read!.booking), already_booked: true } }
+          : otherService;
       }
       // Cancelled or moved in Cal.com: the read wrote that back, freeing the
       // slot. Claim again.
@@ -298,15 +330,60 @@ async function run(args: Args, ctx: ToolContext, opts?: ToolRunOptions): Promise
       }
       continue;
     }
+    if (row.holder_claim === "booked_without_uid" || row.holder_claim === "series") {
+      // Cal.com booked it, and nothing here can check it.
+      return heldUnconfirmed("Cal.com la agendó sin devolver su referencia");
+    }
+    if (row.holder_claim && MAYBE_BOOKED.has(row.holder_claim)) {
+      // Its call may still be running.
+      if ((row.holder_age_seconds ?? 0) < CALCOM_CLAIM_TTL_SECONDS) {
+        await traceOutcome("not_sent", { reason: "slot_held" });
+        return {
+          ok: false,
+          output: null,
+          error: "Ya se está procesando una reserva para ese horario, así que no se hizo otra. Espera unos segundos y vuelve a consultar.",
+        };
+      }
+      // Its call is over and never learned whether Cal.com booked: Cal.com
+      // says, by attendee, service and start. Only a complete "no" frees it.
+      const lookupEmail = row.holder_email || email;
+      if (row.holder_event_type_id === null || !hasTimeToLookUp(startedAt, budgetMs)) {
+        return heldUnconfirmed("no se pudo consultar");
+      }
+      const found = await findCalComBookingAt(cfg.apiKey, {
+        email: lookupEmail,
+        eventTypeId: row.holder_event_type_id,
+        startMs: start.ms,
+      });
+      if (found.kind === "unknown") return heldUnconfirmed("Cal.com no dio una respuesta completa");
+      if (found.kind === "found") {
+        // The booking exists: the claim becomes its cache row.
+        await supabase
+          .from("appointments")
+          .update({
+            calcom_booking_uid: found.booking.uid,
+            status: "booked",
+            meta: {},
+          })
+          .eq("id", row.holder_id as string)
+          .eq("workspace_id", ctx.workspaceId)
+          .is("calcom_booking_uid", null);
+        await traceOutcome("not_sent", { reason: "already_booked" });
+        return sameService
+          ? { ok: true, output: { ...bookedOutput(found.booking), already_booked: true } }
+          : otherService;
+      }
+      // Cal.com has nothing there: free the claim and claim again.
+      await supabase
+        .from("appointments")
+        .update({ status: "cancelled", meta: { calcom_claim: "released" } })
+        .eq("id", row.holder_id as string)
+        .eq("workspace_id", ctx.workspaceId)
+        .is("calcom_booking_uid", null);
+      continue;
+    }
+    // A 'pending' claim within its TTL: its call hasn't sent anything yet.
     await traceOutcome("not_sent", { reason: "slot_held" });
-    if (row.holder_claim === "booked_without_uid") {
-      return sameService
-        ? { ok: true, output: { booking_uid: null, datetime: startLocal, already_booked: true } }
-        : { ok: false, output: null, error: "El cliente ya tiene otra cita a esa hora con otro servicio, así que no se creó otra. Ofrécele otro horario." };
-    }
-    if (row.holder_claim === "unknown") {
-      return needsHuman(UNKNOWN_BOOKING);
-    }
     return {
       ok: false,
       output: null,
@@ -332,15 +409,21 @@ async function run(args: Args, ctx: ToolContext, opts?: ToolRunOptions): Promise
       .is("calcom_booking_uid", null);
     if (error) console.warn("[schedule_calcom] could not release the claim:", error.message);
   };
-  /** Marks what became of the claim (it keeps the slot). Never throws. */
-  const markClaim = async (state: string) => {
-    const { error } = await supabase
+  /**
+   * Marks what became of the claim (it keeps the slot), with the email the
+   * booking goes out with: a later call asks Cal.com by it. True when the
+   * mark was written.
+   */
+  const markClaim = async (state: string): Promise<boolean> => {
+    const { data: marked, error } = await supabase
       .from("appointments")
-      .update({ meta: { calcom_claim: state } })
+      .update({ meta: { calcom_claim: state, attendee_email: email } })
       .eq("id", claimId as string)
       .eq("workspace_id", ctx.workspaceId)
-      .is("calcom_booking_uid", null);
+      .is("calcom_booking_uid", null)
+      .select("id");
     if (error) console.warn("[schedule_calcom] could not mark the claim:", error.message);
+    return !error && ((marked as unknown[] | null) ?? []).length > 0;
   };
 
   // Nothing was sent yet: saying so is true.
@@ -351,6 +434,19 @@ async function run(args: Args, ctx: ToolContext, opts?: ToolRunOptions): Promise
       ok: false,
       output: null,
       error: "El calendario tardó demasiado, así que la cita NO se agendó. Dile al cliente que lo intentas de nuevo en un momento.",
+    };
+  }
+
+  // From here on the booking may exist: the claim says so before the POST,
+  // so no later call can expire it as a dead one. Without that mark nothing
+  // is sent.
+  if (!(await markClaim("sending"))) {
+    await releaseClaim();
+    await traceOutcome("not_sent", { reason: "claim_mark_failed" });
+    return {
+      ok: false,
+      output: null,
+      error: "No pude reservar el horario en este momento, así que la cita NO se agendó. Inténtalo de nuevo en un momento.",
     };
   }
 
@@ -367,7 +463,7 @@ async function run(args: Args, ctx: ToolContext, opts?: ToolRunOptions): Promise
 
   if (res.kind === "no_answer" || (res.kind === "http" && res.status >= 500)) {
     // Sent, and no answer: the booking may exist. The claim keeps the slot
-    // until its TTL; a person confirms.
+    // until Cal.com says otherwise (see the holder handling above).
     console.error("[schedule_calcom] booking got no answer:", res.kind === "http" ? res.status : res.reason);
     await markClaim("unknown");
     await traceOutcome("unknown");
@@ -492,10 +588,7 @@ async function run(args: Args, ctx: ToolContext, opts?: ToolRunOptions): Promise
   }
 
   await traceOutcome("booked", { booking_uid: booking.uid });
-  return {
-    ok: true,
-    output: { booking_uid: booking.uid, datetime: formatWithOffset(booking.startMs, zone) },
-  };
+  return { ok: true, output: bookedOutput(booking) };
 }
 
 export const scheduleCalComTool: Tool<Args> = {

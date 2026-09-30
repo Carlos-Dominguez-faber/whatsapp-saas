@@ -92,7 +92,11 @@ function calFetch(opts: {
   contactEmail?: string | null;
   timezone?: string;
   claim?: Record<string, unknown> | null;
+  /** Answers of successive claims, then `claim`. */
+  claims?: Array<Record<string, unknown>>;
   claimError?: boolean;
+  /** GET /v2/bookings (the list by attendee). */
+  list?: { status: number; body: unknown } | { throws: true };
   create?: { status: number; body?: unknown } | { throws: true };
   cancel?: { status: number } | { throws: true };
   reschedule?: { status: number; body?: unknown } | { throws: true };
@@ -125,6 +129,8 @@ function calFetch(opts: {
     }
     if (url.includes("/rest/v1/rpc/claim_calcom_slot")) {
       if (opts.claimError) return json(500, { message: "db down" });
+      const queued = opts.claims?.shift();
+      if (queued) return json(200, [queued]);
       return json(200, [
         opts.claim ?? {
           claim_id: "claim_1",
@@ -162,6 +168,11 @@ function calFetch(opts: {
     }
     if (url.includes("api.cal.com/v2/bookings")) {
       const path = new URL(url).pathname;
+      if (method === "GET" && path === "/v2/bookings") {
+        const l = opts.list ?? { status: 200, body: { status: "success", data: [], pagination: { hasMore: false } } };
+        if ("throws" in l) throw new Error("socket hang up");
+        return json(l.status, l.body);
+      }
       if (method === "POST" && path === "/v2/bookings") {
         const c = opts.create ?? { status: 201, body: { status: "success", data: booking("new_1", "2030-06-12T16:00:00.000Z") } };
         if ("throws" in c) throw new Error("socket hang up");
@@ -278,8 +289,12 @@ test("schedule: claims, books at the confirmed instant in the business zone, and
     attendee: { name: "Ana", email: "ana@example.com", timeZone: "America/Mexico_City" },
   });
   assert.equal(post.headers["cal-api-version"], "2026-02-25");
+  // Before the POST the claim says it may be booking, with the email.
+  const patches = localWrites(fake.calls).filter((c) => c.method === "PATCH");
+  assert.deepEqual(patches[0].body, { meta: { calcom_claim: "sending", attendee_email: "ana@example.com" } });
+  assert.ok(fake.calls.indexOf(patches[0]) < fake.calls.indexOf(post), "marked before the POST");
   // The claim becomes the booking's row.
-  const link = localWrites(fake.calls).find((c) => c.method === "PATCH")!;
+  const link = patches.find((c) => (c.body as Record<string, unknown>).calcom_booking_uid)!;
   assert.ok(link.url.includes("id=eq.claim_1"));
   assert.deepEqual(link.body, {
     calcom_booking_uid: "new_1",
@@ -352,22 +367,79 @@ test("schedule: the same slot held for another service is not reported as booked
   assert.equal(calPosts(fake.calls).length, 0);
 });
 
-test("schedule: a claim in flight answers 'processing'; one whose outcome is unknown goes to a person", async () => {
-  const inFlight = calFetch({
-    claim: { claim_id: null, holder_id: "row_x", holder_uid: null, holder_event_type_id: 7, holder_claim: "pending" },
-  });
-  const a = await schedule(inFlight);
-  assert.equal(a.ok, false);
-  assert.match(a.error ?? "", /procesando/);
-  assert.equal(calPosts(inFlight.calls).length, 0);
+const holder = (claim: string, age: number, extra: Record<string, unknown> = {}) => ({
+  claim_id: null,
+  holder_id: "row_x",
+  holder_uid: null,
+  holder_event_type_id: 7,
+  holder_claim: claim,
+  holder_age_seconds: age,
+  holder_email: "ana@example.com",
+  ...extra,
+});
 
-  const unknown = calFetch({
-    claim: { claim_id: null, holder_id: "row_x", holder_uid: null, holder_event_type_id: 7, holder_claim: "unknown" },
+test("schedule: a claim whose call may still run answers 'processing' and books nothing", async () => {
+  for (const claim of ["pending", "sending", "unknown", "legacy"]) {
+    const fake = calFetch({ claim: holder(claim, 30) });
+    const result = await schedule(fake);
+    assert.equal(result.ok, false, claim);
+    assert.match(result.error ?? "", /procesando/, claim);
+    assert.equal(calPosts(fake.calls).length, 0, claim);
+  }
+});
+
+test("schedule: a claim that may have booked is asked in Cal.com, by attendee, service and start", async () => {
+  // Cal.com has it: the claim is linked and the answer is the booking.
+  const found = calFetch({
+    claim: holder("unknown", 300),
+    list: { status: 200, body: { status: "success", data: [booking("bk_9", CONFIRMED_UTC)], pagination: { hasMore: false } } },
   });
-  const b = await schedule(unknown);
-  assert.equal(b.ok, false);
-  assert.deepEqual(b.output, { needs_human: true });
-  assert.equal(calPosts(unknown.calls).length, 0);
+  const a = await schedule(found);
+  assert.equal(a.ok, true);
+  assert.deepEqual(a.output, { booking_uid: "bk_9", datetime: CONFIRMED, already_booked: true });
+  const q = found.calls.find((c) => c.method === "GET" && new URL(c.url).pathname === "/v2/bookings")!;
+  const params = new URL(q.url).searchParams;
+  assert.equal(params.get("attendeeEmail"), "ana@example.com");
+  assert.equal(params.get("eventTypeId"), "7");
+  assert.equal(q.headers["cal-api-version"], "2026-05-01");
+  const link = localWrites(found.calls).find((c) => c.method === "PATCH")!;
+  assert.ok(link.url.includes("id=eq.row_x"));
+  assert.deepEqual(link.body, { calcom_booking_uid: "bk_9", status: "booked", meta: {} });
+  assert.equal(calPosts(found.calls).length, 0);
+
+  // Cal.com answers completely that there is none: freed, claimed again, booked.
+  const none = calFetch({ claims: [holder("legacy", 86_400)] });
+  const b = await schedule(none);
+  assert.equal(b.ok, true);
+  const release = localWrites(none.calls).find((c) => c.method === "PATCH" && c.url.includes("id=eq.row_x"))!;
+  assert.deepEqual(release.body, { status: "cancelled", meta: { calcom_claim: "released" } });
+  assert.ok(release.url.includes("calcom_booking_uid=is.null"));
+  assert.equal(calPosts(none.calls).length, 1);
+
+  // No complete answer (an error, more pages, an unreadable booking): a person decides.
+  for (const list of [
+    { throws: true as const },
+    { status: 500, body: {} },
+    { status: 200, body: { status: "success", data: [], pagination: { hasMore: true } } },
+    { status: 200, body: { status: "success", data: [{ weird: true }] } },
+  ]) {
+    const unsure = calFetch({ claim: holder("sending", 300), list });
+    const c = await schedule(unsure);
+    assert.equal(c.ok, false);
+    assert.deepEqual(c.output, { needs_human: true });
+    assert.equal(calPosts(unsure.calls).length, 0);
+    assert.equal(localWrites(unsure.calls).filter((w) => w.url.includes("id=eq.row_x")).length, 0, "nothing freed");
+    assert.equal(notesIn(unsure.calls).length, 1);
+  }
+});
+
+test("schedule: a booking Cal.com made without a uid, or a series, is never answered as booked", async () => {
+  for (const claim of ["booked_without_uid", "series"]) {
+    const fake = calFetch({ claim: holder(claim, 5) });
+    const result = await schedule(fake);
+    assert.equal(result.ok, false, claim);
+    assert.deepEqual(result.output, { needs_human: true });
+  }
 });
 
 test("schedule: no answer from Cal.com keeps the claim as 'unknown', notes the team and reports neither outcome", async () => {
@@ -376,8 +448,8 @@ test("schedule: no answer from Cal.com keeps the claim as 'unknown', notes the t
     () => schedule(fake),
     (err: Error) => err.name === "UnknownOutcomeError" && /No pude confirmar/.test(err.message),
   );
-  const mark = localWrites(fake.calls).find((c) => c.method === "PATCH")!;
-  assert.deepEqual(mark.body, { meta: { calcom_claim: "unknown" } });
+  const mark = localWrites(fake.calls).filter((c) => c.method === "PATCH").at(-1)!;
+  assert.deepEqual(mark.body, { meta: { calcom_claim: "unknown", attendee_email: "ana@example.com" } });
   assert.equal(localWrites(fake.calls).filter((c) => c.method === "DELETE").length, 0);
   assert.equal(notesIn(fake.calls).length, 1);
 
@@ -413,13 +485,13 @@ test("schedule: Cal.com refusing the slot releases the claim and says it wasn't 
   assert.equal(notesIn(other.calls).length, 1);
 });
 
-test("schedule: a booking without a uid is still a success, marked so it never expires", async () => {
+test("schedule: a booking without a uid is still a success, marked so it never frees the slot", async () => {
   const fake = calFetch({ create: { status: 201, body: { status: "success", data: { start: CONFIRMED_UTC } } } });
   const result = await schedule(fake);
   assert.equal(result.ok, true);
   assert.equal((result.output as { booking_uid: unknown }).booking_uid, null);
-  const mark = localWrites(fake.calls).find((c) => c.method === "PATCH")!;
-  assert.deepEqual(mark.body, { meta: { calcom_claim: "booked_without_uid" } });
+  const mark = localWrites(fake.calls).filter((c) => c.method === "PATCH").at(-1)!;
+  assert.deepEqual(mark.body, { meta: { calcom_claim: "booked_without_uid", attendee_email: "ana@example.com" } });
   assert.equal(notesIn(fake.calls).length, 1);
 });
 
