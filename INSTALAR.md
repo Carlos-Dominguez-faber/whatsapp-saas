@@ -695,7 +695,8 @@ conversaciones sin analizar).
   temas (un nombre y qué debe detectar; no puede haber dos activos con el mismo
   nombre, sin contar mayúsculas ni acentos). Cada 5 minutos, el job `classify-topics`
   lee las conversaciones en las que el **cliente** escribió algo nuevo (una hora
-  después de su último mensaje; primero lo más antiguo, turnándose entre workspaces)
+  después de su último mensaje; primero lo más antiguo, y los workspaces se turnan:
+  primero el que lleva más tiempo sin que se le lea nada)
   y marca qué temas plantea. Solo cuenta lo que escribe el cliente: lo que dicen el
   agente o el equipo es contexto, las notas internas nunca se mandan al modelo, y una
   respuesta o un recordatorio no hacen que se vuelva a analizar. El tablero muestra
@@ -707,17 +708,25 @@ conversaciones sin analizar).
   tablero dice cuántas faltan y por qué: pendientes (se leen en las próximas horas),
   que fallaron tres veces (se reintentan si el cliente vuelve a escribir) o de más de
   30 días (ya no se leerán).
-- **Si falla una clave de OpenRouter** (sin créditos, revocada, limitada), se deja de
-  usar esa clave el resto de la corrida: si es la propia de un workspace, se salta
-  ese workspace; si es la de la agencia, todos los que no tienen clave propia. Los
-  demás siguen, y el tablero de los afectados dice que la clave está fallando. Una
-  clave propia que no se puede descifrar cuenta como clave caída de ese workspace:
-  nunca se le cobra a la de la agencia.
-- **Si el proveedor falla** (error 5xx, sin red, tiempo agotado), esa conversación
-  espera una hora sin gastar intento y la corrida sigue con las demás; si la misma
-  conversación vuelve a fallar así, espera el doble cada vez (2, 4, 8… hasta 24 horas)
-  y vuelve a una hora en cuanto se lee. Si fallan así tres conversaciones distintas
-  seguidas, la corrida se detiene: es el proveedor, no las conversaciones.
+- **Cada clave de OpenRouter lleva su propia salud**, que se guarda entre corridas
+  (la de cada workspace con clave propia, y la de la agencia para todos los demás):
+  - si OpenRouter **rechaza la clave** (sin créditos, revocada, limitada, o un 404
+    porque su política de datos no deja usar el modelo), queda caída 15 minutos;
+  - si **falla tres veces seguidas** con esa clave (error 5xx, sin red, tiempo
+    agotado), queda caída 15 minutos, y cada caída seguida dura el doble (30 min,
+    1 h… hasta 6 horas);
+  - mientras está caída no se usa, y sus workspaces esperan; al terminar la espera se
+    prueba con **una sola** llamada: si responde, vuelve a la normalidad.
+  Los demás workspaces siguen a su ritmo: la clave caída de uno nunca detiene a los
+  otros. El tablero de los afectados dice que la clave está fallando (la propia) o que
+  el análisis no está respondiendo (la de la agencia). Si la caída es la de la
+  agencia, el job responde 500 (lo ves en `net._http_response`); las claves propias
+  caídas nunca lo hacen. Una clave propia que no se puede descifrar cuenta como caída
+  de ese workspace: nunca se le cobra a la de la agencia.
+- **Si falla una conversación** con un error pasajero, espera una hora sin gastar
+  intento y la corrida sigue con las demás; si la misma conversación vuelve a fallar
+  así, espera el doble cada vez (2, 4, 8… hasta 24 horas) y vuelve a una hora en
+  cuanto se lee. La corrida solo se detiene si falla nuestra base de datos.
 - **Si el modelo rechaza un mensaje** (contenido, moderación, respuesta inválida),
   la conversación espera una hora (dos, la segunda vez) antes del siguiente intento;
   al tercer fallo queda apartada hasta que el cliente vuelva a escribir.
@@ -730,9 +739,11 @@ conversaciones sin analizar).
   agente use otro modelo (sin nombres ni teléfonos).
 - **Hasta dónde mira:** 30 días hacia atrás, los últimos 60 mensajes de cada
   conversación y hasta 800 caracteres por mensaje; si algo quedó fuera, el tablero lo
-  dice. Un tema nuevo reprocesa los 30 días anteriores a su creación. Mientras eso no
-  termina, o si el tema se creó dentro del período que estás viendo, se mide solo
-  desde la fecha que aparece junto a él, y sin comparación con el período anterior:
+  dice. Un tema nuevo reprocesa los 30 días anteriores a su creación. Una caída del
+  proveedor no hace que se salte ninguna conversación: el reprocesamiento la espera.
+  Solo salta una que falla tres veces seguidas (con horas de espera entre una y otra)
+  mientras la clave sigue funcionando. Mientras eso no termina, o si el tema se creó
+  dentro del período que estás viendo, se mide solo desde la fecha que aparece junto a él, y sin comparación con el período anterior:
   antes de esa fecha no se analizó, y contarlo como 0 % daría números falsos.
 - **Capacidad:** cada corrida lee unas 15 a 20 conversaciones (depende de lo que
   tarde el modelo); cada 5 minutos, eso son miles al día en toda la instalación. El
