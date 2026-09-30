@@ -102,6 +102,11 @@ export function CrossTable({
               <tr key={t.id} className="border-t">
                 <th scope="row" className="p-3 text-left font-medium">
                   {t.name}
+                  {t.coveredFromLabel && (
+                    <span className="block text-xs font-normal text-muted-foreground">
+                      desde el {t.coveredFromLabel}
+                    </span>
+                  )}
                 </th>
                 <td className="p-3">{cell(t.id, t.name, "all", "Conversaciones", t.conversations.toLocaleString("es-CL"))}</td>
                 <td className="p-3">{cell(t.id, t.name, "booked", "Agendaron", formatPct(t.bookedPct))}</td>

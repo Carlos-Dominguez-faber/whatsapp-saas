@@ -101,11 +101,19 @@ function thenable(key: string, run: () => Promise<{ data?: unknown; error: unkno
 
 function query(table: string) {
   const filters: Array<[string, unknown]> = [];
-  const rows = () => (tables[table] ?? []).filter((r) => filters.every(([k, v]) => r[k] === v));
+  const upTo: Array<[string, string]> = [];
+  const rows = () =>
+    (tables[table] ?? []).filter(
+      (r) => filters.every(([k, v]) => r[k] === v) && upTo.every(([k, v]) => String(r[k]) <= v),
+    );
   const q = {
     select: () => q,
     eq: (col: string, val: unknown) => {
       filters.push([col, val]);
+      return q;
+    },
+    lte: (col: string, val: string) => {
+      upTo.push([col, val]);
       return q;
     },
     order: () => q,
@@ -134,7 +142,7 @@ const db = {
 
 const WS_A = "ws-a";
 const WS_B = "ws-b";
-const conv = (id: string, ws = WS_A) => ({ conversation_id: id, workspace_id: ws, contact_id: `c-${id}`, last_message_at: "2026-09-14T20:00:00Z" });
+const conv = (id: string, ws = WS_A) => ({ conversation_id: id, workspace_id: ws, contact_id: `c-${id}`, last_inbound_at: "2026-09-14T20:00:00Z" });
 const topic = (id: string, ws: string, name: string) => ({
   id, workspace_id: ws, name, description: "x", status: "active", backfill_status: "pending",
 });
@@ -798,4 +806,41 @@ test("fase 2 cortada por el deadline al registrar el fallo o al avanzar → sin 
   const r2 = await runBackfillPhase(clock + 40_000, db);
   assert.deepEqual(r2, { processed: 1, failed: 0, topics_done: 0, topics_expired: 0, halt: false });
   assert.equal(callsTo("advance_topic_backfill").length, 1);
+});
+
+test("the prompt ends at the customer's newest message the run picked", async () => {
+  reset();
+  const at = (id: string, when: string, direction: "in" | "out") => ({ ...message(id, "d1", WS_A), created_at: when, direction });
+  // Newest first, as the real query returns them. The reply after the pick
+  // and a message the customer sent after it stay out of this run.
+  tables.messages = [
+    at("m-late-in", "2026-09-14T21:00:00Z", "in"),
+    at("m-reply", "2026-09-14T20:30:00Z", "out"),
+    at("m-picked", "2026-09-14T20:00:00Z", "in"),
+    at("m-before", "2026-09-14T19:00:00Z", "out"),
+  ];
+  const r = await runClassificationPhase(later(), db);
+  assert.equal(r.classified, 1);
+  assert.deepEqual(classifyCalls[0].messageIds, ["m-before", "m-picked"]);
+  assert.equal(callsTo("save_conversation_topics")[0].args.p_classified_until, "2026-09-14T20:00:00Z");
+});
+
+test("with no customer message in view there is no LLM call, and the row is saved", async () => {
+  reset();
+  tables.messages = [{ ...message("m-out", "d1", WS_A), direction: "out" }];
+  const r = await runClassificationPhase(later(), db);
+  assert.equal(r.classified, 1);
+  assert.equal(classifyCalls.length, 0);
+  assert.equal(callsTo("reserve_classification_tokens").length, 0);
+  assert.deepEqual(callsTo("save_conversation_topics")[0].args.p_matches, []);
+});
+
+test("only the customer's cut bodies make the analysis partial", async () => {
+  reset();
+  const long = (id: string, when: string, direction: "in" | "out") => ({
+    ...message(id, "d1", WS_A), created_at: when, direction, body: "z".repeat(MAX_PROMPT_CHARS + 1),
+  });
+  tables.messages = [long("m-in", "2026-09-14T19:30:00Z", "in"), long("m-out", "2026-09-14T19:00:00Z", "out")];
+  await runClassificationPhase(later(), db);
+  assert.deepEqual(callsTo("save_conversation_topics")[0].args.p_truncated_at, ["2026-09-14T19:30:00Z"]);
 });

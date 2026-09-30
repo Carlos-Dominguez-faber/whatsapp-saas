@@ -153,3 +153,47 @@ test("stalePending: pendiente de antes de hoy → true; de hoy → false; sin pe
   assert.equal(toInsightsView(raw({ oldest_pending: "2026-09-15T03:30:00Z" }), TZ, NOW).stalePending, false);
   assert.equal(toInsightsView(raw({ oldest_pending: null }), TZ, NOW).stalePending, false);
 });
+
+test("a topic covered from mid-range is measured over its own universe, without a delta", () => {
+  const view = toInsightsView(
+    raw({
+      topics: [
+        // Covered from 10 Sep (Santiago): 40 customers wrote since, 10 raised it.
+        {
+          id: "t-new", name: "Nuevo", universe: 40, covered_from: "2026-09-10T03:00:00Z",
+          conversations: 10, prev_conversations: null, booked: 2, handed_off: 1, tags: {},
+        },
+        { id: "t-old", name: "Viejo", universe: 200, covered_from: null, conversations: 50, prev_conversations: 16, booked: 0, handed_off: 0, tags: {} },
+      ],
+      trend: [{ topic_id: "t-new", week: "2026-09-07", conversations: 10 }],
+    }),
+    TZ,
+    NOW,
+  );
+  const t = view.topics.find((x) => x.id === "t-new")!;
+  assert.equal(t.sharePct, 25, "10 of the 40 covered, not of the range's 200");
+  assert.equal(t.prevSharePct, null);
+  assert.equal(t.deltaPts, null);
+  assert.equal(t.coveredFromLabel, "10 sept");
+  assert.equal(t.coveredFromWeek, "2026-09-07", "Thursday 10 Sep is in the week of Monday 7 Sep");
+  assert.equal(t.notCovered, false);
+  const old = view.topics.find((x) => x.id === "t-old")!;
+  assert.equal(old.coveredFromLabel, null);
+  assert.equal(old.deltaPts, 15);
+});
+
+test("a topic created after the range has no share at all", () => {
+  const view = toInsightsView(
+    raw({
+      topics: [{
+        id: "t-today", name: "Hoy", universe: 0, covered_from: "2026-09-15T14:00:00Z",
+        conversations: 0, prev_conversations: null, booked: 0, handed_off: 0, tags: {},
+      }],
+      trend: [],
+    }),
+    TZ,
+    NOW,
+  );
+  assert.equal(view.topics[0].sharePct, null);
+  assert.equal(view.topics[0].notCovered, true);
+});

@@ -3,10 +3,12 @@ import { isBodyTruncated, MAX_PROMPT_MESSAGES, type PromptMessage, type PromptTo
 import { classificationTokenCeiling, classifyConversation, CLASSIFY_MODEL, type LlmUsage } from "./classifier";
 
 /**
- * La clasificación se detiene con 300k tokens del día UTC; el bot conserva
- * ≥ 1,2M. Tope DURO: ninguna llamada sale sin una
- * reserva de su techo (`reserve_classification_tokens`), y la reserva se niega
- * si consumo del día + techo > tope.
+ * La clasificación se detiene con 300k tokens del día UTC. Tope DURO: ninguna
+ * llamada sale sin una reserva de su techo (`reserve_classification_tokens`),
+ * y la reserva se niega si consumo del día + techo > tope. It is its own
+ * budget: the sum counts classification spend only (event type
+ * 'topic_classification'), and the bot's daily budget does not count it, so
+ * neither can starve the other.
  */
 export const CLASSIFY_DAILY_TOKEN_CAP = 300_000;
 
@@ -69,7 +71,11 @@ interface ConversationRow {
   conversation_id: string;
   workspace_id: string;
   contact_id: string;
-  last_message_at: string;
+  /**
+   * The customer's newest message when the row was picked. The run covers the
+   * customer's messages up to here (classified_until, the backfill cursor).
+   */
+  last_inbound_at: string;
 }
 
 /**
@@ -203,6 +209,12 @@ async function loadTopics(
   return (data ?? []) as PromptTopic[];
 }
 
+/**
+ * The last MAX_PROMPT_MESSAGES messages up to the customer's newest one. Ending
+ * there keeps what made the conversation eligible inside the prompt however
+ * many replies or reminders came after it, and anything the customer writes
+ * after the pick waits for the next run (classified_until stops at the pick).
+ */
 async function loadMessages(
   db: SupabaseClient,
   row: ConversationRow,
@@ -213,6 +225,7 @@ async function loadMessages(
     .select("id, direction, sender_user_id, body, created_at")
     .eq("conversation_id", row.conversation_id)
     .eq("workspace_id", row.workspace_id)
+    .lte("created_at", row.last_inbound_at)
     .order("created_at", { ascending: false })
     .limit(MAX_PROMPT_MESSAGES)
     .abortSignal(dbSignal(deadline));
@@ -241,7 +254,9 @@ async function classifyOne(
   try {
     let matches: Array<{ topic_id: string; message_id: string }> = [];
 
-    if (messages.length > 0) {
+    // Only the customer's messages can carry a topic: with none in view there
+    // is nothing to ask the LLM, and the row is saved as analysed.
+    if (messages.some((m) => m.direction === "in")) {
       // Piso de LLM COMPLETO antes de reservar. Solo
       // se reserva y se llama si queda tiempo para la reserva, los 20 s enteros
       // del LLM y el techo de cada escritura posterior. Con un piso mínimo, la
@@ -297,7 +312,9 @@ async function classifyOne(
         // y lo suma a los recortados. loadMessages ya trae los últimos 60 en
         // orden: son exactamente los que entran al prompt.
         p_window_from: messages[0]?.created_at ?? null,
-        p_truncated_at: messages.filter(isBodyTruncated).map((m) => m.created_at),
+        p_truncated_at: messages
+          .filter((m) => m.direction === "in" && isBodyTruncated(m))
+          .map((m) => m.created_at),
       })
       .abortSignal(dbSignal(deadline));
     if (!error) return { ok: true };
@@ -347,7 +364,7 @@ export async function runClassificationPhase(
         }
         topicsByWorkspace.set(row.workspace_id, topics);
       }
-      const outcome = await classifyOne(db, row, topics, deadline, row.last_message_at, POST_LLM_WRITES_CLASSIFY);
+      const outcome = await classifyOne(db, row, topics, deadline, row.last_inbound_at, POST_LLM_WRITES_CLASSIFY);
 
       if (outcome.ok) {
         result.classified++;
@@ -491,7 +508,7 @@ export async function runBackfillPhase(
           const { error: advErr } = await db
             .rpc("advance_topic_backfill", {
               p_topic_id: topic.id,
-              p_cursor_at: last.last_message_at,
+              p_cursor_at: last.last_inbound_at,
               p_cursor_id: last.conversation_id,
               p_done: false,
             })
@@ -521,7 +538,7 @@ export async function runBackfillPhase(
         const { error: skipErr } = await db
           .rpc("advance_topic_backfill", {
             p_topic_id: topic.id,
-            p_cursor_at: failedRow.last_message_at,
+            p_cursor_at: failedRow.last_inbound_at,
             p_cursor_id: failedRow.conversation_id,
             p_done: false,
           })

@@ -27,7 +27,8 @@ export function TrendTable({ view }: { view: InsightsView }) {
                 </th>
                 {view.weeks.map((w) => (
                   <td key={w} className="p-3 tabular-nums">
-                    {view.trend[t.id]?.[w] ?? 0}
+                    {/* A week before the topic was analysed is unknown, not 0. */}
+                    {t.coveredFromWeek && w < t.coveredFromWeek ? "—" : (view.trend[t.id]?.[w] ?? 0)}
                   </td>
                 ))}
               </tr>

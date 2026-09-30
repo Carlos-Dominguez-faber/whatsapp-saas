@@ -15,8 +15,13 @@ export function TopicRanking({ view }: { view: InsightsView }) {
       <ul className="space-y-2">
         {view.topics.map((t) => (
           <li key={t.id} className="grid grid-cols-[minmax(0,10rem)_1fr_auto] items-center gap-3 text-sm">
-            <span className="truncate" title={t.name}>
-              {t.name}
+            <span className="min-w-0">
+              <span className="block truncate" title={t.name}>
+                {t.name}
+              </span>
+              {t.coveredFromLabel && (
+                <span className="block text-xs text-muted-foreground">desde el {t.coveredFromLabel}</span>
+              )}
             </span>
             <div
               className="h-3 rounded-full bg-muted"

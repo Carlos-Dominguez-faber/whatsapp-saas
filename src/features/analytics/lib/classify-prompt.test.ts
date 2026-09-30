@@ -26,17 +26,31 @@ function msg(i: number, over: Partial<PromptMessage> = {}): PromptMessage {
   };
 }
 
-test("numera los mensajes en orden cronológico y etiqueta cliente, agente y humano", () => {
+test("orden cronológico; solo los mensajes del cliente llevan número", () => {
   const p = buildClassificationPrompt(topics, [
     msg(3, { direction: "out", sender_user_id: "user-1", body: "te llamo" }),
     msg(1, { body: "está caro" }),
     msg(2, { direction: "out", body: "tenemos cuotas" }),
+    msg(4, { body: "¿hay estacionamiento?" }),
   ]);
-  assert.match(p.user, /1\. \[cliente\] está caro/);
-  assert.match(p.user, /2\. \[agente\] tenemos cuotas/);
-  assert.match(p.user, /3\. \[humano\] te llamo/);
-  assert.equal(p.messageKeys.get(1), "m1");
-  assert.equal(p.messageKeys.get(3), "m3");
+  const conv = p.user.split("CONVERSACIÓN\n")[1].split("\n");
+  assert.deepEqual(conv, [
+    "1. [cliente] está caro",
+    "- [agente] tenemos cuotas",
+    "- [humano] te llamo",
+    "2. [cliente] ¿hay estacionamiento?",
+  ]);
+  assert.deepEqual([...p.messageKeys], [[1, "m1"], [2, "m4"]]);
+  assert.match(p.system, /Solo los mensajes del cliente llevan número/);
+});
+
+test("resolveMatches no acepta un número que no sea de un mensaje del cliente", () => {
+  const p = buildClassificationPrompt(topics, [
+    msg(1, { body: "hola" }),
+    msg(2, { direction: "out", body: "tenemos promociones" }),
+  ]);
+  // Only one customer message: 2 is not a key, whatever the model says.
+  assert.deepEqual(resolveMatches({ matches: [{ topic: "T1", message: 2 }] }, p), []);
 });
 
 test("lista el catálogo con claves cortas T1..Tn y las mapea a los ids reales", () => {

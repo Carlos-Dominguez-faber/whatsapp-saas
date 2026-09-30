@@ -48,6 +48,13 @@ CREATE TABLE IF NOT EXISTS public.insight_topics (
   -- conversation_classification.claimed_until. Lo mueven claim_topic_backfill,
   -- release_topic_backfill y el cierre de advance_topic_backfill.
   backfill_claimed_until TIMESTAMPTZ,
+  -- Earliest moment this topic's detections are complete from. The nightly
+  -- run covers what customers write after the topic exists, so it starts at
+  -- created_at; a finished backfill moves it back to the start of the window
+  -- it went through (advance_topic_backfill). get_insights measures a topic
+  -- only from here on: before it, "no detections" means "not analysed", and
+  -- counting it as 0 % would dilute shares and invent deltas.
+  covered_from       TIMESTAMPTZ NOT NULL DEFAULT now(),
   created_by         UUID REFERENCES public.users(id) ON DELETE SET NULL,
   created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -55,6 +62,18 @@ CREATE TABLE IF NOT EXISTS public.insight_topics (
 );
 CREATE INDEX IF NOT EXISTS idx_insight_topics_ws_status
   ON public.insight_topics (workspace_id, status);
+
+-- An install that ran #13's own migrations (20260915000000..02) already has
+-- the table without covered_from. Its topics get the same value they would
+-- have had here: created_at, or the backfill window when it finished.
+ALTER TABLE public.insight_topics ADD COLUMN IF NOT EXISTS covered_from TIMESTAMPTZ;
+UPDATE public.insight_topics
+   SET covered_from = CASE WHEN backfill_status = 'done'
+                           THEN created_at - INTERVAL '30 days'
+                           ELSE created_at END
+ WHERE covered_from IS NULL;
+ALTER TABLE public.insight_topics ALTER COLUMN covered_from SET DEFAULT now();
+ALTER TABLE public.insight_topics ALTER COLUMN covered_from SET NOT NULL;
 
 DROP TRIGGER IF EXISTS trg_insight_topics_updated_at ON public.insight_topics;
 CREATE TRIGGER trg_insight_topics_updated_at
@@ -191,3 +210,26 @@ REVOKE ALL ON public.conversation_topics FROM anon, authenticated;
 GRANT SELECT ON public.insight_topics TO authenticated;
 GRANT SELECT ON public.conversation_topics TO authenticated;
 REVOKE ALL ON public.conversation_classification FROM anon, authenticated;
+
+-- ── Upgrade from #13's own migrations ──────────────────────
+-- No-ops on a fresh install. An install that ran #13 (20260915000000..02):
+--
+-- * Topics are now detected on the CUSTOMER's messages only (see
+--   save_conversation_topics). Detections #13 stored on the agent's or a
+--   person's replies would keep counting under the new rule, so they go.
+-- * Classification spend is its own event type now ('topic_classification'),
+--   outside the bot's daily budget (see reserve_classification_tokens). #13
+--   logged it as 'llm_usage'; moving those rows keeps today's classification
+--   spend inside its own cap, and out of the bot's budget and of the
+--   per-conversation LLM metrics.
+DELETE FROM public.conversation_topics ct
+ USING public.messages m
+ WHERE m.id = ct.evidence_message_id
+   AND m.direction <> 'in';
+
+-- The containment test uses idx_events_payload_gin instead of scanning every
+-- llm_usage row.
+UPDATE public.events
+   SET type = 'topic_classification'
+ WHERE payload @> '{"purpose": "topic_classification"}'
+   AND type = 'llm_usage';

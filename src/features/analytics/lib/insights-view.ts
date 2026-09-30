@@ -12,7 +12,12 @@ interface RawCounts {
 interface RawTopic extends RawCounts {
   id: string;
   name: string;
-  prev_conversations: Num;
+  /** null when the previous period wasn't covered for this topic. */
+  prev_conversations: Num | null;
+  /** Conversations whose customer wrote while the topic was covered. */
+  universe?: Num;
+  /** Set only when the topic's coverage starts inside the range. */
+  covered_from?: string | null;
 }
 
 interface RawTrend {
@@ -36,6 +41,16 @@ export interface RawInsights {
 export interface TopicView {
   id: string;
   name: string;
+  /**
+   * When the topic started being analysed, if that falls inside the range
+   * (formatted in the workspace's zone): its numbers only count from then.
+   * null = the whole range is covered.
+   */
+  coveredFromLabel: string | null;
+  /** Monday (YYYY-MM-DD) of the week coverage starts; earlier weeks show "—". */
+  coveredFromWeek: string | null;
+  /** The topic has no coverage at all in the range. */
+  notCovered: boolean;
   conversations: number;
   sharePct: number | null;
   prevSharePct: number | null;
@@ -100,6 +115,27 @@ function tagPcts(tags: Record<string, Num>, whole: number): Record<string, numbe
   return Object.fromEntries(Object.entries(tags).map(([tag, n]) => [tag, pct(Number(n), whole)]));
 }
 
+function zonedDate(iso: string, tz: string): string {
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: tz,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(new Date(iso));
+}
+
+/** The Monday (YYYY-MM-DD) of the week `iso` falls in, in `tz` — Postgres's date_trunc('week'). */
+function zonedWeekStart(iso: string, tz: string): string {
+  const day = zonedDate(iso, tz);
+  const d = new Date(`${day}T00:00:00Z`);
+  const sinceMonday = (d.getUTCDay() + 6) % 7;
+  return new Date(d.getTime() - sinceMonday * 86_400_000).toISOString().slice(0, 10);
+}
+
+function coveredLabel(iso: string, tz: string): string {
+  return new Date(iso).toLocaleDateString("es-CL", { timeZone: tz, day: "numeric", month: "short" });
+}
+
 function todayStartMs(tz: string, now: Date): number {
   const today = new Intl.DateTimeFormat("en-CA", {
     timeZone: tz,
@@ -124,11 +160,21 @@ export function toInsightsView(raw: RawInsights, tz: string, now: Date = new Dat
   const topics = raw.topics
     .map((t) => {
       const conversations = Number(t.conversations);
-      const sharePct = pct(conversations, universe);
-      const prevSharePct = pct(Number(t.prev_conversations), universePrev);
+      // A topic covered only from mid-range is measured against the customers
+      // who wrote from then on; the rest of the range was never analysed for
+      // it. A payload without `universe` (older SQL) falls back to the range.
+      const topicUniverse = t.universe == null ? universe : Number(t.universe);
+      const coveredFrom = t.covered_from ?? null;
+      const sharePct = pct(conversations, topicUniverse);
+      // No previous-period coverage → no comparison, not a comparison with 0.
+      const prevSharePct =
+        t.prev_conversations == null ? null : pct(Number(t.prev_conversations), universePrev);
       return {
         id: t.id,
         name: t.name,
+        coveredFromLabel: coveredFrom ? coveredLabel(coveredFrom, tz) : null,
+        coveredFromWeek: coveredFrom ? zonedWeekStart(coveredFrom, tz) : null,
+        notCovered: coveredFrom !== null && topicUniverse === 0,
         conversations,
         sharePct,
         prevSharePct,

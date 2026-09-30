@@ -9,6 +9,14 @@
 -- del workspace en el rango. Agregar messages(workspace_id, created_at)
 -- WHERE direction = 'in' si get_insights pasa de ~1 s.
 
+-- COVERAGE. A topic's detections are complete only from its covered_from
+-- (see insight_topics): before it, nothing was analysed for that topic. So
+-- each topic is measured over the part of the range it covers: its share is
+-- "of the conversations whose customer wrote from covered_from on, how many
+-- brought it up", and its previous-period delta only exists when the previous
+-- period is covered too. The summary cards (conversations, bookings,
+-- handoffs) don't depend on classification and keep the whole range.
+-- 'covered_from' comes back per topic only when it cuts into the range.
 CREATE OR REPLACE FUNCTION public.get_insights(
   p_workspace_id UUID,
   p_from TIMESTAMPTZ,
@@ -22,12 +30,15 @@ STABLE
 SET search_path = ''
 AS $$
 WITH
+-- Each conversation whose customer wrote in the range, with the last time
+-- they did (a topic covered from mid-range counts the ones that wrote after).
 universe AS (
-  SELECT DISTINCT m.conversation_id
+  SELECT m.conversation_id, max(m.created_at) AS last_in
     FROM public.messages m
    WHERE m.workspace_id = p_workspace_id
      AND m.direction = 'in'
      AND m.created_at >= p_from AND m.created_at < p_to
+   GROUP BY m.conversation_id
 ),
 prev_universe AS (
   SELECT DISTINCT m.conversation_id
@@ -38,6 +49,7 @@ prev_universe AS (
 ),
 conv AS (
   SELECT u.conversation_id,
+         u.last_in,
          EXISTS (
            SELECT 1 FROM public.appointments a
             WHERE a.conversation_id = u.conversation_id
@@ -87,7 +99,13 @@ tag_list AS (
   SELECT DISTINCT unnest(COALESCE(p_tags, '{}'::text[])) AS tag
 ),
 topics AS (
-  SELECT t.id, t.name
+  SELECT t.id,
+         t.name,
+         t.covered_from,
+         -- Where this topic's measurement starts inside the range.
+         GREATEST(p_from, t.covered_from) AS cov_from,
+         -- The previous period is comparable only if it was covered too.
+         t.covered_from <= p_from - (p_to - p_from) AS prev_covered
     FROM public.insight_topics t
    WHERE t.workspace_id = p_workspace_id AND t.status = 'active'
 ),
@@ -99,13 +117,15 @@ topics AS (
 hits AS (
   SELECT DISTINCT ctp.topic_id, conv.conversation_id, conv.booked, conv.handed_off, conv.tags
     FROM public.conversation_topics ctp
+    JOIN topics tp ON tp.id = ctp.topic_id
     JOIN conv ON conv.conversation_id = ctp.conversation_id
    WHERE ctp.workspace_id = p_workspace_id
-     AND ctp.detected_at >= p_from AND ctp.detected_at < p_to
+     AND ctp.detected_at >= tp.cov_from AND ctp.detected_at < p_to
 ),
 prev_hits AS (
   SELECT ctp.topic_id, count(DISTINCT ctp.conversation_id) AS n
     FROM public.conversation_topics ctp
+    JOIN topics tp ON tp.id = ctp.topic_id AND tp.prev_covered
     -- Sobre prev_conv (filtrado por tenant en el contacto), igual que
     -- hits usa conv. Con prev_universe crudo el numerador incluiría lo que el
     -- denominador (prev_conversations) descarta: porcentajes sobre 100 %.
@@ -135,8 +155,14 @@ SELECT jsonb_build_object(
     SELECT jsonb_agg(jsonb_build_object(
       'id', tp.id,
       'name', tp.name,
+      'covered_from', CASE WHEN tp.covered_from > p_from THEN tp.covered_from END,
+      -- The topic's own denominator: customers who wrote while it was covered.
+      'universe', (SELECT count(*) FROM conv WHERE conv.last_in >= tp.cov_from),
       'conversations', (SELECT count(*) FROM hits h WHERE h.topic_id = tp.id),
-      'prev_conversations', COALESCE((SELECT ph.n FROM prev_hits ph WHERE ph.topic_id = tp.id), 0),
+      -- NULL, not 0, when the previous period wasn't covered: no delta.
+      'prev_conversations', CASE WHEN tp.prev_covered
+                              THEN COALESCE((SELECT ph.n FROM prev_hits ph WHERE ph.topic_id = tp.id), 0)
+                            END,
       'booked', (SELECT count(*) FROM hits h WHERE h.topic_id = tp.id AND h.booked),
       'handed_off', (SELECT count(*) FROM hits h WHERE h.topic_id = tp.id AND h.handed_off),
       'tags', (
@@ -160,11 +186,11 @@ SELECT jsonb_build_object(
           JOIN conv ON conv.conversation_id = ctp.conversation_id
           JOIN topics tp ON tp.id = ctp.topic_id
          WHERE ctp.workspace_id = p_workspace_id
-           AND ctp.detected_at >= p_from AND ctp.detected_at < p_to
+           AND ctp.detected_at >= tp.cov_from AND ctp.detected_at < p_to
          GROUP BY ctp.topic_id, 2
       ) w
   ), '[]'::jsonb),
-  -- Conversaciones del universo con texto que no
+  -- Conversaciones del universo con texto del cliente que no
   -- llegó entero al LLM (tope de 60 mensajes o cuerpo recortado a 800
   -- caracteres) con fecha dentro del rango. Límite declarado; la UI lo avisa.
   'partial_conversations', (
@@ -180,19 +206,25 @@ SELECT jsonb_build_object(
   -- 30 días, o en cuarentena sin entrante posterior al último intento) no se
   -- reporta como pendiente. Si cambia allá, cambia acá.
   'oldest_pending', (
-    SELECT min(c.last_message_at)
+    SELECT min(li.at)
       FROM public.conversations c
       LEFT JOIN public.conversation_classification cc ON cc.conversation_id = c.id
+      CROSS JOIN LATERAL (
+        SELECT m.created_at AS at
+          FROM public.messages m
+         WHERE m.conversation_id = c.id
+           AND m.direction = 'in'
+         ORDER BY m.created_at DESC
+         LIMIT 1
+      ) li
      WHERE c.workspace_id = p_workspace_id
        AND EXISTS (SELECT 1 FROM topics)
-       AND c.last_message_at <  now() - INTERVAL '1 hour'
        AND c.last_message_at >= now() - INTERVAL '30 days'
-       AND c.last_message_at > COALESCE(cc.classified_until, '-infinity'::timestamptz)
-       AND (cc.quarantined_at IS NULL OR EXISTS (
-             SELECT 1 FROM public.messages m
-              WHERE m.conversation_id = c.id
-                AND m.direction = 'in'
-                AND m.created_at > COALESCE(cc.last_attempt_at, cc.quarantined_at)))
+       AND li.at <  now() - INTERVAL '1 hour'
+       AND li.at >= now() - INTERVAL '30 days'
+       AND li.at > COALESCE(cc.classified_until, '-infinity'::timestamptz)
+       AND (cc.quarantined_at IS NULL
+            OR li.at > COALESCE(cc.last_attempt_at, cc.quarantined_at))
   )
 );
 $$;
@@ -229,7 +261,9 @@ AS $$
     LEFT JOIN public.messages msg ON msg.id = ctp.evidence_message_id AND msg.workspace_id = p_workspace_id
    WHERE ctp.workspace_id = p_workspace_id
      AND ctp.topic_id = p_topic_id
-     AND ctp.detected_at >= p_from AND ctp.detected_at < p_to
+     -- The cell counted from the topic's coverage on (get_insights); the list
+     -- behind it must hold the same conversations.
+     AND ctp.detected_at >= GREATEST(p_from, t.covered_from) AND ctp.detected_at < p_to
      AND EXISTS (
        SELECT 1 FROM public.messages m
         WHERE m.conversation_id = ctp.conversation_id

@@ -14,16 +14,30 @@
 -- conversaciones de hace un año, de la más vieja a la más nueva, sin llegar a
 -- ayer. Misma constante que el reprocesamiento.
 
--- La firma cambió (se agregó p_lease_seconds): sin este DROP, CREATE OR REPLACE
--- dejaría las dos versiones como sobrecargas.
+-- ELIGIBILITY IS THE CUSTOMER'S LAST MESSAGE. A conversation is (re)classified
+-- when the customer wrote something new, not when anything happened in it:
+-- conversations.last_message_at also moves on every reply, template and
+-- automation reminder, and classifying on it paid the LLM again for text the
+-- customer never wrote. `last_inbound_at` below is the newest inbound message,
+-- read through idx_messages_conversation; conversations.last_message_at only
+-- pre-filters (a conversation with an inbound in the last 30 days had its
+-- last_message_at moved then).
+--
+-- p_now defaults to now(). The nightly run never passes it; it lets a
+-- simulation drive the real SQL through several nights.
+--
+-- #13 shipped (INT, UUID[], INT) returning last_message_at; the return type
+-- changed, so both older signatures go first.
 DROP FUNCTION IF EXISTS public.select_conversations_to_classify(INT, UUID[]);
+DROP FUNCTION IF EXISTS public.select_conversations_to_classify(INT, UUID[], INT);
 
 CREATE OR REPLACE FUNCTION public.select_conversations_to_classify(
   p_limit INT,
   p_skip_workspaces UUID[] DEFAULT '{}',
-  p_lease_seconds INT DEFAULT 120
+  p_lease_seconds INT DEFAULT 120,
+  p_now TIMESTAMPTZ DEFAULT now()
 )
-RETURNS TABLE (conversation_id UUID, workspace_id UUID, contact_id UUID, last_message_at TIMESTAMPTZ)
+RETURNS TABLE (conversation_id UUID, workspace_id UUID, contact_id UUID, last_inbound_at TIMESTAMPTZ)
 LANGUAGE plpgsql
 VOLATILE
 SET search_path = ''
@@ -38,6 +52,7 @@ DECLARE
   v_limit INT := LEAST(GREATEST(COALESCE(p_limit, 1), 1), 100);
   v_lease INTERVAL := make_interval(secs => LEAST(GREATEST(COALESCE(p_lease_seconds, 120), 0), 600));
   v_skip  UUID[]   := COALESCE(p_skip_workspaces, '{}');
+  v_now   TIMESTAMPTZ := COALESCE(p_now, now());
 BEGIN
   -- Paso 1: sembrar la fila de estado de las candidatas. El lease vive en
   -- conversation_classification, y FOR UPDATE necesita una fila que bloquear.
@@ -51,61 +66,78 @@ BEGIN
   INSERT INTO public.conversation_classification (conversation_id, workspace_id, attempts, updated_at)
   SELECT c.id, c.workspace_id, 0, now()
     FROM public.conversations c
-   WHERE c.last_message_at IS NOT NULL
-     AND c.last_message_at <  now() - INTERVAL '1 hour'
-     AND c.last_message_at >= now() - INTERVAL '30 days'
+    CROSS JOIN LATERAL (
+      SELECT m.created_at AS at
+        FROM public.messages m
+       WHERE m.conversation_id = c.id
+         AND m.direction = 'in'
+       ORDER BY m.created_at DESC
+       LIMIT 1
+    ) li
+   WHERE c.last_message_at >= v_now - INTERVAL '30 days'
+     AND li.at <  v_now - INTERVAL '1 hour'
+     AND li.at >= v_now - INTERVAL '30 days'
      AND NOT (c.workspace_id = ANY (v_skip))
      AND NOT EXISTS (SELECT 1 FROM public.conversation_classification cc
                       WHERE cc.conversation_id = c.id)
      AND EXISTS (SELECT 1 FROM public.insight_topics t
                   WHERE t.workspace_id = c.workspace_id AND t.status = 'active')
-   ORDER BY c.last_message_at DESC, c.id DESC
+   ORDER BY li.at DESC, c.id DESC
    LIMIT v_limit
   ON CONFLICT (conversation_id) DO NOTHING;
 
   -- Paso 2: reclamar. SKIP LOCKED deja que dos corridas simultáneas se
   -- repartan el trabajo en vez de pelearlo; claimed_until hace que la segunda
   -- ni siquiera vea lo que la primera está procesando.
-  -- La elegibilidad de abajo (cortes de 1 h y 30 días, classified_until
-  -- y liberación de cuarentena) está DUPLICADA en `oldest_pending` de
-  -- get_insights (20261002000002_get_insights.sql). Cambiar una sin la otra
-  -- hace que el dashboard reporte pendientes que el cron nunca va a tomar.
+  -- La elegibilidad de abajo (cortes de 1 h y 30 días sobre el último
+  -- ENTRANTE, classified_until y liberación de cuarentena) está DUPLICADA en
+  -- `oldest_pending` de get_insights (20261002000002_get_insights.sql).
+  -- Cambiar una sin la otra hace que el dashboard reporte pendientes que el
+  -- cron nunca va a tomar.
   RETURN QUERY
   WITH claimable AS (
-    SELECT cc.conversation_id AS id
+    SELECT cc.conversation_id AS id, li.at AS last_in
       FROM public.conversation_classification cc
       JOIN public.conversations c ON c.id = cc.conversation_id
-     WHERE c.last_message_at IS NOT NULL
-       AND c.last_message_at <  now() - INTERVAL '1 hour'
-       AND c.last_message_at >= now() - INTERVAL '30 days'
-       AND c.last_message_at >  COALESCE(cc.classified_until, '-infinity'::timestamptz)
-       AND (cc.claimed_until IS NULL OR cc.claimed_until <= now())
+      CROSS JOIN LATERAL (
+        SELECT m.created_at AS at
+          FROM public.messages m
+         WHERE m.conversation_id = c.id
+           AND m.direction = 'in'
+         ORDER BY m.created_at DESC
+         LIMIT 1
+      ) li
+     WHERE c.last_message_at >= v_now - INTERVAL '30 days'
+       AND li.at <  v_now - INTERVAL '1 hour'
+       AND li.at >= v_now - INTERVAL '30 days'
+       AND li.at >  COALESCE(cc.classified_until, '-infinity'::timestamptz)
+       AND (cc.claimed_until IS NULL OR cc.claimed_until <= v_now)
        -- Cuarentena liberable: solo si llegó un ENTRANTE después del último
        -- intento. Mirar quarantined_at no alcanza.
-       AND (cc.quarantined_at IS NULL OR EXISTS (
-             SELECT 1 FROM public.messages m
-              WHERE m.conversation_id = c.id
-                AND m.direction = 'in'
-                AND m.created_at > COALESCE(cc.last_attempt_at, cc.quarantined_at)))
+       AND (cc.quarantined_at IS NULL
+            OR li.at > COALESCE(cc.last_attempt_at, cc.quarantined_at))
        AND NOT (c.workspace_id = ANY (v_skip))
        AND EXISTS (SELECT 1 FROM public.insight_topics t
                     WHERE t.workspace_id = c.workspace_id AND t.status = 'active')
-     ORDER BY c.last_message_at DESC, c.id DESC
+     ORDER BY li.at DESC, c.id DESC
      LIMIT v_limit
      FOR UPDATE OF cc SKIP LOCKED
   ),
   claimed AS (
     UPDATE public.conversation_classification cc2
-       SET claimed_until = now() + v_lease,
+       SET claimed_until = v_now + v_lease,
            updated_at    = now()
       FROM claimable k
      WHERE cc2.conversation_id = k.id
     RETURNING cc2.conversation_id AS id
   )
-  SELECT c.id, c.workspace_id, c.contact_id, c.last_message_at
+  -- last_inbound_at is what the caller passes back as classified_until: the
+  -- run covers the customer's messages up to it.
+  SELECT c.id, c.workspace_id, c.contact_id, k.last_in
     FROM claimed cl
+    JOIN claimable k ON k.id = cl.id
     JOIN public.conversations c ON c.id = cl.id
-   ORDER BY c.last_message_at DESC, c.id DESC;
+   ORDER BY k.last_in DESC, c.id DESC;
 END;
 $$;
 
@@ -145,11 +177,14 @@ BEGIN
       FROM public.conversation_classification cc
      WHERE cc.conversation_id = p_conversation_id;
   END IF;
+  -- Only the customer's messages: they are the only ones a topic can be
+  -- detected on, so only their text left out makes the analysis partial.
   IF p_window_from IS NOT NULL THEN
     SELECT min(msg.created_at), max(msg.created_at) INTO v_pfrom, v_puntil
       FROM public.messages msg
      WHERE msg.conversation_id = p_conversation_id
        AND msg.workspace_id = p_workspace_id
+       AND msg.direction = 'in'
        AND msg.created_at < p_window_from
        AND msg.created_at > COALESCE(v_prev, '-infinity'::timestamptz);
   END IF;
@@ -170,10 +205,15 @@ BEGIN
       FROM m
       JOIN public.insight_topics t
         ON t.id = m.topic_id AND t.workspace_id = p_workspace_id AND t.status = 'active'
+      -- Evidence is always something the CUSTOMER wrote. The prompt only
+      -- numbers their lines, and this join drops anything else a caller
+      -- passes: a topic the bot or a person brought up is not what the
+      -- customer asked about.
       JOIN public.messages msg
         ON msg.id = m.message_id
        AND msg.conversation_id = p_conversation_id
        AND msg.workspace_id = p_workspace_id
+       AND msg.direction = 'in'
     ON CONFLICT (conversation_id, topic_id, evidence_message_id) DO NOTHING
     RETURNING 1
   )
@@ -273,43 +313,69 @@ BEGIN
 END;
 $$;
 
-CREATE OR REPLACE FUNCTION public.next_backfill_batch(p_topic_id UUID, p_limit INT)
-RETURNS TABLE (conversation_id UUID, workspace_id UUID, contact_id UUID, last_message_at TIMESTAMPTZ)
+-- The backfill walks the conversations whose customer last wrote in the 30
+-- days before the topic existed; the nightly run covers everything they write
+-- after that, with the topic already in the catalog. Both sides split on the
+-- LAST INBOUND message, so a reply or a reminder sent after the topic was
+-- created can't move a conversation out of the backfill without the nightly
+-- run picking it up (it only runs on new customer messages).
+-- #13 shipped (UUID, INT) returning last_message_at.
+DROP FUNCTION IF EXISTS public.next_backfill_batch(UUID, INT);
+
+CREATE OR REPLACE FUNCTION public.next_backfill_batch(
+  p_topic_id UUID,
+  p_limit INT,
+  p_now TIMESTAMPTZ DEFAULT now()
+)
+RETURNS TABLE (conversation_id UUID, workspace_id UUID, contact_id UUID, last_inbound_at TIMESTAMPTZ)
 LANGUAGE sql
 STABLE
 SET search_path = ''
 AS $$
-  SELECT c.id, c.workspace_id, c.contact_id, c.last_message_at
+  SELECT c.id, c.workspace_id, c.contact_id, li.at
   FROM public.insight_topics t
   JOIN public.conversations c ON c.workspace_id = t.workspace_id
+  CROSS JOIN LATERAL (
+    SELECT m.created_at AS at
+      FROM public.messages m
+     WHERE m.conversation_id = c.id
+       AND m.direction = 'in'
+     ORDER BY m.created_at DESC
+     LIMIT 1
+  ) li
   WHERE t.id = p_topic_id
     AND t.status = 'active'
     AND t.backfill_status = 'pending'
+    -- Pre-filter only (see select_conversations_to_classify).
+    AND c.last_message_at >= GREATEST(t.created_at, COALESCE(p_now, now())) - INTERVAL '30 days'
     -- Mismo corte de 30 días que la fase normal. El GREATEST evita que un
     -- tema viejo que quedó `pending` reprocese histórico ya fuera de alcance.
     -- Si cambia este piso, cambiar también la rama 'expired' de
-    -- advance_topic_backfill, que deduce de él si la ventana venció.
-    AND c.last_message_at >= GREATEST(t.created_at - INTERVAL '30 days', now() - INTERVAL '30 days')
-    AND c.last_message_at <= t.created_at
+    -- advance_topic_backfill, que deduce de él si la ventana venció, y el
+    -- covered_from que escribe al terminar.
+    AND li.at >= GREATEST(t.created_at - INTERVAL '30 days', COALESCE(p_now, now()) - INTERVAL '30 days')
+    AND li.at <= t.created_at
     -- Cursor DESCENDENTE: lo más reciente primero, igual que la fase normal.
-    AND (c.last_message_at, c.id) < (
+    AND (li.at, c.id) < (
       COALESCE(t.backfill_cursor_at, 'infinity'::timestamptz),
       COALESCE(t.backfill_cursor_id, 'ffffffff-ffff-ffff-ffff-ffffffffffff'::uuid)
     )
-  ORDER BY c.last_message_at DESC, c.id DESC
+  ORDER BY li.at DESC, c.id DESC
   LIMIT LEAST(GREATEST(COALESCE(p_limit, 1), 1), 100);
 $$;
 
 -- Devuelve el backfill_status resultante para que el caller distinga
 -- "terminado" de "ventana vencida". Cambió el tipo de retorno (era VOID):
 -- CREATE OR REPLACE no puede cambiarlo, de ahí el DROP.
+-- p_now: same as in next_backfill_batch.
 DROP FUNCTION IF EXISTS public.advance_topic_backfill(UUID, TIMESTAMPTZ, UUID, BOOLEAN);
 
 CREATE OR REPLACE FUNCTION public.advance_topic_backfill(
   p_topic_id UUID,
   p_cursor_at TIMESTAMPTZ,
   p_cursor_id UUID,
-  p_done BOOLEAN
+  p_done BOOLEAN,
+  p_now TIMESTAMPTZ DEFAULT now()
 )
 RETURNS TEXT
 LANGUAGE plpgsql
@@ -327,6 +393,7 @@ DECLARE
   v_id     UUID;
   v_moves  BOOLEAN;
   v_status TEXT;
+  v_now    TIMESTAMPTZ := COALESCE(p_now, now());
 BEGIN
   SELECT t.backfill_cursor_at, t.backfill_cursor_id INTO v_at, v_id
     FROM public.insight_topics t
@@ -354,8 +421,19 @@ BEGIN
            -- salió vacío porque la ventana se venció, no porque se terminó.
            -- El vencimiento es deliberado (el dashboard no mira más de 30 días);
            -- lo que no puede pasar es llamarlo 'done'. Mismo 30 d que arriba.
-           WHEN t.created_at < now() - INTERVAL '30 days' THEN 'expired'
+           WHEN t.created_at < v_now - INTERVAL '30 days' THEN 'expired'
            ELSE 'done'
+         END,
+         -- A finished backfill went through every conversation whose customer
+         -- last wrote from the window's floor NOW on (the floor rises with
+         -- the clock, and the walk is newest first, so what fell below it was
+         -- never classified): the topic is complete from that floor. An
+         -- expired one covers nothing before created_at.
+         covered_from = CASE
+           WHEN p_done IS TRUE AND t.created_at >= v_now - INTERVAL '30 days'
+             THEN LEAST(t.covered_from,
+                        GREATEST(t.created_at - INTERVAL '30 days', v_now - INTERVAL '30 days'))
+           ELSE t.covered_from
          END
    WHERE t.id = p_topic_id
   RETURNING t.backfill_status INTO v_status;
@@ -419,18 +497,24 @@ AS $$
 $$;
 
 -- El tope diario de la clasificación es DURO.
--- Consultar sum_daily_llm_tokens y recién después de la llamada insertar el
+-- Consultar el consumo y recién después de la llamada insertar el
 -- consumo no alcanza: dos corridas con trabajo disjunto verían 299.999 y
 -- autorizarían cada una su llamada (319.999), un INSERT caído dejaría el
 -- gasto fuera de la cuenta en cada corrida, y un timeout sin `usage` no se
 -- contaría nunca. Mismo patrón que reserve_llm_turn: bajo un
 -- lock por workspace, en UNA llamada, se suma el día y, si el techo estimado
--- cabe, se inserta la fila de llm_usage con ese techo. settle_classification_tokens
+-- cabe, se inserta la fila con ese techo. settle_classification_tokens
 -- la liquida después con el consumo real; si nunca se liquida (corte, caída),
 -- queda la estimación, que es un techo. NULL = no cabe.
 -- El lock no se sostiene durante la llamada al LLM: dura esta transacción.
--- Sin contact_id en el payload a propósito: así la clasificación no consume
--- el tope por contacto del bot.
+--
+-- ITS OWN BUDGET. The cap counts classification spend only, and that spend
+-- is logged as type 'topic_classification', which sum_daily_llm_tokens (the
+-- bot's daily budget) does not add up. Sharing one sum made each side starve
+-- the other: a busy bot left no room to classify, and a night of
+-- classification pushed the next day's bot toward its degrade threshold. The
+-- workspace's worst-case day is the bot's cap plus this one. Nor does it
+-- count as an agent turn: no contact_id, and not an 'llm_usage' row.
 CREATE OR REPLACE FUNCTION public.reserve_classification_tokens(
   p_workspace_id UUID,
   p_conversation_id UUID,
@@ -443,7 +527,8 @@ SECURITY DEFINER
 SET search_path = ''
 AS $$
 DECLARE
-  v_id UUID;
+  v_id   UUID;
+  v_used BIGINT;
 BEGIN
   -- Una estimación nula o no positiva reservaría sin contar nada.
   IF p_estimate IS NULL OR p_estimate <= 0 OR p_cap IS NULL THEN
@@ -459,14 +544,24 @@ BEGIN
   -- Espacio de claves propio: no compite con reserve_llm_turn (workspace:contacto).
   PERFORM pg_advisory_xact_lock(hashtextextended('classify_budget:' || p_workspace_id::text, 0));
 
-  -- Mismo día UTC y misma suma que el resto del presupuesto de LLM.
-  IF public.sum_daily_llm_tokens(p_workspace_id, date_trunc('day', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC')
-     + p_estimate > p_cap THEN
+  -- The UTC day, like the bot's budget; the same guard on total_tokens as
+  -- sum_daily_llm_tokens, so one malformed row can't break the sum.
+  SELECT COALESCE(SUM(
+           CASE WHEN e.payload->>'total_tokens' ~ '^[0-9]{1,12}$'
+                THEN (e.payload->>'total_tokens')::bigint
+                ELSE 0 END), 0)
+    INTO v_used
+    FROM public.events e
+   WHERE e.workspace_id = p_workspace_id
+     AND e.type = 'topic_classification'
+     AND e.created_at >= date_trunc('day', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC';
+
+  IF v_used + p_estimate > p_cap THEN
     RETURN NULL;
   END IF;
 
   INSERT INTO public.events (type, level, workspace_id, conversation_id, payload)
-  VALUES ('llm_usage', 'info', p_workspace_id, p_conversation_id,
+  VALUES ('topic_classification', 'info', p_workspace_id, p_conversation_id,
           jsonb_build_object(
             'purpose', 'topic_classification',
             'reserved', true,
@@ -479,7 +574,7 @@ $$;
 
 -- Liquida UNA vez (reserved pasa a false) y solo una reserva de clasificación
 -- del mismo workspace. Los negativos se llevan a 0: un total negativo no
--- calza con el ^[0-9]+$ de sum_daily_llm_tokens, y la fila pasaría a contar 0
+-- calza con el ^[0-9]{1,12}$ de la suma, y la fila pasaría a contar 0
 -- en vez de su estimación.
 CREATE OR REPLACE FUNCTION public.settle_classification_tokens(
   p_reservation_id UUID,
@@ -507,30 +602,29 @@ AS $$
       FROM v
      WHERE e.id = p_reservation_id
        AND e.workspace_id = p_workspace_id
-       AND e.type = 'llm_usage'
-       AND e.payload->>'purpose' = 'topic_classification'
+       AND e.type = 'topic_classification'
        AND e.payload->>'reserved' = 'true'
     RETURNING 1
   )
   SELECT EXISTS (SELECT 1 FROM settled);
 $$;
 
-REVOKE ALL ON FUNCTION public.select_conversations_to_classify(INT, UUID[], INT) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.select_conversations_to_classify(INT, UUID[], INT, TIMESTAMPTZ) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.save_conversation_topics(UUID, UUID, JSONB, TIMESTAMPTZ, TIMESTAMPTZ, TIMESTAMPTZ[]) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.record_classification_failure(UUID, UUID, TEXT) FROM PUBLIC, anon, authenticated;
-REVOKE ALL ON FUNCTION public.next_backfill_batch(UUID, INT) FROM PUBLIC, anon, authenticated;
-REVOKE ALL ON FUNCTION public.advance_topic_backfill(UUID, TIMESTAMPTZ, UUID, BOOLEAN) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.next_backfill_batch(UUID, INT, TIMESTAMPTZ) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.advance_topic_backfill(UUID, TIMESTAMPTZ, UUID, BOOLEAN, TIMESTAMPTZ) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.record_backfill_failure(UUID) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.claim_topic_backfill(UUID, INT) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.release_topic_backfill(UUID) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.reserve_classification_tokens(UUID, UUID, INT, BIGINT) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.settle_classification_tokens(UUID, UUID, TEXT, INT, INT) FROM PUBLIC, anon, authenticated;
 
-GRANT EXECUTE ON FUNCTION public.select_conversations_to_classify(INT, UUID[], INT) TO service_role;
+GRANT EXECUTE ON FUNCTION public.select_conversations_to_classify(INT, UUID[], INT, TIMESTAMPTZ) TO service_role;
 GRANT EXECUTE ON FUNCTION public.save_conversation_topics(UUID, UUID, JSONB, TIMESTAMPTZ, TIMESTAMPTZ, TIMESTAMPTZ[]) TO service_role;
 GRANT EXECUTE ON FUNCTION public.record_classification_failure(UUID, UUID, TEXT) TO service_role;
-GRANT EXECUTE ON FUNCTION public.next_backfill_batch(UUID, INT) TO service_role;
-GRANT EXECUTE ON FUNCTION public.advance_topic_backfill(UUID, TIMESTAMPTZ, UUID, BOOLEAN) TO service_role;
+GRANT EXECUTE ON FUNCTION public.next_backfill_batch(UUID, INT, TIMESTAMPTZ) TO service_role;
+GRANT EXECUTE ON FUNCTION public.advance_topic_backfill(UUID, TIMESTAMPTZ, UUID, BOOLEAN, TIMESTAMPTZ) TO service_role;
 GRANT EXECUTE ON FUNCTION public.record_backfill_failure(UUID) TO service_role;
 GRANT EXECUTE ON FUNCTION public.claim_topic_backfill(UUID, INT) TO service_role;
 GRANT EXECUTE ON FUNCTION public.release_topic_backfill(UUID) TO service_role;

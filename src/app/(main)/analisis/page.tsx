@@ -67,6 +67,17 @@ export default async function AnalisisPage({
         </p>
       )}
 
+      {view.topics.some((t) => t.coveredFromLabel) && (
+        <p
+          role="status"
+          data-testid="coverage-notice"
+          className="rounded-lg border border-border bg-muted p-3 text-sm text-muted-foreground"
+        >
+          Algunos temas se empezaron a analizar dentro de este período: sus números cuentan desde la
+          fecha que aparece junto a cada uno, y sin comparación con el período anterior.
+        </p>
+      )}
+
       {/* Límite declarado (60 mensajes, 800 caracteres por mensaje). */}
       {partialNotice && view.universe > 0 && (
         <p
