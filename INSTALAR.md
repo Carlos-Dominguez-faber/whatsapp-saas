@@ -161,8 +161,7 @@ node scripts/setup.mjs cron-apply
 
 Agenda tres jobs: `buffer-flush` (responde los mensajes) y `automations` (corre las
 automatizaciones), cada minuto, y `classify-topics` (el análisis de temas de
-**Análisis**), cada 5 minutos entre las 04:00 y las 08:59 UTC; mientras nadie cree
-un tema no gasta nada. Usa el `SUPABASE_ACCESS_TOKEN` del paso 7
+**Análisis**), cada 5 minutos; mientras nadie cree un tema no gasta nada. Usa el `SUPABASE_ACCESS_TOKEN` del paso 7
 para agendarlos vía Management API e imprime la verificación. Correrlo otra vez no
 duplica nada: actualiza los jobs existentes. Si no hay token, cae al camino manual: corre
 `node scripts/setup.mjs cron-sql` y pega el SQL en **Supabase → SQL Editor → Run**.
@@ -693,14 +692,26 @@ pantalla de Análisis funciona pero nunca se analiza nada (avisa que hay
 conversaciones sin analizar).
 
 - **Análisis** (`/analisis`, en el menú de arriba): un admin o manager crea hasta 10
-  temas (un nombre y qué debe detectar). Entre las 04:00 y las 08:59 UTC, cada 5
-  minutos, el job `classify-topics` lee las conversaciones en las que el **cliente**
-  escribió algo nuevo (una hora después de su último mensaje) y marca qué temas
-  plantea. Solo cuenta lo que escribe el cliente: lo que dicen el agente o el equipo es
-  contexto, y una respuesta o un recordatorio no hacen que se vuelva a analizar. El
-  tablero muestra hasta ayer: conversaciones, cuántas agendaron y cuántas se
-  derivaron, el ranking de temas, la tendencia por semana y el cruce con etiquetas;
-  cada celda abre las conversaciones de evidencia. Cualquier miembro lo ve.
+  temas (un nombre y qué debe detectar; no puede haber dos activos con el mismo
+  nombre, sin contar mayúsculas ni acentos). Cada 5 minutos, el job `classify-topics`
+  lee las conversaciones en las que el **cliente** escribió algo nuevo (una hora
+  después de su último mensaje; primero lo más antiguo, turnándose entre workspaces)
+  y marca qué temas plantea. Solo cuenta lo que escribe el cliente: lo que dicen el
+  agente o el equipo es contexto, las notas internas nunca se mandan al modelo, y una
+  respuesta o un recordatorio no hacen que se vuelva a analizar. El tablero muestra
+  hasta ayer: conversaciones, cuántas agendaron y cuántas se derivaron, el ranking de
+  temas, la tendencia por semana y el cruce con etiquetas; cada celda abre las
+  conversaciones de evidencia. Cualquier miembro lo ve.
+- **Solo cuenta lo analizado.** Un tema se mide sobre las conversaciones ya leídas
+  ("sobre N de M analizadas"); las que faltan no cuentan ni a favor ni en contra, y el
+  tablero dice cuántas faltan y por qué: pendientes (se leen en las próximas horas),
+  que fallaron tres veces (se reintentan si el cliente vuelve a escribir) o de más de
+  30 días (ya no se leerán).
+- **Si la clave de OpenRouter de un workspace falla** (sin créditos, revocada), ese
+  workspace se salta y los demás siguen. Solo si la misma falla aparece en dos
+  workspaces la corrida se detiene (es el proveedor o la clave de la agencia). Un
+  mensaje que el modelo rechaza espera una hora (dos, la segunda vez) antes del
+  siguiente intento; al tercer fallo queda apartado.
 - **Costo:** usa `openai/gpt-4o-mini` por OpenRouter, con la clave del workspace (o
   la de la agencia), y tiene un tope propio de **300,000 tokens por día** (UTC) por
   workspace, unos USD 0.05 a 0.10. **No cuenta en el presupuesto diario del agente**:
@@ -714,9 +725,15 @@ conversaciones sin analizar).
   termina, o si el tema se creó dentro del período que estás viendo, se mide solo
   desde la fecha que aparece junto a él, y sin comparación con el período anterior:
   antes de esa fecha no se analizó, y contarlo como 0 % daría números falsos.
-- **Capacidad:** cada corrida analiza entre 5 y 10 conversaciones (depende de lo que
-  tarde el modelo), unas 300 a 600 por noche entre todos los workspaces de la
-  instalación. Si reciben más, el tablero avisa que hay conversaciones sin analizar.
+- **Capacidad:** cada corrida lee unas 15 a 20 conversaciones (depende de lo que
+  tarde el modelo); cada 5 minutos, eso son miles al día en toda la instalación. El
+  límite real es el tope de 300,000 tokens diarios de cada workspace: unas 200
+  conversaciones al día (a unos 1,500 tokens cada una). Si un workspace recibe más, lo
+  que no cabe espera al día siguiente (lo más antiguo primero) y el tablero muestra
+  cuántas faltan. Para correrlo solo de noche, cambia la línea `'*/5 * * * *'` de
+  `supabase/cron/schedule-classify-topics.sql` por `'*/5 4-8 * * *'` y vuelve a correr
+  `cron-apply`: gasta algo menos, pero lo de ayer llega incompleto a la mañana y se
+  completa la noche siguiente.
 - **Para apagarlo:** `select cron.unschedule('classify-topics');` en el SQL Editor.
   Sin temas activos tampoco gasta nada.
 - **`/probar`:** una pantalla con solo el chat del agente, para que alguien lo pruebe
@@ -728,18 +745,29 @@ conversaciones sin analizar).
   - Solo corren las herramientas de consulta (ver disponibilidad, consultas de n8n),
     también para un admin: desde ahí nadie agenda, cancela ni escribe en un CRM.
   - Hasta 20 mensajes por persona y 60 por workspace cada hora, de hasta 1,000
-    caracteres. Cuentan en el presupuesto diario y se pausan desde los 800,000
-    tokens, igual que la prueba de agentes.
+    caracteres, y **100,000 tokens al día** por workspace (UTC). Cada mensaje reserva
+    antes lo más que puede gastar (dos pasos del modelo con el prompt completo y 500
+    tokens de respuesta); lo reservado de un mensaje en curso cuenta, y al terminar
+    se ajusta a lo real. Alcanza para unos 30 mensajes al día con un prompt de
+    4 KB, 19 con uno de 10 KB y 11 con uno de 20 KB. También cuentan en el presupuesto diario del workspace: se
+    pausan desde los 800,000 tokens, y un mensaje que llevaría al workspace a ese
+    umbral se rechaza, para que `/probar` nunca haga que el agente atienda a clientes
+    con el modelo barato.
+  - Si el agente no responde nada, la pantalla lo dice y el mensaje vuelve a la caja
+    de texto.
   - **No aísla datos.** Solo esconde el menú: con la misma cuenta se pueden abrir el
     inbox, el dashboard y los prompts. Si se la das a alguien de fuera, hazlo en un
     workspace de demostración, sin conversaciones reales.
   - Si alguien abre el enlace sin sesión, al entrar vuelve a `/probar`.
 - **La clave pública (`anon`) ya no tiene permisos sobre ninguna tabla.** Es la
   clave que viaja en el navegador; hasta ahora solo las políticas de RLS impedían que
-  leyera algo. La app no la usa sin sesión. Las tablas que se creen después tampoco se
-  los dan. Si agregaste tablas propias que leías sin sesión, tendrás que darle el
-  permiso a mano (`grant select on public.tu_tabla to anon;`) y pensar si de verdad
-  quieres eso.
+  leyera algo. La app no la usa sin sesión. Las tablas que creen las migraciones
+  (como `postgres`) tampoco se los dan. Las que crees desde el editor de tablas de
+  Supabase Studio sí los reciben (las crea otro rol, `supabase_admin`, cuyos permisos
+  por defecto no se pueden cambiar desde aquí): quítaselos con
+  `revoke all on public.tu_tabla from anon;`. Si agregaste tablas propias que leías
+  sin sesión, tendrás que darle el permiso a mano (`grant select on public.tu_tabla to
+  anon;`) y pensar si de verdad quieres eso.
 - **Historial de automatizaciones: 30 días.** Un job de pg_cron que agenda el propio
   `db-push` (`automation-history-purge`, cada hora) borra las ejecuciones terminadas
   y los eventos sin ejecución de más de 30 días. Nunca borra una ejecución en cola ni
