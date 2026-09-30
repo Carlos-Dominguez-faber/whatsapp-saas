@@ -93,6 +93,8 @@ test("con appointment en el contexto, los marcadores de cita resuelven la fecha 
         time: "15:00",
         scheduledAt: "2026-09-09T21:00:00.000Z",
         hlAppointmentId: null,
+        calcomBookingUid: null,
+        isCalCom: false,
       },
     }),
     ["martes 9 de septiembre", "15:00"],
@@ -183,6 +185,8 @@ test("con appointmentId y cita legible, la fecha y hora salen formateadas en la 
     time: "20:00",
     scheduledAt: "2026-09-08T23:00:00.000Z",
     hlAppointmentId: null,
+    calcomBookingUid: null,
+    isCalCom: false,
   });
 });
 
