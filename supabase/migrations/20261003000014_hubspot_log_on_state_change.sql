@@ -11,7 +11,8 @@
 -- version the conversation had BEFORE the change (OLD.state_version; the
 -- BEFORE trigger trg_conversations_state_version bumps NEW). Queued only when
 -- HubSpot is an enabled CRM of the workspace. A failure never breaks the
--- transition: it is a WARNING.
+-- transition: it is a WARNING and, best effort, a hubspot_log_enqueue_failed
+-- event.
 -- SECURITY DEFINER: the table is service-role only, and a member's own
 -- update of a conversation must still queue its entry.
 -- ============================================================================
@@ -37,6 +38,15 @@ BEGIN
   RETURN NULL;
 EXCEPTION WHEN OTHERS THEN
   RAISE WARNING 'hubspot_log_enqueue_failed: %', SQLERRM;
+  -- Visible where people look, not only in the database log: an event, best
+  -- effort (its own failure is swallowed too; the transition stands).
+  BEGIN
+    INSERT INTO public.events (type, level, workspace_id, conversation_id, payload)
+    VALUES ('hubspot_log_enqueue_failed', 'error', NEW.workspace_id, NEW.id,
+            jsonb_build_object('provider', 'hubspot', 'to', NEW.state, 'code', SQLSTATE));
+  EXCEPTION WHEN OTHERS THEN
+    NULL;
+  END;
   RETURN NULL;
 END;
 $$;

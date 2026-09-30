@@ -5,7 +5,7 @@ BEGIN;
 CREATE EXTENSION IF NOT EXISTS pgtap WITH SCHEMA extensions;
 SET search_path = public, extensions;
 
-SELECT plan(35);
+SELECT plan(37);
 
 -- ── privileges: the queue and its RPCs are service role only ────────────────
 SELECT ok(NOT has_table_privilege('anon', 'public.hubspot_conversation_logs', 'SELECT'),
@@ -94,6 +94,22 @@ SELECT is(public.enqueue_hubspot_conversation_log('e0000000-0000-4000-8000-00000
 UPDATE public.conversations SET state = 'handoff_pending' WHERE id = 'e0000000-0000-4000-8000-0000000000a3';
 SELECT is((SELECT count(*)::INT FROM public.hubspot_conversation_logs WHERE conversation_id = 'e0000000-0000-4000-8000-0000000000a3'),
   0, 'a workspace without HubSpot queues nothing');
+-- A failed enqueue never breaks the transition, and leaves an event. (A
+-- trigger that rejects every insert into the queue stands in for a failure.)
+CREATE FUNCTION pg_temp.reject_log() RETURNS trigger LANGUAGE plpgsql AS $f$
+BEGIN RAISE EXCEPTION 'queue down'; END $f$;
+CREATE TRIGGER trg_reject_log BEFORE INSERT ON public.hubspot_conversation_logs
+  FOR EACH ROW EXECUTE FUNCTION pg_temp.reject_log();
+INSERT INTO public.contacts (id, workspace_id, phone) VALUES
+  ('e0000000-0000-4000-8000-0000000000c4', 'e0000000-0000-4000-8000-000000000001', '+15550002004');
+INSERT INTO public.conversations (id, workspace_id, contact_id) VALUES
+  ('e0000000-0000-4000-8000-0000000000a4', 'e0000000-0000-4000-8000-000000000001', 'e0000000-0000-4000-8000-0000000000c4');
+SELECT lives_ok($$ UPDATE public.conversations SET state = 'handoff_pending' WHERE id = 'e0000000-0000-4000-8000-0000000000a4' $$,
+  'a failed enqueue never breaks the transition');
+SELECT is((SELECT count(*)::INT FROM public.events WHERE type = 'hubspot_log_enqueue_failed'
+            AND conversation_id = 'e0000000-0000-4000-8000-0000000000a4'), 1, 'and leaves an event');
+DROP TRIGGER trg_reject_log ON public.hubspot_conversation_logs;
+
 -- Out of the way of the claim and portal tests below.
 UPDATE public.hubspot_conversation_logs SET status = 'done'
  WHERE conversation_id = 'e0000000-0000-4000-8000-0000000000a2';
