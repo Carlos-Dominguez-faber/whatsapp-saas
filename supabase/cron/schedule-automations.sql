@@ -21,7 +21,7 @@
 -- finish instead of being cut mid-call. In normal operation ticks do not
 -- overlap; an overlap is harmless (FOR UPDATE SKIP LOCKED in the claim,
 -- UNIQUE (rule_id, event_id) in the expansion) -- see route.ts. The explicit
--- timeout_milliseconds := 55000 replaces pg_net's 2 s default, which
+-- timeout_milliseconds := 55000 replaces pg_net's 5 s default, which
 -- would close Postgres' side of the request almost immediately. (Vercel does
 -- NOT kill the function when pg_net hangs up -- schedule-buffer-flush.sql
 -- relies on that -- so the risk this closes is not "the

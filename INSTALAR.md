@@ -887,6 +887,12 @@ sigue haciendo falta si no lo has corrido).
   entrega los lotes o los mensajes sin lote), responde **500** con el código de la
   fase en `net._http_response`, aunque el resto del tick sí haya corrido. Un lote que
   falla sigue siendo un 200.
+- **Cron `buffer-flush`, timeout:** la plantilla ahora espera la respuesta hasta
+  305 s. Antes no fijaba ninguno y pg_net colgaba a los 5 s: la función seguía
+  corriendo en Vercel, pero cualquier tick de más de 5 s (uno con un turno del agente,
+  o un arranque en frío) quedaba en `net._http_response` sin código, incluido ese 500.
+  **Después de actualizar, vuelve a correr `node scripts/setup.mjs cron-apply`** (o
+  `cron-sql` y pégalo en el SQL Editor): reagenda el job en su lugar, sin duplicarlo.
 
 **Si instalaste desde la antigua rama `provider/kapso`** (Kapso), cámbiate a `main`,
 donde ahora viven los dos proveedores. Cada workspace sigue con el proveedor que
