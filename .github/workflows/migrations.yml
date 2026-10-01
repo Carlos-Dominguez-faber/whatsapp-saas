@@ -1,0 +1,26 @@
+# Every pull request: the migrations it adds must be newer than the newest one
+# on its base branch, and no two migrations may share a version. See
+# scripts/check-migrations.mjs. It runs on every PR (no `paths` filter) so it
+# can be a required check without leaving PRs that touch no migration waiting.
+name: Migraciones
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  orden:
+    name: Orden de las migraciones
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: node scripts/check-migrations.mjs "origin/$BASE_BRANCH"
+        env:
+          BASE_BRANCH: ${{ github.base_ref }}
