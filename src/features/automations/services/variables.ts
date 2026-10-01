@@ -58,6 +58,13 @@ export interface VariableContext {
     scheduledAt: string;
     /** HighLevel's id, to confirm the appointment there before reminding. */
     hlAppointmentId: string | null;
+    /** Cal.com's booking uid, to confirm it there before reminding. */
+    calcomBookingUid: string | null;
+    /**
+     * A Cal.com row (it has an event type): without a uid it's a claim, or a
+     * booking Cal.com never identified, and can't be confirmed.
+     */
+    isCalCom: boolean;
   } | null;
 }
 
@@ -217,7 +224,7 @@ export async function loadVariableContext(params: {
     params.appointmentId
       ? supabase
           .from("appointments")
-          .select("status, scheduled_at, hl_appointment_id")
+          .select("status, scheduled_at, hl_appointment_id, calcom_booking_uid, calcom_event_type_id")
           .eq("id", params.appointmentId)
           .eq("workspace_id", params.workspaceId)
           .maybeSingle()
@@ -259,7 +266,13 @@ export async function loadVariableContext(params: {
 
   let appointment: VariableContext["appointment"] = null;
   const appointmentRow = appointmentRes.data as
-    | { status: string; scheduled_at: string; hl_appointment_id: string | null }
+    | {
+        status: string;
+        scheduled_at: string;
+        hl_appointment_id: string | null;
+        calcom_booking_uid: string | null;
+        calcom_event_type_id: number | null;
+      }
     | null;
   if (params.appointmentId && appointmentRow) {
     const tz = await resolveWorkspaceTimezone(supabase, params.workspaceId);
@@ -281,6 +294,10 @@ export async function loadVariableContext(params: {
         time,
         scheduledAt: appointmentRow.scheduled_at,
         hlAppointmentId: appointmentRow.hl_appointment_id ?? null,
+        calcomBookingUid: appointmentRow.calcom_booking_uid ?? null,
+        isCalCom:
+          appointmentRow.calcom_booking_uid != null ||
+          appointmentRow.calcom_event_type_id != null,
       };
     }
   }

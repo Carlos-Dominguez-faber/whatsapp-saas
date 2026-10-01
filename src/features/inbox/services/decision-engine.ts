@@ -304,6 +304,9 @@ export async function applyTransition(
   // 5. Side effects of the new state. Deliberately last and deliberately
   //    non-throwing: the transition above is already committed and must stand
   //    even if notifying anyone fails.
+  //
+  // The HubSpot timeline queue is fed by a trigger on conversations.state
+  // (20261003000014), in this UPDATE's transaction: nothing to do here.
   if (to === "handoff_pending") {
     try {
       const { notifyHandoffPending } = await import("./handoff-notifier");

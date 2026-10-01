@@ -401,6 +401,25 @@ mock.module("@/features/tools/lib/hl-appointment.ts", {
     },
   },
 });
+// Cal.com is the source of truth for a Cal.com booking's reminder.
+let calcomConfig: unknown = null;
+let calcomRead: unknown = null;
+let calcomReadThrows = false;
+const calcomReadCalls: unknown[] = [];
+const calcomReadConversations: unknown[] = [];
+mock.module("@/features/inbox/services/calcom-client.ts", {
+  exports: { loadCalComConfig: async () => calcomConfig },
+});
+mock.module("@/features/tools/lib/calcom-appointment.ts", {
+  exports: {
+    readCalComBooking: async (_opts: unknown, cached: { uid: string; conversationId?: string | null }) => {
+      calcomReadCalls.push(cached.uid);
+      calcomReadConversations.push(cached.conversationId);
+      if (calcomReadThrows) throw new Error("Cal.com respondió 502");
+      return calcomRead;
+    },
+  },
+});
 /** A fixed-offset zone where it is noon right now: sending hours never depend on when the suite runs. */
 function noonZone(): string {
   const off = 12 - new Date().getUTCHours();
@@ -539,6 +558,11 @@ function reset() {
   hlEvent = null;
   hlEventThrows = false;
   hlEventCalls.length = 0;
+  calcomConfig = null;
+  calcomRead = null;
+  calcomReadThrows = false;
+  calcomReadCalls.length = 0;
+  calcomReadConversations.length = 0;
   claimRpcError = null;
   claimOkBeforeError = 0;
   claimQueue = [];
@@ -2295,4 +2319,78 @@ test("waiting for the sending hours gives back the attempt and doesn't ask HighL
   assert.equal(await executeRun(makeRun({ trigger_type: "appointment_upcoming", attempts: 2 })), "retry");
   assert.equal(lastRunUpdate().attempts, 1, "a wait is not a failed attempt");
   assert.deepEqual(hlEventCalls, [], "HighLevel is asked when the reminder can actually go out");
+});
+
+// ── Cal.com bookings: confirmed in Cal.com before the reminder ──────────────
+
+const calcomReminder = (over: Record<string, unknown> = {}) =>
+  reminderContext({ hlAppointmentId: null, isCalCom: true, calcomBookingUid: "cal_b1", ...over });
+
+test("Cal.com: a booking live at the same time in Cal.com is reminded", async () => {
+  reset();
+  ruleRow = { ...APPOINTMENT_RULE };
+  withLiveConversation();
+  eventRow = REMINDER_EVENT;
+  const at = Date.now() + 110 * 60_000;
+  loadVariableContextImpl = calcomReminder({ scheduledAt: new Date(at).toISOString() });
+  calcomConfig = { apiKey: "cal_x" };
+  calcomRead = { booking: { state: "active", startMs: at }, moved: false, fromStartMs: at };
+  assert.equal(await executeRun(makeRun({ trigger_type: "appointment_upcoming" })), "done");
+  assert.deepEqual(calcomReadCalls, ["cal_b1"]);
+  // A booking moved in Cal.com is cached with the run's conversation.
+  assert.deepEqual(calcomReadConversations, [makeRun({ trigger_type: "appointment_upcoming" }).conversation_id]);
+  assert.equal(hlEventCalls.length, 0, "HighLevel is not asked about a Cal.com booking");
+  assert.equal(sendCalls.length, 1);
+});
+
+test("Cal.com: moved, cancelled or still pending confirmation there, the reminder is skipped", async () => {
+  for (const [read, reason] of [
+    [{ booking: { state: "active", startMs: Date.now() + 5 * 3600_000 }, moved: true, fromStartMs: 0 }, "appointment_moved"],
+    [{ booking: { state: "cancelled", startMs: Date.parse(dueNow()) }, moved: false, fromStartMs: 0 }, "appointment_not_active"],
+    [null, "appointment_not_active"],
+    [{ booking: { state: "active", pending: true, startMs: Date.parse(dueNow()) }, moved: false, fromStartMs: 0 }, "pending_confirmation"],
+  ] as const) {
+    reset();
+    ruleRow = { ...APPOINTMENT_RULE };
+    withLiveConversation();
+    eventRow = REMINDER_EVENT;
+    loadVariableContextImpl = calcomReminder();
+    calcomConfig = { apiKey: "cal_x" };
+    calcomRead = read;
+    assert.equal(await executeRun(makeRun({ trigger_type: "appointment_upcoming" })), "skipped");
+    assert.equal(lastRunUpdate().error, reason);
+    assert.equal(sendCalls.length, 0);
+  }
+});
+
+test("Cal.com: a failed read retries; a claim without a uid or no connection is never reminded", async () => {
+  reset();
+  ruleRow = { ...APPOINTMENT_RULE };
+  withLiveConversation();
+  eventRow = REMINDER_EVENT;
+  loadVariableContextImpl = calcomReminder();
+  calcomConfig = { apiKey: "cal_x" };
+  calcomReadThrows = true;
+  assert.equal(await executeRun(makeRun({ trigger_type: "appointment_upcoming" })), "retry");
+  assert.equal(lastRunUpdate().error, "calcom_read_failed");
+
+  reset();
+  ruleRow = { ...APPOINTMENT_RULE };
+  withLiveConversation();
+  eventRow = REMINDER_EVENT;
+  loadVariableContextImpl = calcomReminder({ calcomBookingUid: null });
+  calcomConfig = { apiKey: "cal_x" };
+  assert.equal(await executeRun(makeRun({ trigger_type: "appointment_upcoming" })), "skipped");
+  assert.equal(lastRunUpdate().error, "calcom_unconfirmable");
+  assert.equal(calcomReadCalls.length, 0);
+
+  reset();
+  ruleRow = { ...APPOINTMENT_RULE };
+  withLiveConversation();
+  eventRow = REMINDER_EVENT;
+  loadVariableContextImpl = calcomReminder();
+  calcomConfig = null;
+  assert.equal(await executeRun(makeRun({ trigger_type: "appointment_upcoming" })), "skipped");
+  assert.equal(lastRunUpdate().error, "calcom_not_connected");
+  assert.equal(sendCalls.length, 0);
 });

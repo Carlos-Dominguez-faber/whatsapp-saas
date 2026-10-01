@@ -41,6 +41,11 @@ import {
   loadWhatsAppSettings,
   WHATSAPP_NOT_CONNECTED,
 } from "./whatsapp-provider";
+import { createHubSpotDeal } from "./hubspot-client";
+import { crmStatus } from "./crm-sync";
+
+/** Motivo para el operador cuando falló la LECTURA del CRM activo: no es "no activo". */
+const CRM_READ_FAILED_REASON = "no se pudo verificar cuál es el CRM activo (falló la lectura de la base)";
 
 const DEFAULT_SILENCE_MS = 30_000; // 30 seconds silence window
 const MAX_BATCH_RETRIES = 3;
@@ -113,7 +118,13 @@ export interface ProcessBatchResult {
   conversationId?: string;
   /** The batch this call claimed, if any. */
   batchId?: string;
+  /** A per-item failure: this batch didn't go out (retry or dead letter). */
   error?: string;
+  /**
+   * A PHASE failure: no batch could even be claimed, so the tick didn't do
+   * its work. A code, never PostgREST's text.
+   */
+  phaseError?: string;
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -322,7 +333,7 @@ export async function reconcileOrphanedMessages(
     delayMs?: number;
     sleep?: (ms: number) => Promise<void>;
   } = {},
-): Promise<number> {
+): Promise<{ recovered: number; error?: string }> {
   const supabase = svc();
   const now = Date.now();
   const cutoff = new Date(now - ORPHAN_MESSAGE_AGE_MS).toISOString();
@@ -345,8 +356,11 @@ export async function reconcileOrphanedMessages(
     .limit(MAX_ORPHANS_PER_RUN);
 
   if (error) {
+    // The query that FINDS the phase's work: a bare 0 would read as "no
+    // orphans" and the tick would answer 200 forever. A code, never
+    // PostgREST's text; the detail stays in the log.
     console.error("[buffer] reconcileOrphanedMessages lookup error:", error);
-    return 0;
+    return { recovered: 0, error: "reconcile_failed" };
   }
 
   const orphans = ((data ?? []) as unknown[]).map(
@@ -393,7 +407,9 @@ export async function reconcileOrphanedMessages(
     }
   }
 
-  return recovered;
+  // One orphan that couldn't be relinked is a per-item failure: it's in the
+  // log, and the tick stays healthy.
+  return { recovered };
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -544,7 +560,14 @@ const HANDOFF_REASONS = new Set(["customer_request", "agent_stuck"]);
 const TOOL_FAILED = "tool_failed";
 /** The same for a write outside scheduling (an n8n tool): a generic label. */
 const WRITE_UNCONFIRMED = "write_unconfirmed";
-const NEEDS_HUMAN_TOOLS = new Set(["schedule_highlevel", "cancel_highlevel", "reschedule_highlevel"]);
+const NEEDS_HUMAN_TOOLS = new Set([
+  "schedule_highlevel",
+  "cancel_highlevel",
+  "reschedule_highlevel",
+  "schedule_calcom",
+  "cancel_calcom",
+  "reschedule_calcom",
+]);
 
 function needsHuman(execution: { name: string; ok: boolean | null; output?: unknown }): boolean {
   if (!NEEDS_HUMAN_TOOLS.has(execution.name) || execution.ok === true) return false;
@@ -620,7 +643,7 @@ export async function processNextBatch(): Promise<ProcessBatchResult> {
 
   if (claimError) {
     console.error("[buffer] claim_next_batch RPC error:", claimError);
-    return { processed: false, error: claimError.message };
+    return { processed: false, error: claimError.message, phaseError: "claim_failed" };
   }
 
   const batch = (claimedRows as MessageBatch[] | null)?.[0] ?? null;
@@ -1901,9 +1924,9 @@ async function runSetterEvaluation(params: SetterEvalParams): Promise<void> {
 
 // ──────────────────────────────────────────────────────────────────────────────
 // executeSetterPostAction (private)
-// Runs the configured post_action for a qualified lead. Reuses existing
-// executors; create_hl_opportunity is stubbed (logs a pending event) until HL
-// pipeline/stage config exists.
+// Runs the configured post_action for a qualified lead. create_hl_opportunity (HighLevel) and
+// create_hubspot_deal (HubSpot) are twins and each one acts ONLY when its CRM is THE active
+// one: with the other CRM active, or both enabled, it writes a failed event and calls nobody.
 // ──────────────────────────────────────────────────────────────────────────────
 
 interface PostActionParams {
@@ -1967,6 +1990,24 @@ async function executeSetterPostAction(p: PostActionParams): Promise<void> {
       }
 
       case "create_hl_opportunity": {
+        const hlStatus = await crmStatus(p.workspaceId, "highlevel");
+        if (hlStatus !== "active") {
+          await p.supabase.from("events").insert({
+            type: "setter_post_action_failed",
+            level: "warn",
+            workspace_id: p.workspaceId,
+            conversation_id: p.conversationId,
+            payload: {
+              action: "create_hl_opportunity",
+              contact_id: p.contactId,
+              reason:
+                hlStatus === "error"
+                  ? CRM_READ_FAILED_REASON
+                  : "HighLevel no es el CRM activo de este espacio de trabajo",
+            },
+          });
+          break;
+        }
         // Creates the opportunity in the workspace's configured HL pipeline/stage.
         // Returns null when HL isn't connected or pipeline/stage is unconfigured.
         const result = await createHLOpportunity(p.workspaceId, p.contactId);
@@ -1984,6 +2025,44 @@ async function executeSetterPostAction(p: PostActionParams): Promise<void> {
                   reason:
                     "no se pudo crear la oportunidad (revisa PIT, pipeline y etapa de HighLevel)",
                 }),
+          },
+        });
+        break;
+      }
+
+      case "create_hubspot_deal": {
+        const hsStatus = await crmStatus(p.workspaceId, "hubspot");
+        if (hsStatus !== "active") {
+          await p.supabase.from("events").insert({
+            type: "setter_post_action_failed",
+            level: "warn",
+            workspace_id: p.workspaceId,
+            conversation_id: p.conversationId,
+            payload: {
+              action: "create_hubspot_deal",
+              contact_id: p.contactId,
+              reason:
+                hsStatus === "error"
+                  ? CRM_READ_FAILED_REASON
+                  : "HubSpot no es el CRM activo de este espacio de trabajo",
+            },
+          });
+          break;
+        }
+        // null = HubSpot sin configurar o la API falló; el código técnico ya quedó en `events`
+        // (crm_sync_failed) desde hubspot-client.
+        const result = await createHubSpotDeal(p.workspaceId, p.contactId);
+        await p.supabase.from("events").insert({
+          type: result ? "setter_post_action" : "setter_post_action_failed",
+          level: result ? "info" : "warn",
+          workspace_id: p.workspaceId,
+          conversation_id: p.conversationId,
+          payload: {
+            action: "create_hubspot_deal",
+            contact_id: p.contactId,
+            ...(result
+              ? { deal_id: result.id }
+              : { reason: "no se pudo crear el negocio (revisa el token, el pipeline y la etapa de HubSpot)" }),
           },
         });
         break;

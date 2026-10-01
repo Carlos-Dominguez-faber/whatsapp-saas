@@ -51,17 +51,27 @@ const fakeSvc = {
       const filters: Record<string, unknown> = {};
       const q: any = {
         eq: (c: string, v: unknown) => ((filters[c] = v), q),
-        single: async () => {
-          const row = stored[filters.provider as string];
-          return row ? { data: row, error: null } : { data: null, error: { message: "0 rows" } };
-        },
+        maybeSingle: async () => ({ data: stored[filters.provider as string] ?? null, error: null }),
       };
       return q;
     },
-    upsert: async (row: Record<string, unknown>) => {
-      upserts.push(row);
-      return { error: null };
+    // Non-WhatsApp providers write with a CAS UPDATE (or an INSERT for a first save).
+    update: (row: Record<string, unknown>) => {
+      const chain: any = {
+        eq: () => chain,
+        select: async () => {
+          upserts.push(row);
+          return { data: [{ id: "int_1" }], error: null };
+        },
+      };
+      return chain;
     },
+    insert: (row: Record<string, unknown>) => ({
+      select: async () => {
+        upserts.push(row);
+        return { data: [{ id: "int_1" }], error: null };
+      },
+    }),
   }),
   rpc: async (fn: string, args: Record<string, unknown>) => {
     encryptOrder.push("rpc");

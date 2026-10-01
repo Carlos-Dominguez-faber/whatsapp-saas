@@ -12,7 +12,7 @@ import {
   Wrench,
 } from "lucide-react";
 import { Switch } from "@/components/ui/switch";
-import { BETA_NOTE, BETA_TOOLS } from "@/features/tools/lib/beta-tools";
+import { BETA_TOOLS } from "@/features/tools/lib/beta-tools";
 import { Badge } from "@/components/ui/badge";
 import { cn } from "@/lib/utils";
 import { toast } from "sonner";
@@ -40,6 +40,8 @@ const TOOL_ICONS: Record<string, React.ElementType> = {
   schedule_link: CalendarClock,
   schedule_highlevel: CalendarPlus,
   check_availability: CalendarSearch,
+  schedule_calcom: CalendarPlus,
+  check_availability_calcom: CalendarSearch,
   echo: FlaskConical,
 };
 
@@ -202,7 +204,7 @@ export function ToolsCatalog({ workspaceId, role, initialTools }: Props) {
                     </p>
                   )}
                   {BETA_TOOLS.has(tool.key) && (
-                    <p className="text-xs text-purple-400/90">{BETA_NOTE}</p>
+                    <p className="text-xs text-purple-400/90">{BETA_TOOLS.get(tool.key)}</p>
                   )}
                   {configurable && (
                     <button

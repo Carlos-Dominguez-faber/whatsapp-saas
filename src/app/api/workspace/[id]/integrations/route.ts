@@ -25,13 +25,24 @@ import {
 import { normalizeConfiguredPhone } from "@/features/inbox/services/ycloud-client";
 import { phoneString } from "@/features/inbox/services/phone";
 import { workspaceCountryCode } from "@/features/inbox/services/country-code";
+import { hubSpotTokenFingerprint } from "@/features/inbox/services/hubspot-client";
 
 const IntegrationSchema = z.object({
-  provider: z.enum(["ycloud", "kapso", "openrouter", "highlevel"]),
+  provider: z.enum(["ycloud", "kapso", "openrouter", "highlevel", "caldotcom", "hubspot"]),
   enabled: z.boolean().optional(),
   credentials: z.record(z.string(), z.string()).optional(),
   config: z.record(z.string(), z.unknown()).optional(),
 });
+
+/**
+ * Un solo CRM activo por workspace. Lo IMPONE el índice uq_integrations_one_active_crm
+ * (20260922000002), para todos los escritores; acá solo se traduce su 23505 a un 409 legible.
+ * Cal.com es agenda, no CRM.
+ */
+const CRM_LABELS = { highlevel: "HighLevel", hubspot: "HubSpot" } as const;
+
+/** Claves de config que escribe SOLO el servidor (PUT e integrations/hubspot/test). */
+const SERVER_CONFIG_KEYS = ["properties_ready", "token_fingerprint", "portal_id"] as const;
 
 type IntegrationRow = {
   id: string;
@@ -164,13 +175,21 @@ export async function PUT(
     process.env.SUPABASE_SERVICE_ROLE_KEY!,
   );
 
-  // Load existing to merge (don't overwrite masked values)
-  const { data: existing } = await svc
+  // Load existing to merge (don't overwrite masked values). `updated_at` es el testigo del CAS de
+  // más abajo. Un error de lectura NO es "no existe": iría por el INSERT de una fila nueva.
+  const { data: existing, error: readError } = await svc
     .from("integrations")
-    .select("credentials, config, oauth_tokens")
+    .select("credentials, config, oauth_tokens, updated_at")
     .eq("workspace_id", workspaceId)
     .eq("provider", parsed.data.provider)
-    .single();
+    .maybeSingle();
+  if (readError) {
+    console.error("[PUT /api/workspace/[id]/integrations] read error:", readError.message);
+    return NextResponse.json(
+      { error: "No se pudo guardar la integración. Intenta de nuevo." },
+      { status: 500 },
+    );
+  }
 
   // OpenRouter models: only catalog models, like the agents. The value already
   // stored is accepted unchanged, so an older workspace can still save its
@@ -292,39 +311,82 @@ export async function PUT(
     });
   }
 
-  const mergedConfig: Record<string, unknown> = {
-    ...((existing?.config as object) ?? {}),
-    ...(parsed.data.config ?? {}),
-  };
+  const clientConfig: Record<string, unknown> = { ...(config ?? {}) };
+  for (const key of SERVER_CONFIG_KEYS) delete clientConfig[key];
+  const existingConfig = (existing?.config as Record<string, unknown> | null) ?? {};
+  const mergedConfig: Record<string, unknown> = { ...existingConfig, ...clientConfig };
   // HighLevel: the stored zone belongs to the location it was read from.
   // Another location drops it until saveHLLocationTimeZone reads the new one.
-  if (
-    provider === "highlevel" &&
-    mergedConfig.location_id !== (existing?.config as Record<string, unknown> | null)?.location_id
-  ) {
+  if (provider === "highlevel" && mergedConfig.location_id !== existingConfig.location_id) {
     delete mergedConfig.timezone;
     delete mergedConfig.timezone_source;
   }
+  // Cal.com has no zone of its own: its tools use the workspace's scheduling
+  // zone (scheduling-timezone.ts). A zone an earlier version saved goes away.
+  if (provider === "caldotcom") {
+    for (const key of Object.keys(mergedConfig)) delete mergedConfig[key];
+  }
 
-  const { error } = await svc.from("integrations").upsert(
-    {
-      workspace_id: workspaceId,
-      provider,
-      enabled,
-      credentials: encryptedCreds,
-      config: mergedConfig,
-      updated_at: new Date().toISOString(),
-    },
-    { onConflict: "workspace_id,provider" },
+  // Un token DISTINTO puede ser otra cuenta de HubSpot: hay que volver a probar la conexión, que
+  // es la que valida propiedades y portal. El mismo token reenviado no invalida nada. La huella se
+  // calcula sobre el token EN CLARO que llega en el body (antes de cifrar): el cifrado usa IV
+  // aleatorio, así que un hash del texto cifrado cambiaría en cada guardado del mismo token.
+  if (provider === "hubspot" && typeof newCreds.hubspot_token === "string") {
+    const fingerprint = hubSpotTokenFingerprint(newCreds.hubspot_token);
+    if (fingerprint !== existingConfig.token_fingerprint) {
+      mergedConfig.token_fingerprint = fingerprint;
+      mergedConfig.properties_ready = false;
+    }
+  }
+
+  // La fila se escribe con CAS sobre el `updated_at` leído, nunca con un upsert de la foto. Si
+  // otro PUT o mark_hubspot_ready la cambió en el medio (el trigger trg_integrations_updated_at
+  // mueve updated_at en todo UPDATE), no se afecta ninguna fila y se responde 409: sin esto, un
+  // PUT atrasado restauraba token, huella, properties_ready y portal de la cuenta anterior sobre
+  // enlaces ya hechos con la nueva. Sin fila leída va un INSERT; si otro primer guardado ganó la
+  // carrera, su 23505 de (workspace_id, provider) es el mismo 409.
+  const row = {
+    enabled,
+    credentials: encryptedCreds,
+    config: mergedConfig,
+  };
+  const { data: written, error } = existing
+    ? await svc
+        .from("integrations")
+        .update(row)
+        .eq("workspace_id", workspaceId)
+        .eq("provider", provider)
+        .eq("updated_at", existing.updated_at)
+        .select("id")
+    : await svc
+        .from("integrations")
+        .insert({ workspace_id: workspaceId, provider, ...row })
+        .select("id");
+
+  const concurrent = NextResponse.json(
+    { error: "La configuración cambió mientras guardabas. Recarga e inténtalo de nuevo." },
+    { status: 409 },
   );
-
   if (error) {
-    console.error("[PUT /api/workspace/[id]/integrations] upsert error:", error.message);
+    const otherCrmActive =
+      error.code === "23505" && (error.message ?? "").includes("uq_integrations_one_active_crm");
+    if (error.code === "23505" && !otherCrmActive) return concurrent;
+    if (otherCrmActive && (provider === "highlevel" || provider === "hubspot")) {
+      const other = provider === "highlevel" ? "hubspot" : "highlevel";
+      return NextResponse.json(
+        {
+          error: `Ya tienes ${CRM_LABELS[other]} conectado como CRM. Desactívalo antes de conectar ${CRM_LABELS[provider]}.`,
+        },
+        { status: 409 },
+      );
+    }
+    console.error("[PUT /api/workspace/[id]/integrations] write error:", error.message);
     return NextResponse.json(
       { error: "No se pudo guardar la integración. Intenta de nuevo." },
       { status: 500 },
     );
   }
+  if (!written || written.length === 0) return concurrent;
   // HighLevel's bare times are read in the location's zone: store it with
   // the (possibly new) location. Never throws; a miss leaves the one stored.
   if (provider === "highlevel" && enabled) {

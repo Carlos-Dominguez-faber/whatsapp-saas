@@ -810,6 +810,84 @@ conversaciones sin analizar).
   manager ve las ejecuciones recientes: qué regla, a quién, si se ejecutó, se omitió
   o falló, y por qué. Se filtran por resultado.
 
+**Cal.com, HubSpot y el cron del buffer (Fase 5, octubre de 2026):**
+
+Solo `db-push` y deploy; no agrega crons (el `cron-apply` de la sección anterior
+sigue haciendo falta si no lo has corrido).
+
+- **Cal.com, beta** (Configuración → Integraciones → Cal.com, solo un admin la
+  guarda; las tools vienen apagadas en Configuración → Tools con la etiqueta
+  "Beta"; pruébalas primero con una cuenta de Cal.com de prueba):
+  - `list_event_types_calcom` y `check_availability_calcom` (lectura): los servicios
+    y los horarios libres, en la **zona horaria del negocio** (Configuración →
+    Negocio), la misma que usa el agente para hablar de fechas. Cal.com ya no tiene
+    su propio campo de zona; al guardar la integración se borra el que hubiera.
+  - `schedule_calcom`: agenda con el email del cliente (si no lo tiene, el agente se
+    lo pide). Reserva el horario en la base antes de llamar a Cal.com, así que un
+    reintento no agenda dos veces.
+    - Si la llamada murió antes de mandar nada, el horario se libera a los 2 minutos.
+    - Si Cal.com pudo haber agendado (la llamada se cortó a medio envío), el horario
+      no se libera solo: cuando el cliente vuelve a pedirlo, o a los 10 minutos en el
+      cron `automations`, la app pregunta a Cal.com por su email, servicio y hora
+      (y revisa que la respuesta sea de ese cliente y ese servicio): si la reserva
+      existe, la vincula; si Cal.com responde completo que no existe, la libera
+      (evento `calcom_claim_released`); si no, deja una nota interna en la
+      conversación (una vez) y un evento `calcom_claim_unresolved`. Las reservas
+      pendientes de una versión anterior (#15) nunca se liberan solas: siempre
+      dejan la nota.
+    - Para liberar uno a mano, después de revisar en Cal.com, en Supabase → SQL
+      Editor: `update appointments set status = 'cancelled', meta = meta ||
+      '{"calcom_claim":"released"}' where id = '<id>' and calcom_booking_uid is
+      null and status = 'booked';` (o, si la reserva sí existe: `update
+      appointments set calcom_booking_uid = '<uid>', meta = '{}' where id = '<id>'
+      and calcom_booking_uid is null and status = 'booked';`). Si responde `UPDATE
+      0`, el claim ya cambió: vuelve a revisarlo.
+  - Los tipos de evento **recurrentes** o **con cupos** (varias personas por
+    horario) no se agendan por WhatsApp.
+  - Una reserva que el negocio tiene que **confirmar** en Cal.com se le presenta al
+    cliente como "solicitada, pendiente de confirmación", y no recibe recordatorio
+    mientras siga pendiente.
+  - `list_calcom_appointments`, `cancel_calcom` y `reschedule_calcom`: el agente pasa
+    la fecha y hora de la cita que el cliente confirmó, copiada de la lista. Cal.com
+    manda: la app lee cada cita en Cal.com antes de actuar (y sigue una cita que
+    alguien movió allá; la cita movida conserva su recordatorio). Solo ve las citas
+    que se agendaron **por WhatsApp**: las que el cliente hizo en la página de
+    Cal.com no aparecen.
+  - Si Cal.com no responde a tiempo al agendar, cancelar o mover, el agente no le
+    dice al cliente ni que sí ni que no: deja una nota interna y pasa la
+    conversación a una persona.
+  - Los recordatorios del motor de automatizaciones también sirven para citas de
+    Cal.com: antes de mandar uno, la app confirma en Cal.com que la cita sigue en
+    pie a esa hora.
+- **HubSpot, beta** (Configuración → Integraciones → HubSpot, solo un admin):
+  alternativa a HighLevel como CRM. **Un solo CRM activo por workspace**: la base no
+  deja tener HighLevel y HubSpot encendidos a la vez; para cambiar, desactiva uno.
+  - Se conecta con el token de una app privada de HubSpot (permisos de contactos,
+    negocios, propiedades de contactos y comunicaciones). **Probar conexión** revisa
+    esos permisos, crea en tu HubSpot dos propiedades de contacto, `whatsapp_phone` y
+    `whatsapp_tags`, y es obligatorio antes de que sincronice nada. Cambiar el token
+    por el de otra cuenta suelta los enlaces de contactos y el pipeline de la
+    anterior (hay que elegirlo de nuevo).
+  - Sincroniza el contacto (nombre, email y etiquetas; una etiqueta que quitas aquí
+    se quita en HubSpot) y, cuando una conversación pasa a una persona o se cierra,
+    deja un registro de WhatsApp en la línea de tiempo del contacto, fechado cuando
+    pasó (lo manda el cron `automations`, en menos de un minuto; también cuando el
+    traspaso lo hizo el sistema porque la IA no pudo responder).
+  - Si el token deja de servir (revocado, sin un permiso, sin probar), esos
+    registros **esperan**: al volver a **Probar conexión** con la misma cuenta se
+    envían. Si HubSpot no confirmó si recibió uno, no se reenvía (para no
+    duplicarlo) y queda un evento `crm_sync_failed`.
+  - En el modo setter hay una acción nueva, "Crear negocio en HubSpot", en el
+    pipeline y etapa que elijas.
+  - Los registros ya enviados se borran solos a los 30 días; los que esperan un token
+    arreglado, a los 90.
+- **HighLevel:** editar un contacto en el panel ahora hace **una sola** subida a
+  HighLevel (antes, una por cada etiqueta quitada).
+- **Cron `buffer-flush`:** si una de sus dos fases no puede trabajar (la base no
+  entrega los lotes o los mensajes sin lote), responde **500** con el código de la
+  fase en `net._http_response`, aunque el resto del tick sí haya corrido. Un lote que
+  falla sigue siendo un 200.
+
 **Si instalaste desde la antigua rama `provider/kapso`** (Kapso), cámbiate a `main`,
 donde ahora viven los dos proveedores. Cada workspace sigue con el proveedor que
 tenía **activo**: si tenía Kapso (o Kapso y YCloud a la vez), queda en Kapso; si solo
@@ -829,7 +907,7 @@ vercel --prod
 `db-push` marca como revertidas las dos migraciones que solo existían en esa rama
 (`20260731000000/1`; su contenido ya viene en las de `main`) y aplica las nuevas.
 
-**Si además aplicaste ramas de los PRs #8, #9, #11, #12, #13, #14, #15 o #16 de la
+**Si además aplicaste ramas de los PRs #8, #9, #11, #12, #13, #14, #15, #16 o #17 de la
 comunidad** (Francisco Velásquez), `db-push` también marca como revertidas sus versiones que
 `main` no tiene (la lista está en `scripts/setup.mjs`); si no, `supabase db push` se
 niega a seguir. Eso solo destraba el historial: lo que esas migraciones crearon
@@ -841,13 +919,15 @@ no hace nada si ya no está. El motor de automatizaciones de #16 vuelve como
 `20261001000000`, que se aplica encima de lo que #16 creó: conserva sus eventos y
 ejecuciones, apaga las reglas que #16 encendió solo por existir (las que alguien
 encendió con su motor siguen encendidas) y cambia sus referencias por unas que no
-pueden cruzar workspaces. Lo de Cal.com (#15) se queda en tu base, pero `main` no lo
-usa todavía. El análisis de temas de #13 vuelve como `20261002000000..02`, encima
-de sus tablas: conserva temas y detecciones, borra las detecciones que #13 guardó
-sobre mensajes del agente o del equipo (ahora solo cuenta lo que escribe el cliente)
-y pasa su gasto de LLM a un presupuesto propio.
+pueden cruzar workspaces. El análisis de temas de #13 vuelve como `20261002000000..02`,
+encima de sus tablas: conserva temas y detecciones, borra las detecciones que #13
+guardó sobre mensajes del agente o del equipo (ahora solo cuenta lo que escribe el
+cliente) y pasa su gasto de LLM a un presupuesto propio. Cal.com (#15) vuelve como
+`20261003000000..03` y HubSpot (#17) como `20261003000004..10`, que se aplican encima
+de lo que esos PRs crearon: un enlace de HubSpot que no sea un id numérico se suelta
+(el siguiente sync lo vuelve a enlazar) y el `db push` lo avisa con un WARNING.
 
-**Si aplicaste ramas de otros PRs de la comunidad (#17)**, traen
+**Si aplicaste ramas de otros PRs de la comunidad** (fuera de esa lista), traen
 versiones que ni `main` ni esa lista conocen, y `supabase db push` se va a negar a
 seguir. Es a propósito: nada se aplica a ciegas sobre una base con cambios
 desconocidos.

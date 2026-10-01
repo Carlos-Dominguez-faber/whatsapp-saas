@@ -21,7 +21,13 @@ function nextResponse(): QueueEntry {
   return responseQueue.shift() ?? { data: null, error: null };
 }
 
+const rpcCalls: Array<{ fn: string; args: unknown }> = [];
+let rpcResult: { data: unknown; error: unknown } = { data: true, error: null };
 const fakeClient = {
+  rpc(fn: string, args: unknown) {
+    rpcCalls.push({ fn, args });
+    return Promise.resolve(rpcResult);
+  },
   from(table: string) {
     return {
       select() {
@@ -134,6 +140,8 @@ function reset(queue: QueueEntry[] = [FOUND, { error: null }, { error: null }]) 
   reserveCalls = 0;
   enabledTools = [];
   enabledToolsError = null;
+  rpcCalls.length = 0;
+  rpcResult = { data: true, error: null };
 }
 
 const DECIDE = {
@@ -366,4 +374,12 @@ test("si el INSERT del evento state_change falla, queda registrado server-side",
   assert.ok(logged.some((a) => String(a[0]).includes("state_change insert failed")));
   // Y no se filtra el mensaje crudo del error.
   assert.ok(logged.every((a) => !JSON.stringify(a).includes("connection string")));
+});
+
+// ── The HubSpot timeline queue is fed by a trigger, not from here ───────────
+
+test("a transition never calls the HubSpot queue itself (a trigger does, in the same UPDATE)", async () => {
+  reset();
+  await applyTransition("conv_1", "handoff_pending", { trigger: "keyword" });
+  assert.deepEqual(rpcCalls, []);
 });

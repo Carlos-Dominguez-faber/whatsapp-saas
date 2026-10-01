@@ -28,6 +28,10 @@ const REASON_LABELS: Record<string, string> = {
   rule_reenabled: "ocurrió antes de activar la regla",
   rule_disabled: "la regla estaba apagada",
   no_conversation: "sin conversación",
+  calcom_not_connected: "Cal.com no está conectado",
+  calcom_unconfirmable: "la cita no se puede comprobar en Cal.com",
+  calcom_read_failed: "no se pudo leer Cal.com",
+  pending_confirmation: "la cita espera que el negocio la acepte en Cal.com",
 };
 
 export function runReasonLabel(code: string): string {
@@ -35,7 +39,8 @@ export function runReasonLabel(code: string): string {
     return `falta el dato ${code.slice("missing_variable:".length)}`;
   }
   if (code.startsWith("max_attempts:")) {
-    return `se agotaron los intentos (${code.slice("max_attempts:".length)})`;
+    const cause = code.slice("max_attempts:".length);
+    return `se agotaron los intentos (${REASON_LABELS[cause] ?? cause})`;
   }
   return REASON_LABELS[code] ?? code;
 }

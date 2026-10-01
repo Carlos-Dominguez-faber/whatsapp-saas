@@ -38,6 +38,8 @@ import {
 import type { ActionType, TriggerType } from "../lib/rule-schema";
 import { loadHLConfig } from "@/features/inbox/services/highlevel-client";
 import { fetchHLEvent, hlTimeZone } from "@/features/tools/lib/hl-appointment";
+import { loadCalComConfig } from "@/features/inbox/services/calcom-client";
+import { readCalComBooking } from "@/features/tools/lib/calcom-appointment";
 import { resolveWorkspaceTimezone } from "../lib/workspace-timezone";
 import { parseReminderConfig, reminderTiming } from "../lib/reminder-window";
 
@@ -119,6 +121,7 @@ interface ActionResult {
  *            | transition_not_allowed | opted_out | already_assigned
  *            | appointment_not_active | appointment_passed | appointment_moved
  *            | reminder_too_close | reminder_too_late | hl_not_connected
+ *            | calcom_not_connected | calcom_unconfirmable | pending_confirmation
  *            | cooldown | daily_cap
  *   failed:  outcome_unknown | cross_workspace | conversation_not_found
  *            | missing_business_name | missing_appointment | contact_not_found
@@ -126,7 +129,8 @@ interface ActionResult {
  *            | internal_error | template_paused | send_rejected
  *   retry:   db_read_failed | db_write_failed | dispatch_prepare_failed
  *            | dispatch_mark_failed | send_not_accepted | hl_read_failed
- *            | hl_appointment_unknown | outside_send_window (until the sending
+ *            | hl_appointment_unknown | calcom_read_failed
+ *            | outside_send_window (until the sending
  *            hours open) | tag_write_failed | handoff_failed
  *            | close_failed | assign_failed
  *
@@ -568,6 +572,63 @@ async function confirmAppointmentWithHL(
 }
 
 /**
+ * The same check for a Cal.com booking: Cal.com is the source of truth, and
+ * a booking moved there is cancelled with `rescheduledToUid`. The read
+ * (readCalComBooking) follows the move and writes both bookings back to the
+ * cache, so a moved booking is reminded at its new time under a new
+ * occurrence, and this one is skipped. A Cal.com row without a uid (a claim
+ * in flight, or a booking Cal.com never identified) can't be confirmed and is
+ * never reminded.
+ */
+async function confirmAppointmentWithCalCom(
+  run: AutomationRun,
+  appointment: { scheduledAt: string; calcomBookingUid: string | null },
+  contactId: string | null,
+): Promise<
+  "active" | "cancelled" | "moved" | "pending" | "unconfirmable" | "not_connected" | "error"
+> {
+  if (!appointment.calcomBookingUid || !contactId) return "unconfirmable";
+
+  let cfg: Awaited<ReturnType<typeof loadCalComConfig>>;
+  try {
+    cfg = await loadCalComConfig(run.workspace_id);
+  } catch (err) {
+    console.error("[automations] could not read the Cal.com integration:", {
+      runId: run.id,
+      message: err instanceof Error ? err.message : String(err),
+    });
+    return "error";
+  }
+  if (!cfg) return "not_connected";
+
+  let read: Awaited<ReturnType<typeof readCalComBooking>>;
+  try {
+    read = await readCalComBooking(
+      { supabase: svc(), apiKey: cfg.apiKey, workspaceId: run.workspace_id, contactId },
+      // The run's conversation: a booking moved in Cal.com is cached with it,
+      // or the reminder scan would never see the new time.
+      { uid: appointment.calcomBookingUid, conversationId: run.conversation_id },
+    );
+  } catch (err) {
+    console.error("[automations] could not confirm the booking in Cal.com:", {
+      runId: run.id,
+      message: err instanceof Error ? err.message : String(err),
+    });
+    return "error";
+  }
+  // Gone from Cal.com: nothing to remind about.
+  if (read === null) return "cancelled";
+  if (read.moved) return "moved";
+  if (read.booking.state !== "active") return "cancelled";
+  // The host hasn't confirmed it: a reminder would present a request as an
+  // appointment (Carlos to decide; see the PR).
+  if (read.booking.pending) return "pending";
+  const local = Date.parse(appointment.scheduledAt);
+  if (Math.abs(read.booking.startMs - local) > APPOINTMENT_MATCH_TOLERANCE_MS) return "moved";
+  return "active";
+}
+
+/**
  * Meta pausó la plantilla (132015): apaga la regla para no seguir
  * disparando envíos que van a fallar todos igual.
  *
@@ -699,20 +760,34 @@ async function actSendTemplate(
     // without asking HighLevel yet: nothing is sent or skipped now.
     if (timing.action === "wait") return retryAt("outside_send_window", timing.untilMs);
 
-    // HighLevel before any send or skip: a move or a cancellation is written
-    // back to the local row whatever happens to this reminder.
-    const confirmed = await confirmAppointmentWithHL(
-      run,
-      appointmentId,
-      load.ctx.appointment,
-      zone,
-    );
-    if (confirmed === "error") return retry("hl_read_failed");
-    if (confirmed === "write_failed") return retry("db_write_failed");
-    if (confirmed === "unknown") return retry("hl_appointment_unknown");
-    if (confirmed === "not_connected") return skip("hl_not_connected");
-    if (confirmed === "cancelled") return skip("appointment_not_active");
-    if (confirmed === "moved") return skip("appointment_moved");
+    // The calendar before any send or skip: a move or a cancellation is
+    // written back to the local row whatever happens to this reminder.
+    if (load.ctx.appointment.isCalCom) {
+      const confirmed = await confirmAppointmentWithCalCom(
+        run,
+        load.ctx.appointment,
+        run.contact_id,
+      );
+      if (confirmed === "error") return retry("calcom_read_failed");
+      if (confirmed === "unconfirmable") return skip("calcom_unconfirmable");
+      if (confirmed === "not_connected") return skip("calcom_not_connected");
+      if (confirmed === "cancelled") return skip("appointment_not_active");
+      if (confirmed === "moved") return skip("appointment_moved");
+      if (confirmed === "pending") return skip("pending_confirmation");
+    } else {
+      const confirmed = await confirmAppointmentWithHL(
+        run,
+        appointmentId,
+        load.ctx.appointment,
+        zone,
+      );
+      if (confirmed === "error") return retry("hl_read_failed");
+      if (confirmed === "write_failed") return retry("db_write_failed");
+      if (confirmed === "unknown") return retry("hl_appointment_unknown");
+      if (confirmed === "not_connected") return skip("hl_not_connected");
+      if (confirmed === "cancelled") return skip("appointment_not_active");
+      if (confirmed === "moved") return skip("appointment_moved");
+    }
 
     // The event was emitted for the appointment's time back then. If it has
     // moved since, this reminder is for a time that no longer holds; the scan

@@ -4,8 +4,9 @@ import { test, mock } from "node:test";
 const processCalls: number[] = [];
 let reconcileCalls = 0;
 // Results processNextBatch returns in order; empty → nothing left to claim.
-let queue: Array<{ processed: boolean; error?: string }> = [];
+let queue: Array<{ processed: boolean; error?: string; phaseError?: string }> = [];
 let timeLeft = true;
+let reconcileResult: { recovered: number; error?: string } | "throw" = { recovered: 2 };
 mock.module("@/features/inbox/services/buffer.ts", {
   exports: {
     processNextBatch: async () => {
@@ -14,7 +15,8 @@ mock.module("@/features/inbox/services/buffer.ts", {
     },
     reconcileOrphanedMessages: async () => {
       reconcileCalls++;
-      return 2;
+      if (reconcileResult === "throw") throw new Error("boom");
+      return reconcileResult;
     },
     hasTimeToClaim: () => timeLeft,
   },
@@ -49,7 +51,7 @@ test("runs the drain with the right bearer", async () => {
   processCalls.length = 0;
   const res = await GET(req("Bearer s3cret"));
   assert.equal(res.status, 200);
-  assert.deepEqual(await res.json(), { ok: true, processed: 0, recovered: 2 });
+  assert.deepEqual(await res.json(), { ok: true, processed: 0, recovered: 2, failed: 0 });
   assert.equal(processCalls.length, 1);
 });
 
@@ -74,7 +76,10 @@ test("a failed batch doesn't stop the drain; nothing left does", async () => {
   queue = [{ processed: true }, { processed: false, error: "boom" }, { processed: true }];
   const res = await GET(req("Bearer s3cret"));
   assert.equal(processCalls.length, 4, "3 results, then an empty claim ends it");
-  assert.equal((await res.json()).processed, 2);
+  assert.equal(res.status, 200, "a failed batch is per-item work, not a failed tick");
+  const body = await res.json();
+  assert.equal(body.processed, 2);
+  assert.equal(body.failed, 1);
 });
 
 test("no batch is claimed without time left to finish it", async () => {
@@ -85,4 +90,46 @@ test("no batch is claimed without time left to finish it", async () => {
   await GET(req("Bearer s3cret"));
   assert.equal(processCalls.length, 0);
   timeLeft = true;
+});
+
+test("a claim that fails is a failed phase: 500 with its code, after what the tick did", async () => {
+  process.env.CRON_SECRET = "s3cret";
+  processCalls.length = 0;
+  reconcileResult = { recovered: 2 };
+  queue = [{ processed: true }, { processed: false, error: "rpc down", phaseError: "claim_failed" }, { processed: true }];
+  const res = await GET(req("Bearer s3cret"));
+  assert.equal(res.status, 500);
+  assert.deepEqual(await res.json(), {
+    ok: false,
+    processed: 1,
+    recovered: 2,
+    failed: 0,
+    errors: ["claim_failed"],
+  });
+  assert.equal(processCalls.length, 2, "a failed claim stops the drain");
+  queue = [];
+});
+
+test("a failed orphan lookup is a failed phase, and the drain still runs", async () => {
+  process.env.CRON_SECRET = "s3cret";
+  processCalls.length = 0;
+  reconcileResult = { recovered: 0, error: "reconcile_failed" };
+  queue = [{ processed: true }];
+  const res = await GET(req("Bearer s3cret"));
+  assert.equal(res.status, 500);
+  const body = await res.json();
+  assert.deepEqual(body.errors, ["reconcile_failed"]);
+  assert.equal(body.processed, 1);
+
+  processCalls.length = 0;
+  reconcileResult = "throw";
+  queue = [{ processed: true }];
+  const threw = await GET(req("Bearer s3cret"));
+  assert.equal(threw.status, 500);
+  const threwBody = await threw.json();
+  assert.deepEqual(threwBody.errors, ["reconcile_threw"]);
+  assert.equal(threwBody.processed, 1);
+  assert.doesNotMatch(JSON.stringify(threwBody), /boom/, "codes only");
+  reconcileResult = { recovered: 2 };
+  queue = [];
 });
