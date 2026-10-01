@@ -152,6 +152,19 @@ de un tenant a otro no descifra.
 
 ---
 
+## Seguridad
+
+Si encuentras una vulnerabilidad, **no abras un issue público**: repórtala en
+privado como explica [SECURITY.md](SECURITY.md).
+
+## Contribuir
+
+Los PRs van contra `main`. Si tu PR trae migraciones, cada una necesita un
+timestamp **mayor que la última que ya está en `main`**, para que
+`supabase db push` la aplique en las instalaciones que están al día. El check
+**Migraciones** del CI lo revisa en cada PR. Para correrlo antes de abrir el tuyo:
+`node scripts/check-migrations.mjs`.
+
 ## Licencia
 
 [MIT](LICENSE). Puedes usar, modificar, forkear, redistribuir, vender y cobrar
