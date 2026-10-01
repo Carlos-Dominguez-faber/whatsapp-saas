@@ -165,6 +165,8 @@ automatizaciones), cada minuto, y `classify-topics` (el análisis de temas de
 para agendarlos vía Management API e imprime la verificación. Correrlo otra vez no
 duplica nada: actualiza los jobs existentes. Si no hay token, cae al camino manual: corre
 `node scripts/setup.mjs cron-sql` y pega el SQL en **Supabase → SQL Editor → Run**.
+En macOS, `node scripts/setup.mjs cron-sql | pbcopy` lo deja en el portapapeles: por
+el pipe solo pasa el SQL (los mensajes van a la pantalla).
 
 **10. Entra y crea tu primer workspace.** Abre `https://TU-URL.vercel.app/login`,
 entra con tu super admin, y en el **panel de agencia** (`/workspaces`) dale **crear

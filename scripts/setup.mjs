@@ -321,15 +321,18 @@ function cmdSetAppUrl(args) {
   log("➡️  Acuérdate de setear esta misma URL en Vercel (vercel-env) y en Supabase → Auth → Site URL.");
 }
 
+// Only the SQL goes to stdout, so `cron-sql | pbcopy` copies something the SQL
+// Editor runs as is; the status lines go to stderr (still on screen). Before,
+// the ✅/➡️ lines landed in the clipboard too and the paste failed on line 1.
 function cmdCronSql() {
   const { appUrl, secret } = cronInputs();
   for (const job of CRON_JOBS) {
     const filled = fillCronSql(job, appUrl, secret);
     writeFileSync(job.filled, filled);
-    ok(`SQL del cron '${job.name}' generado: ${job.filled}`);
-    log("➡️  Pega el siguiente SQL en Supabase → SQL Editor → Run:\n");
-    log(filled);
+    console.error(`✅ SQL del cron '${job.name}' generado: ${job.filled}`);
+    process.stdout.write(`${filled.trimEnd()}\n\n`);
   }
+  console.error("➡️  Pega el SQL en Supabase → SQL Editor → Run (en macOS: node scripts/setup.mjs cron-sql | pbcopy).");
 }
 
 async function cmdCronApply() {
