@@ -23,7 +23,7 @@ type Svc = ReturnType<typeof svc>;
 const DAILY_TOKEN_HARD_LIMIT = 1_000_000;
 
 // Warn threshold: degrade to a cheaper model above this count
-const DAILY_TOKEN_WARN_THRESHOLD = 800_000;
+export const DAILY_TOKEN_WARN_THRESHOLD = 800_000;
 
 const FALLBACK_MODEL = "openai/gpt-4o-mini";
 
@@ -32,6 +32,7 @@ export const BUDGET_EVENT_TYPES = [
   "llm_usage",
   "template_generate",
   "agent_test_chat",
+  "client_test_chat",
 ] as const;
 
 export type CostPolicy = "allow" | "degrade" | "cut";

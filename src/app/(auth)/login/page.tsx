@@ -8,8 +8,8 @@ export const metadata: Metadata = {
 export default async function LoginPage({
   searchParams,
 }: {
-  searchParams: Promise<{ message?: string }>;
+  searchParams: Promise<{ message?: string; next?: string }>;
 }) {
-  const { message } = await searchParams;
-  return <LoginForm message={message} />;
+  const { message, next } = await searchParams;
+  return <LoginForm message={message} next={next} />;
 }

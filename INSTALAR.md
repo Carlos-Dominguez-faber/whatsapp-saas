@@ -159,8 +159,9 @@ node scripts/seed-admin.mjs
 node scripts/setup.mjs cron-apply
 ```
 
-Agenda dos jobs, cada minuto: `buffer-flush` (responde los mensajes) y
-`automations` (corre las automatizaciones). Usa el `SUPABASE_ACCESS_TOKEN` del paso 7
+Agenda tres jobs: `buffer-flush` (responde los mensajes) y `automations` (corre las
+automatizaciones), cada minuto, y `classify-topics` (el análisis de temas de
+**Análisis**), cada 5 minutos; mientras nadie cree un tema no gasta nada. Usa el `SUPABASE_ACCESS_TOKEN` del paso 7
 para agendarlos vía Management API e imprime la verificación. Correrlo otra vez no
 duplica nada: actualiza los jobs existentes. Si no hay token, cae al camino manual: corre
 `node scripts/setup.mjs cron-sql` y pega el SQL en **Supabase → SQL Editor → Run**.
@@ -678,6 +679,137 @@ Sin el paso 3 no corre nada: las reglas se guardan, pero ningún job las ejecuta
 - La ruta del cron puede durar hasta 120 segundos (Fluid Compute, igual que el
   buffer).
 
+**Análisis de temas, `/probar` y limpieza (Fase 5, octubre de 2026):**
+
+```bash
+SUPABASE_DB_PASSWORD='tu-contraseña-de-la-base' node scripts/setup.mjs db-push   # 1. migraciones
+vercel --prod                                                                     # 2. deploy
+node scripts/setup.mjs cron-apply                                                 # 3. agenda 'classify-topics'
+```
+
+El paso 3 agenda el job nuevo y reagenda los otros dos sin duplicarlos. Sin él, la
+pantalla de Análisis funciona pero nunca se analiza nada (avisa que hay
+conversaciones sin analizar).
+
+- **Análisis** (`/analisis`, en el menú de arriba): un admin o manager crea hasta 10
+  temas (un nombre y qué debe detectar; no puede haber dos activos con el mismo
+  nombre, sin contar mayúsculas ni acentos). Cada 5 minutos, el job `classify-topics`
+  lee las conversaciones en las que el **cliente** escribió algo nuevo (una hora
+  después de su último mensaje; primero lo más antiguo, y los workspaces se turnan:
+  primero el que lleva más tiempo sin que se le lea nada; el reprocesamiento de temas
+  nuevos lleva su propio turno)
+  y marca qué temas plantea. Solo cuenta lo que escribe el cliente: lo que dicen el
+  agente o el equipo es contexto, las notas internas nunca se mandan al modelo, y una
+  respuesta o un recordatorio no hacen que se vuelva a analizar. El tablero muestra
+  hasta ayer: conversaciones, cuántas agendaron y cuántas se derivaron, el ranking de
+  temas, la tendencia por semana y el cruce con etiquetas; cada celda abre las
+  conversaciones de evidencia. Cualquier miembro lo ve.
+- **Solo cuenta lo analizado.** Un tema se mide sobre las conversaciones ya leídas
+  ("sobre N de M analizadas"); las que faltan no cuentan ni a favor ni en contra, y el
+  tablero dice cuántas faltan y por qué: pendientes (se leen en las próximas horas),
+  que fallaron tres veces (se reintentan si el cliente vuelve a escribir) o de más de
+  30 días (ya no se leerán).
+- **Cada clave de OpenRouter lleva su propia salud**, que se guarda entre corridas
+  (la de cada workspace con clave propia, y la de la agencia para todos los demás):
+  - si OpenRouter **rechaza la clave** (sin créditos, revocada, limitada, o un 404
+    porque su política de datos no deja usar el modelo), queda caída 15 minutos;
+  - si **falla tres veces seguidas** (error 5xx, sin red, tiempo agotado, o un
+    "200" de OpenRouter que trae el error del proveedor), queda caída 15 minutos, y
+    cada caída seguida dura el doble (30 min, 1 h… hasta 6 horas). Una clave que
+    usan varios workspaces (la de la agencia, o una propia pegada en dos) solo cae
+    si fallan **al menos dos** de ellos: si falla uno solo (por ejemplo, porque sus
+    conversaciones rozan el tiempo límite), espera solo ese workspace, con las
+    mismas reglas;
+  - mientras está caída no se usa, y sus workspaces esperan; al terminar la espera se
+    prueba con **una sola** llamada: si responde, vuelve a la normalidad.
+  Los demás workspaces siguen a su ritmo: la clave caída de uno nunca detiene a los
+  otros. El tablero de los afectados dice que la clave está fallando (la propia), que
+  el análisis no está respondiendo (la de la agencia) o que las llamadas de ese
+  espacio están fallando. Si cambias la clave, el aviso de la vieja desaparece. Si la caída es la de la
+  agencia, el job responde 500 (lo ves en `net._http_response`); las claves propias
+  caídas nunca lo hacen. Una clave propia que no se puede descifrar cuenta como caída
+  de ese workspace: nunca se le cobra a la de la agencia.
+- **Si falla una conversación** con un error pasajero, espera una hora sin gastar
+  intento y la corrida sigue con las demás; si la misma conversación vuelve a fallar
+  así, espera el doble cada vez (2, 4, 8… hasta 24 horas) y vuelve a una hora en
+  cuanto se lee. La corrida solo se detiene si falla nuestra base de datos.
+- **Si el modelo rechaza un mensaje** (contenido, moderación, respuesta inválida),
+  la conversación espera una hora (dos, la segunda vez) antes del siguiente intento;
+  al tercer fallo queda apartada hasta que el cliente vuelva a escribir.
+- **Costo:** usa `openai/gpt-4o-mini` por OpenRouter, con la clave del workspace (o
+  la de la agencia), y tiene un tope propio de **600,000 tokens por día** (UTC) por
+  workspace, hasta unos USD 0.10 a 0.20. **No cuenta en el presupuesto diario del
+  agente**: no lo degrada ni lo corta, y el agente tampoco le quita cupo. El día más
+  caro de un workspace pasa a ser 1,600,000 tokens (1,000,000 del agente + 600,000
+  del análisis). El texto de los clientes va a OpenAI a través de OpenRouter aunque el
+  agente use otro modelo (sin nombres ni teléfonos).
+- **Hasta dónde mira:** 30 días hacia atrás, los últimos 60 mensajes de cada
+  conversación y hasta 800 caracteres por mensaje; si algo quedó fuera, el tablero lo
+  dice. Un tema nuevo reprocesa los 30 días anteriores a su creación. Una caída del
+  proveedor no hace que se salte ninguna conversación: el reprocesamiento la espera.
+  Solo salta una que falla tres veces seguidas (con horas de espera entre una y otra)
+  mientras la clave sigue funcionando. Mientras eso no termina, o si el tema se creó
+  dentro del período que estás viendo, se mide solo desde la fecha que aparece junto a él, y sin comparación con el período anterior:
+  antes de esa fecha no se analizó, y contarlo como 0 % daría números falsos.
+- **Capacidad:** cada corrida lee unas 15 a 20 conversaciones (depende de lo que
+  tarde el modelo); cada 5 minutos, eso son unas 4,500 al día para toda la
+  instalación, repartidas por turnos entre los workspaces. Cada workspace tiene además
+  su tope de 600,000 tokens diarios: unas 400 conversaciones al día (a unos 1,500
+  tokens cada una). Si un workspace recibe más, lo que no cabe espera al día siguiente (primero lo de las últimas 48 horas, de lo más
+  antiguo a lo más nuevo; después lo anterior, de lo más reciente hacia atrás) y el
+  tablero muestra cuántas faltan. Para correrlo solo de noche, cambia la línea `'*/5 * * * *'` de
+  `supabase/cron/schedule-classify-topics.sql` por `'*/5 4-8 * * *'` y vuelve a correr
+  `cron-apply`: gasta algo menos, pero lo de ayer llega incompleto a la mañana y se
+  completa la noche siguiente.
+- **Para apagarlo:** `select cron.unschedule('classify-topics');` en el SQL Editor.
+  Sin temas activos tampoco gasta nada.
+- **`/probar`:** una pantalla con solo el chat del agente, para que alguien lo pruebe
+  sin el resto de la app (por ejemplo, un cliente antes de salir en vivo): comparte
+  `https://TU-URL/probar`. La pestaña **Prueba** de cada agente (en **Configuración →
+  Agentes**) también la enlaza.
+  - Cualquier miembro del workspace, incluido un viewer, chatea con el agente
+    **activo**, con su prompt publicado y su modelo. No se manda nada por WhatsApp.
+  - Solo corren las herramientas de consulta (ver disponibilidad, consultas de n8n),
+    también para un admin: desde ahí nadie agenda, cancela ni escribe en un CRM.
+  - Hasta 20 mensajes por persona y 60 por workspace cada hora, de hasta 1,000
+    caracteres, y **100,000 tokens al día** por workspace (UTC). Cada mensaje reserva
+    antes lo más que puede gastar (dos pasos del modelo con el prompt completo y 500
+    tokens de respuesta); lo reservado de un mensaje en curso cuenta, y al terminar
+    se ajusta a lo real. Alcanza para unos 30 mensajes al día con un prompt de
+    4 KB, 19 con uno de 10 KB y 11 con uno de 20 KB. También cuentan en el presupuesto diario del workspace: se
+    pausan desde los 800,000 tokens, y un mensaje que llevaría al workspace a ese
+    umbral se rechaza, para que `/probar` nunca haga que el agente atienda a clientes
+    con el modelo barato.
+  - Si el agente no responde nada, la pantalla lo dice y el mensaje vuelve a la caja
+    de texto.
+  - Un mensaje que falla se ajusta a lo que ya gastó: nada si falló antes de llegar
+    al modelo (la base de conocimiento caída), o los pasos que el modelo terminó si
+    el proveedor contestó con un error (la clave rechazada, un 5xx). Así un paso que
+    usó una herramienta sigue contando, y los reintentos durante una caída no se
+    comen el tope. Tras un tiempo agotado o un corte de red se queda la reserva
+    completa, porque no se sabe qué gastó.
+  - Usa una sola herramienta por mensaje.
+  - **No aísla datos.** Solo esconde el menú: con la misma cuenta se pueden abrir el
+    inbox, el dashboard y los prompts. Si se la das a alguien de fuera, hazlo en un
+    workspace de demostración, sin conversaciones reales.
+  - Si alguien abre el enlace sin sesión, al entrar vuelve a `/probar`.
+- **La clave pública (`anon`) ya no tiene permisos sobre ninguna tabla.** Es la
+  clave que viaja en el navegador; hasta ahora solo las políticas de RLS impedían que
+  leyera algo. La app no la usa sin sesión. Las tablas que creen las migraciones
+  (como `postgres`) tampoco se los dan. Las que crees desde el editor de tablas de
+  Supabase Studio sí los reciben (las crea otro rol, `supabase_admin`, cuyos permisos
+  por defecto no se pueden cambiar desde aquí): quítaselos con
+  `revoke all on public.tu_tabla from anon;`. Si agregaste tablas propias que leías
+  sin sesión, tendrás que darle el permiso a mano (`grant select on public.tu_tabla to
+  anon;`) y pensar si de verdad quieres eso.
+- **Historial de automatizaciones: 30 días.** Un job de pg_cron que agenda el propio
+  `db-push` (`automation-history-purge`, cada hora) borra las ejecuciones terminadas
+  y los eventos sin ejecución de más de 30 días. Nunca borra una ejecución en cola ni
+  un evento que todavía la necesita.
+- **Panel de ejecuciones:** en **Configuración → Automatizaciones**, un admin o
+  manager ve las ejecuciones recientes: qué regla, a quién, si se ejecutó, se omitió
+  o falló, y por qué. Se filtran por resultado.
+
 **Si instalaste desde la antigua rama `provider/kapso`** (Kapso), cámbiate a `main`,
 donde ahora viven los dos proveedores. Cada workspace sigue con el proveedor que
 tenía **activo**: si tenía Kapso (o Kapso y YCloud a la vez), queda en Kapso; si solo
@@ -697,7 +829,7 @@ vercel --prod
 `db-push` marca como revertidas las dos migraciones que solo existían en esa rama
 (`20260731000000/1`; su contenido ya viene en las de `main`) y aplica las nuevas.
 
-**Si además aplicaste ramas de los PRs #8, #9, #11, #12, #14, #15 o #16 de la
+**Si además aplicaste ramas de los PRs #8, #9, #11, #12, #13, #14, #15 o #16 de la
 comunidad** (Francisco Velásquez), `db-push` también marca como revertidas sus versiones que
 `main` no tiene (la lista está en `scripts/setup.mjs`); si no, `supabase db push` se
 niega a seguir. Eso solo destraba el historial: lo que esas migraciones crearon
@@ -710,9 +842,12 @@ no hace nada si ya no está. El motor de automatizaciones de #16 vuelve como
 ejecuciones, apaga las reglas que #16 encendió solo por existir (las que alguien
 encendió con su motor siguen encendidas) y cambia sus referencias por unas que no
 pueden cruzar workspaces. Lo de Cal.com (#15) se queda en tu base, pero `main` no lo
-usa todavía.
+usa todavía. El análisis de temas de #13 vuelve como `20261002000000..02`, encima
+de sus tablas: conserva temas y detecciones, borra las detecciones que #13 guardó
+sobre mensajes del agente o del equipo (ahora solo cuenta lo que escribe el cliente)
+y pasa su gasto de LLM a un presupuesto propio.
 
-**Si aplicaste ramas de otros PRs de la comunidad (#13 o #17)**, traen
+**Si aplicaste ramas de otros PRs de la comunidad (#17)**, traen
 versiones que ni `main` ni esa lista conocen, y `supabase db push` se va a negar a
 seguir. Es a propósito: nada se aplica a ciegas sobre una base con cambios
 desconocidos.

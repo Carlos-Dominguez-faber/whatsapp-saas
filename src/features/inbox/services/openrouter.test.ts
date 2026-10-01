@@ -372,3 +372,143 @@ test("generateChatReply counts a write that threw or timed out (ok null) as mayb
     registryRun = async () => null;
   }
 });
+
+test("generateChatReply with noRetries: one request, no SDK retries, no turn retry (/probar's ceiling)", async () => {
+  const transient = Object.assign(new Error("upstream 503"), { statusCode: 503 });
+  let attempts = 0;
+  let maxRetries: unknown;
+  generateImpl = async (args) => {
+    attempts++;
+    maxRetries = (args as { maxRetries?: unknown }).maxRetries;
+    throw transient;
+  };
+  try {
+    await assert.rejects(
+      generateChatReply({
+        systemPrompt: "s",
+        messages: [{ role: "user", content: "u" }],
+        workspaceId: "ws_1",
+        noRetries: true,
+      } as never),
+    );
+    assert.equal(attempts, 1);
+    assert.equal(maxRetries, 0);
+  } finally {
+    generateImpl = null;
+  }
+});
+
+test("generateChatReply cuts a tool result to maxToolResultChars before the model reads it", async () => {
+  registryRun = async () => ({ ok: true, data: "x".repeat(5_000) });
+  let seen: unknown;
+  generateImpl = async (args) => {
+    seen = await args.tools!.lookup.execute({});
+    return { text: "ok", usage: LAST_STEP, totalUsage: ALL_STEPS, steps: [{}] };
+  };
+  try {
+    await generateChatReply({
+      systemPrompt: "s",
+      messages: [{ role: "user", content: "u" }],
+      workspaceId: "ws_1",
+      tools: [{ name: "lookup", description: "d", schema: {}, sensitivity: "read" }],
+      toolContext: { workspaceId: "ws_1", conversationId: "", contactId: "", batchId: "b" },
+      maxToolResultChars: 100,
+    } as never);
+    assert.deepEqual(Object.keys(seen as object).sort(), ["result", "truncated"]);
+    assert.equal(((seen as { result: string }).result).length, 100);
+  } finally {
+    generateImpl = null;
+    registryRun = async () => null;
+  }
+});
+
+type StepArgs = GenerateArgs & {
+  onStepFinish?: (step: { usage?: { inputTokens?: number; outputTokens?: number } }) => void | Promise<void>;
+  providerOptions?: { openai?: { parallelToolCalls?: boolean } };
+};
+
+test("generateChatReply tells the caller what the finished steps spent when a later one fails", async () => {
+  // Step 1 answers with a tool call (billed); step 2 is refused (429).
+  const refused = Object.assign(new Error("Rate limit exceeded"), { statusCode: 429 });
+  registryRun = async () => ({ ok: true, data: { slots: [] } });
+  generateImpl = async (raw) => {
+    const args = raw as StepArgs;
+    await args.tools!.lookup.execute({});
+    await args.onStepFinish?.({ usage: { inputTokens: 5_000, outputTokens: 40 } });
+    throw refused;
+  };
+  try {
+    await assert.rejects(
+      generateChatReply({
+        systemPrompt: "s",
+        messages: [{ role: "user", content: "u" }],
+        workspaceId: "ws_1",
+        tools: [{ name: "lookup", description: "d", schema: {}, sensitivity: "read" }],
+        toolContext: { workspaceId: "ws_1", conversationId: "", contactId: "", batchId: "b" },
+        noRetries: true,
+      } as never),
+      (err: unknown) => {
+        const e = err as { statusCode?: number; stepsDone?: number; usageSoFar?: unknown };
+        assert.equal(e.statusCode, 429);
+        assert.equal(e.stepsDone, 1);
+        assert.deepEqual(e.usageSoFar, { promptTokens: 5_000, completionTokens: 40 });
+        return true;
+      },
+    );
+  } finally {
+    generateImpl = null;
+    registryRun = async () => null;
+  }
+});
+
+test("generateChatReply with oneToolCall: parallel calls off, and a second call doesn't run", async () => {
+  let ran = 0;
+  registryRun = async () => (ran++, { ok: true, data: "x" });
+  let parallel: unknown;
+  let second: unknown;
+  generateImpl = async (raw) => {
+    const args = raw as StepArgs;
+    parallel = args.providerOptions?.openai?.parallelToolCalls;
+    await args.tools!.lookup.execute({});
+    second = await args.tools!.lookup.execute({});
+    return { text: "ok", usage: LAST_STEP, totalUsage: ALL_STEPS, steps: [{}, {}] };
+  };
+  try {
+    await generateChatReply({
+      systemPrompt: "s",
+      messages: [{ role: "user", content: "u" }],
+      workspaceId: "ws_1",
+      tools: [{ name: "lookup", description: "d", schema: {}, sensitivity: "read" }],
+      toolContext: { workspaceId: "ws_1", conversationId: "", contactId: "", batchId: "b" },
+      oneToolCall: true,
+    } as never);
+    assert.equal(parallel, false);
+    assert.equal(ran, 1, "the second tool call of the turn ran");
+    assert.equal((second as { ok?: boolean }).ok, false);
+  } finally {
+    generateImpl = null;
+    registryRun = async () => null;
+  }
+});
+
+test("generateChatReply without the /probar options sends what it sent before (auto-tagging)", async () => {
+  let seen: StepArgs | undefined;
+  generateImpl = async (raw) => {
+    seen = raw as StepArgs;
+    return { text: "{}", usage: LAST_STEP, totalUsage: ALL_STEPS, steps: [{}] };
+  };
+  try {
+    const reply = await generateChatReply({
+      systemPrompt: "s",
+      messages: [{ role: "user", content: "u" }],
+      maxOutputTokens: 200,
+      workspaceId: "ws_1",
+    });
+    assert.equal(seen?.providerOptions, undefined);
+    assert.equal((seen as { maxRetries?: unknown }).maxRetries, undefined);
+    assert.equal((seen as { stopWhen?: unknown }).stopWhen, undefined);
+    assert.deepEqual(reply, { text: "{}", promptTokens: 50, completionTokens: 9 });
+  } finally {
+    generateImpl = null;
+  }
+});

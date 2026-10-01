@@ -301,16 +301,80 @@ export async function reserveWorkspaceLlmCall(
   return { allowed: true, reservationId: row.reservation_id ?? undefined };
 }
 
+export type ClientTestChatRefusal = "user_hour" | "workspace_hour" | "daily_cap" | "budget";
+
+export interface ReserveClientTestChatResult {
+  allowed: boolean;
+  reason?: ClientTestChatRefusal;
+  reservationId?: string;
+}
+
 /**
- * Records the tokens of a reserveWorkspaceLlmCall() call: fills in the
- * reservation row, or inserts one when there was no reservation. The row's
- * total_tokens is what sum_daily_llm_tokens() adds to the daily budget.
- * Never throws — the call already happened.
+ * Atomically claims one /probar call for `userId` in the workspace: under the
+ * person's and the workspace's calls of the last hour, with the call's token
+ * ceiling fitting /probar's daily cap and keeping the workspace's day under
+ * `workspaceLimit` (see 20261002000003_client_test_chat). The reservation
+ * holds the ceiling until recordWorkspaceLlmCall settles the real count. Same
+ * contract as reserveWorkspaceLlmCall: a database error throws, and a missing
+ * function (code deployed before `db-push`) falls back to a plain count.
+ */
+export async function reserveClientTestChat(
+  workspaceId: string,
+  userId: string,
+  limits: { perUserHour: number; perWorkspaceHour: number; dailyTokens: number },
+  tokens: { ceiling: number; workspaceLimit: number },
+): Promise<ReserveClientTestChatResult> {
+  const supabase = svc();
+
+  const { data, error } = await supabase.rpc("reserve_client_test_chat", {
+    p_workspace_id: workspaceId,
+    p_user_id: userId,
+    p_workspace_hourly_limit: limits.perWorkspaceHour,
+    p_user_hourly_limit: limits.perUserHour,
+    p_ceiling: tokens.ceiling,
+    p_daily_cap: limits.dailyTokens,
+    p_workspace_limit: tokens.workspaceLimit,
+  });
+
+  if (error) {
+    if (isMissingFunctionError(error, "reserve_client_test_chat")) {
+      reportMissingFunctionOnce(
+        "reserve_client_test_chat",
+        "the hourly limit of /probar is checked with a non-atomic count",
+      );
+      const count = await countRecentEvents(supabase, { workspaceId, type: "client_test_chat" });
+      return count >= limits.perWorkspaceHour
+        ? { allowed: false, reason: "workspace_hour" }
+        : { allowed: true };
+    }
+    throw new Error(`reserve_client_test_chat failed: ${error.message}`);
+  }
+
+  const row = (
+    data as { allowed: boolean; reason: string | null; reservation_id: string | null }[] | null
+  )?.[0];
+
+  if (!row?.allowed) {
+    const known: ClientTestChatRefusal[] = ["user_hour", "workspace_hour", "daily_cap", "budget"];
+    const reason = known.find((r) => r === row?.reason) ?? "workspace_hour";
+    return { allowed: false, reason };
+  }
+
+  return { allowed: true, reservationId: row.reservation_id ?? undefined };
+}
+
+/**
+ * Records the tokens of a reserveWorkspaceLlmCall() or reserveClientTestChat()
+ * call: fills in the reservation row, or inserts one when there was no
+ * reservation. The row's total_tokens is what sum_daily_llm_tokens() adds to
+ * the daily budget. `extra` replaces the reservation's payload, so it carries
+ * anything a cap counts by (the user_id of a /probar call). Never throws — the
+ * call already happened.
  */
 export async function recordWorkspaceLlmCall(opts: {
   reservationId?: string;
   workspaceId: string;
-  type: WorkspaceLlmCallType;
+  type: WorkspaceLlmCallType | "client_test_chat";
   model: string;
   promptTokens: number;
   completionTokens: number;

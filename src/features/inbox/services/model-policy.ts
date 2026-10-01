@@ -23,7 +23,7 @@ export async function enforceModelPolicy(
   supabase: SupabaseClient,
   workspaceId: string,
   model: string,
-  source: "agent_turn" | "agent_test_chat",
+  source: "agent_turn" | "agent_test_chat" | "client_test_chat",
 ): Promise<string> {
   const fallback = platformDefaultModel();
   if (model === fallback || isCatalogModel(model)) return model;

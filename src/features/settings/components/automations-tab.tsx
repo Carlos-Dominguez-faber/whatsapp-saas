@@ -27,11 +27,13 @@ import {
   type ActionType,
 } from "../services/automation-actions";
 import { AutomationRuleForm } from "./automation-rule-form";
+import { AutomationRunsPanel } from "./automation-runs-panel";
 import type {
   AutomationHealth,
   RuleHealth,
 } from "@/features/automations/services/rule-health";
 import type { TemplateRow } from "@/features/inbox/services/templates";
+import { RUN_STATUS_LABELS, runReasonLabel } from "@/features/automations/lib/run-labels";
 
 // ── Trigger metadata ──────────────────────────────────────────────────────────
 
@@ -137,41 +139,6 @@ const PAUSED_REASON_LABELS: Record<string, string> = {
     "Apagada porque Meta pausó su plantilla. Revisa la plantilla antes de activarla.",
 };
 
-const STATUS_LABELS: Record<string, string> = {
-  done: "Se ejecutó",
-  skipped: "Se omitió",
-  failed: "Falló",
-};
-
-/** The run causes a person needs to read; any other shows as its code. */
-const REASON_LABELS: Record<string, string> = {
-  cooldown: "ya le había enviado en las últimas 24 h",
-  daily_cap: "se alcanzó el tope diario",
-  opted_out: "el contacto pidió no recibir mensajes",
-  outcome_unknown: "no se sabe si llegó",
-  send_rejected: "WhatsApp la rechazó",
-  template_paused: "Meta pausó la plantilla",
-  reminder_too_late: "demasiado cerca de la cita",
-  outside_send_window: "fuera del horario de envío",
-  appointment_not_active: "la cita ya no está activa",
-  appointment_moved: "la cita cambió de hora",
-  appointment_passed: "la cita ya pasó",
-  stale: "el evento venció",
-  rule_reenabled: "ocurrió antes de activar la regla",
-  rule_disabled: "la regla estaba apagada",
-  no_conversation: "sin conversación",
-};
-
-function reasonLabel(code: string): string {
-  if (code.startsWith("missing_variable:")) {
-    return `falta el dato ${code.slice("missing_variable:".length)}`;
-  }
-  if (code.startsWith("max_attempts:")) {
-    return `se agotaron los intentos (${code.slice("max_attempts:".length)})`;
-  }
-  return REASON_LABELS[code] ?? code;
-}
-
 function RuleHealthLine({ health }: { health: RuleHealth | undefined }) {
   if (!health?.lastStatus) return null;
   const when = health.lastFinishedAt
@@ -182,9 +149,9 @@ function RuleHealthLine({ health }: { health: RuleHealth | undefined }) {
     : null;
   return (
     <p className="text-xs text-muted-foreground">
-      Última ejecución: {STATUS_LABELS[health.lastStatus] ?? health.lastStatus}
+      Última ejecución: {RUN_STATUS_LABELS[health.lastStatus] ?? health.lastStatus}
       {health.lastError && health.lastStatus !== "done"
-        ? ` (${reasonLabel(health.lastError)})`
+        ? ` (${runReasonLabel(health.lastError)})`
         : ""}
       {when ? ` · ${when}` : ""}
       {health.failures24h > 0 && (
@@ -321,9 +288,11 @@ function RuleCard({
 
 interface Props {
   workspaceId: string;
+  /** Admins and managers also see the runs panel (the route checks it too). */
+  canViewRuns?: boolean;
 }
 
-export function AutomationsTab({ workspaceId }: Props) {
+export function AutomationsTab({ workspaceId, canViewRuns = false }: Props) {
   const [rules, setRules] = useState<AutomationRule[]>([]);
   const [health, setHealth] = useState<AutomationHealth | null>(null);
   const [templates, setTemplates] = useState<TemplateRow[]>([]);
@@ -561,6 +530,10 @@ export function AutomationsTab({ workspaceId }: Props) {
               />
             ))}
           </div>
+        )}
+
+        {canViewRuns && !isLoading && !loadError && rules.length > 0 && (
+          <AutomationRunsPanel workspaceId={workspaceId} />
         )}
       </div>
 
