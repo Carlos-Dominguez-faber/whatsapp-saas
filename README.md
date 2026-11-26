@@ -165,6 +165,8 @@ timestamp **mayor que la última que ya está en `main`**, para que
 **Migraciones** del CI lo revisa en cada PR. Para correrlo antes de abrir el tuyo:
 `node scripts/check-migrations.mjs`.
 
+Cuando un PR modifica las migraciones de Supabase, [RattleCheck](.github/workflows/rattlecheck.yml) compara los permisos con los de la rama base. Si detecta un problema nuevo de gravedad alta o crítica, señala la línea SQL para revisarla antes de ejecutar `supabase db push`. La comprobación no necesita credenciales de la base de datos.
+
 ## Licencia
 
 [MIT](LICENSE). Puedes usar, modificar, forkear, redistribuir, vender y cobrar
